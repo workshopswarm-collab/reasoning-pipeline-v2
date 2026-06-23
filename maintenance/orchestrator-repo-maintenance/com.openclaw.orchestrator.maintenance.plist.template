@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.openclaw.orchestrator.maintenance</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/agent2/.openclaw/maintenance/orchestrator-repo-maintenance/run_scheduled_maintenance.py</string>
+    <string>--interval-days</string>
+    <string>14</string>
+  </array>
+
+  <!-- launchd cannot express "every two weeks" directly; run daily and let
+       run_scheduled_maintenance.py skip until 14 days have elapsed. -->
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>11</integer>
+    <key>Minute</key>
+    <integer>15</integer>
+  </dict>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/agent2/.openclaw/maintenance/orchestrator-repo-maintenance</string>
+
+  <key>StandardOutPath</key>
+  <string>/Users/agent2/.openclaw/maintenance/orchestrator-repo-maintenance/generated/scheduled-maintenance.launchd.out.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>/Users/agent2/.openclaw/maintenance/orchestrator-repo-maintenance/generated/scheduled-maintenance.launchd.err.log</string>
+</dict>
+</plist>

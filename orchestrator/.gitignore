@@ -1,0 +1,33 @@
+.openclaw/
+
+# Local environment / secrets files
+.env
+.env.*
+*.env
+.envrc
+
+# Local scratch / temporary artifacts
+/tmp/
+/scratch/
+/.temporary/
+/.trash/
+.tmp*
+/.tmp*/
+qmd_test.txt
+/tmp_boj_case/
+/tmp_plaw*.html
+/qualitative-db/40-research/**/synthesis-response*.raw.txt
+/qualitative-db/40-research/**/synthesis-stage-status.json.lock
+/qualitative-db/40-research/**/decision-stage-status.json.lock
+/qualitative-db/40-research/**/light-refresh-status.json.lock
+__pycache__/
+*.py[cod]
+/runtime/researchers-swarm-subagents/runtime/scripts/.runtime-state/
+/scripts/.runtime-state/
+/runtime/researchers-swarm-subagents/runtime/.runtime-state/
+/runtime/synthesis-subagent/runtime/.runtime-state/
+/backups/automation-reset-*/
+
+.DS_Store
+scripts/.DS_Store
+qualitative-db/.obsidian/

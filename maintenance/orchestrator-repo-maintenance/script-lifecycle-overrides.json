@@ -1,0 +1,102 @@
+{
+  "schema_version": "orchestrator-script-lifecycle-overrides/v1",
+  "description": "Human-reviewed lifecycle annotations layered onto deterministic script classification. These overrides do not mutate source files or change classifier evidence; they document intentional retention, review state, or approved future cleanup.",
+  "overrides": {
+    "quant-db/scripts/backfill_market_categories.py": {
+      "lifecycle_status": "manual_backfill_review",
+      "rationale": "Backfill utility with no inbound static references; retain until market category storage/history is confirmed fully converged.",
+      "owner": "Workbench",
+      "review_after": "2026-05-15",
+      "verification": {
+        "operator_docs_checked": false,
+        "launchd_cron_checked": false,
+        "external_usage_checked": false,
+        "runtime_state_checked": false,
+        "archive_path_defined": false,
+        "underlying_condition_resolved": false,
+        "archived_for_one_cycle": false,
+        "notes": "Set these fields true only after explicit review; maintenance will not infer them from no-ref status alone."
+      }
+    },
+    "quant-db/scripts/repair_market_resolution_links.py": {
+      "lifecycle_status": "manual_repair_review",
+      "rationale": "Historical DB repair utility; retain until the bad market_id-as-case_key state is proven impossible and no existing rows need repair.",
+      "owner": "Workbench",
+      "review_after": "2026-05-15",
+      "verification": {
+        "operator_docs_checked": false,
+        "launchd_cron_checked": false,
+        "external_usage_checked": false,
+        "runtime_state_checked": false,
+        "archive_path_defined": false,
+        "underlying_condition_resolved": false,
+        "archived_for_one_cycle": false,
+        "notes": "Set these fields true only after explicit review; maintenance will not infer them from no-ref status alone."
+      }
+    },
+    "decision-maker/runtime/scripts/handoff_to_decision_maker.py": {
+      "lifecycle_status": "deprecated_candidate_review",
+      "rationale": "No inbound static references after Decision-Maker launch path moved to run_decision_maker.py; verify no operator/manual workflow still uses this before archive/removal.",
+      "owner": "Workbench",
+      "review_after": "2026-05-01",
+      "verification": {
+        "operator_docs_checked": false,
+        "launchd_cron_checked": false,
+        "external_usage_checked": false,
+        "runtime_state_checked": false,
+        "archive_path_defined": false,
+        "underlying_condition_resolved": false,
+        "archived_for_one_cycle": false,
+        "notes": "Set these fields true only after explicit review; maintenance will not infer them from no-ref status alone."
+      }
+    },
+    "runtime/researchers-swarm-subagents/planner/scripts/replay_research_difficulty_cases.py": {
+      "lifecycle_status": "diagnostic_harness_review",
+      "rationale": "Replay harness with no inbound static references; likely useful only during classifier/difficulty-model calibration work.",
+      "owner": "Workbench",
+      "review_after": "2026-05-15",
+      "verification": {
+        "operator_docs_checked": false,
+        "launchd_cron_checked": false,
+        "external_usage_checked": false,
+        "runtime_state_checked": false,
+        "archive_path_defined": false,
+        "underlying_condition_resolved": false,
+        "archived_for_one_cycle": false,
+        "notes": "Set these fields true only after explicit review; maintenance will not infer them from no-ref status alone."
+      }
+    },
+    "runtime/researchers-swarm-subagents/runtime/scripts/sweep_stale_market_pipeline_state.py": {
+      "lifecycle_status": "manual_repair_review",
+      "rationale": "Stale-state sweep/repair helper; verify replacement by current sequencer/watchdog repair semantics before archive/removal.",
+      "owner": "Workbench",
+      "review_after": "2026-05-15",
+      "verification": {
+        "operator_docs_checked": false,
+        "launchd_cron_checked": false,
+        "external_usage_checked": false,
+        "runtime_state_checked": false,
+        "archive_path_defined": false,
+        "underlying_condition_resolved": false,
+        "archived_for_one_cycle": false,
+        "notes": "Set these fields true only after explicit review; maintenance will not infer them from no-ref status alone."
+      }
+    },
+    "runtime/synthesis-subagent/runtime/scripts/runrepairs/repair_structured_bundle_path.py": {
+      "lifecycle_status": "manual_repair_review",
+      "rationale": "One-off synthesis structured-bundle path repair candidate; verify old artifact shape cannot recur before archive/removal.",
+      "owner": "Workbench",
+      "review_after": "2026-05-15",
+      "verification": {
+        "operator_docs_checked": false,
+        "launchd_cron_checked": false,
+        "external_usage_checked": false,
+        "runtime_state_checked": false,
+        "archive_path_defined": false,
+        "underlying_condition_resolved": false,
+        "archived_for_one_cycle": false,
+        "notes": "Set these fields true only after explicit review; maintenance will not infer them from no-ref status alone."
+      }
+    }
+  }
+}

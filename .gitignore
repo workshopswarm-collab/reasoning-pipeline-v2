@@ -1,0 +1,86 @@
+# macOS/editor noise
+.DS_Store
+._*
+*.swp
+*.swo
+*~
+
+# Secrets, local config, and runtime state
+.env
+.env.*
+*.env
+.envrc
+openclaw.json
+openclaw.json.*
+gateway-supervisor-restart-handoff.json
+update-check.json
+openclaw-workspace-state.json
+**/openclaw-workspace-state.json
+**/.openclaw/
+
+# Private continuity and memory
+MEMORY.md
+**/MEMORY.md
+memory/
+**/memory/
+
+# OpenClaw runtime/private areas
+agents/
+devices/
+identity/
+logs/
+service-env/
+state/
+tmp/
+workspace-attestations/
+
+# Installed packages and generated local projects
+completions/
+npm/
+node_modules/
+**/node_modules/
+plugin-skills/
+
+# Caches/build artifacts
+__pycache__/
+*.py[cod]
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.db
+*.db-shm
+*.db-wal
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+.cache/
+coverage/
+
+# Local scratch/temp artifacts
+.tmp/
+**/.tmp/
+scratch/
+**/scratch/
+tmp/
+**/tmp/
+.temporary/
+**/.temporary/
+.trash/
+**/.trash/
+
+# Runtime/generated outputs inside development workspaces
+orchestrator/.env
+orchestrator/.env.*
+orchestrator/backups/
+orchestrator/runtime/
+orchestrator/scripts/.runtime-state/
+orchestrator/scripts/data/
+maintenance/generated/
+maintenance/**/generated/
+maintenance/**/runs/
+workbench/tmp/
+workbench/.tmp/

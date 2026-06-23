@@ -1,0 +1,18 @@
+collections:
+  vault:
+    path: ./qualitative-db
+    pattern: "**/*.md"
+    ignore:
+      - "60-uncategorized/archive/**"
+    context:
+      40-research: Time-indexed research artifacts including source notes, agent findings, syntheses, investigations, and assumptions. Use for provenance and evidence retrieval.
+      30-drivers: Reusable causal mechanisms such as regulation, polling, sentiment, injuries-health, product launches, macro, and conflicts.
+      50-learnings: Resolved-case learnings, cross-case error patterns, driver-learning notes, and intervention tracking for recursive improvement.
+      10-domains: Subject-area knowledge across crypto, culture, economics, geopolitics, politics, sports, and tech-ai. Use for background understanding and domain framing.
+      20-entities: Reusable dossiers on recurring actors and objects such as players, teams, companies, protocols, and major assets. Use for canonical entity memory.
+  archive:
+    path: ./qualitative-db/60-uncategorized/archive
+    pattern: "**/*.md"
+    includeByDefault: false
+    context:
+      /: Archived notes, merged duplicates, low-signal entities, and retired stubs kept for audit history. Not part of default retrieval; search only when explicitly requested.
