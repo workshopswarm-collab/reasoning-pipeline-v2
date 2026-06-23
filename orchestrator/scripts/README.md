@@ -9,6 +9,14 @@ Going forward, all `.openclaw` pipeline runtime scripts belong under `/Users/age
 This is the single home for Orchestrator-run pipeline intake, controls, maintenance, scoring, reporting, and related runtime utilities.
 Do not scatter new pipeline runtime scripts across other `.openclaw` folders; add them here and file each item into the appropriate location from the folder contract below.
 
+## Agent Roles
+
+- Workbench is the development surface. Use Workbench for implementation, edits, refactors, docs, script design, tests, and cleanup work across `.openclaw`.
+- Orchestrator is the functionality and execution surface. Use Orchestrator for live pipeline runtime behavior, scheduled jobs, intake, controls, scoring, reporting, and operational execution.
+- Maintenance is the repository maintenance surface. Use Maintenance for repo hygiene, dependency upkeep, routine checks, cleanup, and non-feature maintenance tasks.
+
+Keep development work, live execution, and repo maintenance distinct. Runtime scripts still live in this folder, but Workbench should make changes to them as development work; Orchestrator should run them as operational behavior; Maintenance should keep the repository healthy around them.
+
 ## Folder Contract
 
 - `bin/`: runnable entrypoints, one-shot jobs, maintenance commands, and shell wrappers.
