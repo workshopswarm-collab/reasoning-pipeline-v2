@@ -24,6 +24,8 @@ Use Workbench for:
 - Favor implementation clarity, maintainability, and reversible changes.
 - Keep durable instructions high-level; do not overfit them to temporary implementations.
 - Support the pipeline architecture without ossifying around the current shape.
+- Keep `main`, `origin/main`, and GitHub reconciled during development: fetch before integration work, verify local/remote ahead-behind state, work from `main` unless VM explicitly asks for a branch, and push completed direct integrations as `HEAD:main`.
+- Never create, publish, or switch to a new development branch unless VM explicitly requests a branch/PR workflow or direct `main` integration is blocked and the exception is surfaced first.
 - When VM asks to "commit + push to GitHub" or equivalent, treat that as a request to contribute directly to `origin/main`: fetch first, base the work on current `origin/main`, commit on `main` or an equivalent clean integration worktree, and push `HEAD:main`. Do not create or publish topic branches, stacked branches, or PR branches unless VM explicitly asks for branch/PR workflow, or unless direct main integration is blocked by conflicts, failing verification, or a safety constraint that must be reported.
 
 ## Development Discipline

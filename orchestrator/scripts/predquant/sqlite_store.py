@@ -19,6 +19,8 @@ from predquant.brier import (
 from predquant.foundation_schema import ensure_foundation_schema
 
 DEFAULT_DB_PATH = Path("data/predquant.sqlite3")
+DEFAULT_MAX_SNAPSHOT_AGE_SECONDS = 3600.0
+BRIER_SCORING_VERSION = "brier-v1"
 
 
 SCHEMA = """
@@ -77,6 +79,12 @@ CREATE INDEX IF NOT EXISTS idx_market_snapshots_market_observed
 CREATE TABLE IF NOT EXISTS market_predictions (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   market_id INTEGER NOT NULL REFERENCES markets(id) ON DELETE CASCADE,
+  prediction_run_id TEXT,
+  forecast_artifact_id TEXT,
+  case_key TEXT,
+  case_id TEXT,
+  dispatch_id TEXT,
+  engine_stage TEXT,
   prediction_source TEXT NOT NULL DEFAULT 'pipeline',
   prediction_label TEXT,
   predicted_at TEXT NOT NULL,
@@ -90,9 +98,18 @@ CREATE TABLE IF NOT EXISTS market_predictions (
   model_name TEXT,
   prompt_version TEXT,
   input_hash TEXT,
+  input_artifact_path TEXT,
+  input_artifact_sha256 TEXT,
+  prediction_artifact_path TEXT,
+  prediction_artifact_sha256 TEXT,
+  snapshot_age_seconds REAL,
   outcome REAL,
   prediction_brier REAL,
   market_brier REAL,
+  scoring_version TEXT,
+  scored_at TEXT,
+  scoring_resolution_payload_hash TEXT,
+  scoring_resolution_source TEXT,
   resolved_at TEXT,
   rationale TEXT,
   metadata TEXT NOT NULL DEFAULT '{}',
@@ -104,6 +121,18 @@ CREATE INDEX IF NOT EXISTS idx_market_predictions_market
   ON market_predictions(market_id, predicted_at);
 CREATE INDEX IF NOT EXISTS idx_market_predictions_source
   ON market_predictions(prediction_source, predicted_at);
+"""
+
+
+PREDICTION_INDEX_SCHEMA = """
+CREATE UNIQUE INDEX IF NOT EXISTS idx_market_predictions_run_id
+  ON market_predictions(prediction_run_id)
+  WHERE prediction_run_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_market_predictions_forecast_artifact
+  ON market_predictions(forecast_artifact_id)
+  WHERE forecast_artifact_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_market_predictions_case
+  ON market_predictions(case_key, dispatch_id, predicted_at);
 """
 
 
@@ -858,6 +887,12 @@ MARKET_COLUMN_MIGRATIONS = {
 }
 
 PREDICTION_COLUMN_MIGRATIONS = {
+    "prediction_run_id": "TEXT",
+    "forecast_artifact_id": "TEXT",
+    "case_key": "TEXT",
+    "case_id": "TEXT",
+    "dispatch_id": "TEXT",
+    "engine_stage": "TEXT",
     "market_probability_method": "TEXT",
     "source_fetched_at": "TEXT",
     "source_payload_hash": "TEXT",
@@ -865,6 +900,15 @@ PREDICTION_COLUMN_MIGRATIONS = {
     "model_name": "TEXT",
     "prompt_version": "TEXT",
     "input_hash": "TEXT",
+    "input_artifact_path": "TEXT",
+    "input_artifact_sha256": "TEXT",
+    "prediction_artifact_path": "TEXT",
+    "prediction_artifact_sha256": "TEXT",
+    "snapshot_age_seconds": "REAL",
+    "scoring_version": "TEXT",
+    "scored_at": "TEXT",
+    "scoring_resolution_payload_hash": "TEXT",
+    "scoring_resolution_source": "TEXT",
 }
 
 FOUNDATION_COMPAT_COLUMN_MIGRATIONS = {
@@ -1073,6 +1117,7 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
     ensure_columns(conn, "markets", MARKET_COLUMN_MIGRATIONS)
     ensure_columns(conn, "market_predictions", PREDICTION_COLUMN_MIGRATIONS)
+    conn.executescript(PREDICTION_INDEX_SCHEMA)
     ensure_foundation_schema(conn)
     for table, columns in FOUNDATION_COMPAT_COLUMN_MIGRATIONS.items():
         ensure_columns(conn, table, columns)
@@ -1104,6 +1149,40 @@ def parse_market_time(value):
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def normalize_timestamp(value, field_name: str, default: Optional[str] = None) -> str:
+    raw_value = value if value not in (None, "") else default
+    parsed = parse_market_time(raw_value)
+    if parsed is None:
+        raise ValueError(f"{field_name} must be a valid timestamp")
+    return parsed.isoformat()
+
+
+def snapshot_age_seconds(
+    source_fetched_at: Optional[str],
+    predicted_at: Optional[str],
+    max_snapshot_age_seconds: Optional[float] = None,
+) -> Optional[float]:
+    if not source_fetched_at or not predicted_at:
+        return None
+    source_time = parse_market_time(source_fetched_at)
+    prediction_time = parse_market_time(predicted_at)
+    if source_time is None or prediction_time is None:
+        return None
+    age = (prediction_time - source_time).total_seconds()
+    if age < 0:
+        raise ValueError("source_fetched_at cannot be after predicted_at")
+    if max_snapshot_age_seconds is not None and age > max_snapshot_age_seconds:
+        raise ValueError(
+            "market snapshot is stale for prediction: "
+            f"{age:.3f}s > {max_snapshot_age_seconds:.3f}s"
+        )
+    return age
 
 
 def market_expired_at(row: sqlite3.Row, cutoff: datetime):
@@ -1398,12 +1477,118 @@ def latest_snapshot_for_market(
     ).fetchone()
 
 
+def find_existing_prediction(
+    conn: sqlite3.Connection,
+    prediction_run_id: Optional[str] = None,
+    forecast_artifact_id: Optional[str] = None,
+):
+    clauses = []
+    params = []
+    if prediction_run_id:
+        clauses.append("prediction_run_id = ?")
+        params.append(prediction_run_id)
+    if forecast_artifact_id:
+        clauses.append("forecast_artifact_id = ?")
+        params.append(forecast_artifact_id)
+    if not clauses:
+        return None
+    rows = conn.execute(
+        f"""
+        SELECT *
+        FROM market_predictions
+        WHERE {" OR ".join(clauses)}
+        ORDER BY id
+        """,
+        params,
+    ).fetchall()
+    if not rows:
+        return None
+    if len({int(row["id"]) for row in rows}) > 1:
+        raise ValueError("prediction identity matches multiple existing rows")
+    return rows[0]
+
+
+def prediction_result(row: sqlite3.Row, idempotent: bool = False) -> dict:
+    result = {
+        "prediction_id": int(row["id"]),
+        "market_id": int(row["market_id"]),
+        "prediction_run_id": row["prediction_run_id"],
+        "forecast_artifact_id": row["forecast_artifact_id"],
+        "case_key": row["case_key"],
+        "case_id": row["case_id"],
+        "dispatch_id": row["dispatch_id"],
+        "engine_stage": row["engine_stage"],
+        "snapshot_id": row["market_snapshot_id"],
+        "predicted_probability": row["predicted_probability"],
+        "market_probability": row["market_probability"],
+        "market_probability_method": row["market_probability_method"],
+        "source_fetched_at": row["source_fetched_at"],
+        "source_payload_hash": row["source_payload_hash"],
+        "snapshot_age_seconds": row["snapshot_age_seconds"],
+        "prediction_brier": row["prediction_brier"],
+        "market_brier": row["market_brier"],
+        "scoring_version": row["scoring_version"],
+        "scored_at": row["scored_at"],
+    }
+    if idempotent:
+        result["idempotent"] = True
+    return result
+
+
+def existing_prediction_result_or_error(
+    row: sqlite3.Row,
+    *,
+    predicted_probability,
+    prediction_run_id: Optional[str],
+    forecast_artifact_id: Optional[str],
+    case_key: Optional[str],
+    case_id: Optional[str],
+    dispatch_id: Optional[str],
+    engine_stage: Optional[str],
+    prediction_source: str,
+    prediction_label: Optional[str],
+    source_payload_hash: Optional[str],
+) -> dict:
+    mismatches = []
+    expected_fields = {
+        "prediction_run_id": prediction_run_id,
+        "forecast_artifact_id": forecast_artifact_id,
+        "case_key": case_key,
+        "case_id": case_id,
+        "dispatch_id": dispatch_id,
+        "engine_stage": engine_stage,
+    }
+    for field_name, expected_value in expected_fields.items():
+        if expected_value is not None and row[field_name] != expected_value:
+            mismatches.append(field_name)
+    if float(row["predicted_probability"]) != float(predicted_probability):
+        mismatches.append("predicted_probability")
+    if row["prediction_source"] != prediction_source:
+        mismatches.append("prediction_source")
+    if (row["prediction_label"] or None) != (prediction_label or None):
+        mismatches.append("prediction_label")
+    if source_payload_hash and row["source_payload_hash"] != source_payload_hash:
+        mismatches.append("source_payload_hash")
+    if mismatches:
+        raise ValueError(
+            "prediction identity already exists with different "
+            + ", ".join(mismatches)
+        )
+    return prediction_result(row, idempotent=True)
+
+
 def record_market_prediction(
     db_path: Path,
     predicted_probability,
     market_id: Optional[int] = None,
     platform: str = "polymarket",
     external_market_id: Optional[str] = None,
+    prediction_run_id: Optional[str] = None,
+    forecast_artifact_id: Optional[str] = None,
+    case_key: Optional[str] = None,
+    case_id: Optional[str] = None,
+    dispatch_id: Optional[str] = None,
+    engine_stage: Optional[str] = None,
     prediction_source: str = "pipeline",
     prediction_label: Optional[str] = None,
     predicted_at: Optional[str] = None,
@@ -1415,6 +1600,11 @@ def record_market_prediction(
     model_name: Optional[str] = None,
     prompt_version: Optional[str] = None,
     input_hash: Optional[str] = None,
+    input_artifact_path: Optional[str] = None,
+    input_artifact_sha256: Optional[str] = None,
+    prediction_artifact_path: Optional[str] = None,
+    prediction_artifact_sha256: Optional[str] = None,
+    max_snapshot_age_seconds: Optional[float] = DEFAULT_MAX_SNAPSHOT_AGE_SECONDS,
     rationale: Optional[str] = None,
     metadata: Optional[dict] = None,
 ) -> dict:
@@ -1422,13 +1612,35 @@ def record_market_prediction(
         predicted_probability,
         "predicted_probability",
     )
-    predicted_at = predicted_at or datetime.now(timezone.utc).isoformat()
+    predicted_at = normalize_timestamp(predicted_at, "predicted_at", utc_now())
+    if source_fetched_at:
+        source_fetched_at = normalize_timestamp(source_fetched_at, "source_fetched_at")
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     try:
         with conn:
             ensure_schema(conn)
+            existing_prediction = find_existing_prediction(
+                conn,
+                prediction_run_id=prediction_run_id,
+                forecast_artifact_id=forecast_artifact_id,
+            )
+            if existing_prediction:
+                return existing_prediction_result_or_error(
+                    existing_prediction,
+                    predicted_probability=predicted_probability,
+                    prediction_run_id=prediction_run_id,
+                    forecast_artifact_id=forecast_artifact_id,
+                    case_key=case_key,
+                    case_id=case_id,
+                    dispatch_id=dispatch_id,
+                    engine_stage=engine_stage,
+                    prediction_source=prediction_source,
+                    prediction_label=prediction_label,
+                    source_payload_hash=source_payload_hash,
+                )
+
             market = find_market(conn, market_id, platform, external_market_id)
             if not market:
                 raise ValueError("market not found")
@@ -1436,6 +1648,13 @@ def record_market_prediction(
             snapshot = latest_snapshot_for_market(conn, int(market["id"]), predicted_at)
             if source_fetched_at is None and snapshot:
                 source_fetched_at = snapshot["observed_at"]
+            if source_fetched_at:
+                source_fetched_at = normalize_timestamp(source_fetched_at, "source_fetched_at")
+            snapshot_age = snapshot_age_seconds(
+                source_fetched_at,
+                predicted_at,
+                max_snapshot_age_seconds,
+            )
             if market_probability is None:
                 market_probability, market_probability_method = market_probability_from_snapshot(
                     snapshot,
@@ -1456,6 +1675,10 @@ def record_market_prediction(
             outcome = market["resolution_outcome"]
             prediction_brier = None
             market_brier = None
+            scoring_version = None
+            scored_at = None
+            scoring_resolution_payload_hash = None
+            scoring_resolution_source = None
             resolved_at = None
             if outcome is not None:
                 scores = prediction_scores(
@@ -1466,11 +1689,22 @@ def record_market_prediction(
                 prediction_brier = scores["prediction_brier"]
                 market_brier = scores["market_brier"]
                 resolved_at = market["resolution_recorded_at"]
+                scoring_version = BRIER_SCORING_VERSION
+                scored_at = utc_now()
+                scoring_resolution_payload_hash = market["resolution_payload_hash"]
+                scoring_resolution_source = market["resolution_source"]
 
+            now = utc_now()
             cursor = conn.execute(
                 """
                 INSERT INTO market_predictions (
                   market_id,
+                  prediction_run_id,
+                  forecast_artifact_id,
+                  case_key,
+                  case_id,
+                  dispatch_id,
+                  engine_stage,
                   prediction_source,
                   prediction_label,
                   predicted_at,
@@ -1484,19 +1718,34 @@ def record_market_prediction(
                   model_name,
                   prompt_version,
                   input_hash,
+                  input_artifact_path,
+                  input_artifact_sha256,
+                  prediction_artifact_path,
+                  prediction_artifact_sha256,
+                  snapshot_age_seconds,
                   outcome,
                   prediction_brier,
                   market_brier,
+                  scoring_version,
+                  scored_at,
+                  scoring_resolution_payload_hash,
+                  scoring_resolution_source,
                   resolved_at,
                   rationale,
                   metadata,
                   created_at,
                   updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     int(market["id"]),
+                    prediction_run_id,
+                    forecast_artifact_id,
+                    case_key,
+                    case_id,
+                    dispatch_id,
+                    engine_stage,
                     prediction_source,
                     prediction_label,
                     predicted_at,
@@ -1510,26 +1759,30 @@ def record_market_prediction(
                     model_name,
                     prompt_version,
                     input_hash,
+                    input_artifact_path,
+                    input_artifact_sha256,
+                    prediction_artifact_path,
+                    prediction_artifact_sha256,
+                    snapshot_age,
                     outcome,
                     prediction_brier,
                     market_brier,
+                    scoring_version,
+                    scored_at,
+                    scoring_resolution_payload_hash,
+                    scoring_resolution_source,
                     resolved_at,
                     rationale,
                     to_json_text(metadata),
-                    datetime.now(timezone.utc).isoformat(),
-                    datetime.now(timezone.utc).isoformat(),
+                    now,
+                    now,
                 ),
             )
-        return {
-            "prediction_id": int(cursor.lastrowid),
-            "market_id": int(market["id"]),
-            "predicted_probability": predicted_probability,
-            "market_probability": market_probability,
-            "market_probability_method": market_probability_method,
-            "source_payload_hash": source_payload_hash,
-            "prediction_brier": prediction_brier,
-            "market_brier": market_brier,
-        }
+            prediction_row = conn.execute(
+                "SELECT * FROM market_predictions WHERE id = ?",
+                (int(cursor.lastrowid),),
+            ).fetchone()
+        return prediction_result(prediction_row)
     finally:
         conn.close()
 
@@ -1538,6 +1791,12 @@ def record_prediction_with_snapshot(
     db_path: Path,
     payload: dict,
     predicted_probability,
+    prediction_run_id: Optional[str] = None,
+    forecast_artifact_id: Optional[str] = None,
+    case_key: Optional[str] = None,
+    case_id: Optional[str] = None,
+    dispatch_id: Optional[str] = None,
+    engine_stage: Optional[str] = None,
     prediction_source: str = "pipeline",
     prediction_label: Optional[str] = None,
     predicted_at: Optional[str] = None,
@@ -1549,6 +1808,11 @@ def record_prediction_with_snapshot(
     model_name: Optional[str] = None,
     prompt_version: Optional[str] = None,
     input_hash: Optional[str] = None,
+    input_artifact_path: Optional[str] = None,
+    input_artifact_sha256: Optional[str] = None,
+    prediction_artifact_path: Optional[str] = None,
+    prediction_artifact_sha256: Optional[str] = None,
+    max_snapshot_age_seconds: Optional[float] = DEFAULT_MAX_SNAPSHOT_AGE_SECONDS,
     rationale: Optional[str] = None,
     metadata: Optional[dict] = None,
 ) -> dict:
@@ -1559,9 +1823,24 @@ def record_prediction_with_snapshot(
     source_payload_hash = source_payload_hash or payload_hash(payload)
     payload, snapshot = normalize_payload(payload)
     if source_fetched_at:
+        source_fetched_at = normalize_timestamp(source_fetched_at, "source_fetched_at")
         snapshot["observed_at"] = source_fetched_at
-    source_fetched_at = source_fetched_at or snapshot.get("observed_at")
-    predicted_at = predicted_at or source_fetched_at or datetime.now(timezone.utc).isoformat()
+    else:
+        source_fetched_at = normalize_timestamp(
+            snapshot.get("observed_at"),
+            "source_fetched_at",
+        )
+        snapshot["observed_at"] = source_fetched_at
+    predicted_at = normalize_timestamp(
+        predicted_at,
+        "predicted_at",
+        source_fetched_at,
+    )
+    snapshot_age = snapshot_age_seconds(
+        source_fetched_at,
+        predicted_at,
+        max_snapshot_age_seconds,
+    )
 
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path)
@@ -1569,6 +1848,26 @@ def record_prediction_with_snapshot(
     try:
         with conn:
             ensure_schema(conn)
+            existing_prediction = find_existing_prediction(
+                conn,
+                prediction_run_id=prediction_run_id,
+                forecast_artifact_id=forecast_artifact_id,
+            )
+            if existing_prediction:
+                return existing_prediction_result_or_error(
+                    existing_prediction,
+                    predicted_probability=predicted_probability,
+                    prediction_run_id=prediction_run_id,
+                    forecast_artifact_id=forecast_artifact_id,
+                    case_key=case_key,
+                    case_id=case_id,
+                    dispatch_id=dispatch_id,
+                    engine_stage=engine_stage,
+                    prediction_source=prediction_source,
+                    prediction_label=prediction_label,
+                    source_payload_hash=source_payload_hash,
+                )
+
             market_id = upsert_market(conn, payload, snapshot)
             snapshot_id = insert_snapshot(conn, market_id, snapshot)
             market = conn.execute(
@@ -1596,6 +1895,10 @@ def record_prediction_with_snapshot(
             outcome = market["resolution_outcome"]
             prediction_brier = None
             market_brier = None
+            scoring_version = None
+            scored_at = None
+            scoring_resolution_payload_hash = None
+            scoring_resolution_source = None
             resolved_at = None
             if outcome is not None:
                 scores = prediction_scores(
@@ -1606,12 +1909,22 @@ def record_prediction_with_snapshot(
                 prediction_brier = scores["prediction_brier"]
                 market_brier = scores["market_brier"]
                 resolved_at = market["resolution_recorded_at"]
+                scoring_version = BRIER_SCORING_VERSION
+                scored_at = utc_now()
+                scoring_resolution_payload_hash = market["resolution_payload_hash"]
+                scoring_resolution_source = market["resolution_source"]
 
-            now = datetime.now(timezone.utc).isoformat()
+            now = utc_now()
             cursor = conn.execute(
                 """
                 INSERT INTO market_predictions (
                   market_id,
+                  prediction_run_id,
+                  forecast_artifact_id,
+                  case_key,
+                  case_id,
+                  dispatch_id,
+                  engine_stage,
                   prediction_source,
                   prediction_label,
                   predicted_at,
@@ -1625,19 +1938,34 @@ def record_prediction_with_snapshot(
                   model_name,
                   prompt_version,
                   input_hash,
+                  input_artifact_path,
+                  input_artifact_sha256,
+                  prediction_artifact_path,
+                  prediction_artifact_sha256,
+                  snapshot_age_seconds,
                   outcome,
                   prediction_brier,
                   market_brier,
+                  scoring_version,
+                  scored_at,
+                  scoring_resolution_payload_hash,
+                  scoring_resolution_source,
                   resolved_at,
                   rationale,
                   metadata,
                   created_at,
                   updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     market_id,
+                    prediction_run_id,
+                    forecast_artifact_id,
+                    case_key,
+                    case_id,
+                    dispatch_id,
+                    engine_stage,
                     prediction_source,
                     prediction_label,
                     predicted_at,
@@ -1651,9 +1979,18 @@ def record_prediction_with_snapshot(
                     model_name,
                     prompt_version,
                     input_hash,
+                    input_artifact_path,
+                    input_artifact_sha256,
+                    prediction_artifact_path,
+                    prediction_artifact_sha256,
+                    snapshot_age,
                     outcome,
                     prediction_brier,
                     market_brier,
+                    scoring_version,
+                    scored_at,
+                    scoring_resolution_payload_hash,
+                    scoring_resolution_source,
                     resolved_at,
                     rationale,
                     to_json_text(metadata),
@@ -1661,18 +1998,11 @@ def record_prediction_with_snapshot(
                     now,
                 ),
             )
-        return {
-            "prediction_id": int(cursor.lastrowid),
-            "market_id": market_id,
-            "snapshot_id": snapshot_id,
-            "predicted_probability": predicted_probability,
-            "market_probability": market_probability,
-            "market_probability_method": market_probability_method,
-            "source_fetched_at": source_fetched_at,
-            "source_payload_hash": source_payload_hash,
-            "prediction_brier": prediction_brier,
-            "market_brier": market_brier,
-        }
+            prediction_row = conn.execute(
+                "SELECT * FROM market_predictions WHERE id = ?",
+                (int(cursor.lastrowid),),
+            ).fetchone()
+        return prediction_result(prediction_row)
     finally:
         conn.close()
 
@@ -1735,6 +2065,7 @@ def settle_market_outcome(
                     int(market["id"]),
                 ),
             )
+            scored_at = utc_now()
             conn.execute(
                 """
                 UPDATE market_predictions
@@ -1745,6 +2076,10 @@ def settle_market_outcome(
                         WHEN market_probability IS NULL THEN NULL
                         ELSE (market_probability - ?) * (market_probability - ?)
                     END,
+                    scoring_version = ?,
+                    scored_at = ?,
+                    scoring_resolution_payload_hash = ?,
+                    scoring_resolution_source = ?,
                     resolved_at = ?,
                     updated_at = ?
                 WHERE market_id = ?
@@ -1755,6 +2090,10 @@ def settle_market_outcome(
                     outcome,
                     outcome,
                     outcome,
+                    BRIER_SCORING_VERSION,
+                    scored_at,
+                    resolution_payload_hash,
+                    resolution_source,
                     resolved_at,
                     now,
                     int(market["id"]),
@@ -1819,6 +2158,7 @@ def brier_score_report(
                     WHEN market_brier IS NULL OR prediction_brier IS NULL THEN NULL
                     ELSE market_brier - prediction_brier
                   END) AS avg_brier_edge,
+              GROUP_CONCAT(DISTINCT scoring_version) AS scoring_versions,
               MIN(predicted_at) AS first_prediction_at,
               MAX(predicted_at) AS last_prediction_at,
               MAX(resolved_at) AS latest_resolved_at

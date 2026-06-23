@@ -22,6 +22,7 @@ Keep development work, live execution, and repo maintenance distinct. Runtime sc
 - `bin/`: runnable entrypoints, one-shot jobs, maintenance commands, and shell wrappers.
 - `predquant/`: importable Python source for intake, storage, scoring, resolution sync, and shared helpers.
 - `migrations/`: ordered SQLite schema migrations and foundation dependencies.
+- `tests/`: focused regression tests for the runtime script bundle.
 - `data/`: local SQLite databases and other durable data files.
 - `.runtime-state/`: generated reports, heartbeats, logs, locks, and transient market payloads.
 - `requirements.txt`: Python dependencies for this bundle.
@@ -60,6 +61,7 @@ Root files should stay minimal. New runnable scripts belong in `bin/`; new reusa
 | `predquant/sqlite_store.py` | SQLite schema, market snapshot storage, prediction recording, settlement, and Brier persistence. |
 | `predquant/foundation_schema.py` | Foundation schema dependency used by `sqlite_store.py`. |
 | `migrations/001_foundation_persistence_and_artifacts.sql` | Ordered schema migration required by this bundle. |
+| `tests/test_prediction_provenance.py` | Regression coverage for prediction provenance, idempotent recording, stale snapshots, and Brier scoring metadata. |
 
 ## Adding Future Scripts
 
@@ -72,6 +74,7 @@ Use this layout when adding new work:
 - Keep launchd-facing root files as compatibility shims only. If a scheduled job needs a new root path, document why in this README.
 - Prefer JSON output for scripts that will be consumed by Orchestrator or health checks.
 - For new schema changes, add a numbered migration under `migrations/` and make initialization idempotent.
+- Add focused tests under `tests/` for any runtime path that changes persistence, scheduling, provenance, scoring, or cleanup behavior.
 - Add every new runnable script to the Script Index in this README before considering the folder organized.
 
 ## Setup
@@ -110,19 +113,46 @@ python3 ingest_polymarket_market_snapshots.py \
 
 ## Prediction and Brier Lifecycle
 
-Record a pipeline forecast against an already-ingested market:
+The canonical prediction-engine write path is `bin/record_prediction_with_snapshot.py`.
+Use it when the prediction engine has just fetched market data and made a prediction from that exact source payload:
+
+```bash
+python3 bin/record_prediction_with_snapshot.py \
+  --file market-payload.json \
+  --probability 0.62 \
+  --prediction-run-id RUN_ID \
+  --forecast-artifact-id FORECAST_ARTIFACT_ID \
+  --case-key CASE_KEY \
+  --case-id CASE_ID \
+  --dispatch-id DISPATCH_ID \
+  --engine-stage prediction-engine \
+  --input-artifact-path artifacts/input.json \
+  --input-artifact-sha256 INPUT_SHA256 \
+  --prediction-artifact-path artifacts/prediction.json \
+  --prediction-artifact-sha256 PREDICTION_SHA256 \
+  --db-path data/predquant.sqlite3
+```
+
+This atomic path stores the market snapshot, the pipeline probability, the prediction-time market baseline, and the case/run/artifact provenance in one transaction. `prediction_run_id` and `forecast_artifact_id` are unique idempotency keys: a retry with the same values returns the existing prediction when the payload matches, and fails if the probability/source identity changed.
+
+The recorder rejects prediction writes when the market snapshot is after the prediction timestamp or older than `--max-snapshot-age-seconds` (default: 3600 seconds). Keep the default unless the prediction engine has an explicit policy for a wider freshness window.
+
+`bin/record_market_prediction.py` remains available for manual or legacy forecasts against an already-ingested market:
 
 ```bash
 python3 bin/record_market_prediction.py \
   --external-market-id MARKET_ID \
   --probability 0.62 \
+  --prediction-run-id RUN_ID \
+  --forecast-artifact-id FORECAST_ARTIFACT_ID \
   --db-path data/predquant.sqlite3
 ```
 
-At prediction time, the recorder stores the latest available market snapshot and derives the market baseline probability from bid/ask midpoint, then yes price, then last price/current price. When the market resolves, `settle_market_outcome.py` or `sync_polymarket_resolutions.py` updates `market_predictions` with both:
+At prediction time, the recorder derives the market baseline probability from bid/ask midpoint, then yes price, then last price/current price. When the market resolves, `settle_market_outcome.py` or `sync_polymarket_resolutions.py` updates `market_predictions` with:
 
 - `prediction_brier`: pipeline probability vs final outcome.
 - `market_brier`: prediction-time market baseline probability vs final outcome.
+- `scoring_version`, `scored_at`, `scoring_resolution_payload_hash`, and `scoring_resolution_source`: scoring provenance for repeatable benchmark interpretation.
 
 Check current SQLite health:
 

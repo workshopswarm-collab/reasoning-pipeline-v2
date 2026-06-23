@@ -7,7 +7,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from predquant.sqlite_store import DEFAULT_DB_PATH, record_market_prediction
+from predquant.sqlite_store import (
+    DEFAULT_DB_PATH,
+    DEFAULT_MAX_SNAPSHOT_AGE_SECONDS,
+    record_market_prediction,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -19,6 +23,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--probability", type=float, required=True, help="Pipeline yes probability")
     parser.add_argument("--source", default="pipeline", help="Prediction source name")
     parser.add_argument("--label", help="Optional prediction label/version")
+    parser.add_argument("--prediction-run-id", help="Stable id for this prediction run")
+    parser.add_argument("--forecast-artifact-id", help="Stable id for the forecast artifact")
+    parser.add_argument("--case-key", help="Pipeline case key associated with this prediction")
+    parser.add_argument("--case-id", help="Pipeline case id associated with this prediction")
+    parser.add_argument("--dispatch-id", help="Pipeline dispatch id associated with this prediction")
+    parser.add_argument("--engine-stage", help="Prediction engine stage that produced this record")
     parser.add_argument("--predicted-at", help="Prediction timestamp; defaults to now")
     parser.add_argument("--market-probability", type=float, help="Override market yes probability")
     parser.add_argument("--market-probability-method", help="Method used for the market probability")
@@ -28,6 +38,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-name", help="Model name used for the prediction")
     parser.add_argument("--prompt-version", help="Prompt or strategy version used for the prediction")
     parser.add_argument("--input-hash", help="SHA-256 hash of the model or strategy input")
+    parser.add_argument("--input-artifact-path", help="Path to the prediction input artifact")
+    parser.add_argument("--input-artifact-sha256", help="SHA-256 of the prediction input artifact")
+    parser.add_argument("--prediction-artifact-path", help="Path to the prediction output artifact")
+    parser.add_argument("--prediction-artifact-sha256", help="SHA-256 of the prediction output artifact")
+    parser.add_argument(
+        "--max-snapshot-age-seconds",
+        type=float,
+        default=DEFAULT_MAX_SNAPSHOT_AGE_SECONDS,
+        help="Reject predictions using older market data; default is 3600 seconds.",
+    )
     parser.add_argument("--rationale", help="Optional prediction rationale")
     parser.add_argument("--metadata-json", default="{}", help="Optional JSON metadata")
     parser.add_argument(
@@ -47,6 +67,12 @@ def main() -> int:
             platform=args.platform,
             external_market_id=args.external_market_id,
             predicted_probability=args.probability,
+            prediction_run_id=args.prediction_run_id,
+            forecast_artifact_id=args.forecast_artifact_id,
+            case_key=args.case_key,
+            case_id=args.case_id,
+            dispatch_id=args.dispatch_id,
+            engine_stage=args.engine_stage,
             prediction_source=args.source,
             prediction_label=args.label,
             predicted_at=args.predicted_at,
@@ -58,6 +84,11 @@ def main() -> int:
             model_name=args.model_name,
             prompt_version=args.prompt_version,
             input_hash=args.input_hash,
+            input_artifact_path=args.input_artifact_path,
+            input_artifact_sha256=args.input_artifact_sha256,
+            prediction_artifact_path=args.prediction_artifact_path,
+            prediction_artifact_sha256=args.prediction_artifact_sha256,
+            max_snapshot_age_seconds=args.max_snapshot_age_seconds,
             rationale=args.rationale,
             metadata=json.loads(args.metadata_json),
         )
