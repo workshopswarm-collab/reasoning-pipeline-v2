@@ -16,6 +16,7 @@ Status values:
 - `CTX-001`, `CTX-002`: ready for integration on 2026-06-24. Session 02 Phase 2 added `scripts/predquant/evidence_packet.py`, `scripts/bin/build_evidence_packet_v2.py`, and tests covering standalone evidence-packet/v2 artifacts, side/axis mapping, source-of-truth status, quote/provenance refs, regime seed fields, artifact-manifest registration, family-aware selected-child validation, sibling context-only prices, invalid side mapping, invalid case contracts, and raw-payload exclusion.
 - `CTX-003`: ready for integration on 2026-06-24. Session 02 Phase 3 added candidate-only `prior-reliability-inputs/v1` inside `evidence-packet/v2`, covering rolling bid/ask spread, depth, volume, open interest, last-trade/snapshot age, priced-through timestamp, freshness state, stale/unavailable/fresh-liquid/spread-warning reason candidates, quote lookahead rejection, and no SCAE probability authority.
 - `POL-001`, `POL-002`, `POL-003`, `MODEL-001`: ready for integration on 2026-06-24. Session 02 Phase 4 added `scripts/predquant/tuning_profile.py`, `scripts/bin/resolve_tuning_profile_context.py`, and tests covering tunable registry metadata, deterministic regime tags, global-baseline fallback, excluded sports/crypto profiles, intended-but-inactive profiles, conservative overlays, no numeric SCAE authoring, effective-profile manifest registration, and model-lane policy validation.
+- `AMRG-009`: ready for integration on 2026-06-24. Session 02 Phase 5 added `scripts/predquant/amrg.py` local vector-source contracts for resolving the Ollama `BAAI/bge-base-en-v1.5` lane, download/unavailable diagnostics, active-safe descriptor hashing, ready/unavailable vector index snapshots, capped weak-context vector neighbor candidates, and focused script tests.
 
 ## Inventory Coordination Contract
 
@@ -98,7 +99,7 @@ These migration groups are the data backbone for replay, scoring, calibration, a
 | Feature ID | Stage | Component | Blocking | Owner | Dependencies | Output | Status |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | AMRG-001 | v2_live_cutover | AMRG | cutover_blocker | Session 2 | CTX-001 | Active-safe candidate pool | not_started |
-| AMRG-009 | v2_live_cutover | AMRG vectorization | non_blocking_candidate_source | Session 2 | CTX-001, MODEL-001, FND-003 | Local Ollama-routed `BAAI/bge-base-en-v1.5` active-market vector index and weak-context neighbor candidates; unavailable model/index records diagnostic and does not block AMRG | not_started |
+| AMRG-009 | v2_live_cutover | AMRG vectorization | non_blocking_candidate_source | Session 2 | CTX-001, MODEL-001, FND-003 | Local Ollama-routed `BAAI/bge-base-en-v1.5` active-market vector index and weak-context neighbor candidates; unavailable model/index records diagnostic and does not block AMRG | ready_for_integration |
 | AMRG-002 | v2_live_cutover | AMRG | cutover_blocker | Session 2 | AMRG-001, FND-003 | `related-live-market-context.json` or waiver | not_started |
 | AMRG-003 | v2_live_cutover | AMRG | integration_blocker | Session 2 | AMRG-002 | Relationship typing and timing alignment | not_started |
 | AMRG-004 | v2_live_cutover | AMRG model assist | integration_blocker | Session 2 | AMRG-001, AMRG-002 | Advisory model-assist packet and output schema | not_started |

@@ -709,14 +709,14 @@ Testing suite:
 
 Completion checklist:
 
-- [ ] `amrg_vector_embedding` local embedding lane exists in the model-lane policy artifact.
-- [ ] Ollama download/wiring contract for `BAAI/bge-base-en-v1.5` is documented.
-- [ ] Descriptor schema and deterministic hashing are specified.
-- [ ] Descriptor write path is specified.
-- [ ] Index snapshot schema is specified.
-- [ ] Vector-neighbor candidate write path is specified.
-- [ ] Unavailable model/index path is non-blocking and records diagnostics.
-- [ ] `AMRG-009` inventory row updated.
+- [x] `amrg_vector_embedding` local embedding lane exists in the model-lane policy artifact.
+- [x] Ollama download/wiring contract for `BAAI/bge-base-en-v1.5` is documented.
+- [x] Descriptor schema and deterministic hashing are specified.
+- [x] Descriptor write path is specified.
+- [x] Index snapshot schema is specified.
+- [x] Vector-neighbor candidate write path is specified.
+- [x] Unavailable model/index path is non-blocking and records diagnostics.
+- [x] `AMRG-009` inventory row updated.
 
 ## Phase 6: AMRG Candidate Pool and Weak-Context Artifact
 
