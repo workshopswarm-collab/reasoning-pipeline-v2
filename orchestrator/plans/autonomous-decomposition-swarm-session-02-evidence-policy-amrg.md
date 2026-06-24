@@ -763,12 +763,12 @@ Testing suite:
 
 Completion checklist:
 
-- [ ] Candidate construction implemented or specified.
-- [ ] Waiver artifact implemented or specified.
-- [ ] Candidate cap enforced.
-- [ ] Weak-context default enforced.
-- [ ] Vector source availability/unavailability is recorded without blocking AMRG.
-- [ ] `AMRG-001`, `AMRG-002`, and `AMRG-009` inventory rows updated.
+- [x] Candidate construction implemented or specified.
+- [x] Waiver artifact implemented or specified.
+- [x] Candidate cap enforced.
+- [x] Weak-context default enforced.
+- [x] Vector source availability/unavailability is recorded without blocking AMRG.
+- [x] `AMRG-001`, `AMRG-002`, and `AMRG-009` inventory rows updated.
 
 ## Phase 7: AMRG Typing, Timing, Model Assist, and Persistence
 
