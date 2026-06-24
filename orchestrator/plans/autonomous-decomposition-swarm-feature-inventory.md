@@ -5,9 +5,34 @@ This is the starter inventory for converting the architecture spec into async im
 Status values:
 `not_started`, `contracting`, `in_progress`, `blocked`, `ready_for_integration`, `done`
 
-## Phase 0 Acceptance Evidence
+## Acceptance Evidence
 
 - `FND-001`: done on 2026-06-24. Phase 0 audit verified all Session 1 owned IDs are present exactly once in the inventory, ownership is correct, master anchors are current, and the Session 1 plan excludes other sessions' runtime behavior.
+- `FND-001`: Phase 1 dependency gate/inventory tracking acceptance completed on 2026-06-24. Evidence: dependency gate validates inventory shape, unknown dependencies, cycles, waiver shape/expiry, runtime blocking, fixture-mode starts, owner/evidence update rules, Markdown/YAML feature sync, and the phase-report convention.
+
+## Inventory Coordination Contract
+
+The Markdown inventory is the human status board. `plans/autonomous-decomposition-swarm-feature-inventory.yaml` is the executable dependency source and must remain JSON-compatible.
+
+Ownership rules:
+
+- Session 1 owns shared coordination files and direct updates for `FND-*`, `AUTO-*`, `MIG-001`, `MIG-002`, and `MIG-013`.
+- Component sessions update only rows they own when they can include acceptance evidence and avoid shared-file conflicts.
+- A row may move to `ready_for_integration` or `done` only when acceptance evidence is recorded.
+- Cross-session dependency, owner, schema-name, script-placement, blocker, or fixture changes are proposed through phase reports when concurrent shared-file edits would conflict.
+
+Waiver rules:
+
+- Waivers live in the executable inventory's `waivers` list.
+- Every waiver requires `dependency_id`, `target_id`, `owner`, `reason`, and `expires_on`.
+- Expired, malformed, or unknown-target waivers are invalid.
+- Waivers are temporary dependency gates only; they cannot create a second forecast authority or bypass SCAE-only production probability.
+
+Async phase-report rules:
+
+- Sessions 2-5 write conflict-safe reports under `plans/phase-reports/` when shared inventory/maps need reconciliation.
+- Report filenames use `session-0N-phase-M-short-slug.md`.
+- Session 1/coordinator reconciles reviewed reports into shared inventory, maps, matrices, and dependency gates in a separate commit.
 
 ## Persistence Migration Inventory
 

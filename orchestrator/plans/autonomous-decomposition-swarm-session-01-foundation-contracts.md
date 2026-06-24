@@ -473,6 +473,7 @@ Implementation shape:
 - Maintain `plans/autonomous-decomposition-swarm-feature-inventory.yaml` as the executable, JSON-compatible dependency inventory.
 - Keep the Markdown inventory and machine-readable inventory synchronized in the same change when ownership, dependency, or stage labels move.
 - Add ownership rules and waiver conventions.
+- Use `plans/phase-reports/` as the conflict-safe handoff directory for Sessions 2-5 when shared inventory, map, matrix, or cross-session row updates need coordinator reconciliation.
 - Maintain `python3 plans/check_dependency_gates.py` as the dependency-check command for fixture, runtime integration, calibration-debt clearance, and autonomous optimization maturity modes.
 - The checker must reject unknown dependencies, dependency cycles, malformed waivers, and runtime integration before upstream rows are `ready_for_integration`, `done`, or explicitly waived.
 - Maintain the supporting coordination artifacts:
@@ -515,13 +516,13 @@ Testing suite:
 
 Completion checklist:
 
-- [ ] Inventory ownership rules are written.
-- [ ] Markdown and machine-readable inventories agree on owner, stage, status, and dependencies.
-- [ ] Dependency gate semantics are written.
-- [ ] Dependency gate command validates clean inventory and blocks unready runtime rows.
-- [ ] Waiver semantics are written.
-- [ ] Blocker matrix, schema-name map, and fixture matrix are linked from this plan.
-- [ ] `FND-001` marked `done` only after acceptance evidence is recorded.
+- [x] Inventory ownership rules are written.
+- [x] Markdown and machine-readable inventories agree on owner, stage, status, and dependencies.
+- [x] Dependency gate semantics are written.
+- [x] Dependency gate command validates clean inventory and blocks unready runtime rows.
+- [x] Waiver semantics are written.
+- [x] Blocker matrix, schema-name map, and fixture matrix are linked from this plan.
+- [x] `FND-001` marked `done` only after acceptance evidence is recorded.
 
 ## Phase 2: V2 Stage Status Model
 

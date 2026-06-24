@@ -1,11 +1,20 @@
 {
   "schema_version": "autonomous-decomposition-swarm-feature-inventory/v1",
   "source_markdown": "plans/autonomous-decomposition-swarm-feature-inventory.md",
+  "coordination_contract": {
+    "shared_inventory_owner": "Session 1",
+    "direct_update_rule": "Sessions update only rows they own when acceptance evidence is available and no concurrent shared-file conflict is expected.",
+    "cross_session_update_rule": "Sessions 2-5 write phase reports under plans/phase-reports/ when shared inventory, map, matrix, or another session's row needs reconciliation.",
+    "phase_report_dir": "plans/phase-reports",
+    "phase_report_required_fields": ["Session", "Phase", "Owner", "Feature IDs", "Migration Groups", "Status", "Acceptance Evidence", "Checks Run", "Shared Inventory Updates Requested", "Shared Map/Matrix Updates Requested", "Blockers", "Commit SHA"],
+    "waiver_required_fields": ["dependency_id", "target_id", "owner", "reason", "expires_on"],
+    "evidence_required_statuses": ["ready_for_integration", "done"]
+  },
   "status_values": ["not_started", "contracting", "in_progress", "blocked", "ready_for_integration", "done"],
   "ready_statuses": ["ready_for_integration", "done"],
   "waivers": [],
   "features": [
-    {"id": "FND-001", "stage": "foundation", "owner": "Session 1", "status": "done", "dependencies": [], "acceptance_evidence": "2026-06-24 Phase 0 audit passed: Session 1 IDs present exactly once, ownership correct, anchors current, runtime boundary confirmed."},
+    {"id": "FND-001", "stage": "foundation", "owner": "Session 1", "status": "done", "dependencies": [], "acceptance_evidence": "2026-06-24 Phase 0 audit passed: Session 1 IDs present exactly once, ownership correct, anchors current, runtime boundary confirmed. Phase 1 added dependency-gate validation, ownership/waiver/update semantics, phase-report convention, and stdlib gate tests."},
     {"id": "FND-002", "stage": "foundation", "owner": "Session 1", "status": "not_started", "dependencies": ["FND-001"]},
     {"id": "FND-003", "stage": "foundation", "owner": "Session 1", "status": "not_started", "dependencies": ["FND-001"]},
     {"id": "FND-004", "stage": "foundation", "owner": "Session 1", "status": "not_started", "dependencies": ["FND-001"]},
@@ -52,8 +61,8 @@
     {"id": "RET-006", "stage": "v2_live_cutover", "owner": "Session 3", "status": "not_started", "dependencies": ["RET-002", "RET-003"]},
     {"id": "RET-007", "stage": "v2_live_cutover", "owner": "Session 3", "status": "not_started", "dependencies": ["RET-001"]},
     {"id": "RET-010", "stage": "v2_live_cutover", "owner": "Session 3", "status": "not_started", "dependencies": ["MODEL-001", "RET-001", "RET-002", "RET-004", "FND-003"]},
-    {"id": "RET-011", "stage": "v2_live_cutover", "owner": "Session 3", "status": "not_started", "dependencies": ["MODEL-001", "RET-004", "FND-003"]},
-    {"id": "RET-009", "stage": "v2_live_cutover", "owner": "Session 3", "status": "not_started", "dependencies": ["QDT-005", "RET-001", "RET-002", "RET-003", "RET-004", "RET-005", "RET-006", "POL-003"]},
+    {"id": "RET-011", "stage": "v2_live_cutover", "owner": "Session 3", "status": "not_started", "dependencies": ["MODEL-001", "RET-004", "RET-010", "FND-003"]},
+    {"id": "RET-009", "stage": "v2_live_cutover", "owner": "Session 3", "status": "not_started", "dependencies": ["QDT-005", "RET-001", "RET-002", "RET-003", "RET-004", "RET-005", "RET-006", "RET-010", "RET-011", "POL-003"]},
     {"id": "RET-008", "stage": "v2_live_cutover", "owner": "Session 3", "status": "not_started", "dependencies": ["QDT-005", "RET-002", "RET-003", "RET-004", "RET-005", "RET-006", "RET-007", "RET-009"]},
 
     {"id": "CLS-001", "stage": "v2_live_cutover", "owner": "Session 4", "status": "not_started", "dependencies": ["QDT-002", "QDT-005", "RET-001", "RET-008"]},

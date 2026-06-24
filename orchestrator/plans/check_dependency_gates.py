@@ -18,6 +18,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_INVENTORY = ROOT / "autonomous-decomposition-swarm-feature-inventory.yaml"
+EVIDENCE_REQUIRED_STATUSES = {"ready_for_integration", "done"}
+WAIVER_REQUIRED_FIELDS = ["dependency_id", "target_id", "owner", "reason", "expires_on"]
 
 
 def load_inventory(path: Path) -> dict:
@@ -51,6 +53,33 @@ def waiver_is_valid(waiver: dict, dependency_id: str, target_id: str) -> bool:
         return date.fromisoformat(waiver["expires_on"]) >= date.today()
     except ValueError:
         return False
+
+
+def validate_waivers(waivers: list[dict], rows: dict[str, dict]) -> list[str]:
+    errors: list[str] = []
+    today = date.today()
+    for idx, waiver in enumerate(waivers):
+        prefix = f"waiver[{idx}]"
+        missing = [field for field in WAIVER_REQUIRED_FIELDS if not waiver.get(field)]
+        if missing:
+            errors.append(f"{prefix}: missing required fields {', '.join(missing)}")
+            continue
+
+        dependency_id = waiver["dependency_id"]
+        target_id = waiver["target_id"]
+        if dependency_id not in rows:
+            errors.append(f"{prefix}: unknown dependency_id {dependency_id}")
+        if target_id not in rows:
+            errors.append(f"{prefix}: unknown target_id {target_id}")
+
+        try:
+            expires_on = date.fromisoformat(waiver["expires_on"])
+        except ValueError:
+            errors.append(f"{prefix}: expires_on must be YYYY-MM-DD")
+            continue
+        if expires_on < today:
+            errors.append(f"{prefix}: expires_on {waiver['expires_on']} is expired")
+    return errors
 
 
 def dependency_ready(dep_id: str, target_id: str, rows: dict[str, dict], ready: set[str], waivers: list[dict]) -> tuple[bool, str]:
@@ -103,8 +132,18 @@ def find_feature_cycles(features: dict[str, dict]) -> list[list[str]]:
 def validate_inventory(inv: dict) -> list[str]:
     errors: list[str] = []
     status_values = set(inv.get("status_values", []))
+    ready_statuses = set(inv.get("ready_statuses", []))
     features = index_rows(inv.get("features", []), "id")
     migrations = index_rows(inv.get("migrations", []), "id")
+    combined = {**features, **migrations}
+
+    if not status_values:
+        errors.append("missing status_values")
+    if not ready_statuses:
+        errors.append("missing ready_statuses")
+    unknown_ready = ready_statuses - status_values
+    if unknown_ready:
+        errors.append("ready_statuses contain unknown values: " + ", ".join(sorted(unknown_ready)))
 
     for feature_id, feature in features.items():
         if feature.get("status") not in status_values:
@@ -131,6 +170,21 @@ def validate_inventory(inv: dict) -> list[str]:
         for dep_id in migration.get("dependencies", []):
             if dep_id not in features and dep_id not in migrations:
                 errors.append(f"{migration_id}: missing dependency {dep_id}")
+    errors.extend(validate_waivers(inv.get("waivers", []), combined))
+    return errors
+
+
+def validate_status_update(row_id: str, session: str, new_status: str, acceptance_evidence: str, rows: dict[str, dict], status_values: set[str]) -> list[str]:
+    errors: list[str] = []
+    row = rows.get(row_id)
+    if row is None:
+        return [f"{row_id}: unknown row"]
+    if row.get("owner") != session:
+        errors.append(f"{row_id}: owner is {row.get('owner')}, not {session}")
+    if new_status not in status_values:
+        errors.append(f"{row_id}: invalid status {new_status}")
+    if new_status in EVIDENCE_REQUIRED_STATUSES and not acceptance_evidence:
+        errors.append(f"{row_id}: acceptance evidence required for {new_status}")
     return errors
 
 
