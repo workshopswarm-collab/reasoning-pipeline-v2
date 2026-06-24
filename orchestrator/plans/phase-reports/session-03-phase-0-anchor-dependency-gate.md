@@ -1,0 +1,25 @@
+# Session 03 Phase 0: Anchor and Dependency Gate
+
+- Session: Session 03, Decomposer and Retrieval Packet
+- Phase: Phase 0, Anchor and Dependency Gate
+- Owner: ADS Session 03
+- Feature IDs: `QDT-001`, `QDT-002`, `QDT-003`, `QDT-004`, `QDT-005`, `MODEL-002`, `RET-001`, `RET-002`, `RET-003`, `RET-004`, `RET-005`, `RET-006`, `RET-007`, `RET-010`, `RET-011`, `RET-009`, `RET-008`
+- Migration Groups: `MIG-003`, `MIG-004`
+- Status: Phase 0 complete. Fixture-mode planning may proceed with explicit fixture refs; runtime integration remains blocked as expected by upstream dependencies.
+- Acceptance Evidence: Audited the tracked Session 03 plan, shared inventory, coverage map, schema-name map, script-placement map, live-cutover blocker matrix, golden fixture matrix, model-lane policy, and dependency-gate script. Verified all Session 03 owned rows are present in the machine inventory and coverage map. No shared inventory/map edits and no runtime code edits were made.
+- Checks Run:
+  - `python3 plans/check_dependency_gates.py --feature-id QDT-001 --mode fixture` -> `OK QDT-001 mode=fixture`
+  - `python3 plans/check_dependency_gates.py --feature-id QDT-001 --mode runtime_integration --report-only` -> `BLOCKED QDT-001: CASE-002 status=not_started; CTX-001 status=not_started; POL-003 status=not_started; AMRG-002 status=not_started`
+  - `python3 plans/check_dependency_gates.py --feature-id RET-001 --mode runtime_integration --report-only` -> `BLOCKED RET-001: QDT-002 status=not_started; FND-003 status=not_started`
+  - `python3 plans/check_dependency_gates.py --feature-id RET-008 --mode runtime_integration --report-only` -> `BLOCKED RET-008: QDT-005 status=not_started; RET-002 status=not_started; RET-003 status=not_started; RET-004 status=not_started; RET-005 status=not_started; RET-006 status=not_started; RET-007 status=not_started; RET-009 status=not_started`
+  - `python3 -m unittest discover -s plans/tests` -> `Ran 10 tests ... OK`
+- Shared Inventory Updates Requested: None in this phase. Runtime statuses should remain `not_started` until implementation phases produce acceptance evidence.
+- Shared Map/Matrix Updates Requested: None in this phase. Existing shared maps already identify Session 03 surfaces and blockers. Session 1/coordinator should reconcile future Session 03 phase reports when implementation evidence exists.
+- Blockers:
+  - Phase 1 fixture work can proceed using explicit fixture refs and no runtime dispatch.
+  - Phase 1 runtime handoff for `QDT-001` is blocked on Session 2 `CASE-002`, `CTX-001`, `POL-003`, and `AMRG-002` or an explicit AMRG waiver.
+  - `MODEL-002` runtime readiness is blocked on Session 2 `MODEL-001`; decomposer QDT generation must resolve the `decomposer_qdt_generation` lane to `gpt-5.5-high` and record model policy refs, prompt hashes, input manifest IDs, and output schema version.
+  - `RET-001` runtime readiness is blocked on `QDT-002` and Session 1 `FND-003`.
+  - `RET-010` and `RET-011` depend on `MODEL-001` plus retrieval/provenance/schema surfaces. Native research is optional and diagnostic when unavailable; classifier assist uses OAuth-routed `openai/gpt-5.4-mini` by default and cannot certify protected-primary, temporal safety, sufficiency, SCAE deltas, or probabilities.
+  - Retrieval sufficiency remains fail-closed: no live researcher dispatch unless every required leaf has `RET-008` high-certainty certification or a policy-valid structural unanswerability proof after breadth validation and bounded expansion.
+- Commit SHA: Pending at report authoring; final pushed commit SHA is reported by the worker session.
