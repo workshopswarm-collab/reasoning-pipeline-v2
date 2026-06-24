@@ -250,7 +250,7 @@
     {"id": "VER-003", "stage": "v2_live_cutover", "owner": "Session 4", "status": "not_started", "dependencies": ["CLS-002", "CLS-005", "VER-001", "VER-002"]},
     {"id": "VER-004", "stage": "v2_live_cutover", "owner": "Session 4", "status": "not_started", "dependencies": ["CLS-005", "CLS-007", "RET-008", "VER-001", "VER-002", "VER-003"]},
 
-    {"id": "SCAE-001", "stage": "v2_live_cutover", "owner": "Session 5", "status": "not_started", "dependencies": ["FND-004", "POL-003"]},
+    {"id": "SCAE-001", "stage": "v2_live_cutover", "owner": "Session 5", "status": "ready_for_integration", "dependencies": ["FND-004", "POL-003"], "acceptance_evidence": "2026-06-24 Session 05 Phase 1 added SCAE base policy and probability taxonomy contract in /Users/agent2/.openclaw/SCAE/scripts/scae/policy.py plus scae-policy.json, with identity post-ledger calibration defaults, explicit calibration-debt active/cleared taxonomy, cap-stack variables, canonical production/canonical probability aliasing, SCAE-only numeric authority boundaries, decision validity/execution downgrade enforcement, and focused unittest coverage."},
     {"id": "SCAE-002", "stage": "v2_live_cutover", "owner": "Session 5", "status": "not_started", "dependencies": ["CTX-003", "SCAE-001"]},
     {"id": "SCAE-003", "stage": "v2_live_cutover", "owner": "Session 5", "status": "not_started", "dependencies": ["VER-001", "VER-002", "RET-003", "SCAE-001"]},
     {"id": "SCAE-004", "stage": "v2_live_cutover", "owner": "Session 5", "status": "not_started", "dependencies": ["SCAE-003"]},

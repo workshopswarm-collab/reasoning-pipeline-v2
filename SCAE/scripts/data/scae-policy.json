@@ -1,0 +1,74 @@
+{
+  "artifact_type": "scae_policy",
+  "schema_version": "scae-policy/v1",
+  "policy_id": "ads-scae-base-policy/v1",
+  "authority_boundary": {
+    "live_numeric_forecast_authority": "scae",
+    "scae_numeric_aggregation_uses_model": false,
+    "model_outputs_may_author_probability": false,
+    "model_outputs_may_override_scae": false,
+    "synthesis_may_author_probability": false,
+    "synthesis_may_override_scae": false,
+    "decision_may_author_probability": false,
+    "decision_may_replace_probability": false,
+    "decision_may_upgrade_forecast_validity": false
+  },
+  "post_ledger_calibration": {
+    "default_method": "identity",
+    "live_eligible_methods": [
+      "identity"
+    ],
+    "allow_beta_calibration_live_cutover": false,
+    "requires_promoted_policy_pointer_for_non_identity": true
+  },
+  "calibration_debt": {
+    "active": true,
+    "allowed_active_values": [
+      false,
+      true
+    ],
+    "default_execution_authority_when_active": "low_size_only",
+    "tail_probability_floor": 0.02,
+    "tail_probability_ceiling": 0.98,
+    "minimum_interval_width_logit": 0.5,
+    "first_100_trace_completeness_clears_debt": false
+  },
+  "cap_stack": {
+    "per_update_log_odds_cap": 0.35,
+    "per_cluster_log_odds_cap": 0.55,
+    "per_branch_log_odds_cap": 0.9,
+    "total_evidence_log_odds_cap": 1.5,
+    "debt_mode_total_evidence_log_odds_cap": 1.0,
+    "representative_selector": "policy_bounded_signed_representative_v1"
+  },
+  "probability_taxonomy": {
+    "fields": [
+      "raw_ledger_probability",
+      "post_ledger_probability",
+      "debt_adjusted_probability",
+      "production_forecast_prob",
+      "canonical_probability"
+    ],
+    "production_source_rule": "debt_adjusted_when_calibration_debt_active_else_post_ledger",
+    "canonical_probability_aliases": "production_forecast_prob"
+  },
+  "validity_and_execution": {
+    "forecast_validity_statuses": [
+      "invalid_for_forecast",
+      "valid_for_forecast_watch_only",
+      "valid_for_forecast"
+    ],
+    "execution_authority_statuses": [
+      "forbidden",
+      "needs_refresh",
+      "watch_only",
+      "low_size_only",
+      "normal_execution_allowed"
+    ],
+    "max_execution_authority_by_forecast_validity": {
+      "invalid_for_forecast": "forbidden",
+      "valid_for_forecast_watch_only": "watch_only",
+      "valid_for_forecast": "normal_execution_allowed"
+    }
+  }
+}
