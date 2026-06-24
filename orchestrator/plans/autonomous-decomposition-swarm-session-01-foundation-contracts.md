@@ -600,14 +600,14 @@ Testing suite:
 
 Completion checklist:
 
-- [ ] Stage enum written.
-- [ ] Status schema written.
-- [ ] Stage execution event schema written.
-- [ ] Stage wrapper lifecycle event helpers written.
-- [ ] Transition rules written.
-- [ ] Failure/stuck metadata written.
-- [ ] Fixture status example written.
-- [ ] `FND-002` updated in inventory.
+- [x] Stage enum written.
+- [x] Status schema written.
+- [x] Stage execution event schema written.
+- [x] Stage wrapper lifecycle event helpers written.
+- [x] Transition rules written.
+- [x] Failure/stuck metadata written.
+- [x] Fixture status example written.
+- [x] `FND-002` updated in inventory.
 
 ## Phase 3: Artifact Manifest and Validation Core
 

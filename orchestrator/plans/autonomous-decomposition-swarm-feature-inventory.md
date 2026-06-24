@@ -9,6 +9,7 @@ Status values:
 
 - `FND-001`: done on 2026-06-24. Phase 0 audit verified all Session 1 owned IDs are present exactly once in the inventory, ownership is correct, master anchors are current, and the Session 1 plan excludes other sessions' runtime behavior.
 - `FND-001`: Phase 1 dependency gate/inventory tracking acceptance completed on 2026-06-24. Evidence: dependency gate validates inventory shape, unknown dependencies, cycles, waiver shape/expiry, runtime blocking, fixture-mode starts, owner/evidence update rules, Markdown/YAML feature sync, and the phase-report convention.
+- `FND-002`: done on 2026-06-24. Phase 2 implemented `scripts/predquant/ads_stage_logging.py`, `scripts/migrations/002_v2_stage_status_model.sql`, and script tests covering stage vocabulary, transition validation, status artifact refs, required execution-event fields, bounded log refs/no-log reason, and named status/event surfaces.
 
 ## Inventory Coordination Contract
 
@@ -59,7 +60,7 @@ These migration groups are the data backbone for replay, scoring, calibration, a
 | Feature ID | Stage | Component | Blocking | Owner | Dependencies | Output | Status |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | FND-001 | foundation | Planning | foundation_blocker | Session 1 | none | Canonical feature inventory and dependency DAG | done |
-| FND-002 | foundation | Control plane | cutover_blocker | Session 1 | FND-001 | v2 stage vocabulary, status contract, and execution-event stream | not_started |
+| FND-002 | foundation | Control plane | cutover_blocker | Session 1 | FND-001 | v2 stage vocabulary, status contract, and execution-event stream | done |
 | FND-003 | foundation | Artifacts | cutover_blocker | Session 1 | FND-001 | Artifact manifest schema and validator | not_started |
 | FND-004 | foundation | Persistence | cutover_blocker | Session 1 | FND-001 | Section 10 migration/schema plan | not_started |
 | FND-005 | foundation | Fixtures | integration_blocker | Session 1 | FND-003, FND-004 | Golden fixture registry and runner | not_started |
