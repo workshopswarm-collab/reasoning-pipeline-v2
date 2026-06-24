@@ -13,11 +13,182 @@
   "status_values": ["not_started", "contracting", "in_progress", "blocked", "ready_for_integration", "done"],
   "ready_statuses": ["ready_for_integration", "done"],
   "waivers": [],
+  "migration_surface_contracts": {
+    "runtime_integration_rule": "Every migration write path must name at least one table, existing table, view, or external artifact contract before runtime integration. Component sessions own their implementations; Session 1 validates shared contract coverage.",
+    "implementation_order": ["MIG-001", "MIG-002", "MIG-013", "MIG-012", "MIG-005", "MIG-003", "MIG-004", "MIG-006", "MIG-007", "MIG-008", "MIG-009", "MIG-010", "MIG-011"],
+    "live_cutover_groups": ["MIG-001", "MIG-002", "MIG-013", "MIG-012", "MIG-005", "MIG-003", "MIG-004", "MIG-006", "MIG-007", "MIG-008", "MIG-009"],
+    "calibration_debt_clearance_groups": ["MIG-010"],
+    "autonomous_optimization_maturity_groups": ["MIG-011"],
+    "groups": {
+      "MIG-001": {
+        "implementation_stage": "foundation",
+        "surface_contract_status": "ready_for_component_implementation",
+        "destinations": {"case_artifact_manifest": "table", "artifact_validation_results": "table"},
+        "write_path_destinations": {"write_artifact_manifest": ["case_artifact_manifest", "artifact_validation_results"]},
+        "idempotency_keys": ["artifact_id"]
+      },
+      "MIG-002": {
+        "implementation_stage": "foundation",
+        "surface_contract_status": "ready_for_component_implementation",
+        "destinations": {"v2_stage_status_snapshots": "table", "v2_stage_execution_events": "table", "v2_pipeline_error_events": "table", "v2_failure_pattern_groups": "table"},
+        "write_path_destinations": {
+          "write_stage_status": ["v2_stage_status_snapshots"],
+          "write_stage_execution_event": ["v2_stage_execution_events"],
+          "write_pipeline_error_event": ["v2_pipeline_error_events", "v2_failure_pattern_groups"]
+        },
+        "idempotency_keys": ["stage_attempt_id", "execution_event_id", "error_event_id"]
+      },
+      "MIG-013": {
+        "implementation_stage": "v2_live_cutover",
+        "surface_contract_status": "ready_for_component_implementation",
+        "destinations": {"ads_pipeline_runs": "table", "ads_pipeline_control_state": "table", "ads_case_leases": "table", "ads_pipeline_loop_iterations": "table", "ads_pipeline_stop_signals": "table"},
+        "write_path_destinations": {
+          "write_pipeline_run": ["ads_pipeline_runs"],
+          "write_pipeline_control_state": ["ads_pipeline_control_state"],
+          "acquire_case_lease": ["ads_case_leases"],
+          "write_pipeline_loop_iteration": ["ads_pipeline_loop_iterations"],
+          "write_pipeline_stop_signal": ["ads_pipeline_stop_signals"],
+          "release_case_lease": ["ads_case_leases"]
+        },
+        "idempotency_keys": ["pipeline_run_id", "case_lease_id", "loop_iteration_id", "stop_signal_id"]
+      },
+      "MIG-012": {
+        "implementation_stage": "v2_live_cutover",
+        "surface_contract_status": "ready_for_component_implementation",
+        "destinations": {"markets": "existing_table", "market_snapshots": "existing_table", "case_intake_handoff_records": "table", "ads_case_contracts": "table", "ads-case-contract.json": "external_artifact_contract"},
+        "write_path_destinations": {
+          "write_case_intake_handoff": ["markets", "market_snapshots", "case_intake_handoff_records"],
+          "write_ads_case_contract": ["ads_case_contracts", "ads-case-contract.json"]
+        },
+        "idempotency_keys": ["case_id", "dispatch_id", "market_id", "market_snapshot_id"]
+      },
+      "MIG-005": {
+        "implementation_stage": "v2_live_cutover",
+        "surface_contract_status": "ready_for_component_implementation",
+        "destinations": {"amrg_candidate_sets": "existing_table", "amrg_candidate_peer_rows": "existing_table", "amrg_market_vector_descriptors": "table", "amrg_vector_index_snapshots": "table", "amrg_vector_neighbor_candidate_slices": "table", "amrg_model_assist_provenance": "existing_table", "related_market_relationship_slices": "existing_table", "amrg_causal_graph_safety_slices": "existing_table", "related_market_prior_anchor_slices": "existing_table", "related_market_refresh_events": "table"},
+        "write_path_destinations": {
+          "write_related_market_context": ["amrg_candidate_sets", "amrg_candidate_peer_rows", "amrg_model_assist_provenance", "related_market_relationship_slices", "amrg_causal_graph_safety_slices", "related_market_prior_anchor_slices", "related_market_refresh_events"],
+          "write_amrg_vector_descriptors": ["amrg_market_vector_descriptors"],
+          "write_amrg_vector_index_snapshot": ["amrg_vector_index_snapshots"],
+          "write_amrg_vector_neighbor_candidates": ["amrg_vector_neighbor_candidate_slices"]
+        },
+        "idempotency_keys": ["case_id", "dispatch_id", "amrg_candidate_set_id", "vector_index_snapshot_id"]
+      },
+      "MIG-003": {
+        "implementation_stage": "v2_live_cutover",
+        "surface_contract_status": "ready_for_component_implementation",
+        "destinations": {"qdt_decomposition_runs": "existing_table", "qdt_required_research_questions": "existing_table", "qdt_leaf_research_sufficiency_requirements": "table", "qdt_amrg_anchor_dependency_slices": "table", "question-decomposition.json": "external_artifact_contract"},
+        "write_path_destinations": {
+          "write_decomposition_run": ["qdt_decomposition_runs", "qdt_required_research_questions", "question-decomposition.json"],
+          "write_qdt_research_sufficiency_requirements": ["qdt_leaf_research_sufficiency_requirements", "qdt_amrg_anchor_dependency_slices"]
+        },
+        "idempotency_keys": ["case_id", "dispatch_id", "decomposition_run_id", "qdt_artifact_id"]
+      },
+      "MIG-004": {
+        "implementation_stage": "v2_live_cutover",
+        "surface_contract_status": "ready_for_component_implementation",
+        "destinations": {"retrieval-packet.json": "external_artifact_contract", "retrieval_evidence_items": "table", "retrieval_evidence_chunk_slices": "table", "native_research_attempts": "table", "browser_retrieval_attempts": "table", "browser_search_provider_diagnostics": "table", "source_metadata_classifier_slices": "table", "source_metadata_resolution_slices": "table", "atomic_claim_candidate_slices": "table", "claim_family_resolution_slices": "table", "retrieval_metadata_fill_diagnostics": "table", "retrieval_quality_slices": "table", "retrieval_evidence_provenance_slices": "table", "retrieval_breadth_profiles": "table", "retrieval_breadth_coverage_slices": "table", "contradiction_search_attempts": "table", "negative_check_attempts": "table", "source_access_failure_slices": "table", "missingness_signal_slices": "table", "retrieval_fallback_state_records": "table", "retrieval_expansion_attempt_slices": "table", "research_sufficiency_certificates": "table"},
+        "write_path_destinations": {
+          "write_retrieval_packet": ["retrieval-packet.json"],
+          "write_retrieval_evidence_items": ["retrieval_evidence_items"],
+          "write_retrieval_evidence_chunk_slices": ["retrieval_evidence_chunk_slices"],
+          "write_native_research_attempts": ["native_research_attempts"],
+          "write_browser_retrieval_attempts": ["browser_retrieval_attempts"],
+          "write_browser_search_provider_diagnostics": ["browser_search_provider_diagnostics"],
+          "write_source_metadata_classifier_slices": ["source_metadata_classifier_slices"],
+          "write_source_metadata_resolution_slices": ["source_metadata_resolution_slices"],
+          "write_atomic_claim_candidate_slices": ["atomic_claim_candidate_slices"],
+          "write_claim_family_resolution_slices": ["claim_family_resolution_slices"],
+          "write_metadata_fill_diagnostics": ["retrieval_metadata_fill_diagnostics"],
+          "write_retrieval_quality_slices": ["retrieval_quality_slices"],
+          "write_evidence_provenance_slices": ["retrieval_evidence_provenance_slices"],
+          "write_retrieval_breadth_profile": ["retrieval_breadth_profiles"],
+          "write_retrieval_breadth_coverage_slices": ["retrieval_breadth_coverage_slices"],
+          "write_contradiction_search_attempts": ["contradiction_search_attempts"],
+          "write_negative_check_attempts": ["negative_check_attempts"],
+          "write_source_access_and_missingness_slices": ["source_access_failure_slices", "missingness_signal_slices"],
+          "write_retrieval_fallback_state": ["retrieval_fallback_state_records"],
+          "write_retrieval_expansion_attempts": ["retrieval_expansion_attempt_slices"],
+          "write_research_sufficiency_certificate": ["research_sufficiency_certificates"]
+        },
+        "idempotency_keys": ["case_id", "dispatch_id", "retrieval_packet_id", "leaf_id", "source_ref"]
+      },
+      "MIG-006": {
+        "implementation_stage": "v2_live_cutover",
+        "surface_contract_status": "ready_for_component_implementation",
+        "destinations": {"leaf_research_assignments": "table", "researcher_context_isolation_audits": "table", "classification_lane_evidence_classification_slices": "existing_table", "classification_lane_evidence_provenance_slices": "existing_table", "researcher_leaf_coverage_proofs": "table", "researcher_escalation_decisions": "table", "normalized_supplemental_evidence": "table", "evidence_direction_verification_slices": "existing_table", "evidence_quality_verification_slices": "existing_table", "research_sufficiency_reconciliation_slices": "table"},
+        "write_path_destinations": {
+          "write_leaf_research_assignments": ["leaf_research_assignments"],
+          "write_researcher_context_isolation_audits": ["researcher_context_isolation_audits"],
+          "write_researcher_classifications": ["classification_lane_evidence_classification_slices", "classification_lane_evidence_provenance_slices"],
+          "write_verification_slices": ["evidence_direction_verification_slices", "evidence_quality_verification_slices", "normalized_supplemental_evidence"],
+          "write_researcher_coverage_proofs": ["researcher_leaf_coverage_proofs"],
+          "write_researcher_escalation_decisions": ["researcher_escalation_decisions"],
+          "write_research_sufficiency_reconciliation": ["research_sufficiency_reconciliation_slices"]
+        },
+        "idempotency_keys": ["case_id", "dispatch_id", "leaf_id", "assignment_id", "researcher_run_id"]
+      },
+      "MIG-007": {
+        "implementation_stage": "v2_live_cutover",
+        "surface_contract_status": "ready_for_component_implementation",
+        "destinations": {"scae_ledger_outputs": "table", "scae_log_odds_update_slices": "table", "scae_cross_leaf_dependency_slices": "existing_table", "scae_branch_subledger_slices": "table", "scae_conditional_branch_slices": "table", "scae_calibration_diagnostic_slices": "table", "scae_mechanism_family_assignment_slices": "existing_table", "scae_research_sufficiency_input_slices": "table", "missingness_signal_slices": "table", "research_sufficiency_reconciliation_slices": "table"},
+        "write_path_destinations": {
+          "write_scae_ledger": ["scae_ledger_outputs", "scae_log_odds_update_slices", "scae_cross_leaf_dependency_slices", "scae_branch_subledger_slices", "scae_conditional_branch_slices", "scae_calibration_diagnostic_slices", "scae_mechanism_family_assignment_slices", "scae_research_sufficiency_input_slices", "missingness_signal_slices", "research_sufficiency_reconciliation_slices"],
+          "write_scae_research_sufficiency_inputs": ["scae_research_sufficiency_input_slices"]
+        },
+        "idempotency_keys": ["case_id", "dispatch_id", "scae_ledger_id", "update_slice_id"]
+      },
+      "MIG-008": {
+        "implementation_stage": "v2_live_cutover",
+        "surface_contract_status": "ready_for_component_implementation",
+        "destinations": {"forecast_decision_records": "table", "market_predictions": "existing_table"},
+        "write_path_destinations": {
+          "write_forecast_decision": ["forecast_decision_records"],
+          "record_market_prediction": ["market_predictions"],
+          "record_prediction_with_snapshot": ["market_predictions"]
+        },
+        "idempotency_keys": ["case_id", "dispatch_id", "prediction_run_id", "market_snapshot_id"]
+      },
+      "MIG-009": {
+        "implementation_stage": "v2_live_cutover_with_maturity_extension",
+        "surface_contract_status": "ready_for_component_implementation",
+        "destinations": {"training_trace_minimal_pointers": "existing_table", "training_trace_full_materializations": "existing_table", "v2_replay_manifests": "table"},
+        "write_path_destinations": {
+          "write_minimal_training_trace": ["training_trace_minimal_pointers"],
+          "write_replay_manifest": ["v2_replay_manifests"],
+          "write_full_training_trace_materialization": ["training_trace_full_materializations"]
+        },
+        "idempotency_keys": ["case_id", "dispatch_id", "trace_run_id", "replay_manifest_id"]
+      },
+      "MIG-010": {
+        "implementation_stage": "calibration_debt_clearance",
+        "surface_contract_status": "ready_for_component_implementation",
+        "destinations": {"market_predictions": "existing_table", "outcome_scoring_records": "table", "evaluator_scorecards": "existing_table", "v2_replay_result_records": "table"},
+        "write_path_destinations": {
+          "write_resolution_score": ["outcome_scoring_records", "market_predictions"],
+          "settle_market_outcome": ["outcome_scoring_records", "market_predictions"],
+          "brier_score_report": ["outcome_scoring_records", "evaluator_scorecards", "v2_replay_result_records"]
+        },
+        "idempotency_keys": ["prediction_id", "market_id", "resolution_id", "scorecard_id"]
+      },
+      "MIG-011": {
+        "implementation_stage": "autonomous_optimization_maturity",
+        "surface_contract_status": "ready_for_component_implementation",
+        "destinations": {"calibration_candidate_records": "existing_table", "calibration_lane_pointer_records": "table", "policy_rollback_events": "table", "effective_tuning_profile_context.json": "external_artifact_contract"},
+        "write_path_destinations": {
+          "write_calibration_candidate": ["calibration_candidate_records"],
+          "promote_policy_pointer": ["calibration_lane_pointer_records", "effective_tuning_profile_context.json"],
+          "write_policy_rollback_event": ["policy_rollback_events"]
+        },
+        "idempotency_keys": ["candidate_id", "lane_id", "pointer_id", "rollback_event_id"]
+      }
+    }
+  },
   "features": [
     {"id": "FND-001", "stage": "foundation", "owner": "Session 1", "status": "done", "dependencies": [], "acceptance_evidence": "2026-06-24 Phase 0 audit passed: Session 1 IDs present exactly once, ownership correct, anchors current, runtime boundary confirmed. Phase 1 added dependency-gate validation, ownership/waiver/update semantics, phase-report convention, and stdlib gate tests."},
     {"id": "FND-002", "stage": "foundation", "owner": "Session 1", "status": "done", "dependencies": ["FND-001"], "acceptance_evidence": "2026-06-24 Phase 2 implemented ads_stage_logging.py with v2 stage vocabulary, legal status transitions, status snapshot and execution-event contracts, named stage/status SQL surfaces, and unittest coverage for unknown stages, illegal transitions, artifact refs, and required event fields."},
     {"id": "FND-003", "stage": "foundation", "owner": "Session 1", "status": "done", "dependencies": ["FND-001"], "acceptance_evidence": "2026-06-24 Phase 3 implemented ads_handoff.py, 003_artifact_manifest_contract.sql, and script tests for artifact manifest construction, digest/schema expectation rejection, missing/unsafe metadata rejection, validation result refs, persistence, and named manifest/result surfaces."},
-    {"id": "FND-004", "stage": "foundation", "owner": "Session 1", "status": "not_started", "dependencies": ["FND-001"]},
+    {"id": "FND-004", "stage": "foundation", "owner": "Session 1", "status": "done", "dependencies": ["FND-001"], "acceptance_evidence": "2026-06-24 Phase 4 added executable migration_surface_contracts with MIG-001 to MIG-013 implementation order, live-cutover/calibration/maturity split, write-path destination coverage, idempotency keys, schema-name-map placeholders, and dependency-gate tests that reject missing migration destinations."},
     {"id": "FND-005", "stage": "foundation", "owner": "Session 1", "status": "not_started", "dependencies": ["FND-003", "FND-004"]},
     {"id": "FND-006", "stage": "foundation", "owner": "Session 1", "status": "not_started", "dependencies": ["FND-002", "FND-003"]},
     {"id": "FND-007", "stage": "foundation", "owner": "Session 1", "status": "not_started", "dependencies": ["FND-003", "FND-004"]},

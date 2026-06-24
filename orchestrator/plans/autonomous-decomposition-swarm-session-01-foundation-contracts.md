@@ -794,17 +794,23 @@ Testing suite:
 - Inventory: every persisted feature row names a persistence surface.
 - Regression: no implementation task writes an unlisted Section 10 slice.
 
+Phase 4 output:
+
+- `plans/autonomous-decomposition-swarm-persistence-migration-order.md`
+- `migration_surface_contracts` in `plans/autonomous-decomposition-swarm-feature-inventory.yaml`
+- `plans/check_dependency_gates.py` validates ordered migration destination coverage for every declared write path.
+
 Completion checklist:
 
-- [ ] Cutover-critical table list written.
-- [ ] Maturity-only table list written.
-- [ ] `MIG-001` to `MIG-013` matrix written and cross-linked to feature rows.
-- [ ] `MIG-001` artifact manifest contract specified.
-- [ ] `MIG-002` stage/status/execution/error contract specified.
-- [ ] Component-owned write paths have destination table/schema placeholders.
-- [ ] Migration order written.
-- [ ] Persistence contract check written or specified.
-- [ ] `FND-004` updated in inventory.
+- [x] Cutover-critical table list written.
+- [x] Maturity-only table list written.
+- [x] `MIG-001` to `MIG-013` matrix written and cross-linked to feature rows.
+- [x] `MIG-001` artifact manifest contract specified.
+- [x] `MIG-002` stage/status/execution/error contract specified.
+- [x] Component-owned write paths have destination table/schema placeholders.
+- [x] Migration order written.
+- [x] Persistence contract check written or specified.
+- [x] `FND-004` updated in inventory.
 
 ## Phase 5: Golden Fixture Registry and Fail-Closed Harness
 

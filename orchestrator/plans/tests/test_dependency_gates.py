@@ -88,14 +88,15 @@ class DependencyGateTests(unittest.TestCase):
     def test_unready_runtime_integration_is_blocked(self) -> None:
         inv = load_inventory()
         rows = rows_by_id(inv)
-        failures = gates.can_start(rows["FND-005"], rows, set(inv["ready_statuses"]), inv["waivers"], "runtime_integration")
-        self.assertNotIn("FND-003 status=not_started", failures)
-        self.assertIn("FND-004 status=not_started", failures)
+        failures = gates.can_start(rows["AUTO-002"], rows, set(inv["ready_statuses"]), inv["waivers"], "runtime_integration")
+        self.assertIn("AUTO-001 status=not_started", failures)
+        self.assertIn("CASE-001 status=not_started", failures)
+        self.assertNotIn("FND-004 status=not_started", failures)
 
     def test_fixture_mode_allows_start_even_when_runtime_is_blocked(self) -> None:
         inv = load_inventory()
         rows = rows_by_id(inv)
-        failures = gates.can_start(rows["FND-005"], rows, set(inv["ready_statuses"]), inv["waivers"], "fixture")
+        failures = gates.can_start(rows["AUTO-002"], rows, set(inv["ready_statuses"]), inv["waivers"], "fixture")
         self.assertEqual(failures, [])
 
     def test_valid_waiver_can_unblock_a_specific_target_dependency_pair(self) -> None:
@@ -174,6 +175,65 @@ class DependencyGateTests(unittest.TestCase):
         ]:
             with self.subTest(field=field):
                 self.assertIn(field, text)
+
+    def test_migration_surface_contracts_cover_write_paths_and_order(self) -> None:
+        inv = load_inventory()
+        contracts = inv["migration_surface_contracts"]
+        self.assertEqual(contracts["implementation_order"][:3], ["MIG-001", "MIG-002", "MIG-013"])
+        self.assertIn("MIG-012", contracts["implementation_order"])
+        self.assertIn("MIG-011", contracts["autonomous_optimization_maturity_groups"])
+
+        rows = rows_by_id(inv)
+        for migration_id, contract in contracts["groups"].items():
+            with self.subTest(migration=migration_id):
+                migration = rows[migration_id]
+                self.assertEqual(contract["surface_contract_status"], "ready_for_component_implementation")
+                self.assertTrue(contract["destinations"])
+                self.assertTrue(contract["idempotency_keys"])
+                for write_path in migration["write_paths"]:
+                    destinations = contract["write_path_destinations"].get(write_path)
+                    self.assertTrue(destinations, f"{write_path} is missing destination coverage")
+                    for destination in destinations:
+                        self.assertIn(destination, contract["destinations"])
+
+        self.assertIn(
+            "ads_case_contracts",
+            contracts["groups"]["MIG-012"]["write_path_destinations"]["write_ads_case_contract"],
+        )
+        self.assertIn(
+            "effective_tuning_profile_context.json",
+            contracts["groups"]["MIG-011"]["write_path_destinations"]["promote_policy_pointer"],
+        )
+
+    def test_missing_migration_write_path_destination_is_rejected(self) -> None:
+        inv = load_inventory()
+        broken = copy.deepcopy(inv)
+        del broken["migration_surface_contracts"]["groups"]["MIG-012"]["write_path_destinations"][
+            "write_ads_case_contract"
+        ]
+        errors = gates.validate_inventory(broken)
+        self.assertTrue(
+            any("MIG-012: write path write_ads_case_contract has no destination surface" in error for error in errors)
+        )
+
+    def test_migration_contract_preserves_owner_boundaries(self) -> None:
+        inv = load_inventory()
+        rows = rows_by_id(inv)
+        for migration_id in ["MIG-001", "MIG-002", "MIG-013"]:
+            self.assertEqual(rows[migration_id]["owner"], "Session 1")
+        for migration_id in [
+            "MIG-003",
+            "MIG-004",
+            "MIG-005",
+            "MIG-006",
+            "MIG-007",
+            "MIG-008",
+            "MIG-009",
+            "MIG-010",
+            "MIG-011",
+            "MIG-012",
+        ]:
+            self.assertNotEqual(rows[migration_id]["owner"], "Session 1")
 
 
 if __name__ == "__main__":

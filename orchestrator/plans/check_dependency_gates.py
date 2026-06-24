@@ -20,6 +20,8 @@ ROOT = Path(__file__).resolve().parent
 DEFAULT_INVENTORY = ROOT / "autonomous-decomposition-swarm-feature-inventory.yaml"
 EVIDENCE_REQUIRED_STATUSES = {"ready_for_integration", "done"}
 WAIVER_REQUIRED_FIELDS = ["dependency_id", "target_id", "owner", "reason", "expires_on"]
+MIGRATION_SURFACE_KINDS = {"table", "existing_table", "external_artifact_contract", "view"}
+MIGRATION_CONTRACT_STATUSES = {"ready_for_component_implementation"}
 
 
 def load_inventory(path: Path) -> dict:
@@ -170,7 +172,73 @@ def validate_inventory(inv: dict) -> list[str]:
         for dep_id in migration.get("dependencies", []):
             if dep_id not in features and dep_id not in migrations:
                 errors.append(f"{migration_id}: missing dependency {dep_id}")
+    errors.extend(validate_migration_surface_contracts(inv.get("migration_surface_contracts"), migrations))
     errors.extend(validate_waivers(inv.get("waivers", []), combined))
+    return errors
+
+
+def validate_migration_surface_contracts(contract_root: dict | None, migrations: dict[str, dict]) -> list[str]:
+    errors: list[str] = []
+    if not isinstance(contract_root, dict):
+        return ["missing migration_surface_contracts"]
+
+    implementation_order = contract_root.get("implementation_order")
+    groups = contract_root.get("groups")
+    if not isinstance(implementation_order, list) or not implementation_order:
+        errors.append("migration_surface_contracts: missing implementation_order")
+        implementation_order = []
+    if not isinstance(groups, dict):
+        errors.append("migration_surface_contracts: missing groups")
+        groups = {}
+
+    ordered_ids = [item for item in implementation_order if isinstance(item, str)]
+    if len(ordered_ids) != len(implementation_order):
+        errors.append("migration_surface_contracts: implementation_order must contain migration IDs")
+    if len(set(ordered_ids)) != len(ordered_ids):
+        errors.append("migration_surface_contracts: duplicate implementation_order entry")
+    missing_order = sorted(set(migrations) - set(ordered_ids))
+    extra_order = sorted(set(ordered_ids) - set(migrations))
+    if missing_order:
+        errors.append("migration_surface_contracts: missing ordered migrations " + ", ".join(missing_order))
+    if extra_order:
+        errors.append("migration_surface_contracts: unknown ordered migrations " + ", ".join(extra_order))
+
+    for migration_id, migration in migrations.items():
+        contract = groups.get(migration_id)
+        if not isinstance(contract, dict):
+            errors.append(f"{migration_id}: missing migration surface contract")
+            continue
+
+        status = contract.get("surface_contract_status")
+        if status not in MIGRATION_CONTRACT_STATUSES:
+            errors.append(f"{migration_id}: invalid surface_contract_status {status}")
+
+        destinations = contract.get("destinations")
+        if not isinstance(destinations, dict) or not destinations:
+            errors.append(f"{migration_id}: missing destination surfaces")
+            destinations = {}
+        for destination, kind in destinations.items():
+            if not isinstance(destination, str) or not destination:
+                errors.append(f"{migration_id}: invalid destination surface name")
+            if kind not in MIGRATION_SURFACE_KINDS:
+                errors.append(f"{migration_id}: invalid destination kind {kind} for {destination}")
+
+        write_path_destinations = contract.get("write_path_destinations")
+        if not isinstance(write_path_destinations, dict):
+            errors.append(f"{migration_id}: missing write_path_destinations")
+            write_path_destinations = {}
+        for write_path in migration.get("write_paths", []):
+            destination_refs = write_path_destinations.get(write_path)
+            if not isinstance(destination_refs, list) or not destination_refs:
+                errors.append(f"{migration_id}: write path {write_path} has no destination surface")
+                continue
+            for destination_ref in destination_refs:
+                if destination_ref not in destinations:
+                    errors.append(f"{migration_id}: write path {write_path} references unknown destination {destination_ref}")
+
+        idempotency_keys = contract.get("idempotency_keys")
+        if not isinstance(idempotency_keys, list) or not all(isinstance(item, str) and item for item in idempotency_keys):
+            errors.append(f"{migration_id}: missing idempotency_keys")
     return errors
 
 

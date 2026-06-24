@@ -11,6 +11,7 @@ Status values:
 - `FND-001`: Phase 1 dependency gate/inventory tracking acceptance completed on 2026-06-24. Evidence: dependency gate validates inventory shape, unknown dependencies, cycles, waiver shape/expiry, runtime blocking, fixture-mode starts, owner/evidence update rules, Markdown/YAML feature sync, and the phase-report convention.
 - `FND-002`: done on 2026-06-24. Phase 2 implemented `scripts/predquant/ads_stage_logging.py`, `scripts/migrations/002_v2_stage_status_model.sql`, and script tests covering stage vocabulary, transition validation, status artifact refs, required execution-event fields, bounded log refs/no-log reason, and named status/event surfaces.
 - `FND-003`: done on 2026-06-24. Phase 3 implemented `scripts/predquant/ads_handoff.py`, `scripts/migrations/003_artifact_manifest_contract.sql`, and script tests covering artifact manifest construction, digest/schema expectation rejection, missing/unsafe metadata rejection, validation result refs, persistence, and named manifest/result surfaces.
+- `FND-004`: done on 2026-06-24. Phase 4 added `migration_surface_contracts` to the executable inventory, wrote `autonomous-decomposition-swarm-persistence-migration-order.md`, updated schema/blocker maps, and added dependency-gate tests proving `MIG-001` to `MIG-013` have ordered write-path destination coverage before runtime integration.
 
 ## Inventory Coordination Contract
 
@@ -63,7 +64,7 @@ These migration groups are the data backbone for replay, scoring, calibration, a
 | FND-001 | foundation | Planning | foundation_blocker | Session 1 | none | Canonical feature inventory and dependency DAG | done |
 | FND-002 | foundation | Control plane | cutover_blocker | Session 1 | FND-001 | v2 stage vocabulary, status contract, and execution-event stream | done |
 | FND-003 | foundation | Artifacts | cutover_blocker | Session 1 | FND-001 | Artifact manifest schema and validator | done |
-| FND-004 | foundation | Persistence | cutover_blocker | Session 1 | FND-001 | Section 10 migration/schema plan | not_started |
+| FND-004 | foundation | Persistence | cutover_blocker | Session 1 | FND-001 | Section 10 migration/schema plan | done |
 | FND-005 | foundation | Fixtures | integration_blocker | Session 1 | FND-003, FND-004 | Golden fixture registry and runner | not_started |
 | FND-006 | foundation | Validation | cutover_blocker | Session 1 | FND-002, FND-003 | Fail-closed validation, safe stage execution logging, and error events | not_started |
 | FND-007 | foundation | Training trace | cutover_blocker | Session 1 | FND-003, FND-004 | Minimal trace pointer contract | not_started |
