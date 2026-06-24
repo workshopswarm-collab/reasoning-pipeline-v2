@@ -16,7 +16,7 @@
   "features": [
     {"id": "FND-001", "stage": "foundation", "owner": "Session 1", "status": "done", "dependencies": [], "acceptance_evidence": "2026-06-24 Phase 0 audit passed: Session 1 IDs present exactly once, ownership correct, anchors current, runtime boundary confirmed. Phase 1 added dependency-gate validation, ownership/waiver/update semantics, phase-report convention, and stdlib gate tests."},
     {"id": "FND-002", "stage": "foundation", "owner": "Session 1", "status": "done", "dependencies": ["FND-001"], "acceptance_evidence": "2026-06-24 Phase 2 implemented ads_stage_logging.py with v2 stage vocabulary, legal status transitions, status snapshot and execution-event contracts, named stage/status SQL surfaces, and unittest coverage for unknown stages, illegal transitions, artifact refs, and required event fields."},
-    {"id": "FND-003", "stage": "foundation", "owner": "Session 1", "status": "not_started", "dependencies": ["FND-001"]},
+    {"id": "FND-003", "stage": "foundation", "owner": "Session 1", "status": "done", "dependencies": ["FND-001"], "acceptance_evidence": "2026-06-24 Phase 3 implemented ads_handoff.py, 003_artifact_manifest_contract.sql, and script tests for artifact manifest construction, digest/schema expectation rejection, missing/unsafe metadata rejection, validation result refs, persistence, and named manifest/result surfaces."},
     {"id": "FND-004", "stage": "foundation", "owner": "Session 1", "status": "not_started", "dependencies": ["FND-001"]},
     {"id": "FND-005", "stage": "foundation", "owner": "Session 1", "status": "not_started", "dependencies": ["FND-003", "FND-004"]},
     {"id": "FND-006", "stage": "foundation", "owner": "Session 1", "status": "not_started", "dependencies": ["FND-002", "FND-003"]},

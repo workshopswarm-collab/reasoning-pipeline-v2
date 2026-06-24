@@ -661,11 +661,11 @@ Testing suite:
 
 Completion checklist:
 
-- [ ] Artifact manifest schema written.
-- [ ] Digest contract written.
-- [ ] Validation result vocabulary linked.
-- [ ] Manifest persistence surface identified.
-- [ ] `FND-003` updated in inventory.
+- [x] Artifact manifest schema written.
+- [x] Digest contract written.
+- [x] Validation result vocabulary linked.
+- [x] Manifest persistence surface identified.
+- [x] `FND-003` updated in inventory.
 
 ## Phase 4: Section 10 Persistence Migration Plan
 
