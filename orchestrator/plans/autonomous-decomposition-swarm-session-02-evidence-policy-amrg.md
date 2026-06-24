@@ -558,12 +558,12 @@ Testing suite:
 
 Completion checklist:
 
-- [ ] Tunable registry metadata schema exists.
-- [ ] Model-lane policy artifact exists and validates.
-- [ ] Regime tag slices defined.
-- [ ] Profile context artifact defined.
-- [ ] Default global baseline behavior verified.
-- [ ] `POL-001`, `POL-002`, `POL-003`, and `MODEL-001` inventory rows updated.
+- [x] Tunable registry metadata schema exists.
+- [x] Model-lane policy artifact exists and validates.
+- [x] Regime tag slices defined.
+- [x] Profile context artifact defined.
+- [x] Default global baseline behavior verified.
+- [x] `POL-001`, `POL-002`, `POL-003`, and `MODEL-001` inventory rows updated.
 
 ## Phase 5: AMRG Local Vector Index
 

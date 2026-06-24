@@ -15,6 +15,7 @@ Status values:
 - `CASE-001`, `CASE-002`, `MIG-012`: ready for integration on 2026-06-24. Session 02 Phase 1 added `scripts/predquant/ads_case_contract.py`, `scripts/bin/build_ads_case_contract.py`, `scripts/migrations/004_ads_case_contract.sql`, and tests covering active intake selection, latest pre-forecast snapshot selection, lookahead/missing/stale blocking, stable IDs, source hashes/provenance, baseline methods, idempotent table writes, and artifact-manifest registration.
 - `CTX-001`, `CTX-002`: ready for integration on 2026-06-24. Session 02 Phase 2 added `scripts/predquant/evidence_packet.py`, `scripts/bin/build_evidence_packet_v2.py`, and tests covering standalone evidence-packet/v2 artifacts, side/axis mapping, source-of-truth status, quote/provenance refs, regime seed fields, artifact-manifest registration, family-aware selected-child validation, sibling context-only prices, invalid side mapping, invalid case contracts, and raw-payload exclusion.
 - `CTX-003`: ready for integration on 2026-06-24. Session 02 Phase 3 added candidate-only `prior-reliability-inputs/v1` inside `evidence-packet/v2`, covering rolling bid/ask spread, depth, volume, open interest, last-trade/snapshot age, priced-through timestamp, freshness state, stale/unavailable/fresh-liquid/spread-warning reason candidates, quote lookahead rejection, and no SCAE probability authority.
+- `POL-001`, `POL-002`, `POL-003`, `MODEL-001`: ready for integration on 2026-06-24. Session 02 Phase 4 added `scripts/predquant/tuning_profile.py`, `scripts/bin/resolve_tuning_profile_context.py`, and tests covering tunable registry metadata, deterministic regime tags, global-baseline fallback, excluded sports/crypto profiles, intended-but-inactive profiles, conservative overlays, no numeric SCAE authoring, effective-profile manifest registration, and model-lane policy validation.
 
 ## Inventory Coordination Contract
 
@@ -87,10 +88,10 @@ These migration groups are the data backbone for replay, scoring, calibration, a
 | CTX-001 | v2_live_cutover | Evidence packet | cutover_blocker | Session 2 | CASE-002, FND-003 | Evidence packet v2 contract | ready_for_integration |
 | CTX-002 | v2_live_cutover | Market family | cutover_blocker | Session 2 | CTX-001, FND-004 | Family-aware binary child metadata | ready_for_integration |
 | CTX-003 | v2_live_cutover | Market prior | cutover_blocker | Session 2 | CTX-001, FND-004 | Prior-reliability input surfaces | ready_for_integration |
-| POL-001 | foundation | Policy | foundation_blocker | Session 2 | FND-004 | Tunable registry metadata contract | not_started |
-| POL-002 | v2_live_cutover | Regime tags | integration_blocker | Session 2 | CTX-001, POL-001 | Deterministic market-regime tags | not_started |
-| POL-003 | v2_live_cutover | Profile resolver | integration_blocker | Session 2 | POL-001, POL-002 | `effective_tuning_profile_context.json` | not_started |
-| MODEL-001 | v2_live_cutover | Model lanes | cutover_blocker | Session 2 | POL-001, FND-003 | Model lane policy artifact with `gpt-5.5-high` decomposer/researcher/native-research defaults plus OpenAI OAuth-routed `openai/gpt-5.4-mini` source metadata classifier assist lane | not_started |
+| POL-001 | foundation | Policy | foundation_blocker | Session 2 | FND-004 | Tunable registry metadata contract | ready_for_integration |
+| POL-002 | v2_live_cutover | Regime tags | integration_blocker | Session 2 | CTX-001, POL-001 | Deterministic market-regime tags | ready_for_integration |
+| POL-003 | v2_live_cutover | Profile resolver | integration_blocker | Session 2 | POL-001, POL-002 | `effective_tuning_profile_context.json` | ready_for_integration |
+| MODEL-001 | v2_live_cutover | Model lanes | cutover_blocker | Session 2 | POL-001, FND-003 | Model lane policy artifact with `gpt-5.5-high` decomposer/researcher/native-research defaults plus OpenAI OAuth-routed `openai/gpt-5.4-mini` source metadata classifier assist lane | ready_for_integration |
 
 ## Layer 2: AMRG
 
