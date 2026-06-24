@@ -868,11 +868,11 @@ Testing suite:
 
 Completion checklist:
 
-- [ ] Handoff schema written.
-- [ ] Decomposer model lane resolution written.
-- [ ] Required input refs listed.
-- [ ] Forbidden input refs listed.
-- [ ] `QDT-001` and `MODEL-002` inventory rows updated.
+- [x] Handoff schema written.
+- [x] Decomposer model lane resolution written.
+- [x] Required input refs listed.
+- [x] Forbidden input refs listed.
+- [x] `QDT-001` and `MODEL-002` inventory rows updated.
 
 ## Phase 2: QDT Schema and Candidate Selection Contract
 
