@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from predquant.ads_case_contract import ensure_case_contract_schema, materialize_ads_case_contract
 from predquant.evidence_packet import (
     EVIDENCE_PACKET_SCHEMA_VERSION,
+    PRIOR_RELIABILITY_INPUT_SCHEMA_VERSION,
     EvidencePacketError,
     build_evidence_packet_v2,
     materialize_evidence_packet_v2,
@@ -107,9 +108,9 @@ class EvidencePacketTest(unittest.TestCase):
         )
         return int(cursor.lastrowid)
 
-    def case_contract_result(self):
+    def case_contract_result(self, snapshot_observed_at: str = "2026-06-24T17:55:00+00:00"):
         market_id = self.insert_market()
-        snapshot_id = self.insert_snapshot(market_id, "2026-06-24T17:55:00+00:00")
+        snapshot_id = self.insert_snapshot(market_id, snapshot_observed_at)
         result = materialize_ads_case_contract(
             self.conn,
             market_id=market_id,
@@ -121,6 +122,9 @@ class EvidencePacketTest(unittest.TestCase):
             (snapshot_id,),
         ).fetchone()
         return result, snapshot
+
+    def reason_codes(self, packet):
+        return {candidate["code"]: candidate for candidate in packet["prior_reliability_inputs"]["reason_code_candidates"]}
 
     def test_standalone_binary_packet_registers_manifest(self):
         contract_result, snapshot = self.case_contract_result()
@@ -147,6 +151,11 @@ class EvidencePacketTest(unittest.TestCase):
         self.assertEqual(packet["prior_context_seed"]["market_snapshot_id"], snapshot["id"])
         self.assertEqual(packet["prior_context_seed"]["quote_observation_refs"][0]["ref_id"], "quote:fixture")
         self.assertEqual(packet["regime_seed_fields"]["contract_structure"], "binary")
+        self.assertEqual(
+            packet["prior_reliability_inputs"]["schema_version"],
+            PRIOR_RELIABILITY_INPUT_SCHEMA_VERSION,
+        )
+        self.assertEqual(packet["prior_reliability_inputs"]["authority"], "candidate_inputs_only_no_scae_probability")
         self.assertNotIn("raw_payload", json.dumps(packet))
         self.assertNotIn("must-not-copy", json.dumps(packet))
 
@@ -255,6 +264,133 @@ class EvidencePacketTest(unittest.TestCase):
                 case_contract=contract_result["contract"],
                 case_contract_ref="",
                 market_snapshot=snapshot,
+            )
+
+    def test_prior_reliability_stale_snapshot_candidate(self):
+        contract_result, snapshot = self.case_contract_result("2026-06-24T17:40:00+00:00")
+        packet = build_evidence_packet_v2(
+            case_contract=contract_result["contract"],
+            case_contract_ref=contract_result["artifact_id"],
+            market_snapshot=snapshot,
+            quote_observations=[
+                {
+                    "ref_id": "quote:stale-window",
+                    "observed_at": "2026-06-24T17:50:00+00:00",
+                    "best_bid": 0.45,
+                    "best_ask": 0.47,
+                    "volume": 200,
+                }
+            ],
+        )
+
+        prior = packet["prior_reliability_inputs"]
+        self.assertEqual(prior["rolling_microstructure"]["market_snapshot_freshness"]["status"], "stale")
+        self.assertIn("prior_snapshot_stale_candidate", self.reason_codes(packet))
+        self.assertEqual(prior["rolling_microstructure"]["market_priced_through_timestamp"], "2026-06-24T17:50:00+00:00")
+
+    def test_prior_reliability_fresh_liquid_candidate_from_compact_quotes(self):
+        contract_result, snapshot = self.case_contract_result()
+        packet = build_evidence_packet_v2(
+            case_contract=contract_result["contract"],
+            case_contract_ref=contract_result["artifact_id"],
+            market_snapshot=snapshot,
+            quote_observations=[
+                {
+                    "source": "fixture_quotes",
+                    "row_id": 1,
+                    "observed_at": "2026-06-24T17:56:00+00:00",
+                    "best_bid": 0.50,
+                    "best_ask": 0.52,
+                    "bid_size": 80,
+                    "ask_size": 90,
+                    "volume": 500,
+                    "open_interest": 300,
+                    "last_trade_at": "2026-06-24T17:55:30+00:00",
+                    "raw_payload": "must-not-copy",
+                },
+                {
+                    "source": "fixture_quotes",
+                    "row_id": 2,
+                    "observed_at": "2026-06-24T17:58:00+00:00",
+                    "best_bid": 0.51,
+                    "best_ask": 0.53,
+                    "bid_size": 100,
+                    "ask_size": 120,
+                    "volume": 700,
+                    "open_interest": 350,
+                },
+            ],
+        )
+
+        prior = packet["prior_reliability_inputs"]
+        self.assertIn("fresh_liquid_market_candidate", self.reason_codes(packet))
+        self.assertEqual(prior["lookback_window"]["observation_count"], 2)
+        self.assertEqual(prior["quote_observation_refs"][0]["ref_id"], "fixture_quotes:1")
+        self.assertEqual(prior["rolling_microstructure"]["order_book_depth_latest"], 220.0)
+        self.assertEqual(prior["rolling_microstructure"]["recent_volume_rolling"]["latest"], 700.0)
+        self.assertIsNotNone(prior["rolling_microstructure"]["last_trade_age_seconds_rolling"])
+        serialized = json.dumps(packet)
+        self.assertNotIn("must-not-copy", serialized)
+        self.assertNotIn("posterior_probability", serialized)
+        self.assertNotIn("production_forecast_prob", serialized)
+        self.assertNotIn("fair_value_probability", serialized)
+        self.assertNotIn("reliability_score", serialized)
+
+    def test_one_instant_spread_spike_is_warning_candidate_only(self):
+        contract_result, snapshot = self.case_contract_result()
+        packet = build_evidence_packet_v2(
+            case_contract=contract_result["contract"],
+            case_contract_ref=contract_result["artifact_id"],
+            market_snapshot=snapshot,
+            quote_observations=[
+                {
+                    "ref_id": "quote:single-spike",
+                    "observed_at": "2026-06-24T17:58:00+00:00",
+                    "best_bid": 0.20,
+                    "best_ask": 0.50,
+                    "volume": 500,
+                }
+            ],
+        )
+
+        candidate = self.reason_codes(packet)["instant_spread_spike_warning_candidate"]
+        self.assertEqual(candidate["severity"], "warning")
+        self.assertTrue(candidate["candidate_only"])
+        self.assertEqual(candidate["scae_reliability_authority"], "none_candidate_input_only")
+        self.assertFalse(candidate["details"]["downgrade_authority"])
+
+    def test_missing_quote_observations_produce_unavailable_candidate(self):
+        contract_result, snapshot = self.case_contract_result()
+        packet = build_evidence_packet_v2(
+            case_contract=contract_result["contract"],
+            case_contract_ref=contract_result["artifact_id"],
+            market_snapshot=snapshot,
+            quote_observations=[],
+        )
+
+        prior = packet["prior_reliability_inputs"]
+        self.assertEqual(prior["lookback_window"]["observation_count"], 0)
+        self.assertIn("quote_observations_unavailable", self.reason_codes(packet))
+        self.assertEqual(
+            prior["rolling_microstructure"]["market_priced_through_timestamp"],
+            contract_result["contract"]["source_cutoff_timestamp"],
+        )
+
+    def test_prior_reliability_rejects_lookahead_quote_observation(self):
+        contract_result, snapshot = self.case_contract_result()
+        with self.assertRaisesRegex(EvidencePacketError, "quote observation"):
+            build_evidence_packet_v2(
+                case_contract=contract_result["contract"],
+                case_contract_ref=contract_result["artifact_id"],
+                market_snapshot=snapshot,
+                quote_observations=[
+                    {
+                        "ref_id": "quote:lookahead",
+                        "observed_at": "2026-06-24T18:01:00+00:00",
+                        "best_bid": 0.50,
+                        "best_ask": 0.51,
+                    }
+                ],
             )
 
 

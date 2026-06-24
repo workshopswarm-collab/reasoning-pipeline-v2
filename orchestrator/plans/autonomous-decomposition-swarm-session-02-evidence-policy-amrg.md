@@ -479,10 +479,10 @@ Testing suite:
 
 Completion checklist:
 
-- [ ] Prior-reliability input schema exists.
-- [ ] Rolling window fields covered.
-- [ ] Priced-through timestamp represented.
-- [ ] `CTX-003` inventory row updated.
+- [x] Prior-reliability input schema exists.
+- [x] Rolling window fields covered.
+- [x] Priced-through timestamp represented.
+- [x] `CTX-003` inventory row updated.
 
 ## Phase 4: Tunable Registry, Regime Tags, and Effective Profile Context
 
