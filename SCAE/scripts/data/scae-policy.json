@@ -41,6 +41,31 @@
     "debt_mode_total_evidence_log_odds_cap": 1.0,
     "representative_selector": "policy_bounded_signed_representative_v1"
   },
+  "prior_reliability": {
+    "epsilon": 0.001,
+    "base_market_prior_reliability": 0.6,
+    "fresh_liquid_reliability_floor": 0.75,
+    "stale_thin_reliability_ceiling": 0.35,
+    "market_prior_min_reliability": 0.0,
+    "market_prior_max_reliability": 0.95,
+    "structural_prior_default_reliability": 0.55,
+    "neutral_prior_default_reliability": 0.0,
+    "tight_spread_threshold": 0.04,
+    "wide_spread_threshold": 0.15,
+    "deep_depth_threshold": 1000.0,
+    "thin_depth_threshold": 100.0,
+    "liquid_volume_threshold": 1000.0,
+    "thin_volume_threshold": 50.0,
+    "active_last_trade_seconds": 300.0,
+    "stale_last_trade_seconds": 1800.0
+  },
+  "market_assimilation": {
+    "old_public_evidence_discount_fresh_liquid": 0.25,
+    "old_public_evidence_discount_default": 0.5,
+    "fresh_or_private_evidence_discount": 1.0,
+    "structural_prior_overlap_multiplier": 0.0,
+    "base_rate_overlap_multiplier": 0.0
+  },
   "probability_taxonomy": {
     "fields": [
       "raw_ledger_probability",

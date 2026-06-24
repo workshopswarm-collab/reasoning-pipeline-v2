@@ -87,6 +87,8 @@ def validate_scae_policy(policy: dict[str, Any]) -> None:
         "post_ledger_calibration",
         "calibration_debt",
         "cap_stack",
+        "prior_reliability",
+        "market_assimilation",
         "probability_taxonomy",
         "validity_and_execution",
     ]
@@ -147,6 +149,67 @@ def validate_scae_policy(policy: dict[str, Any]) -> None:
             raise ScaePolicyError(f"cap_stack.{field} must be a positive number")
     if cap_stack["debt_mode_total_evidence_log_odds_cap"] > cap_stack["total_evidence_log_odds_cap"]:
         raise ScaePolicyError("debt-mode total cap must not be looser than the normal total cap")
+
+    prior_reliability = policy["prior_reliability"]
+    for field in [
+        "epsilon",
+        "base_market_prior_reliability",
+        "fresh_liquid_reliability_floor",
+        "stale_thin_reliability_ceiling",
+        "market_prior_min_reliability",
+        "market_prior_max_reliability",
+        "structural_prior_default_reliability",
+        "neutral_prior_default_reliability",
+    ]:
+        value = prior_reliability.get(field)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ScaePolicyError(f"prior_reliability.{field} must be numeric")
+        if field == "epsilon":
+            if not 0.0 < value < 0.5:
+                raise ScaePolicyError("prior_reliability.epsilon must be in (0, 0.5)")
+        elif not 0.0 <= value <= 1.0:
+            raise ScaePolicyError(f"prior_reliability.{field} must be in [0, 1]")
+    if prior_reliability["fresh_liquid_reliability_floor"] < prior_reliability["stale_thin_reliability_ceiling"]:
+        raise ScaePolicyError("fresh/liquid reliability floor must be at least stale/thin ceiling")
+    if prior_reliability["market_prior_min_reliability"] > prior_reliability["market_prior_max_reliability"]:
+        raise ScaePolicyError("market prior min reliability cannot exceed max reliability")
+    for field in [
+        "tight_spread_threshold",
+        "wide_spread_threshold",
+        "deep_depth_threshold",
+        "thin_depth_threshold",
+        "liquid_volume_threshold",
+        "thin_volume_threshold",
+        "active_last_trade_seconds",
+        "stale_last_trade_seconds",
+    ]:
+        value = prior_reliability.get(field)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+            raise ScaePolicyError(f"prior_reliability.{field} must be a non-negative number")
+    if prior_reliability["tight_spread_threshold"] > prior_reliability["wide_spread_threshold"]:
+        raise ScaePolicyError("tight spread threshold cannot exceed wide spread threshold")
+    if prior_reliability["thin_depth_threshold"] > prior_reliability["deep_depth_threshold"]:
+        raise ScaePolicyError("thin depth threshold cannot exceed deep depth threshold")
+    if prior_reliability["thin_volume_threshold"] > prior_reliability["liquid_volume_threshold"]:
+        raise ScaePolicyError("thin volume threshold cannot exceed liquid volume threshold")
+    if prior_reliability["active_last_trade_seconds"] > prior_reliability["stale_last_trade_seconds"]:
+        raise ScaePolicyError("active trade age threshold cannot exceed stale trade age threshold")
+
+    market_assimilation = policy["market_assimilation"]
+    for field in [
+        "old_public_evidence_discount_fresh_liquid",
+        "old_public_evidence_discount_default",
+        "fresh_or_private_evidence_discount",
+        "structural_prior_overlap_multiplier",
+        "base_rate_overlap_multiplier",
+    ]:
+        value = market_assimilation.get(field)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0.0 <= value <= 1.0:
+            raise ScaePolicyError(f"market_assimilation.{field} must be in [0, 1]")
+    if market_assimilation["structural_prior_overlap_multiplier"] != 0.0:
+        raise ScaePolicyError("structural prior overlap must contribute zero signed delta")
+    if market_assimilation["base_rate_overlap_multiplier"] != 0.0:
+        raise ScaePolicyError("base-rate overlap must contribute zero signed delta")
 
     taxonomy = policy["probability_taxonomy"]
     if taxonomy.get("fields") != PROBABILITY_FIELDS:

@@ -117,6 +117,7 @@ Root-level runtime entrypoints should be avoided except for compatibility shims 
 | `/Users/agent2/.openclaw/SCAE/scripts/bin/report_scae_scorecard.py` | `SCORE-001`, `MIG-010` | Summarize SCAE Brier and market-baseline scorecards. |
 | `/Users/agent2/.openclaw/SCAE/scripts/scae/ledger.py` | `SCAE-001` to `SCAE-013` | Ledger construction and probability field contract. |
 | `/Users/agent2/.openclaw/SCAE/scripts/scae/policy.py` | `SCAE-001`, `SCAE-004`, `SCAE-012` | SCAE policy resolution, caps, and debt controls. |
+| `/Users/agent2/.openclaw/SCAE/scripts/scae/prior.py` | `SCAE-002` | Prior odds, rolling microstructure reliability, structural/neutral shrink targets, and market-assimilation context. |
 | `/Users/agent2/.openclaw/SCAE/scripts/scae/netting.py` | `SCAE-005`, `SCAE-006`, `SCAE-007` | Intra-leaf, cross-leaf, branch, and dependence netting. |
 | `/Users/agent2/.openclaw/SCAE/scripts/scae/intervals.py` | `SCAE-011` | Deterministic logit uncertainty interval builder. |
 | `/Users/agent2/.openclaw/SCAE/scripts/scae/persistence.py` | `PERSIST-001`, `PERSIST-002`, `SCORE-001` | Forecast and scoring persistence helpers. |

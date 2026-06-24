@@ -19,6 +19,7 @@ Status values:
 - `AMRG-009`: ready for integration on 2026-06-24. Session 02 Phase 5 added `scripts/predquant/amrg.py` local vector-source contracts for resolving the Ollama `BAAI/bge-base-en-v1.5` lane, download/unavailable diagnostics, active-safe descriptor hashing, ready/unavailable vector index snapshots, capped weak-context vector neighbor candidates, and focused script tests.
 - `AMRG-001`, `AMRG-002`: ready for integration on 2026-06-24. Session 02 Phase 6 extended `scripts/predquant/amrg.py` and added `scripts/bin/build_related_live_market_context.py` for deterministic active-safe candidate construction, cap/dedupe/order, unsafe/resolved/past/post-cutoff exclusions, weak-context-only edges, optional non-blocking vector diagnostics from `AMRG-009`, explicit no-related-context waiver, manifest registration, and focused script tests.
 - `SCAE-001`: ready for integration on 2026-06-24. Session 05 Phase 1 added `/Users/agent2/.openclaw/SCAE/scripts/scae/policy.py`, `/Users/agent2/.openclaw/SCAE/scripts/data/scae-policy.json`, and focused tests covering identity post-ledger calibration defaults, calibration-debt active/cleared production taxonomy, canonical probability aliasing, SCAE-only numeric authority boundaries, cap-stack variables, and decision validity/execution downgrade enforcement.
+- `SCAE-002`: ready for integration on 2026-06-24. Session 05 Phase 2 added `/Users/agent2/.openclaw/SCAE/scripts/scae/prior.py` and focused tests covering valid market-live prior defaulting, validated structural/base-rate fallback, neutral fallback uncertainty flags, rolling microstructure reliability floor/ceiling controls, shrinkage toward structural or neutral targets, public priced-through evidence discounts, and structural/base-rate overlap zero-delta context.
 
 ## Inventory Coordination Contract
 
@@ -155,7 +156,7 @@ These migration groups are the data backbone for replay, scoring, calibration, a
 | Feature ID | Stage | Component | Blocking | Owner | Dependencies | Output | Status |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | SCAE-001 | v2_live_cutover | SCAE policy | cutover_blocker | Session 5 | FND-004, POL-003 | Base policy and probability taxonomy | ready_for_integration |
-| SCAE-002 | v2_live_cutover | SCAE prior | cutover_blocker | Session 5 | CTX-003, SCAE-001 | Prior odds and market-assimilation context | not_started |
+| SCAE-002 | v2_live_cutover | SCAE prior | cutover_blocker | Session 5 | CTX-003, SCAE-001 | Prior odds and market-assimilation context | ready_for_integration |
 | SCAE-003 | v2_live_cutover | SCAE evidence | cutover_blocker | Session 5 | VER-001, VER-002, RET-003, SCAE-001 | Evidence delta mapping | not_started |
 | SCAE-004 | v2_live_cutover | SCAE caps | cutover_blocker | Session 5 | SCAE-003 | Correlated-quality guard and cap stack | not_started |
 | SCAE-005 | v2_live_cutover | SCAE netting | cutover_blocker | Session 5 | SCAE-003, RET-004 | Intra-leaf representative cluster netting | not_started |
