@@ -15,6 +15,11 @@ ARTIFACT_MANIFEST_TABLE = "case_artifact_manifest"
 ARTIFACT_VALIDATION_RESULTS_TABLE = "artifact_validation_results"
 ARTIFACT_MANIFEST_SCHEMA_VERSION = "artifact-manifest/v1"
 ARTIFACT_VALIDATION_RESULT_SCHEMA_VERSION = "artifact-validation-result/v1"
+ARTIFACT_MANIFEST_MIGRATION = (
+    Path(__file__).resolve().parents[1]
+    / "migrations"
+    / "003_artifact_manifest_contract.sql"
+)
 
 VALIDATION_STATUSES = (
     "valid",
@@ -47,6 +52,25 @@ OPTIONAL_MANIFEST_FIELDS = {
     "stage_attempt_id",
     "pipeline_run_id",
     "validator_version",
+}
+
+ARTIFACT_MANIFEST_COMPAT_COLUMNS = {
+    "artifact_id": "TEXT",
+    "artifact_schema_version": "TEXT",
+    "stage": "TEXT",
+    "stage_attempt_id": "TEXT",
+    "pipeline_run_id": "TEXT",
+    "producer": "TEXT",
+    "generated_at": "TEXT",
+    "forecast_timestamp": "TEXT",
+    "source_cutoff_timestamp": "TEXT",
+    "input_manifest_ids": "TEXT NOT NULL DEFAULT '[]'",
+    "validation_status": "TEXT",
+    "validation_result_refs": "TEXT NOT NULL DEFAULT '[]'",
+    "validator_version": "TEXT",
+    "temporal_isolation_status": "TEXT",
+    "metadata": "TEXT NOT NULL DEFAULT '{}'",
+    "updated_at": "TEXT",
 }
 
 
@@ -88,6 +112,66 @@ def require_list(field: str, value: list[str] | tuple[str, ...] | None) -> list[
 
 def canonical_json(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+
+
+def table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (table,),
+    ).fetchone() is not None
+
+
+def table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def ensure_artifact_manifest_schema(conn: sqlite3.Connection) -> None:
+    """Create or upgrade the ADS artifact manifest surfaces.
+
+    Older Orchestrator bootstrap code created a compact legacy
+    `case_artifact_manifest` table. This helper adds the Phase 3 columns and
+    indexes in place so component migrations can safely reference it.
+    """
+
+    if not table_exists(conn, ARTIFACT_MANIFEST_TABLE):
+        conn.executescript(ARTIFACT_MANIFEST_MIGRATION.read_text(encoding="utf-8"))
+        return
+
+    existing = table_columns(conn, ARTIFACT_MANIFEST_TABLE)
+    for column, definition in ARTIFACT_MANIFEST_COMPAT_COLUMNS.items():
+        if column not in existing:
+            conn.execute(f"ALTER TABLE {ARTIFACT_MANIFEST_TABLE} ADD COLUMN {column} {definition}")
+
+    conn.executescript(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_case_artifact_manifest_artifact_id
+          ON case_artifact_manifest(artifact_id);
+        CREATE INDEX IF NOT EXISTS idx_case_artifact_manifest_case_dispatch
+          ON case_artifact_manifest(case_id, dispatch_id, stage);
+        CREATE INDEX IF NOT EXISTS idx_case_artifact_manifest_type_schema
+          ON case_artifact_manifest(artifact_type, artifact_schema_version);
+        CREATE INDEX IF NOT EXISTS idx_case_artifact_manifest_digest
+          ON case_artifact_manifest(artifact_sha256);
+
+        CREATE TABLE IF NOT EXISTS artifact_validation_results (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          validation_result_id TEXT NOT NULL UNIQUE,
+          schema_version TEXT NOT NULL,
+          artifact_id TEXT NOT NULL,
+          status TEXT NOT NULL,
+          validator_version TEXT NOT NULL,
+          validated_at TEXT NOT NULL,
+          reason_codes TEXT NOT NULL DEFAULT '[]',
+          validation_messages TEXT NOT NULL DEFAULT '[]',
+          metadata TEXT NOT NULL DEFAULT '{}',
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          FOREIGN KEY (artifact_id) REFERENCES case_artifact_manifest(artifact_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_artifact_validation_results_artifact
+          ON artifact_validation_results(artifact_id, status);
+        """
+    )
 
 
 def ensure_safe_metadata(metadata: dict[str, Any] | None) -> dict[str, Any]:
@@ -354,49 +438,69 @@ def validate_validation_result(result: dict[str, Any]) -> None:
 
 def write_artifact_manifest(conn: sqlite3.Connection, manifest: dict[str, Any]) -> str:
     validate_artifact_manifest(manifest)
-    conn.execute(
-        """
-        INSERT INTO case_artifact_manifest (
-          artifact_id, schema_version, artifact_type, artifact_schema_version,
-          case_id, case_key, dispatch_id, stage, stage_attempt_id, pipeline_run_id,
-          producer, artifact_path, artifact_sha256, generated_at,
-          forecast_timestamp, source_cutoff_timestamp, input_manifest_ids,
-          validation_status, validation_result_refs, validator_version,
-          temporal_isolation_status, metadata
+    ensure_artifact_manifest_schema(conn)
+    available = table_columns(conn, ARTIFACT_MANIFEST_TABLE)
+    values = {
+        "artifact_id": manifest["artifact_id"],
+        "schema_version": manifest["schema_version"],
+        "artifact_type": manifest["artifact_type"],
+        "artifact_schema_version": manifest["artifact_schema_version"],
+        "case_id": manifest["case_id"],
+        "case_key": manifest["case_key"],
+        "dispatch_id": manifest["dispatch_id"],
+        "stage": manifest["stage"],
+        "stage_attempt_id": manifest.get("stage_attempt_id"),
+        "pipeline_run_id": manifest.get("pipeline_run_id"),
+        "producer": manifest["producer"],
+        "artifact_path": manifest["path"],
+        "artifact_sha256": manifest["sha256"],
+        "generated_at": manifest["generated_at"],
+        "forecast_timestamp": manifest["forecast_timestamp"],
+        "source_cutoff_timestamp": manifest["source_cutoff_timestamp"],
+        "input_manifest_ids": canonical_json(manifest["input_manifest_ids"]),
+        "validation_status": manifest["validation_status"],
+        "validation_result_refs": canonical_json(manifest["validation_result_refs"]),
+        "validator_version": manifest.get("validator_version"),
+        "temporal_isolation_status": manifest["temporal_isolation_status"],
+        "metadata": canonical_json(manifest["metadata"]),
+    }
+    legacy_values = {
+        "schema_id": manifest["artifact_schema_version"],
+        "producer_stage": manifest["stage"],
+        "sha256": manifest["sha256"],
+        "feature_id": manifest["stage"],
+        "market_id": manifest["metadata"].get("market_id"),
+        "replay_command": "",
+    }
+    values.update({key: value for key, value in legacy_values.items() if key in available})
+
+    insert_columns = [column for column in values if column in available]
+    placeholders = ", ".join("?" for _ in insert_columns)
+    update_columns = [
+        column
+        for column in (
+            "validation_status",
+            "validation_result_refs",
+            "validator_version",
+            "temporal_isolation_status",
+            "metadata",
+            "artifact_path",
+            "artifact_sha256",
+            "sha256",
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        if column in insert_columns
+    ]
+    update_clause = ",\n          ".join(f"{column}=excluded.{column}" for column in update_columns)
+    if "updated_at" in available:
+        update_clause = (update_clause + ",\n          " if update_clause else "") + "updated_at=CURRENT_TIMESTAMP"
+    conn.execute(
+        f"""
+        INSERT INTO {ARTIFACT_MANIFEST_TABLE} ({", ".join(insert_columns)})
+        VALUES ({placeholders})
         ON CONFLICT(artifact_id) DO UPDATE SET
-          validation_status=excluded.validation_status,
-          validation_result_refs=excluded.validation_result_refs,
-          validator_version=excluded.validator_version,
-          temporal_isolation_status=excluded.temporal_isolation_status,
-          metadata=excluded.metadata,
-          updated_at=CURRENT_TIMESTAMP
+          {update_clause}
         """,
-        (
-            manifest["artifact_id"],
-            manifest["schema_version"],
-            manifest["artifact_type"],
-            manifest["artifact_schema_version"],
-            manifest["case_id"],
-            manifest["case_key"],
-            manifest["dispatch_id"],
-            manifest["stage"],
-            manifest.get("stage_attempt_id"),
-            manifest.get("pipeline_run_id"),
-            manifest["producer"],
-            manifest["path"],
-            manifest["sha256"],
-            manifest["generated_at"],
-            manifest["forecast_timestamp"],
-            manifest["source_cutoff_timestamp"],
-            canonical_json(manifest["input_manifest_ids"]),
-            manifest["validation_status"],
-            canonical_json(manifest["validation_result_refs"]),
-            manifest.get("validator_version"),
-            manifest["temporal_isolation_status"],
-            canonical_json(manifest["metadata"]),
-        ),
+        tuple(values[column] for column in insert_columns),
     )
     return manifest["artifact_id"]
 
