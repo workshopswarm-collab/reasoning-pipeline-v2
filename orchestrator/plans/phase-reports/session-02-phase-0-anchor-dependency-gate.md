@@ -1,0 +1,26 @@
+# Session 02 Phase 0: Anchor and Dependency Gate
+
+- Session: 02, Evidence Packet, Policy Context, and AMRG
+- Phase: 0, Anchor and Dependency Gate
+- Owner: Session 02
+- Feature IDs: `CASE-001`, `CASE-002`, `CTX-001`, `CTX-002`, `CTX-003`, `POL-001`, `POL-002`, `POL-003`, `MODEL-001`, `AMRG-001`, `AMRG-002`, `AMRG-003`, `AMRG-004`, `AMRG-005`, `AMRG-006`, `AMRG-007`, `AMRG-008`, `AMRG-009`
+- Migration Groups: `MIG-012` for existing intake/case contract records; `MIG-005` for AMRG records
+- Status: completed for Phase 0 audit only; no implementation, shared inventory edits, runtime code edits, or Phase 1 work started
+- Acceptance Evidence: Owned feature IDs and migration groups are present in the shared inventory and assigned to Session 02. Fixture posture is open for `CASE-001`; runtime integration is correctly blocked by not-started upstream foundation and Session 02 dependency rows. `MODEL-001` confirms the model-lane policy root remains runtime-blocked on `POL-001` and `FND-003`. `AMRG-002` confirms AMRG artifact/waiver runtime work remains blocked until `AMRG-001` and artifact foundation are ready.
+- Checks Run:
+  - `python3 plans/check_dependency_gates.py --feature-id CASE-001 --mode fixture` -> `OK CASE-001 mode=fixture`
+  - `python3 plans/check_dependency_gates.py --feature-id CASE-001 --mode runtime_integration --report-only` -> `BLOCKED CASE-001: FND-003 status=not_started; FND-004 status=not_started`
+  - `python3 plans/check_dependency_gates.py --feature-id MODEL-001 --mode runtime_integration --report-only` -> `BLOCKED MODEL-001: POL-001 status=not_started; FND-003 status=not_started`
+  - `python3 plans/check_dependency_gates.py --feature-id AMRG-002 --mode runtime_integration --report-only` -> `BLOCKED AMRG-002: AMRG-001 status=not_started; FND-003 status=not_started`
+  - `python3 plans/check_dependency_gates.py --feature-id CASE-002 --mode runtime_integration --report-only` -> `BLOCKED CASE-002: CASE-001 status=not_started; FND-003 status=not_started`
+  - `python3 plans/check_dependency_gates.py --feature-id POL-001 --mode runtime_integration --report-only` -> `BLOCKED POL-001: FND-004 status=not_started`
+  - `python3 plans/check_dependency_gates.py --feature-id POL-003 --mode runtime_integration --report-only` -> `BLOCKED POL-003: POL-001 status=not_started; POL-002 status=not_started`
+  - `python3 plans/check_dependency_gates.py --feature-id AMRG-001 --mode runtime_integration --report-only` -> `BLOCKED AMRG-001: CTX-001 status=not_started`
+  - `python3 plans/check_dependency_gates.py --feature-id AMRG-005 --mode runtime_integration --report-only` -> `BLOCKED AMRG-005: AMRG-002 status=not_started; FND-004 status=not_started`
+  - `python3 plans/check_dependency_gates.py --migration-id MIG-012 --mode runtime_integration --report-only` -> `BLOCKED MIG-012: FND-004 status=not_started; CASE-002 status=not_started`
+  - `python3 plans/check_dependency_gates.py --migration-id MIG-005 --mode runtime_integration --report-only` -> `BLOCKED MIG-005: FND-004 status=not_started; AMRG-005 status=not_started`
+  - `python3 -m unittest discover -s plans/tests` -> `Ran 10 tests in 0.004s; OK`
+- Shared Inventory Updates Requested: none in this phase. Session 1/coordinator may reconcile this report as Phase 0 audit evidence, but Session 02 did not directly change shared inventory rows.
+- Shared Map/Matrix Updates Requested: none in this phase. No new scripts, schema names, blocker rows, or fixture rows were added.
+- Blockers: Runtime Phase 1 case-contract integration remains blocked on `FND-003` artifact manifest contracts and `FND-004` persistence/migration contracts. `MIG-012` is blocked until `FND-004` and `CASE-002` advance. `MIG-005` is blocked until `FND-004` and `AMRG-005` advance. Fixture-mode Phase 1 can proceed only when orchestrated and should remain scoped to `CASE-001`/`CASE-002` without runtime cutover assumptions.
+- Commit SHA: recorded in git commit metadata for this report; final pushed SHA reported in the session handoff
