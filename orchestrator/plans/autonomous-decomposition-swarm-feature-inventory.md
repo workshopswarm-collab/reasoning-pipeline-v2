@@ -13,6 +13,7 @@ Status values:
 - `FND-003`: done on 2026-06-24. Phase 3 implemented `scripts/predquant/ads_handoff.py`, `scripts/migrations/003_artifact_manifest_contract.sql`, and script tests covering artifact manifest construction, digest/schema expectation rejection, missing/unsafe metadata rejection, validation result refs, persistence, and named manifest/result surfaces.
 - `FND-004`: done on 2026-06-24. Phase 4 added `migration_surface_contracts` to the executable inventory, wrote `autonomous-decomposition-swarm-persistence-migration-order.md`, updated schema/blocker maps, and added dependency-gate tests proving `MIG-001` to `MIG-013` have ordered write-path destination coverage before runtime integration.
 - `CASE-001`, `CASE-002`, `MIG-012`: ready for integration on 2026-06-24. Session 02 Phase 1 added `scripts/predquant/ads_case_contract.py`, `scripts/bin/build_ads_case_contract.py`, `scripts/migrations/004_ads_case_contract.sql`, and tests covering active intake selection, latest pre-forecast snapshot selection, lookahead/missing/stale blocking, stable IDs, source hashes/provenance, baseline methods, idempotent table writes, and artifact-manifest registration.
+- `CTX-001`, `CTX-002`: ready for integration on 2026-06-24. Session 02 Phase 2 added `scripts/predquant/evidence_packet.py`, `scripts/bin/build_evidence_packet_v2.py`, and tests covering standalone evidence-packet/v2 artifacts, side/axis mapping, source-of-truth status, quote/provenance refs, regime seed fields, artifact-manifest registration, family-aware selected-child validation, sibling context-only prices, invalid side mapping, invalid case contracts, and raw-payload exclusion.
 
 ## Inventory Coordination Contract
 
@@ -82,8 +83,8 @@ These migration groups are the data backbone for replay, scoring, calibration, a
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | CASE-001 | v2_live_cutover | Intake adapter | cutover_blocker | Session 2 | FND-003, FND-004 | Existing case pipeline source adapter over `markets` and `market_snapshots` | ready_for_integration |
 | CASE-002 | v2_live_cutover | ADS case contract | cutover_blocker | Session 2 | CASE-001, FND-003 | `ads-case-contract/v1` with dispatch identity, source cutoff, snapshot binding, and raw intake provenance | ready_for_integration |
-| CTX-001 | v2_live_cutover | Evidence packet | cutover_blocker | Session 2 | CASE-002, FND-003 | Evidence packet v2 contract | not_started |
-| CTX-002 | v2_live_cutover | Market family | cutover_blocker | Session 2 | CTX-001, FND-004 | Family-aware binary child metadata | not_started |
+| CTX-001 | v2_live_cutover | Evidence packet | cutover_blocker | Session 2 | CASE-002, FND-003 | Evidence packet v2 contract | ready_for_integration |
+| CTX-002 | v2_live_cutover | Market family | cutover_blocker | Session 2 | CTX-001, FND-004 | Family-aware binary child metadata | ready_for_integration |
 | CTX-003 | v2_live_cutover | Market prior | cutover_blocker | Session 2 | CTX-001, FND-004 | Prior-reliability input surfaces | not_started |
 | POL-001 | foundation | Policy | foundation_blocker | Session 2 | FND-004 | Tunable registry metadata contract | not_started |
 | POL-002 | v2_live_cutover | Regime tags | integration_blocker | Session 2 | CTX-001, POL-001 | Deterministic market-regime tags | not_started |
