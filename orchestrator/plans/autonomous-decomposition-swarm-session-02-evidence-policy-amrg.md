@@ -815,11 +815,11 @@ Testing suite:
 
 Completion checklist:
 
-- [ ] Relationship type/status vocabularies implemented.
-- [ ] Timing-alignment fields implemented.
-- [ ] Model-assist advisory schema implemented.
-- [ ] Persistence surfaces mapped to Section 10.
-- [ ] `AMRG-003`, `AMRG-004`, and `AMRG-005` inventory rows updated.
+- [x] Relationship type/status vocabularies implemented.
+- [x] Timing-alignment fields implemented.
+- [x] Model-assist advisory schema implemented.
+- [x] Persistence surfaces mapped to Section 10.
+- [x] `AMRG-003`, `AMRG-004`, and `AMRG-005` inventory rows updated.
 
 ## Phase 8: AMRG Refresh, Reuse, and Strict-Precedence Anchors
 

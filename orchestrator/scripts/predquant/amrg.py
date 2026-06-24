@@ -37,16 +37,74 @@ NO_RELATED_CONTEXT_WAIVER_SCHEMA_VERSION = "no-related-context-waiver/v1"
 RELATED_LIVE_MARKET_CONTEXT_ARTIFACT_TYPE = "related-live-market-context"
 NO_RELATED_CONTEXT_WAIVER_ARTIFACT_TYPE = "no-related-context-waiver"
 AMRG_VECTOR_LANE_ID = "amrg_vector_embedding"
+AMRG_MODEL_ASSIST_LANE_ID = "amrg_model_assist"
+AMRG_MODEL_ASSIST_PACKET_SCHEMA_VERSION = "amrg-model-assist-packet/v1"
+AMRG_MODEL_ASSIST_OUTPUT_SCHEMA_VERSION = "amrg-model-assist-output/v1"
+AMRG_MODEL_ASSIST_PROVENANCE_SCHEMA_VERSION = "amrg-model-assist-provenance/v1"
 AMRG_VECTOR_MODEL_ID = "BAAI/bge-base-en-v1.5"
 AMRG_VECTOR_ROUTE_ID = "ollama/local"
 AMRG_VECTOR_PROVIDER = "ollama"
 AMRG_VECTOR_EMBEDDING_DIMENSION = 768
 AMRG_VECTOR_SIMILARITY_METRIC = "cosine"
 AMRG_VECTOR_CANDIDATE_SOURCE = "local_bge_vector_neighbor"
+AMRG_CONTEXT_MIGRATION = Path(__file__).resolve().parents[1] / "migrations" / "005_amrg_context_persistence.sql"
 AMRG_STAGE = "amrg"
 AMRG_PRODUCER = "session-02-amrg"
 DEFAULT_AMRG_CANDIDATE_CAP = 8
 WEAK_CONTEXT_ONLY = "weak_context_only"
+RELATIONSHIP_TYPES = {
+    "same_platform_family_sibling",
+    "shared_named_entity",
+    "shared_contract_source",
+    "shared_resolution_source",
+    "current_exposure_context",
+    "generic_theme",
+    "vector_similarity_neighbor",
+}
+RELATIONSHIP_STATUSES = {
+    WEAK_CONTEXT_ONLY,
+    "deterministic_context_candidate",
+    "timing_mismatch_weak_context_only",
+    "model_assisted_weak_context_only",
+}
+TIMING_ALIGNMENT_STATUSES = {
+    "aligned",
+    "skew_warning",
+    "skew_exceeds_policy",
+    "missing_related_snapshot",
+    "lookahead_blocked",
+}
+GRAPH_SAFETY_STATUSES = {
+    "not_applicable_weak_context",
+    "acyclic_placeholder",
+    "blocked_cycle_or_concurrent_timing",
+}
+REFRESH_STATUSES = {
+    "not_requested_phase7_placeholder",
+    "refresh_required_later",
+    "unavailable_not_blocking",
+}
+MODEL_ASSIST_STATUSES = {
+    "not_requested",
+    "not_invoked_missing_active_safe_manifest",
+    "advisory_validated",
+    "advisory_rejected_forbidden_output",
+}
+AMRG_ALLOWED_EFFECTS_BY_STATUS = {
+    WEAK_CONTEXT_ONLY: ["decomposition_context_hint"],
+    "model_assisted_weak_context_only": ["decomposition_context_hint"],
+    "timing_mismatch_weak_context_only": ["decomposition_context_hint"],
+    "deterministic_context_candidate": ["decomposition_context_hint", "retrieval_query_hint"],
+}
+AMRG_FORBIDDEN_EFFECTS = [
+    "probability_authority",
+    "scae_delta",
+    "prior_anchor",
+    "relationship_promotion",
+    "edge_promotion",
+    "retrieval_sufficiency",
+    "qdt_selection",
+]
 OPEN_STATUSES = {"open", "active"}
 POST_CUTOFF_FIELDS = {"observed_at", "updated_at", "last_seen_at", "captured_at", "snapshot_observed_at"}
 UNSAFE_MARKET_FIELDS = {
@@ -94,6 +152,22 @@ AMRG_FORBIDDEN_ARTIFACT_KEYS = UNSAFE_MARKET_FIELDS | {
     "body",
     "html",
     "page_text",
+}
+AMRG_FORBIDDEN_MODEL_OUTPUT_KEYS = AMRG_FORBIDDEN_ARTIFACT_KEYS | {
+    "probability",
+    "probabilities",
+    "fair_value",
+    "fair_value_probability",
+    "interval",
+    "probability_interval",
+    "confidence_interval",
+    "scae_delta",
+    "scae_evidence_delta",
+    "qdt_selection",
+    "edge_promotion",
+    "active_graph_promotion",
+    "production_forecast_prob",
+    "posterior_probability",
 }
 TOKEN_STOPWORDS = {
     "the",
@@ -166,6 +240,44 @@ def resolve_amrg_vector_embedding_lane(policy: dict[str, Any] | None = None) -> 
     } - required
     if missing:
         raise AMRGError("amrg_vector_embedding missing required fields: " + ", ".join(sorted(missing)))
+    return dict(lane)
+
+
+def resolve_amrg_model_assist_lane(policy: dict[str, Any] | None = None) -> dict[str, Any]:
+    policy = policy or load_model_lane_policy(MODEL_LANE_POLICY_PATH)
+    lane = policy.get("lanes", {}).get(AMRG_MODEL_ASSIST_LANE_ID)
+    if not isinstance(lane, dict):
+        raise AMRGError("model policy missing amrg_model_assist lane")
+    if lane.get("provider") != "openai":
+        raise AMRGError("amrg_model_assist provider must be openai")
+    if lane.get("default_model_id") not in lane.get("allowed_model_ids", []):
+        raise AMRGError("amrg_model_assist default_model_id must be allowed")
+    if lane.get("owner_feature_id") != "AMRG-004":
+        raise AMRGError("amrg_model_assist owner_feature_id must be AMRG-004")
+    required = set(lane.get("required_artifact_fields", []))
+    missing = {
+        "model_lane_id",
+        "resolved_model_id",
+        "model_policy_ref",
+        "prompt_template_id",
+        "prompt_template_sha256",
+        "input_manifest_sha256",
+        "output_schema_version",
+    } - required
+    if missing:
+        raise AMRGError("amrg_model_assist missing required fields: " + ", ".join(sorted(missing)))
+    forbidden = set(lane.get("forbidden_outputs", []))
+    missing_forbidden = {
+        "probability",
+        "scae_evidence_delta",
+        "qdt_selection",
+        "edge_promotion",
+        "concept_creation",
+        "label_creation",
+        "active_graph_promotion",
+    } - forbidden
+    if missing_forbidden:
+        raise AMRGError("amrg_model_assist missing forbidden outputs: " + ", ".join(sorted(missing_forbidden)))
     return dict(lane)
 
 
@@ -560,6 +672,17 @@ def ensure_no_raw_amrg_fields(value: Any, path: str = "amrg_artifact") -> None:
     elif isinstance(value, list):
         for idx, child in enumerate(value):
             ensure_no_raw_amrg_fields(child, f"{path}[{idx}]")
+
+
+def ensure_no_forbidden_model_output_fields(value: Any, path: str = "model_output") -> None:
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if str(key).lower() in AMRG_FORBIDDEN_MODEL_OUTPUT_KEYS:
+                raise AMRGError(f"{path}.{key} is forbidden in AMRG model-assist output")
+            ensure_no_forbidden_model_output_fields(child, f"{path}.{key}")
+    elif isinstance(value, list):
+        for idx, child in enumerate(value):
+            ensure_no_forbidden_model_output_fields(child, f"{path}[{idx}]")
 
 
 def text_tokens(value: Any) -> set[str]:
@@ -1234,14 +1357,8 @@ def make_weak_edge(candidate_set_id: str, candidate: dict[str, Any]) -> dict[str
         "market_id": candidate["market_id"],
         "relationship_status": WEAK_CONTEXT_ONLY,
         "relationship_label": "weak_context_untyped_phase6",
-        "allowed_effects": ["decomposition_context_hint"],
-        "forbidden_effects": [
-            "probability_authority",
-            "scae_delta",
-            "prior_anchor",
-            "relationship_promotion",
-            "retrieval_sufficiency",
-        ],
+        "allowed_effects": AMRG_ALLOWED_EFFECTS_BY_STATUS[WEAK_CONTEXT_ONLY],
+        "forbidden_effects": AMRG_FORBIDDEN_EFFECTS,
         "concept_authority": "none_candidate_input_only",
     }
     ensure_no_raw_amrg_fields(edge, "relationship_edge")
@@ -1272,6 +1389,7 @@ def build_related_live_market_context_or_waiver(
     common = {
         "case_id": evidence_packet["case_id"],
         "case_key": evidence_packet["case_key"],
+        "market_id": evidence_packet["market_id"],
         "dispatch_id": evidence_packet["dispatch_id"],
         "forecast_timestamp": evidence_packet["forecast_timestamp"],
         "source_cutoff_timestamp": evidence_packet["source_cutoff_timestamp"],
@@ -1369,14 +1487,9 @@ def validate_related_live_market_context(context: dict[str, Any]) -> None:
     if len(context["relationship_edges"]) != len(context["candidates"]):
         raise AMRGError("relationship edge count must match candidate count")
     for edge in context["relationship_edges"]:
-        if edge.get("schema_version") != AMRG_WEAK_EDGE_SCHEMA_VERSION:
-            raise AMRGError(f"edge schema_version must be {AMRG_WEAK_EDGE_SCHEMA_VERSION}")
         if edge.get("candidate_id") not in candidate_ids:
             raise AMRGError("edge references unknown candidate")
-        if edge.get("relationship_status") != WEAK_CONTEXT_ONLY:
-            raise AMRGError("Phase 6 relationship edges must be weak_context_only")
-        if "probability_authority" not in edge.get("forbidden_effects", []):
-            raise AMRGError("weak edge must forbid probability authority")
+        validate_relationship_edge(edge)
 
 
 def validate_no_related_context_waiver(waiver: dict[str, Any]) -> None:
@@ -1391,6 +1504,390 @@ def validate_no_related_context_waiver(waiver: dict[str, Any]) -> None:
         raise AMRGError("no-related-context waiver must not include candidates or edges")
     if not str(waiver.get("waiver_id", "")).startswith("amrg-waiver:"):
         raise AMRGError("waiver_id must use amrg-waiver prefix")
+
+
+def validate_relationship_type_list(types: list[str]) -> list[str]:
+    if not isinstance(types, list):
+        raise AMRGError("relationship_types must be a list")
+    unknown = sorted(set(types) - RELATIONSHIP_TYPES)
+    if unknown:
+        raise AMRGError("unknown relationship types: " + ", ".join(unknown))
+    return sorted(set(types))
+
+
+def relationship_types_for_candidate(candidate: dict[str, Any]) -> list[str]:
+    validate_amrg_candidate(candidate)
+    types: set[str] = set()
+    sources = set(candidate.get("candidate_sources") or [candidate["candidate_source"]])
+    reasons = set(candidate.get("reason_codes") or [])
+    if "platform_family_context" in sources or "family_sibling_context_only" in reasons:
+        types.add("same_platform_family_sibling")
+    if "entity_match" in sources:
+        types.add("shared_named_entity")
+    if "contract_source_match" in sources:
+        types.add("shared_contract_source")
+    if "shared_resolution_source" in sources:
+        types.add("shared_resolution_source")
+    if "current_exposure" in sources:
+        types.add("current_exposure_context")
+    if "generic_theme_match" in sources:
+        types.add("generic_theme")
+    if AMRG_VECTOR_CANDIDATE_SOURCE in sources or candidate.get("vector_only"):
+        types.add("vector_similarity_neighbor")
+    if not types:
+        types.add("generic_theme")
+    return validate_relationship_type_list(sorted(types))
+
+
+def timing_alignment_for_candidate(
+    evidence_packet: dict[str, Any],
+    candidate: dict[str, Any],
+    *,
+    max_snapshot_skew_seconds: int = 900,
+) -> dict[str, Any]:
+    validate_evidence_packet_v2(evidence_packet)
+    validate_amrg_candidate(candidate)
+    forecast_at = parse_timestamp(evidence_packet["forecast_timestamp"], "forecast_timestamp")
+    selected_snapshot = evidence_packet.get("prior_context_seed", {}).get("market_snapshot_timestamp")
+    related_snapshot = (
+        candidate.get("timing_inputs", {}).get("related_market_snapshot_as_of")
+        or candidate.get("timing_inputs", {}).get("source_cutoff_timestamp")
+    )
+    basis_refs = [
+        {
+            "source": "evidence_packet.prior_context_seed",
+            "ref_id": str(evidence_packet.get("prior_context_seed", {}).get("market_snapshot_id")),
+            "timestamp": selected_snapshot,
+        },
+        {
+            "source": "amrg_candidate.timing_inputs",
+            "ref_id": candidate["candidate_id"],
+            "timestamp": related_snapshot,
+        },
+    ]
+    if not related_snapshot:
+        status = "missing_related_snapshot"
+        skew = None
+    else:
+        related_at = parse_timestamp(related_snapshot, "related_market_snapshot_as_of")
+        if related_at > forecast_at:
+            status = "lookahead_blocked"
+            skew = None
+        elif not selected_snapshot:
+            status = "skew_warning"
+            skew = None
+        else:
+            selected_at = parse_timestamp(selected_snapshot, "selected_market_snapshot_as_of")
+            if selected_at > forecast_at:
+                status = "lookahead_blocked"
+                skew = None
+            else:
+                skew = int(abs((selected_at - related_at).total_seconds()))
+                status = "aligned" if skew <= max_snapshot_skew_seconds else "skew_exceeds_policy"
+    return {
+        "timing_alignment_status": status,
+        "timing_alignment_basis_refs": basis_refs,
+        "selected_market_snapshot_as_of": selected_snapshot,
+        "related_market_snapshot_as_of": related_snapshot,
+        "max_snapshot_skew_seconds": max_snapshot_skew_seconds,
+        "snapshot_skew_seconds": skew,
+    }
+
+
+def status_for_typed_candidate(candidate: dict[str, Any], relationship_types: list[str], timing_status: str) -> str:
+    if timing_status in {"lookahead_blocked", "skew_exceeds_policy", "missing_related_snapshot"}:
+        return "timing_mismatch_weak_context_only"
+    if candidate.get("vector_only") or relationship_types == ["generic_theme"] or relationship_types == ["vector_similarity_neighbor"]:
+        return WEAK_CONTEXT_ONLY
+    if timing_status == "aligned":
+        return "deterministic_context_candidate"
+    return WEAK_CONTEXT_ONLY
+
+
+def graph_safety_for_edge(edge: dict[str, Any]) -> dict[str, Any]:
+    status = edge.get("relationship_status")
+    timing = edge.get("timing_alignment_status")
+    if status == "deterministic_context_candidate" and timing == "aligned":
+        graph_status = "acyclic_placeholder"
+        cycle_status = "not_evaluated_phase7_no_anchor_authority"
+        downgrade_applied = False
+        downgrade_reasons: list[str] = []
+    else:
+        graph_status = "not_applicable_weak_context"
+        cycle_status = "not_applicable_weak_context"
+        downgrade_applied = status != WEAK_CONTEXT_ONLY
+        downgrade_reasons = ["weak_context_or_timing_mismatch"]
+    return {
+        "graph_safety_slice_id": stable_id("amrg-graph-safety", edge["edge_id"]),
+        "graph_component_id": stable_id("amrg-graph-component", edge["edge_id"]),
+        "causal_graph_status": graph_status,
+        "cycle_status": cycle_status,
+        "causal_edge_role": "not_validated_anchor",
+        "event_time_ordering_basis": edge.get("timing_alignment_status"),
+        "strict_precedence_proof_ref": None,
+        "max_refresh_hop_depth": 0,
+        "refresh_generation_id": stable_id("amrg-refresh-generation", edge["edge_id"], "phase7"),
+        "downgrade_applied": downgrade_applied,
+        "downgrade_reason_codes": downgrade_reasons,
+    }
+
+
+def type_and_validate_edge(
+    edge: dict[str, Any],
+    *,
+    evidence_packet: dict[str, Any],
+    candidate: dict[str, Any],
+    model_assist_status: str = "not_requested",
+) -> dict[str, Any]:
+    relationship_types = relationship_types_for_candidate(candidate)
+    timing = timing_alignment_for_candidate(evidence_packet, candidate)
+    status = status_for_typed_candidate(candidate, relationship_types, timing["timing_alignment_status"])
+    if model_assist_status == "advisory_validated" and status == WEAK_CONTEXT_ONLY:
+        status = "model_assisted_weak_context_only"
+    enriched = {
+        **edge,
+        "relationship_types": relationship_types,
+        "relationship_status": status,
+        "timing_alignment_status": timing["timing_alignment_status"],
+        "timing_alignment_basis_refs": timing["timing_alignment_basis_refs"],
+        "selected_market_snapshot_as_of": timing["selected_market_snapshot_as_of"],
+        "related_market_snapshot_as_of": timing["related_market_snapshot_as_of"],
+        "max_snapshot_skew_seconds": timing["max_snapshot_skew_seconds"],
+        "snapshot_skew_seconds": timing["snapshot_skew_seconds"],
+        "allowed_effects": AMRG_ALLOWED_EFFECTS_BY_STATUS[status],
+        "forbidden_effects": AMRG_FORBIDDEN_EFFECTS,
+        "model_assist_status": model_assist_status,
+        "model_assist_context": {},
+    }
+    enriched.update(graph_safety_for_edge(enriched))
+    validate_relationship_edge(enriched)
+    return enriched
+
+
+def validate_relationship_edge(edge: dict[str, Any]) -> None:
+    if edge.get("schema_version") != AMRG_WEAK_EDGE_SCHEMA_VERSION:
+        raise AMRGError(f"edge schema_version must be {AMRG_WEAK_EDGE_SCHEMA_VERSION}")
+    status = edge.get("relationship_status")
+    if status not in RELATIONSHIP_STATUSES:
+        raise AMRGError("relationship_status is unknown")
+    if "probability_authority" not in edge.get("forbidden_effects", []):
+        raise AMRGError("edge must forbid probability authority")
+    if "scae_delta" not in edge.get("forbidden_effects", []):
+        raise AMRGError("edge must forbid SCAE deltas")
+    if "qdt_selection" not in edge.get("forbidden_effects", []):
+        raise AMRGError("edge must forbid QDT selection")
+    relationship_types = edge.get("relationship_types")
+    if relationship_types is not None:
+        validate_relationship_type_list(relationship_types)
+    timing_status = edge.get("timing_alignment_status")
+    if timing_status is not None and timing_status not in TIMING_ALIGNMENT_STATUSES:
+        raise AMRGError("timing_alignment_status is unknown")
+    if status == "deterministic_context_candidate":
+        if timing_status != "aligned":
+            raise AMRGError("deterministic_context_candidate requires aligned timing")
+        if not relationship_types:
+            raise AMRGError("deterministic_context_candidate requires relationship_types")
+    ensure_no_raw_amrg_fields(edge, "relationship_edge")
+
+
+def enrich_related_live_market_context(
+    context: dict[str, Any],
+    *,
+    evidence_packet: dict[str, Any],
+    model_assist_status: str = "not_requested",
+) -> dict[str, Any]:
+    validate_related_live_market_context(context)
+    if context["artifact_type"] != "related_live_market_context":
+        return dict(context)
+    candidates_by_id = {candidate["candidate_id"]: candidate for candidate in context["candidates"]}
+    enriched_edges = [
+        type_and_validate_edge(
+            edge,
+            evidence_packet=evidence_packet,
+            candidate=candidates_by_id[edge["candidate_id"]],
+            model_assist_status=model_assist_status,
+        )
+        for edge in context["relationship_edges"]
+    ]
+    enriched = {**context, "relationship_edges": enriched_edges}
+    validate_related_live_market_context(enriched)
+    return enriched
+
+
+def model_assist_prompt_descriptor() -> str:
+    return "\n".join(
+        [
+            "amrg model assist advisory prompt v1",
+            "classify only existing candidate rows using fixed relationship vocabularies",
+            "do not author probability, SCAE deltas, QDT selection, edge promotion, labels, or concepts",
+        ]
+    )
+
+
+def build_amrg_model_assist_packet(
+    context: dict[str, Any],
+    *,
+    model_lane_policy_ref: str = "plans/autonomous-decomposition-swarm-model-lane-policy.json",
+    policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    validate_related_live_market_context(context)
+    if not context.get("input_manifest_hash"):
+        raise AMRGError("active-safe input_manifest_hash is required for model assist")
+    lane = resolve_amrg_model_assist_lane(policy)
+    packet = {
+        "artifact_type": "amrg_model_assist_packet",
+        "schema_version": AMRG_MODEL_ASSIST_PACKET_SCHEMA_VERSION,
+        "model_lane_id": AMRG_MODEL_ASSIST_LANE_ID,
+        "resolved_model_id": lane["default_model_id"],
+        "model_policy_ref": model_lane_policy_ref,
+        "prompt_template_id": "amrg-model-assist-advisory/v1",
+        "prompt_template_sha256": prefixed_sha256(model_assist_prompt_descriptor()),
+        "input_manifest_sha256": context["input_manifest_hash"],
+        "input_manifest_ids": context["input_manifest_ids"],
+        "output_schema_version": AMRG_MODEL_ASSIST_OUTPUT_SCHEMA_VERSION,
+        "authority": "advisory_only_no_promotion",
+        "forbidden_outputs": sorted(lane["forbidden_outputs"]),
+        "relationship_type_vocabulary": sorted(RELATIONSHIP_TYPES),
+        "relationship_status_vocabulary": sorted(RELATIONSHIP_STATUSES),
+        "candidate_set_id": context["candidate_set_id"],
+        "candidate_refs": [
+            {
+                "candidate_id": candidate["candidate_id"],
+                "market_id": candidate["market_id"],
+                "candidate_sources": candidate["candidate_sources"],
+                "reason_codes": candidate["reason_codes"],
+                "active_safe_fields_hash": candidate["active_safe_fields_hash"],
+            }
+            for candidate in context["candidates"]
+        ],
+        "edge_refs": [
+            {
+                "edge_id": edge["edge_id"],
+                "candidate_id": edge["candidate_id"],
+                "relationship_status": edge["relationship_status"],
+            }
+            for edge in context["relationship_edges"]
+        ],
+    }
+    validate_amrg_model_assist_packet(packet)
+    return packet
+
+
+def validate_amrg_model_assist_packet(packet: dict[str, Any]) -> None:
+    required = [
+        "artifact_type",
+        "schema_version",
+        "model_lane_id",
+        "resolved_model_id",
+        "model_policy_ref",
+        "prompt_template_id",
+        "prompt_template_sha256",
+        "input_manifest_sha256",
+        "output_schema_version",
+        "authority",
+        "forbidden_outputs",
+        "candidate_set_id",
+        "candidate_refs",
+        "edge_refs",
+    ]
+    for field in required:
+        if field not in packet:
+            raise AMRGError(f"model assist packet {field} is required")
+    if packet["artifact_type"] != "amrg_model_assist_packet":
+        raise AMRGError("model assist packet artifact_type is invalid")
+    if packet["schema_version"] != AMRG_MODEL_ASSIST_PACKET_SCHEMA_VERSION:
+        raise AMRGError(f"model assist packet schema_version must be {AMRG_MODEL_ASSIST_PACKET_SCHEMA_VERSION}")
+    if packet["model_lane_id"] != AMRG_MODEL_ASSIST_LANE_ID:
+        raise AMRGError("model assist packet must use amrg_model_assist lane")
+    if packet["output_schema_version"] != AMRG_MODEL_ASSIST_OUTPUT_SCHEMA_VERSION:
+        raise AMRGError(f"model assist output schema must be {AMRG_MODEL_ASSIST_OUTPUT_SCHEMA_VERSION}")
+    if packet["authority"] != "advisory_only_no_promotion":
+        raise AMRGError("model assist packet authority must be advisory_only_no_promotion")
+    if not str(packet["input_manifest_sha256"]).startswith("sha256:"):
+        raise AMRGError("model assist packet input_manifest_sha256 must be sha256")
+    ensure_no_raw_amrg_fields(packet, "model_assist_packet")
+
+
+def validate_amrg_model_assist_output(output: dict[str, Any]) -> None:
+    required = [
+        "artifact_type",
+        "schema_version",
+        "model_lane_id",
+        "resolved_model_id",
+        "authority",
+        "candidate_set_id",
+        "edge_annotations",
+    ]
+    for field in required:
+        if field not in output:
+            raise AMRGError(f"model assist output {field} is required")
+    if output["artifact_type"] != "amrg_model_assist_output":
+        raise AMRGError("model assist output artifact_type is invalid")
+    if output["schema_version"] != AMRG_MODEL_ASSIST_OUTPUT_SCHEMA_VERSION:
+        raise AMRGError(f"model assist output schema_version must be {AMRG_MODEL_ASSIST_OUTPUT_SCHEMA_VERSION}")
+    if output["model_lane_id"] != AMRG_MODEL_ASSIST_LANE_ID:
+        raise AMRGError("model assist output must use amrg_model_assist lane")
+    if output["authority"] != "advisory_only_no_promotion":
+        raise AMRGError("model assist output authority must be advisory_only_no_promotion")
+    ensure_no_forbidden_model_output_fields(output)
+    for annotation in output["edge_annotations"]:
+        if not isinstance(annotation, dict):
+            raise AMRGError("edge_annotations must be objects")
+        if annotation.get("suggested_relationship_types") is not None:
+            validate_relationship_type_list(annotation["suggested_relationship_types"])
+        if annotation.get("advisory_only") is not True:
+            raise AMRGError("model assist edge annotations must be advisory_only")
+
+
+def build_model_assist_provenance(
+    context: dict[str, Any],
+    *,
+    packet: dict[str, Any] | None = None,
+    output: dict[str, Any] | None = None,
+    status: str | None = None,
+    output_artifact_ref: str | None = None,
+) -> dict[str, Any]:
+    if status is None:
+        status = "advisory_validated" if output is not None else "not_requested"
+    if status not in MODEL_ASSIST_STATUSES:
+        raise AMRGError("unknown model assist status")
+    if status != "not_invoked_missing_active_safe_manifest":
+        validate_related_live_market_context(context)
+    if packet is not None:
+        validate_amrg_model_assist_packet(packet)
+    if output is not None:
+        validate_amrg_model_assist_output(output)
+    provenance = {
+        "schema_version": AMRG_MODEL_ASSIST_PROVENANCE_SCHEMA_VERSION,
+        "model_assist_id": stable_id("amrg-model-assist", context["case_id"], context["dispatch_id"], context["candidate_set_id"], status),
+        "case_id": context["case_id"],
+        "market_id": str(context.get("market_id") or context["case_key"]),
+        "dispatch_id": context["dispatch_id"],
+        "candidate_set_id": context["candidate_set_id"],
+        "model_assist_status": status,
+        "model_id": packet.get("resolved_model_id") if packet else "not_invoked",
+        "input_manifest_sha256": context.get("input_manifest_hash") or "sha256:missing",
+        "output_artifact_ref": output_artifact_ref,
+        "forbidden_output_check_status": "passed" if output is not None else "not_applicable",
+        "invoked_at": utc_now_iso() if output is not None else None,
+        "generated_at": utc_now_iso(),
+        "metadata": {
+            "authority": "advisory_only_no_promotion",
+            "output_schema_version": output.get("schema_version") if output else None,
+            "edge_annotation_count": len(output.get("edge_annotations", [])) if output else 0,
+        },
+    }
+    ensure_no_raw_amrg_fields(provenance, "model_assist_provenance")
+    return provenance
+
+
+def model_assist_downgrade_for_missing_manifest(context: dict[str, Any]) -> dict[str, Any]:
+    degraded = dict(context)
+    degraded["input_manifest_hash"] = context.get("input_manifest_hash") or "sha256:missing"
+    return build_model_assist_provenance(
+        degraded,
+        status="not_invoked_missing_active_safe_manifest",
+    )
 
 
 def related_live_market_artifact_path(artifact_dir: Path | str, artifact: dict[str, Any]) -> Path:
@@ -1495,6 +1992,465 @@ def materialize_related_live_market_context(
         "artifact_type": artifact["artifact_type"],
         "artifact": artifact,
         "manifest": manifest,
+    }
+
+
+def ensure_amrg_context_schema(conn: sqlite3.Connection) -> None:
+    conn.executescript(AMRG_CONTEXT_MIGRATION.read_text(encoding="utf-8"))
+
+
+def selected_market_id_for_context(context: dict[str, Any], evidence_packet: dict[str, Any] | None = None) -> str:
+    return str(context.get("market_id") or (evidence_packet or {}).get("market_id") or context["case_key"])
+
+
+def write_amrg_vector_descriptors(conn: sqlite3.Connection, descriptors: list[dict[str, Any]]) -> list[str]:
+    ensure_amrg_context_schema(conn)
+    rows = descriptor_rows_for_write(descriptors)
+    written: list[str] = []
+    for row in rows:
+        conn.execute(
+            """
+            INSERT INTO amrg_market_vector_descriptors (
+              descriptor_sha256, market_id, external_market_id, case_key,
+              source_cutoff_timestamp, descriptor_schema_version, descriptor_text,
+              active_safe_fields
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(descriptor_sha256) DO UPDATE SET
+              market_id=excluded.market_id,
+              external_market_id=excluded.external_market_id,
+              case_key=excluded.case_key,
+              source_cutoff_timestamp=excluded.source_cutoff_timestamp,
+              descriptor_schema_version=excluded.descriptor_schema_version,
+              descriptor_text=excluded.descriptor_text,
+              active_safe_fields=excluded.active_safe_fields
+            """,
+            (
+                row["descriptor_sha256"],
+                str(row["market_id"]),
+                row.get("external_market_id"),
+                row.get("case_key"),
+                row["source_cutoff_timestamp"],
+                row["descriptor_schema_version"],
+                row["descriptor_text"],
+                row["active_safe_fields"],
+            ),
+        )
+        written.append(row["descriptor_sha256"])
+    return written
+
+
+def write_amrg_vector_index_snapshot(conn: sqlite3.Connection, snapshot: dict[str, Any]) -> str:
+    ensure_amrg_context_schema(conn)
+    validate_vector_index_snapshot(snapshot)
+    conn.execute(
+        """
+        INSERT INTO amrg_vector_index_snapshots (
+          index_snapshot_id, schema_version, embedding_lane_id, provider, route_id,
+          resolved_model_id, model_policy_ref, embedding_model_sha256,
+          embedding_dimension, similarity_metric, source_cutoff_timestamp,
+          descriptor_schema_version, descriptor_count, descriptor_sha256s,
+          index_status, unavailable_reason, diagnostic
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(index_snapshot_id) DO UPDATE SET
+          index_status=excluded.index_status,
+          unavailable_reason=excluded.unavailable_reason,
+          diagnostic=excluded.diagnostic
+        """,
+        (
+            snapshot["index_snapshot_id"],
+            snapshot["schema_version"],
+            snapshot["embedding_lane_id"],
+            snapshot["provider"],
+            snapshot["route_id"],
+            snapshot["resolved_model_id"],
+            snapshot["model_policy_ref"],
+            snapshot["embedding_model_sha256"],
+            snapshot["embedding_dimension"],
+            snapshot["similarity_metric"],
+            snapshot["source_cutoff_timestamp"],
+            snapshot["descriptor_schema_version"],
+            snapshot["descriptor_count"],
+            canonical_json(snapshot["descriptor_sha256s"]),
+            snapshot["index_status"],
+            snapshot.get("unavailable_reason"),
+            canonical_json(snapshot.get("diagnostic") or {}),
+        ),
+    )
+    return snapshot["index_snapshot_id"]
+
+
+def write_amrg_vector_neighbor_candidates(
+    conn: sqlite3.Connection,
+    *,
+    candidate_set_id: str | None,
+    case_id: str | None,
+    dispatch_id: str | None,
+    candidates: list[dict[str, Any]],
+) -> list[str]:
+    ensure_amrg_context_schema(conn)
+    written: list[str] = []
+    for candidate in candidates:
+        validate_vector_neighbor_candidate(candidate)
+        row_id = stable_id(
+            "amrg-vector-neighbor",
+            candidate_set_id,
+            case_id,
+            dispatch_id,
+            candidate["market_id"],
+            candidate["index_snapshot_id"],
+            candidate["candidate_descriptor_sha256"],
+        )
+        conn.execute(
+            """
+            INSERT INTO amrg_vector_neighbor_candidate_slices (
+              vector_neighbor_candidate_id, candidate_set_id, case_id, dispatch_id,
+              market_id, external_market_id, relationship_status, similarity_score,
+              similarity_metric, query_descriptor_sha256, candidate_descriptor_sha256,
+              index_snapshot_id, embedding_lane_id, resolved_model_id, route_id,
+              metadata
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(vector_neighbor_candidate_id) DO UPDATE SET
+              similarity_score=excluded.similarity_score,
+              metadata=excluded.metadata
+            """,
+            (
+                row_id,
+                candidate_set_id,
+                case_id,
+                dispatch_id,
+                str(candidate["market_id"]),
+                candidate.get("external_market_id"),
+                candidate["relationship_status"],
+                candidate["similarity_score"],
+                candidate["similarity_metric"],
+                candidate["query_descriptor_sha256"],
+                candidate["candidate_descriptor_sha256"],
+                candidate["index_snapshot_id"],
+                candidate["embedding_lane_id"],
+                candidate["resolved_model_id"],
+                candidate["route_id"],
+                canonical_json({"vector_only": True}),
+            ),
+        )
+        written.append(row_id)
+    return written
+
+
+def write_model_assist_provenance(conn: sqlite3.Connection, provenance: dict[str, Any]) -> str:
+    ensure_amrg_context_schema(conn)
+    if provenance.get("schema_version") != AMRG_MODEL_ASSIST_PROVENANCE_SCHEMA_VERSION:
+        raise AMRGError(f"model assist provenance schema_version must be {AMRG_MODEL_ASSIST_PROVENANCE_SCHEMA_VERSION}")
+    if provenance.get("model_assist_status") not in MODEL_ASSIST_STATUSES:
+        raise AMRGError("unknown model assist provenance status")
+    ensure_no_raw_amrg_fields(provenance, "model_assist_provenance")
+    conn.execute(
+        """
+        INSERT INTO amrg_model_assist_provenance (
+          model_assist_id, case_id, market_id, dispatch_id, candidate_set_id,
+          model_assist_status, model_id, input_manifest_sha256,
+          output_artifact_ref, forbidden_output_check_status, invoked_at,
+          generated_at, metadata
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(model_assist_id) DO UPDATE SET
+          model_assist_status=excluded.model_assist_status,
+          output_artifact_ref=excluded.output_artifact_ref,
+          forbidden_output_check_status=excluded.forbidden_output_check_status,
+          metadata=excluded.metadata
+        """,
+        (
+            provenance["model_assist_id"],
+            provenance["case_id"],
+            str(provenance["market_id"]),
+            provenance["dispatch_id"],
+            provenance["candidate_set_id"],
+            provenance["model_assist_status"],
+            provenance["model_id"],
+            provenance["input_manifest_sha256"],
+            provenance.get("output_artifact_ref"),
+            provenance["forbidden_output_check_status"],
+            provenance.get("invoked_at"),
+            provenance["generated_at"],
+            canonical_json(provenance.get("metadata") or {}),
+        ),
+    )
+    return provenance["model_assist_id"]
+
+
+def relationship_strength_for_status(status: str) -> str:
+    return "context_candidate" if status == "deterministic_context_candidate" else "weak_context"
+
+
+def guardrail_reason_codes_for_edge(edge: dict[str, Any]) -> list[str]:
+    reasons: list[str] = []
+    if edge.get("timing_alignment_status") in {"lookahead_blocked", "skew_exceeds_policy", "missing_related_snapshot"}:
+        reasons.append(edge["timing_alignment_status"])
+    if edge.get("relationship_status") in {"timing_mismatch_weak_context_only", WEAK_CONTEXT_ONLY}:
+        reasons.append("weak_context_only")
+    return sorted(set(reasons))
+
+
+def write_related_market_context(
+    conn: sqlite3.Connection,
+    context: dict[str, Any],
+    *,
+    evidence_packet: dict[str, Any],
+    model_assist_provenance: dict[str, Any] | None = None,
+    artifact_path: str | None = None,
+    artifact_sha256: str | None = None,
+) -> dict[str, Any]:
+    ensure_amrg_context_schema(conn)
+    model_assist_status = model_assist_provenance["model_assist_status"] if model_assist_provenance else "not_requested"
+    enriched = enrich_related_live_market_context(
+        context,
+        evidence_packet=evidence_packet,
+        model_assist_status=model_assist_status,
+    )
+    selected_market_id = selected_market_id_for_context(enriched, evidence_packet)
+    generated_at = utc_now_iso()
+
+    conn.execute(
+        """
+        INSERT INTO amrg_candidate_sets (
+          candidate_set_id, case_id, case_key, market_id, dispatch_id,
+          forecast_timestamp, source_policy, candidate_pool_max, candidate_count,
+          exclusion_counts, input_manifest_sha256, artifact_path, artifact_sha256,
+          generated_at, metadata
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(candidate_set_id) DO UPDATE SET
+          candidate_count=excluded.candidate_count,
+          exclusion_counts=excluded.exclusion_counts,
+          artifact_path=excluded.artifact_path,
+          artifact_sha256=excluded.artifact_sha256,
+          metadata=excluded.metadata
+        """,
+        (
+            enriched["candidate_set_id"],
+            enriched["case_id"],
+            enriched["case_key"],
+            selected_market_id,
+            enriched["dispatch_id"],
+            enriched["forecast_timestamp"],
+            canonical_json(enriched["source_policy"]),
+            enriched["source_policy"]["candidate_pool_max"],
+            len(enriched["candidates"]),
+            canonical_json(enriched["exclusion_counts"]),
+            enriched["input_manifest_hash"],
+            artifact_path,
+            artifact_sha256,
+            generated_at,
+            canonical_json({"schema_version": enriched["schema_version"], "profile_context_ref": enriched.get("profile_context_ref")}),
+        ),
+    )
+
+    candidates_by_id = {candidate["candidate_id"]: candidate for candidate in enriched["candidates"]}
+    candidate_row_ids: list[str] = []
+    relationship_row_ids: list[str] = []
+    graph_row_ids: list[str] = []
+    refresh_row_ids: list[str] = []
+
+    for edge in enriched["relationship_edges"]:
+        validate_relationship_edge(edge)
+        candidate = candidates_by_id[edge["candidate_id"]]
+        relationship_types = edge.get("relationship_types") or relationship_types_for_candidate(candidate)
+        timing_refs = edge.get("timing_alignment_basis_refs") or []
+        conn.execute(
+            """
+            INSERT INTO amrg_candidate_peer_rows (
+              candidate_id, candidate_set_id, case_id, market_id, dispatch_id,
+              selected_market_id, related_market_id, candidate_rank,
+              nomination_methods, relationship_type_proposals, directionality_proposal,
+              timing_input_refs, snapshot_as_of, generated_at, metadata
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(candidate_id) DO UPDATE SET
+              candidate_rank=excluded.candidate_rank,
+              nomination_methods=excluded.nomination_methods,
+              relationship_type_proposals=excluded.relationship_type_proposals,
+              timing_input_refs=excluded.timing_input_refs,
+              metadata=excluded.metadata
+            """,
+            (
+                candidate["candidate_id"],
+                enriched["candidate_set_id"],
+                enriched["case_id"],
+                selected_market_id,
+                enriched["dispatch_id"],
+                selected_market_id,
+                str(candidate["market_id"]),
+                candidate.get("candidate_rank", 0),
+                canonical_json(candidate["candidate_sources"]),
+                canonical_json(relationship_types),
+                "undirected_context",
+                canonical_json(timing_refs),
+                edge.get("related_market_snapshot_as_of"),
+                generated_at,
+                canonical_json({"candidate_source": candidate["candidate_source"], "reason_codes": candidate["reason_codes"]}),
+            ),
+        )
+        candidate_row_ids.append(candidate["candidate_id"])
+
+        relationship_slice_id = stable_id("amrg-relationship-slice", enriched["candidate_set_id"], edge["edge_id"])
+        guardrail_reasons = guardrail_reason_codes_for_edge(edge)
+        conn.execute(
+            """
+            INSERT INTO related_market_relationship_slices (
+              relationship_slice_id, case_id, market_id, dispatch_id, edge_id,
+              selected_market_id, related_market_id, related_case_key,
+              related_pipeline_state, candidate_set_id, candidate_rank,
+              candidate_generation_methods, candidate_pool_input_manifest_sha256,
+              model_assist_status, model_assist_context, relationship_types,
+              relationship_strength, shared_causal_driver_tier, directionality,
+              concrete_shared_objects, causal_influence_fingerprint,
+              relationship_valid_before_forecast, selected_market_snapshot_as_of,
+              related_market_snapshot_as_of, max_snapshot_skew_seconds,
+              timing_alignment_status, evidence_basis, source_policy,
+              allowed_effects, forbidden_effects, related_market_snapshot_pricing,
+              causal_graph_status, guardrail_status, guardrail_reason_codes,
+              artifact_path, artifact_sha256, generated_at, metadata
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(relationship_slice_id) DO UPDATE SET
+              model_assist_status=excluded.model_assist_status,
+              relationship_types=excluded.relationship_types,
+              relationship_strength=excluded.relationship_strength,
+              timing_alignment_status=excluded.timing_alignment_status,
+              guardrail_status=excluded.guardrail_status,
+              guardrail_reason_codes=excluded.guardrail_reason_codes,
+              metadata=excluded.metadata
+            """,
+            (
+                relationship_slice_id,
+                enriched["case_id"],
+                selected_market_id,
+                enriched["dispatch_id"],
+                edge["edge_id"],
+                selected_market_id,
+                str(candidate["market_id"]),
+                candidate.get("external_market_id"),
+                "active_safe_candidate",
+                enriched["candidate_set_id"],
+                candidate.get("candidate_rank", 0),
+                canonical_json(candidate["candidate_sources"]),
+                enriched["input_manifest_hash"],
+                edge.get("model_assist_status", model_assist_status),
+                canonical_json(edge.get("model_assist_context") or {}),
+                canonical_json(relationship_types),
+                relationship_strength_for_status(edge["relationship_status"]),
+                "none_phase7_no_anchor_authority",
+                "undirected_context",
+                canonical_json({"source_refs": candidate.get("source_refs", [])}),
+                None,
+                1 if edge.get("timing_alignment_status") == "aligned" else 0,
+                edge.get("selected_market_snapshot_as_of"),
+                edge.get("related_market_snapshot_as_of"),
+                edge.get("max_snapshot_skew_seconds"),
+                edge.get("timing_alignment_status") or "missing_related_snapshot",
+                canonical_json(timing_refs),
+                canonical_json(enriched["source_policy"]),
+                canonical_json(edge["allowed_effects"]),
+                canonical_json(edge["forbidden_effects"]),
+                canonical_json({}),
+                edge.get("causal_graph_status", "not_applicable_weak_context"),
+                "pass" if not guardrail_reasons else "downgraded",
+                canonical_json(guardrail_reasons),
+                artifact_path,
+                artifact_sha256,
+                generated_at,
+                canonical_json({"relationship_status": edge["relationship_status"], "schema_version": AMRG_WEAK_EDGE_SCHEMA_VERSION}),
+            ),
+        )
+        relationship_row_ids.append(relationship_slice_id)
+
+        graph_slice_id = edge["graph_safety_slice_id"]
+        conn.execute(
+            """
+            INSERT INTO amrg_causal_graph_safety_slices (
+              graph_safety_slice_id, case_id, market_id, dispatch_id, edge_id,
+              graph_component_id, causal_edge_role, topological_rank,
+              event_time_ordering_basis, strict_precedence_proof_ref,
+              cycle_status, cycle_break_reason, max_refresh_hop_depth,
+              refresh_generation_id, downgrade_applied, downgrade_reason_codes,
+              generated_at, metadata
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(graph_safety_slice_id) DO UPDATE SET
+              cycle_status=excluded.cycle_status,
+              downgrade_applied=excluded.downgrade_applied,
+              downgrade_reason_codes=excluded.downgrade_reason_codes,
+              metadata=excluded.metadata
+            """,
+            (
+                graph_slice_id,
+                enriched["case_id"],
+                selected_market_id,
+                enriched["dispatch_id"],
+                edge["edge_id"],
+                edge["graph_component_id"],
+                edge["causal_edge_role"],
+                None,
+                edge.get("event_time_ordering_basis"),
+                edge.get("strict_precedence_proof_ref"),
+                edge["cycle_status"],
+                None,
+                edge["max_refresh_hop_depth"],
+                edge["refresh_generation_id"],
+                1 if edge["downgrade_applied"] else 0,
+                canonical_json(edge["downgrade_reason_codes"]),
+                generated_at,
+                canonical_json({"causal_graph_status": edge.get("causal_graph_status")}),
+            ),
+        )
+        graph_row_ids.append(graph_slice_id)
+
+        refresh_event_id = stable_id("amrg-refresh-event", edge["edge_id"], "phase7")
+        conn.execute(
+            """
+            INSERT INTO related_market_refresh_events (
+              refresh_event_id, case_id, market_id, dispatch_id, edge_id,
+              candidate_set_id, refresh_status, refresh_reason_codes,
+              refresh_generation_id, max_refresh_hop_depth,
+              stale_effect_downgrade_applied, next_refresh_after,
+              generated_at, metadata
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(refresh_event_id) DO UPDATE SET
+              refresh_status=excluded.refresh_status,
+              refresh_reason_codes=excluded.refresh_reason_codes,
+              metadata=excluded.metadata
+            """,
+            (
+                refresh_event_id,
+                enriched["case_id"],
+                selected_market_id,
+                enriched["dispatch_id"],
+                edge["edge_id"],
+                enriched["candidate_set_id"],
+                "not_requested_phase7_placeholder",
+                canonical_json(["refresh_lifecycle_owned_by_amrg_006"]),
+                edge["refresh_generation_id"],
+                edge["max_refresh_hop_depth"],
+                0,
+                None,
+                generated_at,
+                canonical_json({"phase": "phase7_persistence_placeholder"}),
+            ),
+        )
+        refresh_row_ids.append(refresh_event_id)
+
+    model_assist_id = write_model_assist_provenance(conn, model_assist_provenance) if model_assist_provenance else None
+    return {
+        "candidate_set_id": enriched["candidate_set_id"],
+        "candidate_row_ids": candidate_row_ids,
+        "relationship_slice_ids": relationship_row_ids,
+        "graph_safety_slice_ids": graph_row_ids,
+        "refresh_event_ids": refresh_row_ids,
+        "model_assist_id": model_assist_id,
+        "context": enriched,
     }
 
 

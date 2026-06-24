@@ -9,13 +9,21 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from predquant.amrg import (
     AMRG_VECTOR_CANDIDATE_SOURCE,
+    AMRG_MODEL_ASSIST_OUTPUT_SCHEMA_VERSION,
     AMRG_VECTOR_NEIGHBOR_CANDIDATE_SCHEMA_VERSION,
     NO_RELATED_CONTEXT_WAIVER_SCHEMA_VERSION,
     RELATED_LIVE_MARKET_CONTEXT_SCHEMA_VERSION,
     WEAK_CONTEXT_ONLY,
+    build_amrg_model_assist_packet,
     build_related_live_market_context_or_waiver,
     build_unavailable_vector_source_diagnostic,
+    build_model_assist_provenance,
+    enrich_related_live_market_context,
+    ensure_amrg_context_schema,
     materialize_related_live_market_context,
+    model_assist_downgrade_for_missing_manifest,
+    validate_amrg_model_assist_output,
+    write_related_market_context,
 )
 from predquant.evidence_packet import EVIDENCE_PACKET_SCHEMA_VERSION, PRIOR_RELIABILITY_INPUT_SCHEMA_VERSION
 
@@ -347,6 +355,172 @@ class AMRGContextTest(unittest.TestCase):
         self.assertEqual(artifact["candidates"][0]["candidate_source"], AMRG_VECTOR_CANDIDATE_SOURCE)
         self.assertEqual(artifact["candidates"][0]["relationship_status"], WEAK_CONTEXT_ONLY)
         self.assertTrue(artifact["candidates"][0]["vector_only"])
+
+    def test_relationship_typing_and_timing_alignment_can_add_safe_context_status(self):
+        packet = self.evidence_packet()
+        artifact = self.build_artifact([self.market(2)])
+        enriched = enrich_related_live_market_context(artifact, evidence_packet=packet)
+        edge = enriched["relationship_edges"][0]
+
+        self.assertEqual(edge["timing_alignment_status"], "aligned")
+        self.assertEqual(edge["relationship_status"], "deterministic_context_candidate")
+        self.assertIn("shared_named_entity", edge["relationship_types"])
+        self.assertIn("shared_contract_source", edge["relationship_types"])
+        self.assertIn("retrieval_query_hint", edge["allowed_effects"])
+        self.assertIn("probability_authority", edge["forbidden_effects"])
+        self.assertIn("scae_delta", edge["forbidden_effects"])
+        self.assertIn("qdt_selection", edge["forbidden_effects"])
+
+    def test_timing_mismatch_prevents_stronger_effects(self):
+        packet = self.evidence_packet()
+        artifact = self.build_artifact([self.market(2)])
+        artifact["candidates"][0]["timing_inputs"]["related_market_snapshot_as_of"] = "2026-06-24T17:00:00+00:00"
+        enriched = enrich_related_live_market_context(artifact, evidence_packet=packet)
+        edge = enriched["relationship_edges"][0]
+
+        self.assertEqual(edge["timing_alignment_status"], "skew_exceeds_policy")
+        self.assertEqual(edge["relationship_status"], "timing_mismatch_weak_context_only")
+        self.assertEqual(edge["allowed_effects"], ["decomposition_context_hint"])
+        self.assertNotIn("retrieval_query_hint", edge["allowed_effects"])
+
+    def test_model_assist_forbidden_probability_output_is_rejected(self):
+        artifact = self.build_artifact([self.market(2)])
+        packet = build_amrg_model_assist_packet(artifact)
+        self.assertEqual(packet["model_lane_id"], "amrg_model_assist")
+        self.assertEqual(packet["authority"], "advisory_only_no_promotion")
+
+        output = {
+            "artifact_type": "amrg_model_assist_output",
+            "schema_version": AMRG_MODEL_ASSIST_OUTPUT_SCHEMA_VERSION,
+            "model_lane_id": "amrg_model_assist",
+            "resolved_model_id": packet["resolved_model_id"],
+            "authority": "advisory_only_no_promotion",
+            "candidate_set_id": artifact["candidate_set_id"],
+            "edge_annotations": [
+                {
+                    "edge_id": artifact["relationship_edges"][0]["edge_id"],
+                    "candidate_id": artifact["candidates"][0]["candidate_id"],
+                    "suggested_relationship_types": ["shared_named_entity"],
+                    "advisory_only": True,
+                    "probability": 0.7,
+                }
+            ],
+        }
+        with self.assertRaisesRegex(Exception, "forbidden"):
+            validate_amrg_model_assist_output(output)
+
+    def test_model_assist_remains_advisory_and_model_only_candidate_stays_weak(self):
+        artifact = self.build_artifact(
+            [
+                self.market(
+                    2,
+                    title="Will a policy bill pass?",
+                    normalized_entities=[],
+                    contract_terms=[],
+                    source_of_truth_kind="different",
+                    source_url="https://example.test/other",
+                )
+            ]
+        )
+        packet = build_amrg_model_assist_packet(artifact)
+        output = {
+            "artifact_type": "amrg_model_assist_output",
+            "schema_version": AMRG_MODEL_ASSIST_OUTPUT_SCHEMA_VERSION,
+            "model_lane_id": "amrg_model_assist",
+            "resolved_model_id": packet["resolved_model_id"],
+            "authority": "advisory_only_no_promotion",
+            "candidate_set_id": artifact["candidate_set_id"],
+            "edge_annotations": [
+                {
+                    "edge_id": artifact["relationship_edges"][0]["edge_id"],
+                    "candidate_id": artifact["candidates"][0]["candidate_id"],
+                    "suggested_relationship_types": ["generic_theme"],
+                    "advisory_only": True,
+                    "rationale_ref": "compact:theme",
+                }
+            ],
+        }
+        validate_amrg_model_assist_output(output)
+        provenance = build_model_assist_provenance(artifact, packet=packet, output=output)
+        enriched = enrich_related_live_market_context(
+            artifact,
+            evidence_packet=self.evidence_packet(),
+            model_assist_status=provenance["model_assist_status"],
+        )
+
+        edge = enriched["relationship_edges"][0]
+        self.assertEqual(edge["relationship_status"], "model_assisted_weak_context_only")
+        self.assertEqual(edge["allowed_effects"], ["decomposition_context_hint"])
+        self.assertIn("edge_promotion", edge["forbidden_effects"])
+
+        degraded = model_assist_downgrade_for_missing_manifest({**artifact, "input_manifest_hash": None})
+        self.assertEqual(degraded["model_assist_status"], "not_invoked_missing_active_safe_manifest")
+        self.assertEqual(degraded["forbidden_output_check_status"], "not_applicable")
+
+    def test_amrg_persistence_schema_and_write_rows(self):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        try:
+            ensure_amrg_context_schema(conn)
+            table_names = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                ).fetchall()
+            }
+            self.assertIn("related_market_relationship_slices", table_names)
+            self.assertIn("amrg_causal_graph_safety_slices", table_names)
+            self.assertIn("related_market_refresh_events", table_names)
+            self.assertIn("amrg_model_assist_provenance", table_names)
+            self.assertIn("amrg_market_vector_descriptors", table_names)
+
+            artifact = self.build_artifact([self.market(2)])
+            packet = build_amrg_model_assist_packet(artifact)
+            output = {
+                "artifact_type": "amrg_model_assist_output",
+                "schema_version": AMRG_MODEL_ASSIST_OUTPUT_SCHEMA_VERSION,
+                "model_lane_id": "amrg_model_assist",
+                "resolved_model_id": packet["resolved_model_id"],
+                "authority": "advisory_only_no_promotion",
+                "candidate_set_id": artifact["candidate_set_id"],
+                "edge_annotations": [
+                    {
+                        "edge_id": artifact["relationship_edges"][0]["edge_id"],
+                        "candidate_id": artifact["candidates"][0]["candidate_id"],
+                        "suggested_relationship_types": ["shared_named_entity"],
+                        "advisory_only": True,
+                    }
+                ],
+            }
+            provenance = build_model_assist_provenance(artifact, packet=packet, output=output)
+            result = write_related_market_context(
+                conn,
+                artifact,
+                evidence_packet=self.evidence_packet(),
+                model_assist_provenance=provenance,
+                artifact_path="/tmp/related-live-market-context.json",
+                artifact_sha256="sha256:artifact",
+            )
+
+            self.assertEqual(len(result["candidate_row_ids"]), 1)
+            self.assertEqual(len(result["relationship_slice_ids"]), 1)
+            self.assertEqual(len(result["graph_safety_slice_ids"]), 1)
+            self.assertEqual(len(result["refresh_event_ids"]), 1)
+            self.assertIsNotNone(result["model_assist_id"])
+
+            relationship = conn.execute(
+                "SELECT relationship_types, timing_alignment_status, allowed_effects, forbidden_effects FROM related_market_relationship_slices"
+            ).fetchone()
+            self.assertIn("shared_named_entity", json.loads(relationship["relationship_types"]))
+            self.assertEqual(relationship["timing_alignment_status"], "aligned")
+            self.assertIn("retrieval_query_hint", json.loads(relationship["allowed_effects"]))
+            self.assertIn("probability_authority", json.loads(relationship["forbidden_effects"]))
+
+            refresh = conn.execute("SELECT refresh_status, refresh_reason_codes FROM related_market_refresh_events").fetchone()
+            self.assertEqual(refresh["refresh_status"], "not_requested_phase7_placeholder")
+            self.assertIn("refresh_lifecycle_owned_by_amrg_006", json.loads(refresh["refresh_reason_codes"]))
+        finally:
+            conn.close()
 
 
 if __name__ == "__main__":
