@@ -1,0 +1,262 @@
+{
+  "artifact_type": "model_lane_policy",
+  "schema_version": "model-lane-policy/v1",
+  "policy_id": "autonomous-decomposition-swarm-model-lanes/v1",
+  "default_provider": "openai",
+  "authority_boundary": {
+    "scae_numeric_aggregation_uses_model": false,
+    "model_outputs_may_author_probability": false,
+    "model_outputs_may_override_scae": false
+  },
+  "lanes": {
+    "decomposer_qdt_generation": {
+      "provider": "openai",
+      "default_model_id": "gpt-5.5-high",
+      "allowed_model_ids": [
+        "gpt-5.5-high"
+      ],
+      "owner_feature_id": "MODEL-002",
+      "consumer_feature_ids": [
+        "QDT-001",
+        "QDT-002",
+        "QDT-003",
+        "QDT-004"
+      ],
+      "required_artifact_fields": [
+        "model_lane_id",
+        "resolved_model_id",
+        "model_policy_ref",
+        "prompt_template_id",
+        "prompt_template_sha256",
+        "input_manifest_ids",
+        "output_schema_version"
+      ],
+      "forbidden_outputs": [
+        "sub_forecast_probability",
+        "leaf_probability",
+        "macro_probability",
+        "fair_value",
+        "scae_delta"
+      ]
+    },
+    "researcher_leaf_nli_classification": {
+      "provider": "openai",
+      "default_model_id": "gpt-5.5-high",
+      "allowed_model_ids": [
+        "gpt-5.5-high"
+      ],
+      "owner_feature_id": "MODEL-003",
+      "consumer_feature_ids": [
+        "CLS-001",
+        "CLS-002",
+        "CLS-003",
+        "CLS-004",
+        "VER-001",
+        "VER-002",
+        "VER-003"
+      ],
+      "required_artifact_fields": [
+        "model_lane_id",
+        "resolved_model_id",
+        "model_policy_ref",
+        "prompt_template_id",
+        "prompt_template_sha256",
+        "sidecar_schema_version",
+        "classification_output_schema_version"
+      ],
+      "forbidden_outputs": [
+        "own_probability",
+        "leaf_probability",
+        "researcher_reassembled_probability",
+        "final_macro_probability",
+        "fair_value",
+        "probability_interval"
+      ]
+    },
+    "amrg_model_assist": {
+      "provider": "openai",
+      "default_model_id": "gpt-5.4-high",
+      "allowed_model_ids": [
+        "gpt-5.4-high",
+        "gpt-5.5-high"
+      ],
+      "owner_feature_id": "AMRG-004",
+      "consumer_feature_ids": [
+        "AMRG-003",
+        "AMRG-004",
+        "AMRG-005"
+      ],
+      "required_artifact_fields": [
+        "model_lane_id",
+        "resolved_model_id",
+        "model_policy_ref",
+        "prompt_template_id",
+        "prompt_template_sha256",
+        "input_manifest_sha256",
+        "output_schema_version"
+      ],
+      "forbidden_outputs": [
+        "probability",
+        "scae_evidence_delta",
+        "qdt_selection",
+        "edge_promotion",
+        "concept_creation",
+        "label_creation",
+        "active_graph_promotion"
+      ]
+    },
+        "native_research_candidate_discovery": {
+            "provider": "openai",
+            "default_model_id": "gpt-5.5-high",
+            "allowed_model_ids": [
+                "gpt-5.5-high"
+      ],
+      "native_research_capability_required": true,
+      "owner_feature_id": "RET-010",
+      "consumer_feature_ids": [
+        "RET-001",
+        "RET-004",
+        "RET-009",
+        "RET-008"
+      ],
+      "required_artifact_fields": [
+        "model_lane_id",
+        "resolved_model_id",
+        "model_policy_ref",
+        "prompt_template_id",
+        "prompt_template_sha256",
+        "query_manifest_sha256",
+        "research_transport",
+        "candidate_output_schema_version"
+      ],
+      "forbidden_outputs": [
+        "probability",
+        "scae_evidence_delta",
+        "source_metadata_final_authority",
+        "source_class_final_authority",
+        "source_family_final_authority",
+        "claim_family_final_authority",
+                "research_sufficiency_certification",
+                "decision_output"
+            ]
+        },
+        "source_metadata_classifier_assist": {
+            "provider": "openai",
+            "default_model_id": "gpt-5.4-mini",
+            "default_provider_model_key": "openai/gpt-5.4-mini",
+            "allowed_model_ids": [
+                "gpt-5.4-mini",
+                "gpt-5.4-nano",
+                "o4-mini",
+                "o3-mini"
+            ],
+            "allowed_provider_model_keys": [
+                "openai/gpt-5.4-mini",
+                "openai/gpt-5.4-nano",
+                "openai/o4-mini",
+                "openai/o3-mini"
+            ],
+            "oauth_route_required": true,
+            "owner_feature_id": "RET-011",
+            "consumer_feature_ids": [
+                "RET-004",
+                "RET-010",
+                "RET-009",
+                "RET-008"
+            ],
+            "usage": "compact_source_metadata_classification_and_claim_tuple_assist",
+            "authority_scope": {
+                "may_accept_source_class_when": "high_confidence_non_protected_source_and_no_deterministic_contradiction",
+                "may_accept_claim_family_when": "atomic_claim_tuple_normalizes_and_hashes_deterministically",
+                "may_accept_source_family_when": "classifier_hint_matches_canonical_url_domain_registry_or_syndication_evidence",
+                "may_accept_visible_date_when": "deterministic_parser_confirms_timestamp_and_source_cutoff_safety",
+                "protected_primary_requires_deterministic_or_market_contract_proof": true,
+                "temporal_safety_requires_deterministic_cutoff_validation": true
+            },
+            "required_artifact_fields": [
+                "model_lane_id",
+                "resolved_model_id",
+                "provider_model_key",
+                "model_policy_ref",
+                "prompt_template_id",
+                "prompt_template_sha256",
+                "input_candidate_sha256",
+                "classifier_output_schema_version",
+                "authority_scope"
+            ],
+            "forbidden_outputs": [
+                "probability",
+                "scae_evidence_delta",
+                "research_sufficiency_certification",
+                "protected_primary_final_authority",
+                "temporal_safety_final_authority",
+                "decision_output"
+            ]
+        }
+    },
+  "local_embedding_lanes": {
+    "amrg_vector_embedding": {
+      "provider": "ollama",
+      "route_id": "ollama/local",
+      "default_model_id": "BAAI/bge-base-en-v1.5",
+      "allowed_model_ids": [
+        "BAAI/bge-base-en-v1.5"
+      ],
+      "owner_feature_id": "AMRG-009",
+      "consumer_feature_ids": [
+        "AMRG-001",
+        "AMRG-002",
+        "AMRG-009"
+      ],
+      "download_required": true,
+      "download_command_contract": "ollama pull BAAI/bge-base-en-v1.5",
+      "usage": "active_market_descriptor_embedding_for_amrg_candidate_neighbors",
+      "non_blocking_runtime_behavior": "record_unavailable_diagnostic_and_continue_deterministic_candidate_sources",
+      "required_artifact_fields": [
+        "embedding_lane_id",
+        "resolved_model_id",
+        "model_policy_ref",
+        "route_id",
+        "embedding_model_sha256",
+        "descriptor_schema_version",
+        "descriptor_sha256",
+        "embedding_dimension",
+        "index_snapshot_id",
+        "source_cutoff_timestamp"
+      ],
+      "forbidden_outputs": [
+        "probability",
+        "scae_evidence_delta",
+        "relationship_promotion",
+        "qdt_selection",
+        "classification",
+        "decision_output"
+      ]
+    }
+  },
+  "trace_requirements": {
+    "owner_feature_id": "MODEL-004",
+    "training_trace_minimal_must_record": [
+      "model_lane_id",
+      "resolved_model_id",
+      "model_policy_ref",
+      "prompt_template_id",
+      "prompt_template_sha256",
+      "input_artifact_hashes",
+      "output_artifact_hash",
+      "output_schema_version"
+    ],
+    "embedding_trace_minimal_must_record": [
+      "embedding_lane_id",
+      "resolved_model_id",
+      "model_policy_ref",
+      "route_id",
+      "descriptor_schema_version",
+      "descriptor_sha256",
+      "index_snapshot_id",
+      "input_artifact_hashes",
+      "output_artifact_hash",
+      "output_schema_version"
+    ]
+  }
+}
