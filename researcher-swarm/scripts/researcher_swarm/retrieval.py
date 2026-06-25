@@ -46,6 +46,8 @@ RETRIEVAL_CANDIDATE_RECORD_SCHEMA_VERSION = "retrieval-candidate-record/v1"
 NATIVE_RESEARCH_ATTEMPT_SCHEMA_VERSION = "native-research-attempt/v1"
 BROWSER_RETRIEVAL_ATTEMPT_SCHEMA_VERSION = "browser-retrieval-attempt/v1"
 BROWSER_PROVIDER_DIAGNOSTIC_SCHEMA_VERSION = "browser-search-provider-diagnostic/v1"
+SOURCE_METADATA_CLASSIFIER_SCHEMA_VERSION = "source-metadata-classifier/v1"
+SOURCE_METADATA_CLASSIFIER_UNAVAILABLE_SCHEMA_VERSION = "source-metadata-classifier-unavailable/v1"
 SOURCE_METADATA_RESOLUTION_SCHEMA_VERSION = "source-metadata-resolution/v1"
 ATOMIC_CLAIM_CANDIDATE_SCHEMA_VERSION = "atomic-claim-candidate/v1"
 CLAIM_FAMILY_RESOLUTION_SCHEMA_VERSION = "claim-family-resolution/v1"
@@ -64,7 +66,36 @@ RETRIEVAL_PROVENANCE_NORMALIZER_VERSION = "ads-ret-004-provenance-normalizer/v1"
 RETRIEVAL_SOURCE_ACCESS_TRACKER_VERSION = "ads-ret-005-source-access-missingness/v1"
 RETRIEVAL_EXPANSION_FALLBACK_VERSION = "ads-ret-006-expansion-fallback/v1"
 NATIVE_RESEARCH_RESOLVER_VERSION = "ads-ret-010-native-diagnostic-resolver/v1"
+SOURCE_METADATA_CLASSIFIER_VERSION = "ads-ret-011-source-metadata-classifier/v1"
 OPENCLAW_BROWSER_PROVIDER_ID = "openclaw_web_fetch_browser"
+SOURCE_METADATA_CLASSIFIER_LANE_ID = "source_metadata_classifier_assist"
+SOURCE_METADATA_CLASSIFIER_PROMPT_TEMPLATE_ID = "source-metadata-classifier/v1"
+SOURCE_METADATA_CLASSIFIER_MODEL_POLICY_REF = (
+    "orchestrator/plans/autonomous-decomposition-swarm-model-lane-policy.json"
+)
+DEFAULT_SOURCE_METADATA_CLASSIFIER_PROVIDER_MODEL_KEY = "openai/gpt-5.4-mini"
+DEFAULT_SOURCE_METADATA_CLASSIFIER_MODEL_ID = "gpt-5.4-mini"
+ALLOWED_SOURCE_METADATA_CLASSIFIER_PROVIDER_MODEL_KEYS = (
+    "openai/gpt-5.4-mini",
+    "openai/gpt-5.4-nano",
+    "openai/o4-mini",
+    "openai/o3-mini",
+)
+SOURCE_METADATA_CLASSIFIER_PROMPT_TEMPLATE = (
+    "Classify compact retrieval source metadata only. Return source class, "
+    "source-family hints, syndication hints, visible date candidates, and "
+    "atomic claim tuples; do not author probabilities, SCAE deltas, final "
+    "protected-primary decisions, temporal-safety decisions, or research sufficiency."
+)
+SOURCE_METADATA_CLASSIFIER_FORBIDDEN_OUTPUTS = (
+    "probability",
+    "scae_evidence_delta",
+    "research_sufficiency_certification",
+    "claim_family_final_authority",
+    "protected_primary_final_authority",
+    "temporal_safety_final_authority",
+    "decision_output",
+)
 
 ALLOWED_RETRIEVAL_TRANSPORTS = {
     "browser",
@@ -120,11 +151,19 @@ ALLOWED_CLAIM_VALIDATION_STATUSES = {
 }
 ALLOWED_CLASSIFIER_ACCEPTANCE_STATUSES = {
     "not_used",
-    "accepted",
+    "accepted_source_class",
+    "accepted_claim_tuple",
+    "accepted_source_family_hint",
+    "accepted_visible_date_candidate",
     "rejected",
+    "contradicted",
     "classifier_unsupported",
     "unsupported_source_class",
+    "unsupported",
 }
+ALLOWED_CLASSIFIER_CONFIDENCES = {"high", "medium", "low", "unknown"}
+ALLOWED_CLASSIFIER_AVAILABILITY_STATUSES = {"available", "unavailable", "not_checked"}
+ALLOWED_SYNDICATION_HINTS = {"reuters_copy", "ap_copy", "press_release_copy", "none", "unknown"}
 ALLOWED_SOURCE_FAMILY_STATUSES = {
     "resolved",
     "same_source_family",
@@ -1100,6 +1139,378 @@ def build_retrieval_candidate_record(
     }
 
 
+def _bounded_excerpt(value: Any, max_chars: int = 1200) -> str:
+    if not _is_non_empty_string(value):
+        return ""
+    text = _normalized_space(str(value))
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 1].rstrip() + "..."
+
+
+def _compact_string_values(value: Any, *, max_items: int = 8, max_chars: int = 240) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    compact: list[str] = []
+    for item in value:
+        if _is_non_empty_string(item):
+            compact.append(_bounded_excerpt(item, max_chars=max_chars))
+        elif isinstance(item, dict):
+            text = item.get("text") or item.get("date_text") or item.get("url") or item.get("source_ref")
+            if _is_non_empty_string(text):
+                compact.append(_bounded_excerpt(text, max_chars=max_chars))
+        if len(compact) >= max_items:
+            break
+    return compact
+
+
+def _compact_metadata(value: Any, *, max_items: int = 8, max_chars: int = 160) -> dict[str, str]:
+    if not isinstance(value, dict):
+        return {}
+    compact: dict[str, str] = {}
+    for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))[:max_items]:
+        if not _is_non_empty_string(key):
+            continue
+        if isinstance(item, (dict, list)):
+            rendered = canonical_json(item)
+        else:
+            rendered = str(item)
+        compact[str(key)[:80]] = _bounded_excerpt(rendered, max_chars=max_chars)
+    return compact
+
+
+def build_compact_source_candidate_packet(
+    candidate: dict[str, Any],
+    *,
+    max_excerpt_chars: int = 1200,
+) -> dict[str, Any]:
+    """Materialize the bounded RET-011 classifier input packet."""
+
+    if not isinstance(candidate, dict):
+        raise RetrievalPacketError("candidate must be an object")
+    _ensure_no_forbidden_keys(candidate, "candidate")
+    canonical_url = canonicalize_source_url(candidate.get("canonical_url"), candidate.get("final_url"), candidate.get("requested_url"))
+    packet_seed = {
+        "leaf_id": candidate.get("leaf_id"),
+        "transport_attempt_ref": candidate.get("transport_attempt_ref"),
+        "canonical_url": canonical_url,
+        "content_sha256": _content_sha256(candidate, canonical_url),
+    }
+    publisher_metadata = candidate.get("publisher_metadata")
+    if not isinstance(publisher_metadata, dict):
+        publisher_metadata = {
+            key: candidate.get(key)
+            for key in ("publisher", "publisher_name", "site_name", "organization")
+            if _is_non_empty_string(candidate.get(key))
+        }
+    return {
+        "candidate_id": str(candidate.get("candidate_id") or _sha_id("candidate", packet_seed)),
+        "leaf_id": str(candidate.get("leaf_id") or ""),
+        "transport_attempt_ref": str(candidate.get("transport_attempt_ref") or ""),
+        "canonical_url": canonical_url,
+        "registrable_domain": _registrable_domain(canonical_url),
+        "page_title_excerpt": _bounded_excerpt(
+            candidate.get("page_title") or candidate.get("title") or candidate.get("html_title"),
+            max_chars=240,
+        ),
+        "publisher_metadata": _compact_metadata(publisher_metadata),
+        "byline_excerpt": _bounded_excerpt(candidate.get("byline") or candidate.get("author"), max_chars=240),
+        "snippet_excerpt": _bounded_excerpt(
+            candidate.get("snippet") or candidate.get("excerpt") or candidate.get("description"),
+            max_chars=max_excerpt_chars,
+        ),
+        "visible_date_text_candidates": _compact_string_values(
+            candidate.get("visible_date_text_candidates") or candidate.get("visible_date_candidates") or [],
+            max_items=8,
+            max_chars=160,
+        ),
+        "content_sha256": _content_sha256(candidate, canonical_url),
+        "market_contract_source_hints": _compact_string_values(
+            candidate.get("market_contract_source_hints") or candidate.get("official_source_hints") or [],
+            max_items=8,
+            max_chars=240,
+        ),
+        "forbidden_outputs": list(SOURCE_METADATA_CLASSIFIER_FORBIDDEN_OUTPUTS),
+    }
+
+
+def _model_id_from_provider_model_key(provider_model_key: str) -> str:
+    if "/" in provider_model_key:
+        return provider_model_key.split("/", 1)[1]
+    return provider_model_key
+
+
+def resolve_source_metadata_classifier_lane(
+    model_lane_policy: dict[str, Any] | None = None,
+    *,
+    available_provider_model_keys: list[str] | None = None,
+    model_policy_ref: str = SOURCE_METADATA_CLASSIFIER_MODEL_POLICY_REF,
+) -> dict[str, Any]:
+    lanes = (model_lane_policy or {}).get("lanes")
+    lane = lanes.get(SOURCE_METADATA_CLASSIFIER_LANE_ID) if isinstance(lanes, dict) else {}
+    if not isinstance(lane, dict):
+        lane = {}
+
+    allowed_keys = lane.get("allowed_provider_model_keys")
+    if not isinstance(allowed_keys, list) or not allowed_keys:
+        allowed_keys = list(ALLOWED_SOURCE_METADATA_CLASSIFIER_PROVIDER_MODEL_KEYS)
+    allowed_keys = [str(key) for key in allowed_keys if str(key) in ALLOWED_SOURCE_METADATA_CLASSIFIER_PROVIDER_MODEL_KEYS]
+    if not allowed_keys:
+        allowed_keys = list(ALLOWED_SOURCE_METADATA_CLASSIFIER_PROVIDER_MODEL_KEYS)
+
+    default_key = str(lane.get("default_provider_model_key") or DEFAULT_SOURCE_METADATA_CLASSIFIER_PROVIDER_MODEL_KEY)
+    if default_key not in allowed_keys:
+        default_key = allowed_keys[0]
+
+    provider_model_key = default_key
+    availability_status = "not_checked"
+    unavailable_reason = None
+    if available_provider_model_keys is not None:
+        available = {str(key) for key in available_provider_model_keys}
+        provider_model_key = next((key for key in allowed_keys if key in available), "")
+        if provider_model_key:
+            availability_status = "available"
+        else:
+            provider_model_key = default_key
+            availability_status = "unavailable"
+            unavailable_reason = "allowed_oauth_routed_small_model_unavailable"
+
+    return {
+        "model_lane_id": SOURCE_METADATA_CLASSIFIER_LANE_ID,
+        "provider": str(lane.get("provider") or "openai"),
+        "route_id": "openclaw_openai_oauth",
+        "oauth_route_required": bool(lane.get("oauth_route_required", True)),
+        "default_provider_model_key": default_key,
+        "provider_model_key": provider_model_key,
+        "resolved_model_id": _model_id_from_provider_model_key(provider_model_key),
+        "allowed_provider_model_keys": allowed_keys,
+        "availability_status": availability_status,
+        "unavailable_reason": unavailable_reason,
+        "model_policy_ref": model_policy_ref,
+        "prompt_template_id": SOURCE_METADATA_CLASSIFIER_PROMPT_TEMPLATE_ID,
+        "prompt_template_sha256": _prefixed_sha256(SOURCE_METADATA_CLASSIFIER_PROMPT_TEMPLATE),
+        "classifier_output_schema_version": SOURCE_METADATA_CLASSIFIER_SCHEMA_VERSION,
+        "forbidden_outputs": list(SOURCE_METADATA_CLASSIFIER_FORBIDDEN_OUTPUTS),
+        "authority_scope": {
+            "protected_primary_requires_deterministic_or_market_contract_proof": True,
+            "temporal_safety_requires_deterministic_cutoff_validation": True,
+            "source_family_final_requires_deterministic_evidence": True,
+            "claim_family_final_requires_tuple_validation_and_hashing": True,
+            "authors_research_sufficiency": False,
+        },
+    }
+
+
+def build_source_metadata_classifier_unavailable(
+    lane: dict[str, Any] | None = None,
+    *,
+    checked_at: str | None = None,
+    unavailable_reason: str | None = None,
+) -> dict[str, Any]:
+    lane = lane or resolve_source_metadata_classifier_lane(available_provider_model_keys=[])
+    reason = unavailable_reason or lane.get("unavailable_reason") or "source_metadata_classifier_unavailable"
+    return {
+        "artifact_type": "source_metadata_classifier_unavailable",
+        "schema_version": SOURCE_METADATA_CLASSIFIER_UNAVAILABLE_SCHEMA_VERSION,
+        "diagnostic_id": _sha_id(
+            "source-classifier-unavailable",
+            {
+                "provider_model_key": lane.get("provider_model_key"),
+                "checked_at": checked_at,
+                "reason": reason,
+            },
+        ),
+        "model_lane_id": SOURCE_METADATA_CLASSIFIER_LANE_ID,
+        "provider": lane.get("provider", "openai"),
+        "route_id": lane.get("route_id", "openclaw_openai_oauth"),
+        "oauth_route_required": bool(lane.get("oauth_route_required", True)),
+        "provider_model_key": lane.get("provider_model_key", DEFAULT_SOURCE_METADATA_CLASSIFIER_PROVIDER_MODEL_KEY),
+        "resolved_model_id": lane.get("resolved_model_id", DEFAULT_SOURCE_METADATA_CLASSIFIER_MODEL_ID),
+        "availability_status": "unavailable",
+        "checked_at": checked_at,
+        "unavailable_reason": reason,
+        "fallback_provider_model_keys": [
+            key
+            for key in lane.get("allowed_provider_model_keys", ALLOWED_SOURCE_METADATA_CLASSIFIER_PROVIDER_MODEL_KEYS)
+            if key != lane.get("provider_model_key")
+        ],
+        "non_blocking_when_alternative_transport_satisfies_requirements": True,
+        "classifier_assist_authority": {
+            "source_metadata_final_authority": False,
+            "protected_primary_final_authority": False,
+            "temporal_safety_final_authority": False,
+            "research_sufficiency_authority": False,
+        },
+        "reason_codes": [reason],
+        "classifier_version": SOURCE_METADATA_CLASSIFIER_VERSION,
+    }
+
+
+def _classifier_confidence(value: Any) -> str:
+    text = str(value or "unknown")
+    return text if text in ALLOWED_CLASSIFIER_CONFIDENCES else "unknown"
+
+
+def _classifier_reason_codes(value: Any) -> list[str]:
+    if _reason_codes_are_compact(value):
+        return sorted(set(str(item) for item in value))
+    return []
+
+
+def _classifier_claim_candidates(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    compact: list[dict[str, Any]] = []
+    for item in value[:8]:
+        if not isinstance(item, dict):
+            continue
+        _ensure_no_forbidden_keys(item, "classifier_atomic_claim_candidate")
+        proposed_tuple = item.get("proposed_tuple") if isinstance(item.get("proposed_tuple"), dict) else item
+        compact.append(
+            {
+                "proposed_tuple": {
+                    "subject": _bounded_excerpt(proposed_tuple.get("subject"), max_chars=160),
+                    "predicate": _bounded_excerpt(proposed_tuple.get("predicate"), max_chars=120),
+                    "object_or_value": _bounded_excerpt(proposed_tuple.get("object_or_value"), max_chars=240),
+                    "event_time": _bounded_excerpt(proposed_tuple.get("event_time"), max_chars=120),
+                    "entity_or_jurisdiction": _bounded_excerpt(
+                        proposed_tuple.get("entity_or_jurisdiction"),
+                        max_chars=160,
+                    ),
+                    "condition_scope": proposed_tuple.get("condition_scope", "unconditional"),
+                    "polarity": proposed_tuple.get("polarity", "uncertain"),
+                },
+                "candidate_confidence": _classifier_confidence(item.get("candidate_confidence") or item.get("confidence")),
+                "supporting_span_refs": _compact_string_values(item.get("supporting_span_refs") or [], max_items=8),
+            }
+        )
+    return compact
+
+
+def _classifier_visible_date_candidates(value: Any) -> list[dict[str, str]]:
+    if not isinstance(value, list):
+        return []
+    compact: list[dict[str, str]] = []
+    for item in value[:8]:
+        if isinstance(item, dict):
+            text = item.get("date_text") or item.get("text") or item.get("visible_text") or item.get("timestamp")
+            normalized = item.get("normalized_timestamp") or item.get("timestamp") or item.get("iso_timestamp")
+        else:
+            text = item
+            normalized = None
+        if not _is_non_empty_string(text) and not _is_non_empty_string(normalized):
+            continue
+        compact.append(
+            {
+                "date_text": _bounded_excerpt(text or normalized, max_chars=160),
+                "normalized_timestamp": _iso_or_none(normalized) or "",
+            }
+        )
+    return compact
+
+
+def build_source_metadata_classifier_slice(
+    candidate_packet: dict[str, Any],
+    classifier_output: dict[str, Any] | None = None,
+    *,
+    lane: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if not isinstance(candidate_packet, dict):
+        raise RetrievalPacketError("candidate packet must be an object")
+    output = copy.deepcopy(classifier_output or {})
+    if not isinstance(output, dict):
+        raise RetrievalPacketError("classifier output must be an object")
+    _ensure_no_forbidden_keys(output, "classifier_output")
+    lane = lane or resolve_source_metadata_classifier_lane()
+    proposed_source_class = str(output.get("proposed_source_class") or output.get("source_class") or "unknown")
+    if proposed_source_class not in ALLOWED_SOURCE_CLASSES:
+        proposed_source_class = "unknown"
+    syndication_hint = str(output.get("syndication_hint") or "unknown")
+    if syndication_hint not in ALLOWED_SYNDICATION_HINTS:
+        syndication_hint = "unknown"
+    reason_codes = _classifier_reason_codes(output.get("reason_codes"))
+    input_sha = _prefixed_sha256(candidate_packet)
+    seed = {
+        "candidate_id": candidate_packet.get("candidate_id"),
+        "input_sha": input_sha,
+        "provider_model_key": lane.get("provider_model_key"),
+        "output": output,
+    }
+    return {
+        "artifact_type": "source_metadata_classifier_slice",
+        "schema_version": SOURCE_METADATA_CLASSIFIER_SCHEMA_VERSION,
+        "classifier_slice_id": _sha_id("source-classifier", seed),
+        "candidate_id": candidate_packet.get("candidate_id"),
+        "leaf_id": candidate_packet.get("leaf_id"),
+        "model_lane_id": SOURCE_METADATA_CLASSIFIER_LANE_ID,
+        "resolved_model_id": lane.get("resolved_model_id", DEFAULT_SOURCE_METADATA_CLASSIFIER_MODEL_ID),
+        "provider_model_key": lane.get("provider_model_key", DEFAULT_SOURCE_METADATA_CLASSIFIER_PROVIDER_MODEL_KEY),
+        "model_policy_ref": lane.get("model_policy_ref", SOURCE_METADATA_CLASSIFIER_MODEL_POLICY_REF),
+        "prompt_template_id": SOURCE_METADATA_CLASSIFIER_PROMPT_TEMPLATE_ID,
+        "prompt_template_sha256": lane.get("prompt_template_sha256") or _prefixed_sha256(SOURCE_METADATA_CLASSIFIER_PROMPT_TEMPLATE),
+        "input_candidate_sha256": input_sha,
+        "classifier_output_schema_version": SOURCE_METADATA_CLASSIFIER_SCHEMA_VERSION,
+        "proposed_source_class": proposed_source_class,
+        "source_class_confidence": _classifier_confidence(output.get("source_class_confidence") or output.get("confidence")),
+        "proposed_source_family_hint": _bounded_excerpt(output.get("proposed_source_family_hint") or "unknown", max_chars=160),
+        "source_family_confidence": _classifier_confidence(output.get("source_family_confidence")),
+        "syndication_hint": syndication_hint,
+        "atomic_claim_candidates": _classifier_claim_candidates(output.get("atomic_claim_candidates")),
+        "visible_date_candidates": _classifier_visible_date_candidates(output.get("visible_date_candidates")),
+        "reason_codes": reason_codes,
+        "forbidden_outputs": list(SOURCE_METADATA_CLASSIFIER_FORBIDDEN_OUTPUTS),
+        "authority_boundary": {
+            "source_class_final_authority": False,
+            "source_family_final_authority": False,
+            "claim_family_final_authority": False,
+            "protected_primary_final_authority": False,
+            "temporal_safety_final_authority": False,
+            "research_sufficiency_authority": False,
+        },
+        "classifier_version": SOURCE_METADATA_CLASSIFIER_VERSION,
+    }
+
+
+def build_atomic_claim_candidates_from_classifier_slice(
+    *,
+    evidence_ref: str,
+    leaf_id: str,
+    chunk_refs: list[str],
+    classifier_slice: dict[str, Any],
+) -> list[dict[str, Any]]:
+    if not isinstance(classifier_slice, dict):
+        return []
+    candidates = []
+    for proposed in classifier_slice.get("atomic_claim_candidates", []):
+        if not isinstance(proposed, dict):
+            continue
+        span_refs = [
+            str(ref)
+            for ref in proposed.get("supporting_span_refs", [])
+            if _is_non_empty_string(ref)
+        ]
+        tuple_value = proposed.get("proposed_tuple") if isinstance(proposed.get("proposed_tuple"), dict) else {}
+        if not span_refs:
+            status = "rejected_no_span"
+        elif not all(_is_non_empty_string(tuple_value.get(field)) for field in ("subject", "predicate", "object_or_value")):
+            status = "rejected_not_market_relevant"
+        else:
+            status = "accepted_for_normalization"
+        candidates.append(
+            build_atomic_claim_candidate(
+                evidence_ref=evidence_ref,
+                leaf_id=leaf_id,
+                chunk_refs=chunk_refs,
+                extraction_method="model_assisted_bounded_passage",
+                proposed_tuple=tuple_value,
+                supporting_span_refs=span_refs,
+                candidate_confidence=str(proposed.get("candidate_confidence") or "unknown"),
+                validation_status=status,
+            )
+        )
+    return candidates
+
+
 def _matches_any_url(candidate_url: str, urls: list[Any]) -> bool:
     if not candidate_url:
         return False
@@ -1158,16 +1569,43 @@ def _resolve_classifier_source_class(
     )
     if proposed not in ALLOWED_SOURCE_CLASSES:
         return "unsupported_source_class", "unknown", ["unsupported_classifier_source_class"]
+    if proposed == "unknown":
+        return "not_used", "unknown", ["classifier_source_class_unknown_not_counted"]
+    explicit = str(candidate.get("source_class") or "unknown")
+    if explicit in ALLOWED_SOURCE_CLASSES and explicit != "unknown" and explicit != proposed:
+        explicit_has_proof, explicit_proof = _deterministic_source_class_proof(
+            candidate,
+            explicit,
+            market_rules=market_rules,
+        )
+        if explicit not in PROTECTED_SOURCE_CLASSES or explicit_has_proof:
+            return "contradicted", "unknown", [
+                "classifier_contradicted_by_deterministic_source_class",
+                explicit_proof if explicit_has_proof else "candidate_field",
+            ]
     protected_primary = bool(classifier_slice.get("protected_primary_proposed")) or proposed in PROTECTED_SOURCE_CLASSES
     has_proof, proof_method = _deterministic_source_class_proof(candidate, proposed, market_rules=market_rules)
     if protected_primary and not has_proof:
         return "classifier_unsupported", "unknown", ["classifier_unsupported_for_protected_primary"]
-    accepted = classifier_slice.get("deterministic_acceptance_status") == "accepted" or classifier_slice.get("validator_acceptance_status") == "accepted"
-    if accepted or has_proof:
+    confidence = _classifier_confidence(classifier_slice.get("source_class_confidence") or classifier_slice.get("confidence"))
+    validator_accepted = (
+        classifier_slice.get("deterministic_acceptance_status") == "accepted"
+        or classifier_slice.get("validator_acceptance_status") == "accepted"
+    )
+    if confidence != "high" and not validator_accepted:
+        return "rejected", "unknown", ["classifier_source_class_confidence_not_high"]
+    if proposed not in PROTECTED_SOURCE_CLASSES or has_proof:
         reason_codes = list(classifier_slice.get("acceptance_reason_codes") or [])
         if proof_method != "no_deterministic_proof":
             reason_codes.append(proof_method)
-        return "accepted", proposed, sorted(set(reason_codes or ["classifier_validated"]))
+        reason_codes.append(
+            "validator_accepted_classifier_source_class"
+            if validator_accepted
+            else "high_confidence_classifier_source_class"
+        )
+        if proposed not in PROTECTED_SOURCE_CLASSES:
+            reason_codes.append("ordinary_source_class_not_protected")
+        return "accepted_source_class", proposed, sorted(set(reason_codes))
     return "rejected", "unknown", ["classifier_not_accepted_by_validator"]
 
 
@@ -1181,6 +1619,13 @@ def _resolve_source_class(
     if explicit in ALLOWED_SOURCE_CLASSES and explicit != "unknown":
         has_proof, proof_method = _deterministic_source_class_proof(candidate, explicit, market_rules=market_rules)
         if explicit not in PROTECTED_SOURCE_CLASSES or has_proof:
+            if classifier_slice:
+                proposed = str(classifier_slice.get("proposed_source_class") or classifier_slice.get("source_class") or "unknown")
+                if proposed in ALLOWED_SOURCE_CLASSES and proposed not in {"unknown", explicit}:
+                    return explicit, proof_method if has_proof else "candidate_field", "contradicted", [
+                        "classifier_contradicted_by_deterministic_source_class",
+                        proof_method if has_proof else "candidate_field",
+                    ]
             return explicit, proof_method if has_proof else "candidate_field", "not_used", []
     proposed_native = candidate.get("model_proposed_source_class")
     if _is_non_empty_string(proposed_native) and str(proposed_native) not in ALLOWED_SOURCE_CLASSES:
@@ -1192,7 +1637,7 @@ def _resolve_source_class(
         classifier_slice,
         market_rules=market_rules,
     )
-    if classifier_status == "accepted" and classifier_class != "unknown":
+    if classifier_status == "accepted_source_class" and classifier_class != "unknown":
         return classifier_class, "classifier_assist_validated", classifier_status, classifier_reasons
     return "unknown", "unknown", classifier_status, classifier_reasons or ["source_class_unknown"]
 
@@ -1240,6 +1685,74 @@ def _resolve_independence_status(
     if seen_source_family_ids and source_family_id in seen_source_family_ids:
         return "same_source_family"
     return "independent"
+
+
+def _accepted_classifier_visible_date(
+    classifier_slice: dict[str, Any] | None,
+    *,
+    source_cutoff_timestamp: str | None,
+) -> tuple[str | None, list[str]]:
+    if not classifier_slice:
+        return None, []
+    for candidate in classifier_slice.get("visible_date_candidates", []):
+        if not isinstance(candidate, dict):
+            continue
+        raw = candidate.get("normalized_timestamp") or candidate.get("date_text")
+        parsed = _iso_or_none(raw)
+        if not parsed:
+            continue
+        if source_cutoff_timestamp and _timestamp_at_or_after(parsed, source_cutoff_timestamp):
+            return None, ["classifier_visible_date_after_cutoff_not_accepted"]
+        return parsed, ["classifier_visible_date_deterministically_parsed"]
+    return None, []
+
+
+def _classifier_source_family_hint_status(
+    classifier_slice: dict[str, Any] | None,
+    *,
+    canonical_url: str,
+    source_family_id: str,
+    source_family_status: str,
+) -> tuple[str | None, list[str]]:
+    if not classifier_slice:
+        return None, []
+    hint = str(classifier_slice.get("proposed_source_family_hint") or "")
+    confidence = _classifier_confidence(classifier_slice.get("source_family_confidence"))
+    if not hint or hint == "unknown" or confidence != "high":
+        return None, []
+    if source_family_id == "source-family-unknown":
+        return None, ["classifier_source_family_hint_without_deterministic_support"]
+    normalized_hint = hint.lower()
+    domain = _registrable_domain(canonical_url)
+    syndication_hint = str(classifier_slice.get("syndication_hint") or "unknown")
+    if domain and (domain in normalized_hint or normalized_hint in domain):
+        return "accepted_source_family_hint", ["classifier_source_family_hint_supported_by_domain"]
+    if source_family_status == "syndicated_copy" and syndication_hint not in {"none", "unknown"}:
+        return "accepted_source_family_hint", ["classifier_syndication_hint_supported_by_syndication_key"]
+    return None, ["classifier_source_family_hint_not_used_for_final_family"]
+
+
+def _merge_classifier_acceptance(
+    source_class_status: str,
+    source_class_reasons: list[str],
+    *,
+    family_hint_status: str | None = None,
+    family_hint_reasons: list[str] | None = None,
+    visible_date_accepted: bool = False,
+    visible_date_reasons: list[str] | None = None,
+) -> tuple[str, list[str]]:
+    reasons = list(source_class_reasons or [])
+    reasons.extend(family_hint_reasons or [])
+    reasons.extend(visible_date_reasons or [])
+    if source_class_status in {"classifier_unsupported", "unsupported_source_class", "contradicted"}:
+        return source_class_status, sorted(set(reasons))
+    if source_class_status == "accepted_source_class":
+        return source_class_status, sorted(set(reasons))
+    if family_hint_status:
+        return family_hint_status, sorted(set(reasons))
+    if visible_date_accepted:
+        return "accepted_visible_date_candidate", sorted(set(reasons))
+    return source_class_status, sorted(set(reasons))
 
 
 def build_source_metadata_resolution(
@@ -1329,7 +1842,10 @@ def build_source_metadata_resolution(
         "model_proposed_metadata_counted": False,
         "authority_boundary": {
             "native_research_final_authority": False,
+            "classifier_source_family_final_authority": False,
+            "classifier_claim_family_final_authority": False,
             "classifier_protected_primary_final_authority": False,
+            "classifier_temporal_safety_final_authority": False,
             "research_sufficiency_authority": False,
         },
         "feature_gate_status": "ret_004_deterministic_resolution",
@@ -1680,6 +2196,12 @@ def normalize_retrieval_provenance(
         canonical_url=canonical_url,
         content_sha256=content_hash,
     )
+    family_hint_status, family_hint_reasons = _classifier_source_family_hint_status(
+        classifier_slice,
+        canonical_url=canonical_url,
+        source_family_id=source_family_id,
+        source_family_status=source_family_status,
+    )
     canonical_source_id = "source-" + _hash_suffix(
         {
             "source_family_id": source_family_id,
@@ -1687,9 +2209,28 @@ def normalize_retrieval_provenance(
             "registrable_domain": _registrable_domain(canonical_url),
         }
     )
+    cutoff = (dispatch_context or {}).get("source_cutoff_timestamp")
+    classifier_visible_published_at, visible_date_reason_codes = _accepted_classifier_visible_date(
+        classifier_slice,
+        source_cutoff_timestamp=str(cutoff) if cutoff else None,
+    )
+    candidate_for_temporal = {**candidate, "retrieval_transport": retrieval_transport, "canonical_url": canonical_url}
+    if classifier_visible_published_at and not any(
+        _is_non_empty_string(candidate.get(field))
+        for field in ("source_published_at", "published_at", "source_updated_at", "source_observed_at", "source_authored_at")
+    ):
+        candidate_for_temporal["source_published_at"] = classifier_visible_published_at
     temporal_validation = validate_temporal_eligibility(
-        {**candidate, "retrieval_transport": retrieval_transport, "canonical_url": canonical_url},
+        candidate_for_temporal,
         dispatch_context=dispatch_context,
+    )
+    classifier_status, classifier_reason_codes = _merge_classifier_acceptance(
+        classifier_status,
+        classifier_reason_codes,
+        family_hint_status=family_hint_status,
+        family_hint_reasons=family_hint_reasons,
+        visible_date_accepted=bool(classifier_visible_published_at),
+        visible_date_reasons=visible_date_reason_codes,
     )
     resolutions = list(claim_family_resolutions or resolve_claim_families(claim_candidates or []))
     claim_family_ids = [
@@ -1730,7 +2271,21 @@ def normalize_retrieval_provenance(
     published_at = _iso_or_none(
         candidate.get("source_published_at")
         or candidate.get("published_at")
-        or (classifier_slice or {}).get("visible_published_at")
+        or classifier_visible_published_at
+    )
+    published_at_method = str(candidate.get("published_at_extraction_method") or "unknown")
+    if published_at == classifier_visible_published_at and published_at_method == "unknown":
+        published_at_method = "classifier_visible_date_deterministically_parsed"
+    elif visible_date_reason_codes and "classifier_visible_date_after_cutoff_not_accepted" in visible_date_reason_codes:
+        unknown_reason_codes.append("classifier_visible_date_after_cutoff_not_accepted")
+    if family_hint_reasons and family_hint_status is None:
+        unknown_reason_codes.extend(family_hint_reasons)
+    metadata_confidence = (
+        "medium"
+        if counts_toward_breadth
+        else "low"
+        if classifier_status in {"classifier_unsupported", "contradicted", "unsupported_source_class"}
+        else "unknown"
     )
     metadata_resolution = build_source_metadata_resolution(
         evidence_ref=str(candidate.get("evidence_ref") or ""),
@@ -1748,11 +2303,11 @@ def normalize_retrieval_provenance(
         claim_family_ids=claim_family_ids,
         temporal_safety_status=temporal_validation["temporal_gate_status"],
         published_at=published_at,
-        published_at_method=str(candidate.get("published_at_extraction_method") or "unknown"),
+        published_at_method=published_at_method,
         classifier_slice_ref=classifier_ref,
         classifier_acceptance_status=classifier_status,
         classifier_acceptance_reason_codes=classifier_reason_codes,
-        metadata_confidence="medium" if counts_toward_breadth else "unknown",
+        metadata_confidence=metadata_confidence,
         counts_toward_breadth=counts_toward_breadth,
         unknown_reason_codes=sorted(set(unknown_reason_codes)),
         content_sha256=content_hash,
@@ -2397,6 +2952,35 @@ def attach_native_research_transport_diagnostics(
     return packet_copy
 
 
+def attach_source_metadata_classifier_unavailable(
+    packet: dict[str, Any],
+    *,
+    model_lane_policy: dict[str, Any] | None = None,
+    available_provider_model_keys: list[str] | None = None,
+    unavailable_reason: str | None = None,
+) -> dict[str, Any]:
+    packet_copy = copy.deepcopy(packet)
+    lane = resolve_source_metadata_classifier_lane(
+        model_lane_policy,
+        available_provider_model_keys=available_provider_model_keys or [],
+    )
+    diagnostic = build_source_metadata_classifier_unavailable(
+        lane,
+        checked_at=packet_copy.get("forecast_timestamp"),
+        unavailable_reason=unavailable_reason,
+    )
+    packet_copy["source_metadata_classifier_unavailable_diagnostics"] = [diagnostic]
+    packet_copy.setdefault("source_metadata_classifier_slices", [])
+    packet_copy.setdefault("schema_feature_gates", {})["RET-011"] = "implemented"
+    packet_copy.setdefault("validation_summary", {}).setdefault("reason_codes", []).append(
+        "ret_011_classifier_unavailable_diagnostic_recorded"
+    )
+    result = validate_retrieval_packet(packet_copy)
+    if not result.valid:
+        raise RetrievalPacketError("; ".join(result.errors))
+    return packet_copy
+
+
 def build_retrieval_packet(
     qdt: dict[str, Any],
     *,
@@ -2441,10 +3025,15 @@ def build_retrieval_packet(
     selected = copy.deepcopy(selected_evidence or [])
     provenance_slices = []
     source_metadata_resolutions = []
+    source_metadata_classifier_slices = []
     for item in selected:
+        classifier_slice = item.get("source_metadata_classifier_slice")
+        if isinstance(classifier_slice, dict):
+            source_metadata_classifier_slices.append(classifier_slice)
         provenance = normalize_retrieval_provenance(
             item,
             dispatch_context=dispatch_context,
+            classifier_slice=classifier_slice if isinstance(classifier_slice, dict) else None,
             market_rules=(evidence_packet or {}).get("market_rules") if isinstance(evidence_packet, dict) else None,
         )
         provenance_slices.append(provenance)
@@ -2510,6 +3099,8 @@ def build_retrieval_packet(
         "native_research_attempts": [],
         "native_research_transport_diagnostics": [],
         "browser_retrieval_attempts": [],
+        "source_metadata_classifier_slices": source_metadata_classifier_slices,
+        "source_metadata_classifier_unavailable_diagnostics": [],
         "source_metadata_resolutions": source_metadata_resolutions,
         "atomic_claim_candidates": [],
         "claim_family_resolutions": [],
@@ -2528,7 +3119,7 @@ def build_retrieval_packet(
             "RET-008": "pending",
             "RET-009": "pending",
             "RET-010": "pending",
-            "RET-011": "pending",
+            "RET-011": "implemented" if source_metadata_classifier_slices else "pending",
         },
         "validation_summary": {
             "status": "schema_constructed",
@@ -2682,6 +3273,122 @@ def validate_candidate_record(item: Any, path: str, errors: list[str]) -> None:
         errors.append(f"{path}.omission_reason_codes must be compact reason codes")
 
 
+def validate_source_metadata_classifier_slice(item: Any, path: str, errors: list[str]) -> None:
+    if not isinstance(item, dict):
+        errors.append(f"{path} must be an object")
+        return
+    for field in (
+        "artifact_type",
+        "schema_version",
+        "classifier_slice_id",
+        "candidate_id",
+        "model_lane_id",
+        "resolved_model_id",
+        "provider_model_key",
+        "prompt_template_id",
+        "prompt_template_sha256",
+        "input_candidate_sha256",
+        "classifier_output_schema_version",
+        "proposed_source_class",
+        "source_class_confidence",
+        "proposed_source_family_hint",
+        "source_family_confidence",
+        "syndication_hint",
+        "atomic_claim_candidates",
+        "visible_date_candidates",
+        "reason_codes",
+        "authority_boundary",
+    ):
+        if field not in item:
+            errors.append(f"{path} missing {field}")
+    if item.get("artifact_type") != "source_metadata_classifier_slice":
+        errors.append(f"{path}.artifact_type must be source_metadata_classifier_slice")
+    if item.get("schema_version") != SOURCE_METADATA_CLASSIFIER_SCHEMA_VERSION:
+        errors.append(f"{path}.schema_version must be {SOURCE_METADATA_CLASSIFIER_SCHEMA_VERSION}")
+    if item.get("model_lane_id") != SOURCE_METADATA_CLASSIFIER_LANE_ID:
+        errors.append(f"{path}.model_lane_id must be {SOURCE_METADATA_CLASSIFIER_LANE_ID}")
+    if item.get("provider_model_key") not in ALLOWED_SOURCE_METADATA_CLASSIFIER_PROVIDER_MODEL_KEYS:
+        errors.append(f"{path}.provider_model_key is not an allowed OAuth-routed classifier model")
+    if item.get("prompt_template_id") != SOURCE_METADATA_CLASSIFIER_PROMPT_TEMPLATE_ID:
+        errors.append(f"{path}.prompt_template_id is invalid")
+    if item.get("classifier_output_schema_version") != SOURCE_METADATA_CLASSIFIER_SCHEMA_VERSION:
+        errors.append(f"{path}.classifier_output_schema_version is invalid")
+    if item.get("proposed_source_class") not in ALLOWED_SOURCE_CLASSES:
+        errors.append(f"{path}.proposed_source_class is invalid")
+    if item.get("source_class_confidence") not in ALLOWED_CLASSIFIER_CONFIDENCES:
+        errors.append(f"{path}.source_class_confidence is invalid")
+    if item.get("source_family_confidence") not in ALLOWED_CLASSIFIER_CONFIDENCES:
+        errors.append(f"{path}.source_family_confidence is invalid")
+    if item.get("syndication_hint") not in ALLOWED_SYNDICATION_HINTS:
+        errors.append(f"{path}.syndication_hint is invalid")
+    if not isinstance(item.get("atomic_claim_candidates"), list):
+        errors.append(f"{path}.atomic_claim_candidates must be a list")
+    if not isinstance(item.get("visible_date_candidates"), list):
+        errors.append(f"{path}.visible_date_candidates must be a list")
+    if not _reason_codes_are_compact(item.get("reason_codes")):
+        errors.append(f"{path}.reason_codes must be compact reason codes")
+    boundary = item.get("authority_boundary")
+    if not isinstance(boundary, dict):
+        errors.append(f"{path}.authority_boundary must be an object")
+    else:
+        for field in (
+            "source_class_final_authority",
+            "source_family_final_authority",
+            "claim_family_final_authority",
+            "protected_primary_final_authority",
+            "temporal_safety_final_authority",
+            "research_sufficiency_authority",
+        ):
+            if boundary.get(field) is not False:
+                errors.append(f"{path}.authority_boundary.{field} must be false")
+
+
+def validate_source_metadata_classifier_unavailable(item: Any, path: str, errors: list[str]) -> None:
+    if not isinstance(item, dict):
+        errors.append(f"{path} must be an object")
+        return
+    for field in (
+        "artifact_type",
+        "schema_version",
+        "diagnostic_id",
+        "model_lane_id",
+        "provider_model_key",
+        "availability_status",
+        "unavailable_reason",
+        "non_blocking_when_alternative_transport_satisfies_requirements",
+        "classifier_assist_authority",
+        "reason_codes",
+    ):
+        if field not in item:
+            errors.append(f"{path} missing {field}")
+    if item.get("artifact_type") != "source_metadata_classifier_unavailable":
+        errors.append(f"{path}.artifact_type must be source_metadata_classifier_unavailable")
+    if item.get("schema_version") != SOURCE_METADATA_CLASSIFIER_UNAVAILABLE_SCHEMA_VERSION:
+        errors.append(f"{path}.schema_version must be {SOURCE_METADATA_CLASSIFIER_UNAVAILABLE_SCHEMA_VERSION}")
+    if item.get("model_lane_id") != SOURCE_METADATA_CLASSIFIER_LANE_ID:
+        errors.append(f"{path}.model_lane_id must be {SOURCE_METADATA_CLASSIFIER_LANE_ID}")
+    if item.get("provider_model_key") not in ALLOWED_SOURCE_METADATA_CLASSIFIER_PROVIDER_MODEL_KEYS:
+        errors.append(f"{path}.provider_model_key is invalid")
+    if item.get("availability_status") != "unavailable":
+        errors.append(f"{path}.availability_status must be unavailable")
+    if item.get("non_blocking_when_alternative_transport_satisfies_requirements") is not True:
+        errors.append(f"{path}.non_blocking_when_alternative_transport_satisfies_requirements must be true")
+    if not _reason_codes_are_compact(item.get("reason_codes")):
+        errors.append(f"{path}.reason_codes must be compact reason codes")
+    authority = item.get("classifier_assist_authority")
+    if not isinstance(authority, dict):
+        errors.append(f"{path}.classifier_assist_authority must be an object")
+    else:
+        for field in (
+            "source_metadata_final_authority",
+            "protected_primary_final_authority",
+            "temporal_safety_final_authority",
+            "research_sufficiency_authority",
+        ):
+            if authority.get(field) is not False:
+                errors.append(f"{path}.classifier_assist_authority.{field} must be false")
+
+
 def validate_source_metadata_resolution(item: Any, path: str, errors: list[str]) -> None:
     if not isinstance(item, dict):
         errors.append(f"{path} must be an object")
@@ -2803,6 +3510,8 @@ def validate_retrieval_packet(packet: dict[str, Any]) -> RetrievalValidationResu
         "missingness_candidates",
         "native_research_attempts",
         "native_research_transport_diagnostics",
+        "source_metadata_classifier_slices",
+        "source_metadata_classifier_unavailable_diagnostics",
         "source_metadata_resolutions",
         "retrieval_evidence_provenance_slices",
         "policy_context_ref",
@@ -2905,6 +3614,8 @@ def validate_retrieval_packet(packet: dict[str, Any]) -> RetrievalValidationResu
         "missingness_candidates",
         "native_research_attempts",
         "native_research_transport_diagnostics",
+        "source_metadata_classifier_slices",
+        "source_metadata_classifier_unavailable_diagnostics",
         "source_metadata_resolutions",
         "retrieval_evidence_provenance_slices",
     ):
@@ -2914,6 +3625,14 @@ def validate_retrieval_packet(packet: dict[str, Any]) -> RetrievalValidationResu
         errors.append("research_sufficiency_summary must be an object")
     for idx, candidate in enumerate(packet.get("omitted_candidates", []) if isinstance(packet.get("omitted_candidates"), list) else []):
         validate_candidate_record(candidate, f"omitted_candidates[{idx}]", errors)
+    for idx, item in enumerate(packet.get("source_metadata_classifier_slices", []) if isinstance(packet.get("source_metadata_classifier_slices"), list) else []):
+        validate_source_metadata_classifier_slice(item, f"source_metadata_classifier_slices[{idx}]", errors)
+    for idx, item in enumerate(packet.get("source_metadata_classifier_unavailable_diagnostics", []) if isinstance(packet.get("source_metadata_classifier_unavailable_diagnostics"), list) else []):
+        validate_source_metadata_classifier_unavailable(
+            item,
+            f"source_metadata_classifier_unavailable_diagnostics[{idx}]",
+            errors,
+        )
     for idx, item in enumerate(packet.get("source_metadata_resolutions", []) if isinstance(packet.get("source_metadata_resolutions"), list) else []):
         validate_source_metadata_resolution(item, f"source_metadata_resolutions[{idx}]", errors)
     for idx, item in enumerate(packet.get("retrieval_evidence_provenance_slices", []) if isinstance(packet.get("retrieval_evidence_provenance_slices"), list) else []):

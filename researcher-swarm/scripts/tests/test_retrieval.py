@@ -27,10 +27,13 @@ from researcher_swarm.retrieval import (  # noqa: E402
     RetrievalPacketError,
     attach_native_research_transport_diagnostics,
     attach_retrieval_expansion_and_fallback_plan,
+    attach_source_metadata_classifier_unavailable,
     attach_source_access_and_missingness,
     build_atomic_claim_candidate,
+    build_atomic_claim_candidates_from_classifier_slice,
     build_browser_retrieval_attempt,
     build_claim_family_resolution,
+    build_compact_source_candidate_packet,
     build_evidence_chunk,
     build_evidence_span,
     build_native_research_attempt,
@@ -40,8 +43,11 @@ from researcher_swarm.retrieval import (  # noqa: E402
     build_retrieval_packet_manifest,
     build_retrieval_query_contexts,
     build_retrieval_fallback_state,
+    build_source_metadata_classifier_slice,
     build_source_metadata_resolution_placeholder,
     normalize_retrieval_provenance,
+    resolve_claim_families,
+    resolve_source_metadata_classifier_lane,
     validate_temporal_eligibility,
     dump_retrieval_packet,
     validate_retrieval_packet,
@@ -416,7 +422,7 @@ class RetrievalPacketContractTest(unittest.TestCase):
 
         self.assertEqual(provenance["source_class"], "independent_secondary")
         self.assertEqual(provenance["source_metadata_classifier_ref"], "classifier:1")
-        self.assertEqual(provenance["classifier_acceptance_status"], "accepted")
+        self.assertEqual(provenance["classifier_acceptance_status"], "accepted_source_class")
         self.assertIn("domain_matches_reporter_registry", provenance["classifier_acceptance_reason_codes"])
 
     def test_classifier_protected_primary_without_deterministic_proof_does_not_count(self) -> None:
@@ -751,6 +757,238 @@ class RetrievalPacketContractTest(unittest.TestCase):
         self.assertEqual(resolution["accepted_metadata_authority"], "deterministic_source_metadata_resolver")
         self.assertIn("source_class", resolution["deterministic_resolver_accepted_fields"])
         self.assertFalse(resolution["model_proposed_metadata_counted"])
+
+    def test_source_metadata_classifier_slice_records_oauth_lane_and_compact_packet(self) -> None:
+        lane = resolve_source_metadata_classifier_lane(
+            {
+                "lanes": {
+                    "source_metadata_classifier_assist": {
+                        "provider": "openai",
+                        "default_provider_model_key": "openai/gpt-5.4-mini",
+                        "allowed_provider_model_keys": ["openai/gpt-5.4-mini", "openai/o4-mini"],
+                        "oauth_route_required": True,
+                    }
+                }
+            },
+            available_provider_model_keys=["openai/gpt-5.4-mini"],
+        )
+        candidate_packet = build_compact_source_candidate_packet(
+            {
+                "candidate_id": "candidate-news",
+                "leaf_id": "leaf-1",
+                "retrieval_transport": "browser",
+                "transport_attempt_ref": "browser-attempt-1",
+                "canonical_url": "https://news.example.com/story?utm_source=search",
+                "title": "Example publisher reports result",
+                "snippet": "A bounded passage about the example event.",
+                "publisher_metadata": {"name": "News Example"},
+            }
+        )
+        classifier_slice = build_source_metadata_classifier_slice(
+            candidate_packet,
+            {
+                "proposed_source_class": "primary_reporting",
+                "source_class_confidence": "high",
+                "proposed_source_family_hint": "news.example.com",
+                "source_family_confidence": "high",
+                "syndication_hint": "none",
+                "reason_codes": ["ordinary_publisher_page"],
+            },
+            lane=lane,
+        )
+
+        self.assertEqual(classifier_slice["model_lane_id"], "source_metadata_classifier_assist")
+        self.assertEqual(classifier_slice["provider_model_key"], "openai/gpt-5.4-mini")
+        self.assertTrue(classifier_slice["input_candidate_sha256"].startswith("sha256:"))
+        self.assertFalse(classifier_slice["authority_boundary"]["protected_primary_final_authority"])
+        self.assertLessEqual(len(candidate_packet["snippet_excerpt"]), 1200)
+
+        evidence = build_retrieval_evidence_item(
+            case_id="case-1",
+            dispatch_id="dispatch-1",
+            leaf_id=self.qdt["required_leaf_questions"][0]["leaf_id"],
+            parent_branch_id=self.qdt["required_leaf_questions"][0]["parent_branch_id"],
+            retrieval_transport="browser",
+            transport_attempt_ref="browser-attempt-1",
+            canonical_url="https://news.example.com/story",
+            source_published_at="2026-06-24T11:00:00+00:00",
+            claim_family_resolution_refs=["claim-family-example"],
+        )
+        evidence["source_metadata_classifier_slice"] = classifier_slice
+        packet = build_retrieval_packet(self.qdt, evidence_packet=self.evidence_packet, selected_evidence=[evidence])
+
+        self.assertTrue(validate_retrieval_packet(packet).valid)
+        self.assertEqual(packet["schema_feature_gates"]["RET-011"], "implemented")
+        self.assertEqual(packet["source_metadata_classifier_slices"][0]["classifier_slice_id"], classifier_slice["classifier_slice_id"])
+
+    def test_classifier_source_class_acceptance_is_bounded_to_ordinary_sources(self) -> None:
+        candidate_packet = build_compact_source_candidate_packet(
+            {
+                "candidate_id": "candidate-ordinary",
+                "leaf_id": "leaf-1",
+                "retrieval_transport": "browser",
+                "transport_attempt_ref": "browser-attempt-ordinary",
+                "canonical_url": "https://publisher.example.com/report",
+                "snippet": "Publisher reports one market-relevant claim.",
+            }
+        )
+        classifier_slice = build_source_metadata_classifier_slice(
+            candidate_packet,
+            {
+                "proposed_source_class": "primary_reporting",
+                "source_class_confidence": "high",
+                "syndication_hint": "none",
+            },
+        )
+
+        provenance = normalize_retrieval_provenance(
+            {
+                "retrieval_transport": "browser",
+                "transport_attempt_ref": "browser-attempt-ordinary",
+                "canonical_url": "https://publisher.example.com/report",
+                "source_published_at": "2026-06-24T11:00:00+00:00",
+                "claim_family_resolution_refs": ["claim-family-example"],
+            },
+            dispatch_context={
+                "forecast_timestamp": "2026-06-24T12:00:00+00:00",
+                "source_cutoff_timestamp": "2026-06-24T12:00:00+00:00",
+            },
+            classifier_slice=classifier_slice,
+        )
+
+        self.assertEqual(provenance["source_class"], "primary_reporting")
+        self.assertEqual(provenance["classifier_acceptance_status"], "accepted_source_class")
+        self.assertIn("ordinary_source_class_not_protected", provenance["classifier_acceptance_reason_codes"])
+
+        protected_slice = build_source_metadata_classifier_slice(
+            candidate_packet,
+            {
+                "proposed_source_class": "official_or_primary",
+                "source_class_confidence": "high",
+            },
+        )
+        protected_provenance = normalize_retrieval_provenance(
+            {
+                "retrieval_transport": "browser",
+                "transport_attempt_ref": "browser-attempt-protected",
+                "canonical_url": "https://publisher.example.com/report",
+                "source_published_at": "2026-06-24T11:00:00+00:00",
+            },
+            dispatch_context={
+                "forecast_timestamp": "2026-06-24T12:00:00+00:00",
+                "source_cutoff_timestamp": "2026-06-24T12:00:00+00:00",
+            },
+            classifier_slice=protected_slice,
+        )
+
+        self.assertEqual(protected_provenance["source_class"], "unknown")
+        self.assertEqual(protected_provenance["classifier_acceptance_status"], "classifier_unsupported")
+        self.assertIn("classifier_unsupported_for_protected_primary", protected_provenance["unknown_reason_codes"])
+
+    def test_classifier_family_claim_and_visible_date_require_deterministic_validation(self) -> None:
+        candidate_packet = build_compact_source_candidate_packet(
+            {
+                "candidate_id": "candidate-claim",
+                "leaf_id": "leaf-1",
+                "retrieval_transport": "browser",
+                "transport_attempt_ref": "browser-attempt-claim",
+                "snippet": "The event was confirmed on June 24.",
+            }
+        )
+        classifier_slice = build_source_metadata_classifier_slice(
+            candidate_packet,
+            {
+                "proposed_source_class": "unknown",
+                "source_class_confidence": "unknown",
+                "proposed_source_family_hint": "wire-service-example",
+                "source_family_confidence": "high",
+                "syndication_hint": "reuters_copy",
+                "visible_date_candidates": [{"date_text": "2026-06-24T10:00:00+00:00"}],
+                "atomic_claim_candidates": [
+                    {
+                        "subject": "Example event",
+                        "predicate": "was confirmed",
+                        "object_or_value": "yes",
+                        "event_time": "2026-06-24",
+                        "entity_or_jurisdiction": "example",
+                        "condition_scope": "unconditional",
+                        "polarity": "affirmed",
+                        "supporting_span_refs": ["retrieval-span-1"],
+                        "confidence": "high",
+                    }
+                ],
+            },
+        )
+
+        unsupported_family = normalize_retrieval_provenance(
+            {
+                "retrieval_transport": "browser",
+                "transport_attempt_ref": "browser-attempt-claim",
+            },
+            dispatch_context={
+                "forecast_timestamp": "2026-06-24T12:00:00+00:00",
+                "source_cutoff_timestamp": "2026-06-24T12:00:00+00:00",
+            },
+            classifier_slice=classifier_slice,
+        )
+        self.assertEqual(unsupported_family["source_family_id"], "source-family-unknown")
+        self.assertEqual(unsupported_family["temporal_gate_status"], "pass")
+        self.assertEqual(unsupported_family["classifier_acceptance_status"], "accepted_visible_date_candidate")
+        self.assertIn(
+            "classifier_source_family_hint_without_deterministic_support",
+            unsupported_family["unknown_reason_codes"],
+        )
+
+        claim_candidates = build_atomic_claim_candidates_from_classifier_slice(
+            evidence_ref="retrieval-evidence-claim",
+            leaf_id="leaf-1",
+            chunk_refs=["retrieval-chunk-1"],
+            classifier_slice=classifier_slice,
+        )
+        claim_resolutions = resolve_claim_families(claim_candidates)
+        self.assertEqual(claim_candidates[0]["validation_status"], "accepted_for_normalization")
+        self.assertNotEqual(claim_resolutions[0]["claim_family_id"], "claim-family-unknown")
+        self.assertEqual(claim_resolutions[0]["resolution_method"], "candidate_validated_then_deterministic_tuple_hash")
+
+        no_span_slice = build_source_metadata_classifier_slice(
+            candidate_packet,
+            {
+                "atomic_claim_candidates": [
+                    {
+                        "subject": "Example event",
+                        "predicate": "was confirmed",
+                        "object_or_value": "yes",
+                    }
+                ],
+            },
+        )
+        no_span_candidates = build_atomic_claim_candidates_from_classifier_slice(
+            evidence_ref="retrieval-evidence-claim",
+            leaf_id="leaf-1",
+            chunk_refs=["retrieval-chunk-1"],
+            classifier_slice=no_span_slice,
+        )
+        self.assertEqual(no_span_candidates[0]["validation_status"], "rejected_no_span")
+
+    def test_classifier_unavailable_is_non_blocking_diagnostic(self) -> None:
+        packet = build_retrieval_packet(self.qdt, evidence_packet=self.evidence_packet)
+
+        packet = attach_source_metadata_classifier_unavailable(
+            packet,
+            available_provider_model_keys=[],
+            unavailable_reason="openai_oauth_classifier_route_unavailable",
+        )
+
+        self.assertTrue(validate_retrieval_packet(packet).valid)
+        self.assertEqual(packet["schema_feature_gates"]["RET-011"], "implemented")
+        diagnostic = packet["source_metadata_classifier_unavailable_diagnostics"][0]
+        self.assertEqual(diagnostic["artifact_type"], "source_metadata_classifier_unavailable")
+        self.assertTrue(diagnostic["non_blocking_when_alternative_transport_satisfies_requirements"])
+        self.assertFalse(diagnostic["classifier_assist_authority"]["protected_primary_final_authority"])
+        self.assertEqual(
+            packet["research_sufficiency_summary"]["classification_dispatch_status"],
+            "blocked_until_certified",
+        )
 
     def test_forbidden_probability_field_is_rejected(self) -> None:
         packet = build_retrieval_packet(self.qdt, evidence_packet=self.evidence_packet)
