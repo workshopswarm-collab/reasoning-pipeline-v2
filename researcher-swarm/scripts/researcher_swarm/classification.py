@@ -8,6 +8,12 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
+from .model_context import (
+    DEFAULT_MODEL_LANE_POLICY_PATH,
+    resolve_researcher_leaf_nli_model_context,
+    validate_researcher_model_execution_context,
+)
+
 
 RESEARCHER_NLI_PROMPT_CONTRACT_SCHEMA_VERSION = "researcher-nli-prompt-contract/v1"
 RESEARCHER_NLI_PROMPT_TEMPLATE_ID = "researcher-leaf-nli/v1"
@@ -189,6 +195,8 @@ def build_researcher_nli_prompt_contract(
     *,
     qdt: dict[str, Any],
     retrieval_packet: dict[str, Any],
+    model_execution_context: dict[str, Any] | None = None,
+    model_lane_policy_path: Any = DEFAULT_MODEL_LANE_POLICY_PATH,
     output_contract_ref: str = "schema:researcher-sidecar/v2",
     classification_contract_ref: str = "schema:researcher-classification/v1",
     coverage_contract_ref: str = "schema:researcher-coverage-proof/v1",
@@ -284,6 +292,22 @@ def build_researcher_nli_prompt_contract(
     if missing:
         raise ClassificationPromptContractError("prompt contract missing required leaf inputs: " + ", ".join(sorted(missing)))
 
+    if model_execution_context:
+        resolved_model_context = copy.deepcopy(model_execution_context)
+    else:
+        resolved_model_context = resolve_researcher_leaf_nli_model_context(
+            model_lane_policy_path=model_lane_policy_path,
+            prompt_template_id=RESEARCHER_NLI_PROMPT_TEMPLATE_ID,
+            prompt_template_sha256=RESEARCHER_NLI_PROMPT_TEMPLATE_SHA256,
+            sidecar_schema_version=RESEARCHER_SIDECAR_SCHEMA_VERSION,
+            classification_output_schema_version=RESEARCHER_CLASSIFICATION_SCHEMA_VERSION,
+        )
+    model_validation = validate_researcher_model_execution_context(resolved_model_context)
+    if not model_validation.valid:
+        raise ClassificationPromptContractError(
+            "model_execution_context invalid: " + "; ".join(model_validation.errors)
+        )
+
     context_payload = {
         "case_id": qdt.get("case_id"),
         "dispatch_id": qdt.get("dispatch_id"),
@@ -307,6 +331,7 @@ def build_researcher_nli_prompt_contract(
             "classification_contract_ref": classification_contract_ref,
             "coverage_contract_ref": coverage_contract_ref,
         },
+        "model_execution_context": resolved_model_context,
         "authority_boundary": {
             "researcher_work_type": "evidence_classification_not_forecasting",
             "forecast_authority": False,
@@ -343,12 +368,13 @@ def build_researcher_nli_prompt_contract(
             "prompt_template_version": RESEARCHER_NLI_PROMPT_TEMPLATE_VERSION,
             "prompt_template_sha256": RESEARCHER_NLI_PROMPT_TEMPLATE_SHA256,
         },
+        "model_execution_context": resolved_model_context,
         "context_payload": context_payload,
         "prompt_text": prompt_text,
         "prompt_text_sha256": _prefixed_sha256(prompt_text),
         "scope_boundaries": {
-            "implements": ["CLS-001"],
-            "not_implemented": ["CLS-006", "CLS-007", "CLS-008", "CLS-002", "CLS-003", "CLS-004", "CLS-005", "MODEL-003", "VER-001", "VER-002", "VER-003", "VER-004", "SCAE"],
+            "implements": ["CLS-001", "MODEL-003"],
+            "not_implemented": ["CLS-006", "CLS-007", "CLS-008", "CLS-002", "CLS-003", "CLS-004", "CLS-005", "VER-001", "VER-002", "VER-003", "VER-004", "SCAE"],
         },
     }
     validation = validate_researcher_nli_prompt_contract(contract)
@@ -371,6 +397,7 @@ def validate_researcher_nli_prompt_contract(contract: Any) -> ClassificationProm
     template = contract.get("prompt_template")
     if not isinstance(template, dict):
         errors.append("prompt_template must be an object")
+        template = {}
     else:
         if template.get("prompt_template_id") != RESEARCHER_NLI_PROMPT_TEMPLATE_ID:
             errors.append("prompt_template_id is invalid")
@@ -440,6 +467,19 @@ def validate_researcher_nli_prompt_contract(contract: Any) -> ClassificationProm
         for field in ("sidecar_contract_ref", "classification_contract_ref", "coverage_contract_ref"):
             if not _is_non_empty_string(output_refs.get(field)):
                 errors.append(f"output_sidecar_contract_refs.{field} is required")
+
+    model_context = contract.get("model_execution_context")
+    payload_model_context = payload.get("model_execution_context") if isinstance(payload, dict) else None
+    if model_context != payload_model_context:
+        errors.append("model_execution_context must match context_payload.model_execution_context")
+    model_validation = validate_researcher_model_execution_context(model_context)
+    if not model_validation.valid:
+        errors.extend(f"model_execution_context.{error}" for error in model_validation.errors)
+    elif isinstance(template, dict):
+        if model_context.get("prompt_template_id") != template.get("prompt_template_id"):
+            errors.append("model_execution_context.prompt_template_id must match prompt_template")
+        if model_context.get("prompt_template_sha256") != template.get("prompt_template_sha256"):
+            errors.append("model_execution_context.prompt_template_sha256 must match prompt_template")
 
     authority = payload.get("authority_boundary")
     if not isinstance(authority, dict):

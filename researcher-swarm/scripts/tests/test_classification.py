@@ -28,6 +28,11 @@ from researcher_swarm.classification import (  # noqa: E402
     build_researcher_nli_prompt_contract,
     validate_researcher_nli_prompt_contract,
 )
+from researcher_swarm.model_context import (  # noqa: E402
+    MODEL_LANE_POLICY_REF,
+    RESEARCHER_MODEL_ID,
+    RESEARCHER_MODEL_LANE_ID,
+)
 from researcher_swarm.retrieval import (  # noqa: E402
     build_retrieval_evidence_item,
     build_retrieval_packet,
@@ -162,17 +167,33 @@ class ResearcherClassificationPromptContractTest(unittest.TestCase):
         self.assertEqual(contract["prompt_template"]["prompt_template_sha256"], RESEARCHER_NLI_PROMPT_TEMPLATE_SHA256)
         self.assertEqual(contract["schema_metadata"]["sidecar_schema_version"], "researcher-sidecar/v2")
         self.assertEqual(contract["schema_metadata"]["classification_schema_version"], "researcher-classification/v1")
+        self.assertIn("MODEL-003", contract["scope_boundaries"]["implements"])
+        self.assertNotIn("MODEL-003", contract["scope_boundaries"]["not_implemented"])
 
         payload = contract["context_payload"]
         self.assertEqual(payload["macro_question"], "Will example happen?")
         self.assertTrue(payload["market_constraints"]["read_only"])
         self.assertEqual(payload["retrieval_dispatch_gate"]["classification_dispatch_status"], "allowed")
+        self.assertEqual(payload["model_execution_context"], contract["model_execution_context"])
         self.assertEqual(payload["forbidden_output_fields"], list(FORBIDDEN_OUTPUT_FIELDS))
         self.assertEqual(payload["forbidden_context_ref_patterns"], list(FORBIDDEN_CONTEXT_REF_PATTERNS))
         self.assertFalse(payload["authority_boundary"]["probability_authority"])
         self.assertFalse(payload["authority_boundary"]["fair_value_authority"])
         self.assertFalse(payload["authority_boundary"]["interval_authority"])
         self.assertFalse(payload["authority_boundary"]["decision_authority"])
+
+        model_context = contract["model_execution_context"]
+        self.assertEqual(model_context["feature_id"], "MODEL-003")
+        self.assertEqual(model_context["model_lane_id"], RESEARCHER_MODEL_LANE_ID)
+        self.assertEqual(model_context["resolved_model_id"], RESEARCHER_MODEL_ID)
+        self.assertEqual(model_context["model_policy_ref"], MODEL_LANE_POLICY_REF)
+        self.assertEqual(model_context["prompt_template_id"], RESEARCHER_NLI_PROMPT_TEMPLATE_ID)
+        self.assertEqual(model_context["prompt_template_sha256"], RESEARCHER_NLI_PROMPT_TEMPLATE_SHA256)
+        self.assertEqual(model_context["sidecar_schema_version"], "researcher-sidecar/v2")
+        self.assertEqual(model_context["classification_output_schema_version"], "researcher-classification/v1")
+        self.assertFalse(model_context["runtime"]["model_call_performed"])
+        self.assertIn("metadata_only_no_model_call", model_context["runtime_reason_codes"])
+        self.assertEqual(model_context["fallback_reason_codes"], ["no_fallback_required"])
 
         leaves = payload["flattened_required_leaves"]
         self.assertEqual(
@@ -193,7 +214,6 @@ class ResearcherClassificationPromptContractTest(unittest.TestCase):
         self.assertIn("evidence classification", contract["prompt_text"])
         self.assertIn("Do not forecast", contract["prompt_text"])
         self.assertIn("scae-ledger:*", contract["prompt_text"])
-        self.assertIn("MODEL-003", contract["scope_boundaries"]["not_implemented"])
 
     def test_prompt_contract_fails_closed_when_retrieval_dispatch_is_not_allowed(self) -> None:
         packet = self._certifiable_packet()
@@ -212,7 +232,7 @@ class ResearcherClassificationPromptContractTest(unittest.TestCase):
         with self.assertRaisesRegex(ClassificationPromptContractError, "blocked_until_certified"):
             build_researcher_nli_prompt_contract(qdt=self.qdt, retrieval_packet=not_finalized)
 
-    def test_contract_is_deterministic_ref_oriented_and_not_model_lane_resolution(self) -> None:
+    def test_contract_is_deterministic_ref_oriented_and_records_model_lane_resolution(self) -> None:
         packet = self._certifiable_packet()
 
         first = build_researcher_nli_prompt_contract(qdt=self.qdt, retrieval_packet=packet)
@@ -221,7 +241,15 @@ class ResearcherClassificationPromptContractTest(unittest.TestCase):
         self.assertEqual(first["prompt_contract_id"], second["prompt_contract_id"])
         self.assertEqual(first["prompt_contract_digest"], second["prompt_contract_digest"])
         self.assertEqual(first["prompt_text_sha256"], second["prompt_text_sha256"])
-        self.assertFalse(_contains_key(first, "resolved_model_id"))
+        self.assertEqual(first["model_execution_context"], second["model_execution_context"])
+        self.assertEqual(
+            first["model_execution_context"]["resolved_model_id"],
+            RESEARCHER_MODEL_ID,
+        )
+        self.assertEqual(
+            first["model_execution_context"]["model_context_digest"],
+            second["model_execution_context"]["model_context_digest"],
+        )
         for leaf in first["context_payload"]["flattened_required_leaves"]:
             for evidence_ref in leaf["assigned_evidence_refs"]:
                 self.assertIn("evidence_ref", evidence_ref)

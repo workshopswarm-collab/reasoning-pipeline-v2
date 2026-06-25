@@ -245,7 +245,7 @@
     {"id": "CLS-004", "stage": "v2_live_cutover", "owner": "Session 4", "status": "not_started", "dependencies": ["CLS-003", "RET-004"]},
     {"id": "CLS-005", "stage": "v2_live_cutover", "owner": "Session 4", "status": "not_started", "dependencies": ["CLS-002", "CLS-003", "CLS-006", "CLS-008", "RET-008"]},
     {"id": "CLS-007", "stage": "v2_live_cutover", "owner": "Session 4", "status": "not_started", "dependencies": ["CLS-003", "CLS-005", "VER-001", "VER-002", "RET-008", "QDT-005", "POL-003"]},
-    {"id": "MODEL-003", "stage": "v2_live_cutover", "owner": "Session 4", "status": "not_started", "dependencies": ["MODEL-001", "CLS-001"]},
+    {"id": "MODEL-003", "stage": "v2_live_cutover", "owner": "Session 4", "status": "ready_for_integration", "dependencies": ["MODEL-001", "CLS-001"], "acceptance_evidence": "2026-06-25 Session 04 MODEL-003 added researcher_swarm/model_context.py metadata-only researcher_leaf_nli_classification lane resolution for policy-default gpt-5.5-high, recording policy ref/id/hash, lane id, resolved model, prompt template id/hash, sidecar/classification schema metadata, runtime/fallback reason codes, no-model-call status, and no-probability forbidden outputs; CLS-001 prompt contracts embed the execution context without classifier result semantics."},
     {"id": "VER-001", "stage": "v2_live_cutover", "owner": "Session 4", "status": "not_started", "dependencies": ["CLS-003", "FND-004"]},
     {"id": "VER-002", "stage": "v2_live_cutover", "owner": "Session 4", "status": "not_started", "dependencies": ["CLS-003", "FND-004"]},
     {"id": "VER-003", "stage": "v2_live_cutover", "owner": "Session 4", "status": "not_started", "dependencies": ["CLS-002", "CLS-005", "VER-001", "VER-002"]},

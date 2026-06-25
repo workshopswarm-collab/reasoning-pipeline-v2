@@ -110,6 +110,7 @@ Root-level runtime entrypoints should be avoided except for compatibility shims 
 | `/Users/agent2/.openclaw/researcher-swarm/scripts/researcher_swarm/isolation.py` | `CLS-008` | Importable context isolation policy, allowlist/denylist scans, and audit helpers. |
 | `/Users/agent2/.openclaw/researcher-swarm/scripts/researcher_swarm/escalation.py` | `CLS-007` | Importable adaptive escalation policy, caps, pre-SCAE leverage proxy, and decision artifact helpers. |
 | `/Users/agent2/.openclaw/researcher-swarm/scripts/researcher_swarm/classification.py` | `CLS-001` to `CLS-005` | Importable classification sidecar and coverage proof helpers. |
+| `/Users/agent2/.openclaw/researcher-swarm/scripts/researcher_swarm/model_context.py` | `MODEL-003` | Importable metadata-only researcher leaf NLI model lane resolver and execution-context validator. |
 | `/Users/agent2/.openclaw/researcher-swarm/scripts/researcher_swarm/verification.py` | `VER-001` to `VER-004` | Importable verification and sufficiency reconciliation helpers. |
 | `/Users/agent2/.openclaw/researcher-swarm/scripts/researcher_swarm/subagents.py` | `CLS-001`, `MODEL-003` | Leaf researcher subagent coordination helpers. |
 
