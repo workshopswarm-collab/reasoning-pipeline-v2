@@ -15,6 +15,7 @@ from scae.intervals import build_pre_debt_ledger_output  # noqa: E402
 from scae.ledger import apply_research_sufficiency_guard, finalize_scae_probability_fields  # noqa: E402
 from scae.persistence import (  # noqa: E402
     FORECAST_DECISION_TABLE,
+    FORECAST_DECISION_MIGRATION,
     MIG007_TABLES,
     MISSINGNESS_SIGNAL_TABLE,
     PERSIST001_SCHEMA_VERSION,
@@ -575,6 +576,65 @@ class ScaePersistenceTest(unittest.TestCase):
         }
         self.assertIn(FORECAST_DECISION_TABLE, tables)
         self.assertNotIn("market_predictions", tables)
+
+    def test_mig008_migration_defines_forecast_decision_and_existing_bridge_surfaces(self):
+        with sqlite3.connect(":memory:") as conn:
+            conn.executescript(FORECAST_DECISION_MIGRATION.read_text(encoding="utf-8"))
+            tables = {
+                row[0]
+                for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+            }
+            decision_columns = {
+                row[1]
+                for row in conn.execute(f"PRAGMA table_info({FORECAST_DECISION_TABLE})").fetchall()
+            }
+
+        self.assertIn(FORECAST_DECISION_TABLE, tables)
+        self.assertNotIn("market_predictions", tables)
+        self.assertTrue(
+            {
+                "forecast_decision_id",
+                "scae_ledger_id",
+                "decision_gate_id",
+                "synthesis_annotation_ref",
+                "production_forecast_prob",
+                "canonical_probability",
+                "forecast_validity_status",
+                "execution_authority_status",
+                "actionability_status",
+                "production_forecast_persisted",
+                "writes_market_prediction",
+                "artifact_sha256",
+            }.issubset(decision_columns)
+        )
+
+        with sqlite3.connect(":memory:") as conn:
+            conn.row_factory = sqlite3.Row
+            ensure_schema(conn)
+            prediction_columns = {
+                row[1]
+                for row in conn.execute("PRAGMA table_info(market_predictions)").fetchall()
+            }
+
+        self.assertTrue(
+            {
+                "prediction_run_id",
+                "forecast_artifact_id",
+                "case_key",
+                "case_id",
+                "dispatch_id",
+                "engine_stage",
+                "predicted_probability",
+                "market_probability",
+                "market_probability_method",
+                "market_snapshot_id",
+                "source_fetched_at",
+                "source_payload_hash",
+                "input_artifact_sha256",
+                "prediction_artifact_sha256",
+                "snapshot_age_seconds",
+            }.issubset(prediction_columns)
+        )
 
     def test_write_forecast_decision_uses_only_scae_probability_and_is_idempotent(self):
         self.conn.execute("CREATE TABLE market_predictions (id TEXT PRIMARY KEY, marker TEXT NOT NULL)")

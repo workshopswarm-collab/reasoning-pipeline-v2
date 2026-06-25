@@ -1,8 +1,9 @@
 """SCAE persistence surfaces for ledger audit and forecast decisions.
 
 MIG-007 stores SCAE-owned ledger artifacts and diagnostic slices. PERSIST-001
-adds the SCAE-only forecast decision record. It does not bridge to
-market_predictions, scoring, replay, or calibration tuning surfaces.
+adds the SCAE-only forecast decision record. MIG-008 binds that record and the
+existing market_predictions bridge for scoreable SCAE production forecasts. It
+does not add scoring, replay, or calibration tuning surfaces.
 """
 
 from __future__ import annotations
@@ -50,6 +51,11 @@ SCAE_LEDGER_MIGRATION = (
     Path(__file__).resolve().parents[1]
     / "migrations"
     / "007_scae_ledger_probability_audit.sql"
+)
+FORECAST_DECISION_MIGRATION = (
+    Path(__file__).resolve().parents[1]
+    / "migrations"
+    / "008_forecast_decision_records.sql"
 )
 
 VALIDITY_INVALID = "invalid_for_forecast"
@@ -309,57 +315,9 @@ def ensure_scae_ledger_schema(conn: sqlite3.Connection) -> None:
 
 
 def ensure_forecast_decision_schema(conn: sqlite3.Connection) -> None:
-    """Create the PERSIST-001 forecast decision table."""
+    """Create the MIG-008/PERSIST-001 forecast decision table."""
 
-    conn.executescript(
-        f"""
-        PRAGMA foreign_keys = ON;
-
-        CREATE TABLE IF NOT EXISTS {FORECAST_DECISION_TABLE} (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          forecast_decision_id TEXT NOT NULL UNIQUE,
-          schema_version TEXT NOT NULL,
-          case_id TEXT NOT NULL,
-          case_key TEXT,
-          dispatch_id TEXT NOT NULL,
-          run_id TEXT,
-          forecast_timestamp TEXT,
-          scae_ledger_id TEXT NOT NULL,
-          scae_ledger_digest TEXT NOT NULL,
-          decision_gate_id TEXT NOT NULL,
-          decision_gate_digest TEXT NOT NULL,
-          synthesis_annotation_ref TEXT,
-          synthesis_annotation_digest TEXT,
-          production_forecast_prob REAL,
-          canonical_probability REAL,
-          forecast_validity_status TEXT NOT NULL,
-          execution_authority_status TEXT NOT NULL,
-          actionability_status TEXT NOT NULL,
-          final_probability_fields_status TEXT NOT NULL,
-          production_persistence_status TEXT NOT NULL,
-          production_forecast_persisted INTEGER NOT NULL DEFAULT 0,
-          scoreable_forecast_output INTEGER NOT NULL DEFAULT 0,
-          writes_market_prediction INTEGER NOT NULL DEFAULT 0,
-          probability_source TEXT NOT NULL,
-          decision_effect_status TEXT NOT NULL,
-          non_scoreable_reason_code TEXT,
-          metadata_json TEXT NOT NULL DEFAULT '{{}}',
-          artifact_payload_json TEXT NOT NULL,
-          artifact_sha256 TEXT NOT NULL,
-          scae_ledger_payload_sha256 TEXT NOT NULL,
-          decision_gate_payload_sha256 TEXT NOT NULL,
-          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-          updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_forecast_decision_case
-          ON {FORECAST_DECISION_TABLE}(case_id, dispatch_id);
-        CREATE INDEX IF NOT EXISTS idx_forecast_decision_scae
-          ON {FORECAST_DECISION_TABLE}(scae_ledger_id, decision_gate_id);
-        CREATE INDEX IF NOT EXISTS idx_forecast_decision_status
-          ON {FORECAST_DECISION_TABLE}(forecast_validity_status, actionability_status);
-        """
-    )
+    conn.executescript(FORECAST_DECISION_MIGRATION.read_text(encoding="utf-8"))
 
 
 def _rows_from(value: Any, field_name: str) -> list[dict[str, Any]]:

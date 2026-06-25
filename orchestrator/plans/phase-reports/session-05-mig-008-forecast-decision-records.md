@@ -1,0 +1,25 @@
+# Session 05 MIG-008: Forecast Decision Records
+
+- Session: 05
+- Phase: MIG-008
+- Owner: Session 5
+- Feature IDs: `SYN-001`, `DEC-001`, `PERSIST-001`, `PERSIST-002`
+- Migration Groups: `MIG-008`
+- Status: local implementation complete; push held for coordinator review
+- Acceptance Evidence: Added explicit MIG-008 schema creation in `/Users/agent2/.openclaw/SCAE/scripts/migrations/008_forecast_decision_records.sql` and wired `/Users/agent2/.openclaw/SCAE/scripts/scae/persistence.py` so `write_forecast_decision()` creates `forecast_decision_records` from the durable migration file instead of an inline schema. The table persists only SCAE-owned `production_forecast_prob`/`canonical_probability`, SCAE/DEC/SYN refs and digests, forecast validity, execution authority, actionability, stable hashes, and blocked/non-scoreable invalid-forecast status. The existing PERSIST-002 bridge continues to write the same SCAE production probability into the existing `market_predictions` spine through `record_market_prediction()` or `record_prediction_with_snapshot()` with `ads-case-contract/v1` snapshot provenance. Decision and synthesis remain non-authoritative; this slice adds no scoring, calibration, replay, AUTO rows, or second probability authority.
+- Checks Run:
+  - `python3 orchestrator/plans/check_dependency_gates.py` -> `inventory valid`
+  - `python3 orchestrator/plans/check_dependency_gates.py --all --mode runtime_integration --report-only` -> report-only sweep passed with expected later blockers only: `CAL-001`, `CAL-002`, `CAL-003`, `CAL-004`, `CAL-005`
+  - `python3 orchestrator/plans/check_dependency_gates.py --migration-id MIG-008 --mode runtime_integration --report-only` -> `OK MIG-008 mode=runtime_integration`
+  - `python3 orchestrator/plans/check_dependency_gates.py --feature-id PERSIST-002 --mode runtime_integration --report-only` -> `OK PERSIST-002 mode=runtime_integration`
+  - `python3 -m unittest discover -s orchestrator/plans/tests` -> 13 tests, OK
+  - `python3 -m unittest discover -s orchestrator/scripts/tests` -> 144 tests, OK
+  - `PYTHONPATH=SCAE/scripts python3 -m unittest discover -s SCAE/scripts/tests` -> 96 tests, OK
+  - `PYTHONPATH=SCAE/scripts python3 -m unittest SCAE/scripts/tests/test_scae_persistence.py` -> 20 tests, OK
+  - `python3 -m unittest orchestrator/scripts/tests/test_prediction_provenance.py` -> 2 tests, OK
+  - `git diff --check` -> OK
+  - `git diff --cached --check` -> OK
+- Shared Inventory Updates Requested: Mark `MIG-008` `ready_for_integration` after coordinator review, with acceptance evidence covering the durable `forecast_decision_records` migration, SCAE-only `write_forecast_decision()` probability persistence, existing `market_predictions` bridge coverage through `record_market_prediction()` and `record_prediction_with_snapshot()`, idempotent prediction identity, case-contract snapshot provenance, invalid/non-scoreable blocking, and no scoring/calibration/replay/AUTO authority.
+- Shared Map/Matrix Updates Requested: Reconcile the schema-name map entry for `forecast_decision_records` from `needs_new_migration` to implemented SCAE-local SQLite migration. BLK-002 can use this MIG-008 evidence with PERSIST-001 evidence; BLK-031 still needs the later SCORE-001/MIG-010 resolution-scoring side before full scoring readiness.
+- Expected Reconciliation Effects: `MIG-008` should become `ready_for_integration`. `SYN-001`, `DEC-001`, `PERSIST-001`, and `PERSIST-002` remain ready and retain their authority boundaries. `SCORE-001`, `CAL-*`, `MIG-010`, and AUTO loop rows are not implemented or advanced by this migration.
+- Blockers: No implementation blocker. Coordinator reconciliation is required before shared inventory status changes.
