@@ -32,6 +32,13 @@ def _add_orchestrator_scripts_to_path() -> None:
 _add_orchestrator_scripts_to_path()
 
 from predquant.ads_handoff import ArtifactManifestContext, build_artifact_manifest, canonical_json
+from predquant.ads_stage_logging import (
+    StageContext,
+    build_stage_execution_event,
+    build_stage_status_snapshot,
+    validate_stage_execution_event,
+    validate_stage_status_snapshot,
+)
 
 
 RETRIEVAL_PACKET_ARTIFACT_TYPE = "retrieval_packet"
@@ -62,6 +69,7 @@ PROTECTED_PRIMARY_ACCESS_FAILURE_SCHEMA_VERSION = "protected-primary-access-fail
 EXPECTED_SOURCE_MISSINGNESS_CANDIDATE_SCHEMA_VERSION = "expected-source-missingness-candidate/v1"
 RETRIEVAL_EXPANSION_ATTEMPT_SCHEMA_VERSION = "retrieval-expansion-attempt/v1"
 RETRIEVAL_FALLBACK_STATE_SCHEMA_VERSION = "retrieval-fallback-state/v1"
+RESEARCH_SUFFICIENCY_CERTIFICATE_SCHEMA_VERSION = "research-sufficiency-certificate/v1"
 NATIVE_RESEARCH_TRANSPORT_DIAGNOSTIC_SCHEMA_VERSION = "native-research-transport-diagnostic/v1"
 RETRIEVAL_VALIDATOR_VERSION = "ads-ret-002-004-retrieval-schema/v1"
 RETRIEVAL_QUERY_PLANNER_VERSION = "ads-ret-001-query-planner/v1"
@@ -70,6 +78,7 @@ RETRIEVAL_PROVENANCE_NORMALIZER_VERSION = "ads-ret-004-provenance-normalizer/v1"
 RETRIEVAL_SOURCE_ACCESS_TRACKER_VERSION = "ads-ret-005-source-access-missingness/v1"
 RETRIEVAL_EXPANSION_FALLBACK_VERSION = "ads-ret-006-expansion-fallback/v1"
 RETRIEVAL_BREADTH_EVALUATOR_VERSION = "ads-ret-009-breadth-profile-coverage/v1"
+RESEARCH_SUFFICIENCY_CERTIFIER_VERSION = "ads-ret-008-research-sufficiency-dispatch-gate/v1"
 NATIVE_RESEARCH_RESOLVER_VERSION = "ads-ret-010-native-diagnostic-resolver/v1"
 SOURCE_METADATA_CLASSIFIER_VERSION = "ads-ret-011-source-metadata-classifier/v1"
 OPENCLAW_BROWSER_PROVIDER_ID = "openclaw_web_fetch_browser"
@@ -176,6 +185,20 @@ ALLOWED_SOURCE_FAMILY_STATUSES = {
     "mirrored_api_endpoint",
     "content_hash_dedupe",
     "unknown_not_counted",
+}
+ALLOWED_RESEARCH_SUFFICIENCY_STATUSES = {
+    "certified_high_certainty",
+    "blocked_insufficient_research",
+    "blocked_missing_breadth",
+    "blocked_stale",
+    "blocked_temporal_invalid",
+    "blocked_macro_fallback_only",
+    "structurally_unanswerable",
+}
+ALLOWED_CLASSIFICATION_DISPATCH_STATUSES = {
+    "blocked_until_certified",
+    "allowed",
+    "blocked_insufficient_research",
 }
 DEFAULT_LIVE_RETRIEVAL_TRANSPORT_ALLOWLIST = {
     "browser",
@@ -3345,6 +3368,443 @@ def attach_retrieval_expansion_and_fallback_plan(
     return packet_copy
 
 
+def _coverage_by_leaf(packet: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    coverage = packet.get("retrieval_breadth_coverage_slices", [])
+    if not isinstance(coverage, list):
+        return {}
+    return {
+        item.get("leaf_id"): item
+        for item in coverage
+        if isinstance(item, dict) and _is_non_empty_string(item.get("leaf_id"))
+    }
+
+
+def _fallback_by_leaf(packet: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    states = packet.get("retrieval_fallback_states", [])
+    if not isinstance(states, list):
+        return {}
+    return {
+        item.get("leaf_id"): item
+        for item in states
+        if isinstance(item, dict) and _is_non_empty_string(item.get("leaf_id"))
+    }
+
+
+def _expansion_attempts_by_leaf(packet: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+    attempts = packet.get("retrieval_expansion_attempts", [])
+    if not isinstance(attempts, list):
+        return {}
+    return _attempts_by_leaf(attempts)
+
+
+def _max_expansion_attempts(context: dict[str, Any]) -> int:
+    requirements = context.get("sufficiency_requirements")
+    if not isinstance(requirements, dict):
+        return 1
+    value = requirements.get("max_targeted_expansion_attempts", 1)
+    if isinstance(value, bool):
+        return 1
+    try:
+        return max(1, int(value))
+    except (TypeError, ValueError):
+        return 1
+
+
+def _structural_unanswerability_proof_ref(
+    context: dict[str, Any],
+    result: dict[str, Any] | None,
+    coverage: dict[str, Any] | None,
+) -> str | None:
+    requirements = context.get("sufficiency_requirements")
+    candidates = []
+    if isinstance(requirements, dict):
+        candidates.append(requirements.get("structural_unanswerability_proof_ref"))
+    candidates.append((result or {}).get("structural_unanswerability_proof_ref"))
+    candidates.append((coverage or {}).get("structural_unanswerability_proof_ref"))
+    for candidate in candidates:
+        if _is_non_empty_string(candidate):
+            return str(candidate)
+    return None
+
+
+def _freshness_status(
+    context: dict[str, Any],
+    coverage: dict[str, Any] | None,
+    unsatisfied: set[str],
+) -> str:
+    targets = context.get("breadth_targets") if isinstance(context.get("breadth_targets"), dict) else {}
+    minimum = targets.get("min_temporally_fresh_sources", 0)
+    try:
+        minimum_value = int(minimum)
+    except (TypeError, ValueError):
+        minimum_value = 0
+    if minimum_value <= 0:
+        return "not_required"
+    if "freshness" in unsatisfied:
+        return "stale_or_missing_fresh_source"
+    if not isinstance(coverage, dict):
+        return "unknown_not_certified"
+    if coverage.get("fresh_source_count", 0) >= minimum_value:
+        return "freshness_window_satisfied"
+    return "stale_or_missing_fresh_source"
+
+
+def certify_leaf_research_sufficiency(
+    query_context: dict[str, Any],
+    result: dict[str, Any] | None,
+    *,
+    packet: dict[str, Any],
+    coverage: dict[str, Any] | None = None,
+    expansion_attempts: list[dict[str, Any]] | None = None,
+    fallback_state: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    requirements = query_context.get("sufficiency_requirements")
+    if not isinstance(requirements, dict):
+        requirements = {}
+    selected = _selected_from_result(result)
+    expansion_attempts = expansion_attempts or []
+    expansion_refs = [
+        item["attempt_id"]
+        for item in expansion_attempts
+        if isinstance(item, dict) and _is_non_empty_string(item.get("attempt_id"))
+    ]
+    unsatisfied: set[str] = set()
+    blocking: set[str] = set()
+    breadth_coverage_ref = None
+    breadth_certified = False
+    if isinstance(coverage, dict):
+        breadth_coverage_ref = coverage.get("coverage_id")
+        breadth_certified = bool(coverage.get("breadth_certified") is True)
+        for code in coverage.get("unsatisfied_breadth_dimensions", []):
+            if _is_non_empty_string(code):
+                unsatisfied.add(str(code))
+        for code in coverage.get("expansion_requirement_codes", []):
+            if _is_non_empty_string(code):
+                unsatisfied.add(str(code))
+    else:
+        unsatisfied.add("missing_breadth_coverage")
+        blocking.add("missing_breadth_coverage")
+    for attempt in expansion_attempts:
+        if not isinstance(attempt, dict):
+            continue
+        for code in attempt.get("unsatisfied_requirement_codes", []):
+            if _is_non_empty_string(code):
+                unsatisfied.add(str(code))
+
+    temporal_invalid = packet.get("temporal_isolation_status") == "fail" or any(
+        item.get("temporal_gate_status") != "pass" for item in selected
+    )
+    if temporal_invalid:
+        blocking.add("temporally_invalid_evidence")
+
+    freshness = _freshness_status(query_context, coverage, unsatisfied)
+    if freshness == "stale_or_missing_fresh_source":
+        blocking.add("stale_evidence_or_freshness_not_met")
+
+    critical_or_source = _leaf_is_critical_or_source_of_truth(query_context)
+    fallback_ref = None
+    macro_fallback_only = False
+    if isinstance(fallback_state, dict):
+        fallback_ref = fallback_state.get("fallback_state_id")
+        fallback_requested = bool(fallback_state.get("macro_fallback_requested") or fallback_state.get("macro_fallback_used"))
+        macro_fallback_only = critical_or_source and fallback_requested and not breadth_certified
+    if macro_fallback_only:
+        blocking.add("macro_fallback_only_for_critical_or_source_of_truth")
+
+    proof_ref = _structural_unanswerability_proof_ref(query_context, result, coverage)
+    proof_allowed = (
+        _is_non_empty_string(proof_ref)
+        and bool(requirements.get("unanswerability_proof_required") is True)
+        and len(expansion_refs) >= _max_expansion_attempts(query_context)
+        and not temporal_invalid
+        and not macro_fallback_only
+    )
+    if proof_ref and not proof_allowed:
+        blocking.add("structural_unanswerability_proof_not_policy_valid")
+    if proof_allowed:
+        freshness = "not_applicable_structural_unanswerability"
+
+    if not breadth_certified and not proof_allowed:
+        blocking.add("breadth_not_certified")
+    classification_allowed = not blocking or proof_allowed
+    if proof_allowed:
+        status = "structurally_unanswerable"
+        classification_allowed = True
+    elif temporal_invalid:
+        status = "blocked_temporal_invalid"
+    elif macro_fallback_only:
+        status = "blocked_macro_fallback_only"
+    elif freshness == "stale_or_missing_fresh_source":
+        status = "blocked_stale"
+    elif not isinstance(coverage, dict):
+        status = "blocked_missing_breadth"
+    elif not breadth_certified:
+        status = "blocked_insufficient_research"
+    else:
+        status = "certified_high_certainty"
+        classification_allowed = True
+
+    if status == "certified_high_certainty" and not selected:
+        status = "blocked_insufficient_research"
+        classification_allowed = False
+        blocking.add("no_admitted_evidence")
+        unsatisfied.add("empty_retrieval")
+
+    certificate_seed = {
+        "leaf_id": query_context.get("leaf_id"),
+        "requirement_ref": requirements.get("requirement_id"),
+        "coverage_ref": breadth_coverage_ref,
+        "expansion_refs": expansion_refs,
+        "proof_ref": proof_ref,
+        "status": status,
+    }
+    return {
+        "artifact_type": "research_sufficiency_certificate",
+        "schema_version": RESEARCH_SUFFICIENCY_CERTIFICATE_SCHEMA_VERSION,
+        "certificate_id": _sha_id("research-sufficiency", certificate_seed),
+        "leaf_id": query_context.get("leaf_id"),
+        "query_context_ref": query_context.get("query_context_ref"),
+        "requirement_ref": requirements.get("requirement_id"),
+        "sufficiency_profile_id": requirements.get("sufficiency_profile_id", "high-certainty-default/v1"),
+        "status": status,
+        "classification_dispatch_allowed": bool(classification_allowed),
+        "evidence_refs": [item["evidence_ref"] for item in selected if _is_non_empty_string(item.get("evidence_ref"))],
+        "breadth_coverage_ref": breadth_coverage_ref,
+        "breadth_certified": bool(breadth_certified),
+        "expansion_attempt_refs": expansion_refs,
+        "fallback_state_ref": fallback_ref,
+        "structural_unanswerability_proof_ref": proof_ref,
+        "temporal_validation_status": "invalid" if temporal_invalid else "pass",
+        "freshness_status": freshness,
+        "macro_fallback_sufficiency_status": (
+            fallback_state.get("macro_fallback_sufficiency_status")
+            if isinstance(fallback_state, dict)
+            else "not_requested"
+        ),
+        "unsatisfied_requirement_codes": sorted(unsatisfied),
+        "blocking_reason_codes": sorted(blocking),
+        "authority_boundary": {
+            "classification_dispatch_authority": True,
+            "research_sufficiency_authority": True,
+            "forecast_authority": False,
+            "scae_authority": False,
+        },
+        "certifier_version": RESEARCH_SUFFICIENCY_CERTIFIER_VERSION,
+    }
+
+
+def _retrieval_replay_command(packet: dict[str, Any]) -> str:
+    qdt_ref = packet.get("question_decomposition_artifact_id", "artifact:question-decomposition")
+    return (
+        "python3 researcher-swarm/scripts/bin/build_retrieval_packet.py "
+        f"--question-decomposition {qdt_ref} --case-id {packet.get('case_id')} "
+        f"--dispatch-id {packet.get('dispatch_id')}"
+    )
+
+
+def build_blocked_retrieval_stage_contract_records(
+    packet: dict[str, Any],
+    *,
+    reason_codes: list[str],
+    certificate_refs: list[str],
+    replay_command: str | None = None,
+) -> dict[str, list[dict[str, Any]]]:
+    replay = replay_command or _retrieval_replay_command(packet)
+    stage_attempt_id = _sha_id(
+        "stage-attempt",
+        {"case_id": packet.get("case_id"), "dispatch_id": packet.get("dispatch_id"), "stage": "retrieval"},
+    )
+    context = StageContext(
+        case_id=str(packet.get("case_id")),
+        case_key=str(packet.get("case_key") or packet.get("case_id")),
+        dispatch_id=str(packet.get("dispatch_id")),
+        stage="retrieval",
+        stage_attempt_id=stage_attempt_id,
+    )
+    event_id = _sha_id(
+        "stage-exec-event",
+        {
+            "case_id": packet.get("case_id"),
+            "dispatch_id": packet.get("dispatch_id"),
+            "reason_codes": sorted(set(reason_codes)),
+            "certificate_refs": certificate_refs,
+        },
+    )
+    event = build_stage_execution_event(
+        execution_event_id=event_id,
+        context=context,
+        event_type="stage_blocked",
+        event_status="warning",
+        attempt_number=1,
+        max_attempts=1,
+        runner_ref="ads_retrieval_sufficiency_dispatch_gate",
+        agent_or_component_ref="researcher-swarm",
+        script_path="researcher-swarm/scripts/researcher_swarm/retrieval.py",
+        command_sha256_value=_prefixed_sha256(replay),
+        input_artifact_refs=[packet.get("question_decomposition_artifact_id")],
+        output_artifact_refs=certificate_refs,
+        validation_result_refs=[],
+        failure_class="dependency_not_ready",
+        safe_exception_class="ResearchSufficiencyNotMet",
+        safe_exception_message="retrieval research sufficiency not met",
+        no_log_reason="ret_008_structured_packet_diagnostics",
+        redaction_status="not_needed",
+        replay_command=replay,
+        safe_metadata={
+            "feature_id": "RET-008",
+            "reason_codes": sorted(set(reason_codes)),
+            "certificate_refs": certificate_refs,
+        },
+    )
+    status = build_stage_status_snapshot(
+        context=context,
+        status="blocked",
+        input_artifacts=[packet.get("question_decomposition_artifact_id")],
+        output_artifacts=certificate_refs,
+        dependency_feature_ids=["RET-008"],
+        blocking_feature_ids=["RET-008"],
+        reason_codes=sorted(set(reason_codes)),
+        latest_execution_event_ids=[event_id],
+        replay_command=replay,
+        metadata={
+            "feature_id": "RET-008",
+            "classification_dispatch_status": "blocked_insufficient_research",
+        },
+    )
+    return {
+        "retrieval_stage_status_records": [status],
+        "retrieval_stage_execution_events": [event],
+    }
+
+
+def finalize_retrieval_packet_for_dispatch(
+    packet: dict[str, Any],
+    *,
+    replay_command: str | None = None,
+) -> dict[str, Any]:
+    packet_copy = copy.deepcopy(packet)
+    if not packet_copy.get("retrieval_breadth_coverage_slices"):
+        packet_copy["retrieval_breadth_coverage_slices"] = build_retrieval_breadth_coverage_slices(packet_copy)
+    if not packet_copy.get("retrieval_expansion_attempts"):
+        expansion_plan = build_retrieval_expansion_and_fallback_plan(packet_copy)
+        packet_copy["retrieval_expansion_attempts"] = expansion_plan["retrieval_expansion_attempts"]
+        if not packet_copy.get("retrieval_fallback_states"):
+            packet_copy["retrieval_fallback_states"] = expansion_plan["retrieval_fallback_states"]
+        packet_copy["retrieval_fallback_summary"] = expansion_plan["summary"]
+
+    contexts = _contexts_by_leaf(packet_copy)
+    results = _results_by_leaf(packet_copy)
+    coverage = _coverage_by_leaf(packet_copy)
+    expansion = _expansion_attempts_by_leaf(packet_copy)
+    fallback = _fallback_by_leaf(packet_copy)
+    certificates = [
+        certify_leaf_research_sufficiency(
+            context,
+            results.get(leaf_id),
+            packet=packet_copy,
+            coverage=coverage.get(leaf_id),
+            expansion_attempts=expansion.get(str(leaf_id), []),
+            fallback_state=fallback.get(leaf_id),
+        )
+        for leaf_id, context in sorted(contexts.items())
+    ]
+    additional_attempts: list[dict[str, Any]] = []
+    additional_fallback_states: list[dict[str, Any]] = []
+    for cert in certificates:
+        leaf_id = cert.get("leaf_id")
+        context = contexts.get(leaf_id)
+        if not isinstance(context, dict) or expansion.get(str(leaf_id)):
+            continue
+        unsatisfied = [
+            code
+            for code in cert.get("unsatisfied_requirement_codes", [])
+            if _is_non_empty_string(code)
+        ]
+        if not unsatisfied or cert.get("classification_dispatch_allowed") is True:
+            continue
+        leaf_attempts = [
+            build_retrieval_expansion_attempt(
+                context,
+                attempt_index=attempt_index,
+                unsatisfied_requirement_codes=unsatisfied,
+            )
+            for attempt_index in range(1, _max_expansion_attempts(context) + 1)
+        ]
+        additional_attempts.extend(leaf_attempts)
+        if str(leaf_id) not in fallback:
+            additional_fallback_states.append(
+                build_retrieval_fallback_state(
+                    context,
+                    [attempt["attempt_id"] for attempt in leaf_attempts],
+                )
+            )
+    if additional_attempts:
+        packet_copy.setdefault("retrieval_expansion_attempts", []).extend(additional_attempts)
+        packet_copy.setdefault("retrieval_fallback_states", []).extend(additional_fallback_states)
+        expansion = _expansion_attempts_by_leaf(packet_copy)
+        fallback = _fallback_by_leaf(packet_copy)
+        certificates = [
+            certify_leaf_research_sufficiency(
+                context,
+                results.get(leaf_id),
+                packet=packet_copy,
+                coverage=coverage.get(leaf_id),
+                expansion_attempts=expansion.get(str(leaf_id), []),
+                fallback_state=fallback.get(leaf_id),
+            )
+            for leaf_id, context in sorted(contexts.items())
+        ]
+    cert_refs = [cert["certificate_id"] for cert in certificates]
+    blocked_codes = sorted(
+        {
+            code
+            for cert in certificates
+            for code in cert.get("blocking_reason_codes", [])
+            if _is_non_empty_string(code)
+        }
+    )
+    all_allowed = bool(certificates) and all(cert.get("classification_dispatch_allowed") is True for cert in certificates)
+    packet_copy["leaf_research_sufficiency_certificates"] = certificates
+    packet_copy["research_sufficiency_summary"] = {
+        "all_required_leaves_certified": all_allowed,
+        "classification_dispatch_status": "allowed" if all_allowed else "blocked_insufficient_research",
+        "leaf_certificate_refs": cert_refs,
+        "feature_id": "RET-008",
+        "certificate_status": "complete" if all_allowed else "blocked",
+        "unsatisfied_requirement_codes": sorted(
+            {
+                code
+                for cert in certificates
+                for code in cert.get("unsatisfied_requirement_codes", [])
+                if _is_non_empty_string(code)
+            }
+        ),
+        "blocking_reason_codes": blocked_codes or ([] if all_allowed else ["research_sufficiency_not_met"]),
+        "certifier_version": RESEARCH_SUFFICIENCY_CERTIFIER_VERSION,
+    }
+    packet_copy.setdefault("schema_feature_gates", {})["RET-008"] = "implemented"
+    packet_copy.setdefault("schema_feature_gates", {})["RET-006"] = "implemented"
+    packet_copy.setdefault("validation_summary", {}).setdefault("reason_codes", []).append(
+        "ret_008_research_sufficiency_dispatch_gate_evaluated"
+    )
+    if all_allowed:
+        packet_copy["retrieval_stage_status_records"] = []
+        packet_copy["retrieval_stage_execution_events"] = []
+    else:
+        stage_records = build_blocked_retrieval_stage_contract_records(
+            packet_copy,
+            reason_codes=blocked_codes or ["research_sufficiency_not_met"],
+            certificate_refs=cert_refs,
+            replay_command=replay_command,
+        )
+        packet_copy.update(stage_records)
+
+    result = validate_retrieval_packet(packet_copy)
+    if not result.valid:
+        raise RetrievalPacketError("; ".join(result.errors))
+    return packet_copy
+
+
 def attach_native_research_transport_diagnostics(
     packet: dict[str, Any],
     *,
@@ -3547,6 +4007,8 @@ def build_retrieval_packet(
         "retrieval_expansion_attempts": [],
         "retrieval_fallback_states": [],
         "leaf_research_sufficiency_certificates": [],
+        "retrieval_stage_status_records": [],
+        "retrieval_stage_execution_events": [],
         "protected_primary_access_failures": [],
         "missingness_candidates": [],
         "browser_search_provider_diagnostics": [
@@ -4087,6 +4549,162 @@ def validate_retrieval_breadth_coverage_slice(item: Any, path: str, errors: list
         errors.append(f"{path}.breadth_certified must be boolean")
 
 
+def validate_research_sufficiency_certificate(item: Any, path: str, errors: list[str]) -> None:
+    if not isinstance(item, dict):
+        errors.append(f"{path} must be an object")
+        return
+    for field in (
+        "artifact_type",
+        "schema_version",
+        "certificate_id",
+        "leaf_id",
+        "query_context_ref",
+        "requirement_ref",
+        "sufficiency_profile_id",
+        "status",
+        "classification_dispatch_allowed",
+        "evidence_refs",
+        "breadth_coverage_ref",
+        "breadth_certified",
+        "expansion_attempt_refs",
+        "fallback_state_ref",
+        "temporal_validation_status",
+        "freshness_status",
+        "macro_fallback_sufficiency_status",
+        "unsatisfied_requirement_codes",
+        "blocking_reason_codes",
+        "authority_boundary",
+        "certifier_version",
+    ):
+        if field not in item:
+            errors.append(f"{path} missing {field}")
+    if item.get("artifact_type") != "research_sufficiency_certificate":
+        errors.append(f"{path}.artifact_type must be research_sufficiency_certificate")
+    if item.get("schema_version") != RESEARCH_SUFFICIENCY_CERTIFICATE_SCHEMA_VERSION:
+        errors.append(f"{path}.schema_version must be {RESEARCH_SUFFICIENCY_CERTIFICATE_SCHEMA_VERSION}")
+    if item.get("status") not in ALLOWED_RESEARCH_SUFFICIENCY_STATUSES:
+        errors.append(f"{path}.status is invalid")
+    if not isinstance(item.get("classification_dispatch_allowed"), bool):
+        errors.append(f"{path}.classification_dispatch_allowed must be boolean")
+    if item.get("classification_dispatch_allowed") is True and item.get("status") not in {
+        "certified_high_certainty",
+        "structurally_unanswerable",
+    }:
+        errors.append(f"{path}.classification_dispatch_allowed requires a certified status")
+    if item.get("classification_dispatch_allowed") is False and item.get("status") in {
+        "certified_high_certainty",
+        "structurally_unanswerable",
+    }:
+        errors.append(f"{path}.certified status must allow classification dispatch")
+    if item.get("status") == "certified_high_certainty" and item.get("breadth_certified") is not True:
+        errors.append(f"{path}.certified_high_certainty requires breadth_certified true")
+    if item.get("temporal_validation_status") not in {"pass", "invalid"}:
+        errors.append(f"{path}.temporal_validation_status is invalid")
+    for list_field in (
+        "evidence_refs",
+        "expansion_attempt_refs",
+        "unsatisfied_requirement_codes",
+        "blocking_reason_codes",
+    ):
+        if not isinstance(item.get(list_field), list):
+            errors.append(f"{path}.{list_field} must be a list")
+    if not _reason_codes_are_compact(item.get("unsatisfied_requirement_codes")):
+        errors.append(f"{path}.unsatisfied_requirement_codes must be compact reason codes")
+    if not _reason_codes_are_compact(item.get("blocking_reason_codes")):
+        errors.append(f"{path}.blocking_reason_codes must be compact reason codes")
+    if not isinstance(item.get("authority_boundary"), dict):
+        errors.append(f"{path}.authority_boundary must be an object")
+    elif item["authority_boundary"].get("forecast_authority") is not False:
+        errors.append(f"{path}.authority_boundary.forecast_authority must be false")
+
+
+def validate_retrieval_stage_contract_records(packet: dict[str, Any], errors: list[str]) -> None:
+    for idx, record in enumerate(
+        packet.get("retrieval_stage_status_records", [])
+        if isinstance(packet.get("retrieval_stage_status_records"), list)
+        else []
+    ):
+        if not isinstance(record, dict):
+            errors.append(f"retrieval_stage_status_records[{idx}] must be an object")
+            continue
+        try:
+            validate_stage_status_snapshot(record)
+        except Exception as exc:  # pragma: no cover - exact contract exception belongs to Session 1
+            errors.append(f"retrieval_stage_status_records[{idx}] invalid: {exc}")
+    for idx, record in enumerate(
+        packet.get("retrieval_stage_execution_events", [])
+        if isinstance(packet.get("retrieval_stage_execution_events"), list)
+        else []
+    ):
+        if not isinstance(record, dict):
+            errors.append(f"retrieval_stage_execution_events[{idx}] must be an object")
+            continue
+        try:
+            validate_stage_execution_event(record)
+        except Exception as exc:  # pragma: no cover - exact contract exception belongs to Session 1
+            errors.append(f"retrieval_stage_execution_events[{idx}] invalid: {exc}")
+
+
+def validate_research_sufficiency_dispatch_gate(packet: dict[str, Any], errors: list[str]) -> None:
+    summary = packet.get("research_sufficiency_summary")
+    if not isinstance(summary, dict):
+        return
+    status = summary.get("classification_dispatch_status")
+    if status not in ALLOWED_CLASSIFICATION_DISPATCH_STATUSES:
+        errors.append("research_sufficiency_summary.classification_dispatch_status is invalid")
+    leaf_ids = {
+        context.get("leaf_id")
+        for context in packet.get("leaf_query_contexts", [])
+        if isinstance(context, dict) and _is_non_empty_string(context.get("leaf_id"))
+    }
+    certificates = {
+        cert.get("leaf_id"): cert
+        for cert in packet.get("leaf_research_sufficiency_certificates", [])
+        if isinstance(cert, dict) and _is_non_empty_string(cert.get("leaf_id"))
+    }
+    missing_leaf_ids = sorted(str(leaf_id) for leaf_id in leaf_ids if leaf_id not in certificates)
+    cert_refs = [
+        cert.get("certificate_id")
+        for cert in packet.get("leaf_research_sufficiency_certificates", [])
+        if isinstance(cert, dict) and _is_non_empty_string(cert.get("certificate_id"))
+    ]
+    if status == "allowed":
+        if missing_leaf_ids:
+            errors.append(
+                "research_sufficiency_summary.classification_dispatch_status allowed with missing certificates: "
+                + ",".join(missing_leaf_ids)
+            )
+        for leaf_id, cert in certificates.items():
+            if cert.get("classification_dispatch_allowed") is not True:
+                errors.append(f"certificate for {leaf_id} does not allow classification dispatch")
+            if cert.get("status") in {
+                "blocked_insufficient_research",
+                "blocked_missing_breadth",
+                "blocked_stale",
+                "blocked_temporal_invalid",
+                "blocked_macro_fallback_only",
+            }:
+                errors.append(f"certificate for {leaf_id} has blocked status {cert.get('status')}")
+            if cert.get("temporal_validation_status") != "pass":
+                errors.append(f"certificate for {leaf_id} is temporally invalid")
+            if cert.get("freshness_status") == "stale_or_missing_fresh_source":
+                errors.append(f"certificate for {leaf_id} is stale")
+            if "macro_fallback_only_for_critical_or_source_of_truth" in cert.get("blocking_reason_codes", []):
+                errors.append(f"certificate for {leaf_id} is macro-fallback-only for critical/source-of-truth leaf")
+    if status == "blocked_insufficient_research":
+        if not isinstance(packet.get("retrieval_stage_status_records"), list) or not packet["retrieval_stage_status_records"]:
+            errors.append("blocked retrieval requires retrieval_stage_status_records")
+        if not isinstance(packet.get("retrieval_stage_execution_events"), list) or not packet["retrieval_stage_execution_events"]:
+            errors.append("blocked retrieval requires retrieval_stage_execution_events")
+    if summary.get("all_required_leaves_certified") is True and status != "allowed":
+        errors.append("all_required_leaves_certified true requires classification_dispatch_status allowed")
+    if status == "allowed" and summary.get("all_required_leaves_certified") is not True:
+        errors.append("classification_dispatch_status allowed requires all_required_leaves_certified true")
+    if status in {"allowed", "blocked_insufficient_research"}:
+        if sorted(summary.get("leaf_certificate_refs", [])) != sorted(cert_refs):
+            errors.append("research_sufficiency_summary.leaf_certificate_refs must match certificate ids")
+
+
 def validate_retrieval_packet(packet: dict[str, Any]) -> RetrievalValidationResult:
     errors: list[str] = []
     warnings: list[str] = []
@@ -4117,6 +4735,8 @@ def validate_retrieval_packet(packet: dict[str, Any]) -> RetrievalValidationResu
         "retrieval_expansion_attempts",
         "retrieval_fallback_states",
         "leaf_research_sufficiency_certificates",
+        "retrieval_stage_status_records",
+        "retrieval_stage_execution_events",
         "protected_primary_access_failures",
         "missingness_candidates",
         "native_research_attempts",
@@ -4222,6 +4842,8 @@ def validate_retrieval_packet(packet: dict[str, Any]) -> RetrievalValidationResu
         "retrieval_expansion_attempts",
         "retrieval_fallback_states",
         "leaf_research_sufficiency_certificates",
+        "retrieval_stage_status_records",
+        "retrieval_stage_execution_events",
         "protected_primary_access_failures",
         "missingness_candidates",
         "native_research_attempts",
@@ -4245,6 +4867,14 @@ def validate_retrieval_packet(packet: dict[str, Any]) -> RetrievalValidationResu
         validate_negative_check_attempt(item, f"negative_check_attempts[{idx}]", errors)
     for idx, item in enumerate(packet.get("retrieval_breadth_coverage_slices", []) if isinstance(packet.get("retrieval_breadth_coverage_slices"), list) else []):
         validate_retrieval_breadth_coverage_slice(item, f"retrieval_breadth_coverage_slices[{idx}]", errors)
+    for idx, item in enumerate(packet.get("leaf_research_sufficiency_certificates", []) if isinstance(packet.get("leaf_research_sufficiency_certificates"), list) else []):
+        validate_research_sufficiency_certificate(
+            item,
+            f"leaf_research_sufficiency_certificates[{idx}]",
+            errors,
+        )
+    validate_retrieval_stage_contract_records(packet, errors)
+    validate_research_sufficiency_dispatch_gate(packet, errors)
     for idx, item in enumerate(packet.get("source_metadata_classifier_slices", []) if isinstance(packet.get("source_metadata_classifier_slices"), list) else []):
         validate_source_metadata_classifier_slice(item, f"source_metadata_classifier_slices[{idx}]", errors)
     for idx, item in enumerate(packet.get("source_metadata_classifier_unavailable_diagnostics", []) if isinstance(packet.get("source_metadata_classifier_unavailable_diagnostics"), list) else []):

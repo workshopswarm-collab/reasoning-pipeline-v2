@@ -43,6 +43,7 @@ from researcher_swarm.retrieval import (  # noqa: E402
     build_retrieval_packet_manifest,
     build_retrieval_query_contexts,
     build_retrieval_fallback_state,
+    finalize_retrieval_packet_for_dispatch,
     build_source_metadata_classifier_slice,
     build_source_metadata_resolution_placeholder,
     normalize_retrieval_provenance,
@@ -126,6 +127,38 @@ class RetrievalPacketContractTest(unittest.TestCase):
             retrieval_capture_for_dispatch=True,
             claim_family_resolution_refs=[claim_family_id],
             admission_reason_codes=["manual_fixture_selected"],
+        )
+
+    def _certifiable_packet(self, qdt: dict | None = None) -> dict:
+        qdt = copy.deepcopy(qdt or self.qdt)
+        contexts = build_retrieval_query_contexts(qdt, evidence_packet=self.evidence_packet)
+        selected = []
+        for context in contexts:
+            official = self._evidence(
+                context,
+                attempt_ref=f"{context['leaf_id']}-official",
+                canonical_url=f"https://example.com/official/{context['leaf_id']}",
+                source_class="official_or_primary",
+                source_family_id=f"source-family-{context['leaf_id']}-official",
+                claim_family_id=f"claim-family-{context['leaf_id']}-official",
+            )
+            official["deterministic_source_class_proof"] = True
+            official["source_class_resolution_method"] = "manual_fixture"
+            secondary = self._evidence(
+                context,
+                attempt_ref=f"{context['leaf_id']}-secondary",
+                canonical_url=f"https://independent.example/{context['leaf_id']}",
+                source_class="independent_secondary",
+                source_family_id=f"source-family-{context['leaf_id']}-secondary",
+                claim_family_id=f"claim-family-{context['leaf_id']}-secondary",
+            )
+            selected.extend([official, secondary])
+        return build_retrieval_packet(
+            qdt,
+            evidence_packet=self.evidence_packet,
+            selected_evidence=selected,
+            question_decomposition_artifact_id="artifact:qdt-1",
+            policy_context_ref="artifact:profile-1",
         )
 
     def test_query_contexts_cover_every_leaf_with_sufficiency_and_breadth_targets(self) -> None:
@@ -885,6 +918,138 @@ class RetrievalPacketContractTest(unittest.TestCase):
         self.assertEqual(fallback["macro_fallback_policy"], "explicit_last_resort_discovery_only")
         self.assertEqual(fallback["macro_fallback_sufficiency_status"], "not_research_sufficiency_authority")
         self.assertFalse(fallback["authority_boundary"]["research_sufficiency_authority"])
+
+    def test_ret_008_finalization_writes_required_leaf_certificates_and_allows_dispatch(self) -> None:
+        packet = self._certifiable_packet()
+
+        finalized = finalize_retrieval_packet_for_dispatch(packet)
+
+        self.assertTrue(validate_retrieval_packet(finalized).valid)
+        self.assertEqual(finalized["schema_feature_gates"]["RET-008"], "implemented")
+        self.assertEqual(
+            finalized["research_sufficiency_summary"]["classification_dispatch_status"],
+            "allowed",
+        )
+        self.assertTrue(finalized["research_sufficiency_summary"]["all_required_leaves_certified"])
+        self.assertEqual(
+            sorted(cert["leaf_id"] for cert in finalized["leaf_research_sufficiency_certificates"]),
+            sorted(leaf["leaf_id"] for leaf in self.qdt["required_leaf_questions"]),
+        )
+        self.assertTrue(
+            all(
+                cert["classification_dispatch_allowed"]
+                and cert["status"] == "certified_high_certainty"
+                and cert["breadth_certified"]
+                and cert["temporal_validation_status"] == "pass"
+                for cert in finalized["leaf_research_sufficiency_certificates"]
+            )
+        )
+        self.assertEqual(finalized["retrieval_stage_status_records"], [])
+        self.assertEqual(finalized["retrieval_stage_execution_events"], [])
+
+    def test_ret_008_missing_certificate_rejects_allowed_dispatch_status(self) -> None:
+        packet = self._certifiable_packet()
+        finalized = finalize_retrieval_packet_for_dispatch(packet)
+        finalized["leaf_research_sufficiency_certificates"] = finalized["leaf_research_sufficiency_certificates"][:-1]
+        finalized["research_sufficiency_summary"]["classification_dispatch_status"] = "allowed"
+        finalized["research_sufficiency_summary"]["all_required_leaves_certified"] = True
+        finalized["research_sufficiency_summary"]["leaf_certificate_refs"] = [
+            cert["certificate_id"] for cert in finalized["leaf_research_sufficiency_certificates"]
+        ]
+
+        result = validate_retrieval_packet(finalized)
+
+        self.assertFalse(result.valid)
+        self.assertIn("missing certificates", "; ".join(result.errors))
+
+    def test_ret_008_macro_fallback_only_blocks_critical_leaf_dispatch(self) -> None:
+        qdt = copy.deepcopy(self.qdt)
+        leaf = qdt["required_leaf_questions"][0]
+        leaf["purpose"] = "source_of_truth"
+        leaf["research_sufficiency_requirements"]["protected_primary_required"] = True
+        packet = build_retrieval_packet(qdt, evidence_packet=self.evidence_packet)
+        packet = attach_retrieval_expansion_and_fallback_plan(packet, macro_fallback_requested=True)
+
+        finalized = finalize_retrieval_packet_for_dispatch(packet)
+
+        self.assertEqual(
+            finalized["research_sufficiency_summary"]["classification_dispatch_status"],
+            "blocked_insufficient_research",
+        )
+        blocked = next(
+            cert for cert in finalized["leaf_research_sufficiency_certificates"] if cert["leaf_id"] == leaf["leaf_id"]
+        )
+        self.assertEqual(blocked["status"], "blocked_macro_fallback_only")
+        self.assertIn(
+            "macro_fallback_only_for_critical_or_source_of_truth",
+            blocked["blocking_reason_codes"],
+        )
+        self.assertTrue(finalized["retrieval_stage_status_records"])
+        self.assertEqual(finalized["retrieval_stage_execution_events"][0]["event_type"], "stage_blocked")
+
+    def test_ret_008_stale_or_failed_breadth_blocks_dispatch_and_persists_expansion_codes(self) -> None:
+        qdt = copy.deepcopy(self.qdt)
+        qdt["required_leaf_questions"] = [qdt["required_leaf_questions"][1]]
+        context = build_retrieval_query_contexts(qdt, evidence_packet=self.evidence_packet)[0]
+        official = self._evidence(
+            context,
+            attempt_ref="stale-official",
+            canonical_url="https://example.com/official/stale",
+            source_class="official_or_primary",
+            source_family_id="source-family-stale-official",
+            claim_family_id="claim-family-stale-official",
+            source_published_at="2026-06-01T11:30:00+00:00",
+        )
+        official["deterministic_source_class_proof"] = True
+        official["source_class_resolution_method"] = "manual_fixture"
+        secondary = self._evidence(
+            context,
+            attempt_ref="stale-secondary",
+            canonical_url="https://independent.example/stale",
+            source_class="independent_secondary",
+            source_family_id="source-family-stale-secondary",
+            claim_family_id="claim-family-stale-secondary",
+            source_published_at="2026-06-01T11:30:00+00:00",
+        )
+        packet = build_retrieval_packet(
+            qdt,
+            evidence_packet=self.evidence_packet,
+            selected_evidence=[official, secondary],
+        )
+
+        finalized = finalize_retrieval_packet_for_dispatch(packet)
+
+        cert = finalized["leaf_research_sufficiency_certificates"][0]
+        self.assertEqual(cert["status"], "blocked_stale")
+        self.assertFalse(cert["classification_dispatch_allowed"])
+        self.assertIn("freshness", cert["unsatisfied_requirement_codes"])
+        self.assertTrue(finalized["retrieval_expansion_attempts"])
+        self.assertTrue(
+            all(
+                "unsatisfied_requirement_codes" in attempt
+                for attempt in finalized["retrieval_expansion_attempts"]
+            )
+        )
+
+    def test_ret_008_structural_unanswerability_after_bounded_expansion_can_certify_leaf(self) -> None:
+        qdt = copy.deepcopy(self.qdt)
+        qdt["required_leaf_questions"] = [qdt["required_leaf_questions"][0]]
+        leaf = qdt["required_leaf_questions"][0]
+        leaf["research_sufficiency_requirements"]["max_targeted_expansion_attempts"] = 2
+        packet = build_retrieval_packet(qdt, evidence_packet=self.evidence_packet)
+        packet["leaf_retrieval_results"][0]["structural_unanswerability_proof_ref"] = "artifact:unanswerable-proof-1"
+        packet["retrieval_breadth_coverage_slices"] = []
+        packet = attach_retrieval_expansion_and_fallback_plan(packet)
+
+        finalized = finalize_retrieval_packet_for_dispatch(packet)
+
+        cert = finalized["leaf_research_sufficiency_certificates"][0]
+        self.assertEqual(cert["status"], "structurally_unanswerable")
+        self.assertTrue(cert["classification_dispatch_allowed"])
+        self.assertEqual(
+            finalized["research_sufficiency_summary"]["classification_dispatch_status"],
+            "allowed",
+        )
 
     def test_native_transport_unavailability_is_diagnostic_and_resolver_owns_metadata(self) -> None:
         packet = build_retrieval_packet(self.qdt, evidence_packet=self.evidence_packet)
