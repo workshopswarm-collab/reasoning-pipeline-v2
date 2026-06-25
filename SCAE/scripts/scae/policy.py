@@ -89,6 +89,7 @@ def validate_scae_policy(policy: dict[str, Any]) -> None:
         "cap_stack",
         "prior_reliability",
         "market_assimilation",
+        "family_diagnostics",
         "probability_taxonomy",
         "validity_and_execution",
     ]
@@ -210,6 +211,22 @@ def validate_scae_policy(policy: dict[str, Any]) -> None:
         raise ScaePolicyError("structural prior overlap must contribute zero signed delta")
     if market_assimilation["base_rate_overlap_multiplier"] != 0.0:
         raise ScaePolicyError("base-rate overlap must contribute zero signed delta")
+
+    family_diagnostics = policy["family_diagnostics"]
+    if family_diagnostics.get("schema_version") != "scae-family-diagnostics-policy/v1":
+        raise ScaePolicyError("family diagnostics policy schema is invalid")
+    if family_diagnostics.get("sibling_prices_context_only") is not True:
+        raise ScaePolicyError("sibling prices must remain context-only")
+    for field in [
+        "allow_sibling_price_evidence_updates",
+        "allow_sibling_softmax_reallocation",
+        "allow_sibling_price_probability_movement",
+    ]:
+        if family_diagnostics.get(field) is not False:
+            raise ScaePolicyError(f"family_diagnostics.{field} must be false")
+    tolerance = family_diagnostics.get("exclusive_family_price_tolerance")
+    if isinstance(tolerance, bool) or not isinstance(tolerance, (int, float)) or tolerance < 0.0:
+        raise ScaePolicyError("family_diagnostics.exclusive_family_price_tolerance must be non-negative")
 
     taxonomy = policy["probability_taxonomy"]
     if taxonomy.get("fields") != PROBABILITY_FIELDS:

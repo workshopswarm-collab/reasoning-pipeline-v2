@@ -100,6 +100,11 @@ class ScaePolicyTest(unittest.TestCase):
         with self.assertRaisesRegex(ScaePolicyError, "active must be a boolean"):
             validate_scae_policy(unsafe_debt)
 
+        unsafe_family = copy.deepcopy(policy)
+        unsafe_family["family_diagnostics"]["allow_sibling_softmax_reallocation"] = True
+        with self.assertRaisesRegex(ScaePolicyError, "allow_sibling_softmax_reallocation"):
+            validate_scae_policy(unsafe_family)
+
 
 if __name__ == "__main__":
     unittest.main()

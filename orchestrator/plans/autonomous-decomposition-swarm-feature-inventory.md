@@ -165,7 +165,7 @@ These migration groups are the data backbone for replay, scoring, calibration, a
 | SCAE-006 | v2_live_cutover | SCAE dependence | cutover_blocker | Session 5 | SCAE-005, RET-004 | Cross-leaf dependence guard | not_started |
 | SCAE-007 | v2_live_cutover | SCAE branches | integration_blocker | Session 5 | SCAE-006, QDT-002 | Branch sub-ledgers | not_started |
 | SCAE-008 | v2_live_cutover | SCAE temporal | integration_blocker | Session 5 | SCAE-003, RET-005 | Missingness and survival/no-catalyst policy | not_started |
-| SCAE-009 | v2_live_cutover | SCAE family | integration_blocker | Session 5 | CTX-002, SCAE-002 | Binary-child diagnostics and displacement signals | not_started |
+| SCAE-009 | v2_live_cutover | SCAE family | integration_blocker | Session 5 | CTX-002, SCAE-002 | Binary-child diagnostics and displacement signals | ready_for_integration |
 | SCAE-010 | v2_live_cutover | SCAE AMRG | integration_blocker | Session 5 | AMRG-008, QDT-004, SCAE-007 | Conditional branch recombination | not_started |
 | SCAE-011 | v2_live_cutover | SCAE interval | cutover_blocker | Session 5 | SCAE-004, SCAE-006 | Deterministic logit interval builder | not_started |
 | SCAE-013 | v2_live_cutover | SCAE sufficiency gate | cutover_blocker | Session 5 | VER-004, SCAE-011 | Research sufficiency certificate intake and high-certainty forecast-validity guard | not_started |

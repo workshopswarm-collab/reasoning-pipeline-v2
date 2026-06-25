@@ -258,7 +258,7 @@
     {"id": "SCAE-006", "stage": "v2_live_cutover", "owner": "Session 5", "status": "not_started", "dependencies": ["SCAE-005", "RET-004"]},
     {"id": "SCAE-007", "stage": "v2_live_cutover", "owner": "Session 5", "status": "not_started", "dependencies": ["SCAE-006", "QDT-002"]},
     {"id": "SCAE-008", "stage": "v2_live_cutover", "owner": "Session 5", "status": "not_started", "dependencies": ["SCAE-003", "RET-005"]},
-    {"id": "SCAE-009", "stage": "v2_live_cutover", "owner": "Session 5", "status": "not_started", "dependencies": ["CTX-002", "SCAE-002"]},
+    {"id": "SCAE-009", "stage": "v2_live_cutover", "owner": "Session 5", "status": "ready_for_integration", "dependencies": ["CTX-002", "SCAE-002"], "acceptance_evidence": "2026-06-24 Session 05 SCAE-009 added deterministic family-aware binary child diagnostics in /Users/agent2/.openclaw/SCAE/scripts/scae/family.py plus policy guard fields and focused tests proving sibling prices emit displacement/consistency sidecars only, cannot create SCAE updates, cannot move production probability, cannot mutate prior context, and cannot apply hidden sibling softmax/reallocation."},
     {"id": "SCAE-010", "stage": "v2_live_cutover", "owner": "Session 5", "status": "not_started", "dependencies": ["AMRG-008", "QDT-004", "SCAE-007"]},
     {"id": "SCAE-011", "stage": "v2_live_cutover", "owner": "Session 5", "status": "not_started", "dependencies": ["SCAE-004", "SCAE-006"]},
     {"id": "SCAE-013", "stage": "v2_live_cutover", "owner": "Session 5", "status": "not_started", "dependencies": ["VER-004", "SCAE-011"]},

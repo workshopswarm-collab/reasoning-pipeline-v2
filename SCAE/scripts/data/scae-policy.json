@@ -66,6 +66,14 @@
     "structural_prior_overlap_multiplier": 0.0,
     "base_rate_overlap_multiplier": 0.0
   },
+  "family_diagnostics": {
+    "schema_version": "scae-family-diagnostics-policy/v1",
+    "sibling_prices_context_only": true,
+    "allow_sibling_price_evidence_updates": false,
+    "allow_sibling_softmax_reallocation": false,
+    "allow_sibling_price_probability_movement": false,
+    "exclusive_family_price_tolerance": 0.02
+  },
   "probability_taxonomy": {
     "fields": [
       "raw_ledger_probability",
