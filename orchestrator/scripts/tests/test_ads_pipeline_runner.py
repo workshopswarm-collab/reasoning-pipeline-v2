@@ -10,7 +10,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from predquant.ads_pipeline_runner import (
     ADS_PIPELINE_STAGE_ORDER,
     PIPELINE_CONTROL_STATE_TABLE,
+    PIPELINE_LOOP_ITERATION_TABLE,
     PIPELINE_RUN_TABLE,
+    PIPELINE_STOP_SIGNAL_TABLE,
     TERMINAL_REASON_AUTO003_COMPLETE,
     TERMINAL_REASON_AUTO003_FAILED,
     TERMINAL_REASON_DISABLED,
@@ -29,6 +31,7 @@ from predquant.ads_pipeline_runner import (
     build_pipeline_run,
     ensure_pipeline_runner_schema,
     read_pipeline_control_state,
+    read_pipeline_loop_iteration,
     read_pipeline_run,
     recover_stuck_case_leases,
     run_ads_pipeline_loop,
@@ -302,7 +305,16 @@ class AdsPipelineRunnerTest(unittest.TestCase):
             ).fetchall()
         }
 
-        self.assertEqual(tables, {PIPELINE_CONTROL_STATE_TABLE, PIPELINE_RUN_TABLE, "ads_case_leases"})
+        self.assertEqual(
+            tables,
+            {
+                PIPELINE_CONTROL_STATE_TABLE,
+                PIPELINE_RUN_TABLE,
+                PIPELINE_LOOP_ITERATION_TABLE,
+                PIPELINE_STOP_SIGNAL_TABLE,
+                "ads_case_leases",
+            },
+        )
 
     def test_auto003_executes_one_leased_case_and_releases_after_forecast_decision_persistence(self):
         self.initialize_intake_case()
@@ -333,6 +345,12 @@ class AdsPipelineRunnerTest(unittest.TestCase):
         lease = read_case_lease(self.conn, result.case_lease_id)
         self.assertEqual(lease["lease_status"], "released")
         self.assertEqual(lease["release_reason"], "auto003_single_case_complete")
+        loop = read_pipeline_loop_iteration(self.conn, run["last_iteration_id"])
+        self.assertEqual(loop["terminal_status"], TERMINAL_REASON_AUTO003_COMPLETE)
+        self.assertEqual(loop["case_lease_id"], result.case_lease_id)
+        self.assertEqual(loop["completed_stage_count"], len(ADS_PIPELINE_STAGE_ORDER))
+        self.assertEqual(loop["forecast_decision_record_id"], "forecast-decision:auto003")
+        self.assertEqual(loop["error_event_refs"], [])
 
         completed = self.conn.execute(
             f"SELECT COUNT(*) FROM {STAGE_STATUS_TABLE} WHERE status = 'complete'"
@@ -357,6 +375,11 @@ class AdsPipelineRunnerTest(unittest.TestCase):
         self.assertEqual(second.terminal_status, TERMINAL_REASON_NO_ELIGIBLE_CASE)
         self.assertEqual(second_calls, [])
         self.assertEqual(self.conn.execute(f"SELECT COUNT(*) FROM {CASE_LEASE_TABLE}").fetchone()[0], 1)
+        second_run = read_pipeline_run(self.conn, second.pipeline_run_id)
+        second_loop = read_pipeline_loop_iteration(self.conn, second_run["last_iteration_id"])
+        self.assertEqual(second_loop["terminal_status"], TERMINAL_REASON_NO_ELIGIBLE_CASE)
+        self.assertIsNone(second_loop["case_lease_id"])
+        self.assertTrue(second_loop["metadata"]["empty_queue"])
 
     def test_auto004_stop_before_next_case_exits_without_acquiring_lease(self):
         self.initialize_intake_case()
@@ -375,6 +398,9 @@ class AdsPipelineRunnerTest(unittest.TestCase):
         run = read_pipeline_run(self.conn, result.pipeline_run_id)
         self.assertEqual(run["status"], "stopped")
         self.assertIsNone(run["active_case_lease_id"])
+        loop = read_pipeline_loop_iteration(self.conn, run["last_iteration_id"])
+        self.assertEqual(loop["terminal_status"], TERMINAL_REASON_STOP_BEFORE_NEXT)
+        self.assertIsNone(loop["case_lease_id"])
 
     def test_auto004_stop_after_current_case_finishes_and_acknowledges(self):
         self.initialize_intake_case()
@@ -397,6 +423,9 @@ class AdsPipelineRunnerTest(unittest.TestCase):
         self.assertEqual(run["status"], "stopped")
         self.assertIsNone(run["active_case_lease_id"])
         self.assertTrue(run["metadata"]["stop_after_current_requested"])
+        loop = read_pipeline_loop_iteration(self.conn, run["last_iteration_id"])
+        self.assertEqual(loop["terminal_status"], TERMINAL_REASON_STOP_AFTER_CURRENT)
+        self.assertEqual(loop["forecast_decision_record_id"], "forecast-decision:auto003")
 
     def test_auto004_retryable_stage_failure_writes_backoff_and_keeps_lease_recoverable(self):
         self.initialize_intake_case()
@@ -418,6 +447,10 @@ class AdsPipelineRunnerTest(unittest.TestCase):
         self.assertEqual(run["active_case_lease_id"], result.case_lease_id)
         self.assertEqual(run["metadata"]["retry_stage"], "retrieval")
         self.assertIn("next_retry_at", run["metadata"])
+        loop = read_pipeline_loop_iteration(self.conn, run["last_iteration_id"])
+        self.assertEqual(loop["terminal_status"], TERMINAL_REASON_RETRY_SCHEDULED)
+        self.assertEqual(loop["retry_summary"]["retry_stage"], "retrieval")
+        self.assertEqual(loop["error_event_refs"][0].split(":")[0], "pipeline-error")
         retry_events = self.conn.execute(
             f"SELECT COUNT(*) FROM {STAGE_EXECUTION_EVENT_TABLE} WHERE event_type = 'retry_scheduled'"
         ).fetchone()[0]
@@ -444,6 +477,9 @@ class AdsPipelineRunnerTest(unittest.TestCase):
         self.assertEqual(lease["release_reason"], "auto004_non_retryable_stage_failed")
         run = read_pipeline_run(self.conn, result.pipeline_run_id)
         self.assertTrue(run["metadata"]["non_retryable_failure"])
+        loop = read_pipeline_loop_iteration(self.conn, run["last_iteration_id"])
+        self.assertEqual(loop["terminal_status"], TERMINAL_REASON_AUTO003_FAILED)
+        self.assertTrue(loop["metadata"]["non_retryable_failure"])
 
     def test_auto004_safe_drain_disable_releases_active_lease_and_acknowledges_control(self):
         self.initialize_intake_case()
@@ -466,6 +502,9 @@ class AdsPipelineRunnerTest(unittest.TestCase):
         self.assertEqual(run["metadata"]["safe_drained_after_stage"], "retrieval")
         control = read_pipeline_control_state(self.conn)
         self.assertEqual(control["acknowledged_by_run_id"], result.pipeline_run_id)
+        loop = read_pipeline_loop_iteration(self.conn, run["last_iteration_id"])
+        self.assertEqual(loop["terminal_status"], TERMINAL_REASON_SAFE_DRAIN)
+        self.assertEqual(loop["metadata"]["safe_drained_after_stage"], "retrieval")
 
     def test_auto004_stuck_lease_recovery_expires_lease_and_clears_active_run(self):
         self.initialize_intake_case()
@@ -521,6 +560,9 @@ class AdsPipelineRunnerTest(unittest.TestCase):
         error_events = self.conn.execute(f"SELECT COUNT(*) FROM {PIPELINE_ERROR_EVENT_TABLE}").fetchone()[0]
         self.assertEqual(failed_events, 1)
         self.assertEqual(error_events, 1)
+        loop = read_pipeline_loop_iteration(self.conn, run["last_iteration_id"])
+        self.assertEqual(loop["terminal_status"], TERMINAL_REASON_AUTO003_FAILED)
+        self.assertEqual(len(loop["error_event_refs"]), 1)
 
     def test_auto003_rejects_duplicate_forecast_decision_persistence_within_one_case(self):
         self.initialize_intake_case()

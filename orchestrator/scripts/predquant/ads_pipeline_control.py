@@ -7,17 +7,19 @@ from typing import Any
 
 from predquant.ads_pipeline_runner import (
     DEFAULT_DISABLE_ACTIONS,
+    PIPELINE_STOP_SIGNAL_SCHEMA_VERSION,
     RUNNER_MODES,
     STOP_POLICIES,
     PipelineRunnerContractError,
     build_pipeline_control_state,
+    build_pipeline_stop_signal_record,
     read_pipeline_control_state,
     utc_now_iso,
     write_pipeline_control_state,
+    write_pipeline_stop_signal,
 )
 
 
-PIPELINE_STOP_SIGNAL_SCHEMA_VERSION = "ads-pipeline-stop-signal/v1"
 STOP_SIGNAL_POLICIES = tuple(policy for policy in STOP_POLICIES if policy != "none")
 STOP_POLICY_DISABLE_ACTIONS = {
     "stop_before_next_case": "no_new_leases",
@@ -72,24 +74,14 @@ def build_pipeline_stop_signal(
 ) -> dict[str, Any]:
     """Build the structured AUTO-004 stop/drain request stored in control metadata."""
 
-    if stop_policy not in STOP_SIGNAL_POLICIES:
-        raise PipelineRunnerContractError("stop_policy must be a concrete stop signal policy")
-    if not isinstance(reason, str) or not reason:
-        raise PipelineRunnerContractError("reason is required")
-    if not isinstance(requested_by, str) or not requested_by:
-        raise PipelineRunnerContractError("requested_by is required")
-    signal = {
-        "schema_version": PIPELINE_STOP_SIGNAL_SCHEMA_VERSION,
-        "stop_policy": stop_policy,
-        "requested_at": requested_at or utc_now_iso(),
-        "requested_by": requested_by,
-        "reason": reason,
-        "pipeline_run_id": pipeline_run_id,
-        "metadata": metadata or {},
-    }
-    if pipeline_run_id is None:
-        del signal["pipeline_run_id"]
-    return signal
+    return build_pipeline_stop_signal_record(
+        stop_policy=stop_policy,
+        reason=reason,
+        requested_by=requested_by,
+        requested_at=requested_at or utc_now_iso(),
+        pipeline_run_id=pipeline_run_id,
+        metadata=metadata,
+    )
 
 
 def request_pipeline_stop(
@@ -105,13 +97,15 @@ def request_pipeline_stop(
 
     current = read_pipeline_control_state(conn)
     control_metadata = dict(current["metadata"])
-    control_metadata["stop_signal"] = build_pipeline_stop_signal(
+    signal = build_pipeline_stop_signal(
         stop_policy=stop_policy,
         reason=reason,
         requested_by=requested_by,
         pipeline_run_id=pipeline_run_id,
         metadata=metadata,
     )
+    write_pipeline_stop_signal(conn, signal)
+    control_metadata["stop_signal"] = signal
     record = build_pipeline_control_state(
         pipeline_enabled=False,
         desired_runner_mode=current["desired_runner_mode"],

@@ -28,6 +28,7 @@ from predquant.ads_pipeline_runner import (
     DEFAULT_DISABLE_ACTION,
     PipelineRunnerPolicy,
     build_pipeline_run,
+    read_pipeline_stop_signal,
     run_ads_pipeline_loop,
     write_pipeline_run,
 )
@@ -206,6 +207,10 @@ class AdsPipelineControlTest(unittest.TestCase):
         self.assertEqual(signal["stop_policy"], "stop_after_current_case")
         self.assertEqual(signal["pipeline_run_id"], "ads-pipeline-run:active")
         self.assertEqual(signal["metadata"], {"scope": "AUTO-004"})
+        stored_signal = read_pipeline_stop_signal(self.conn, signal["stop_signal_id"])
+        self.assertEqual(stored_signal["signal_status"], "pending")
+        self.assertEqual(stored_signal["stop_policy"], "stop_after_current_case")
+        self.assertEqual(stored_signal["metadata"], {"scope": "AUTO-004"})
 
     def test_set_and_get_cli_helpers_share_durable_state(self):
         set_cli = load_bin_module("set_ads_pipeline_enabled")
@@ -266,6 +271,7 @@ class AdsPipelineControlTest(unittest.TestCase):
             conn = sqlite3.connect(db_path)
             try:
                 control = get_pipeline_control_state(conn, create_default=False)
+                signal = read_pipeline_stop_signal(conn, control["metadata"]["stop_signal"]["stop_signal_id"])
             finally:
                 conn.close()
 
@@ -274,6 +280,7 @@ class AdsPipelineControlTest(unittest.TestCase):
         self.assertEqual(control["default_disable_action"], "safe_drain_now")
         self.assertEqual(control["metadata"]["stop_signal"]["stop_policy"], "safe_drain_now")
         self.assertEqual(control["metadata"]["stop_signal"]["metadata"], {"scope": "AUTO-004"})
+        self.assertEqual(signal["signal_status"], "pending")
 
 
 if __name__ == "__main__":
