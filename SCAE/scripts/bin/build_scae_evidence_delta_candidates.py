@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build SCAE-003 evidence delta candidate slices from JSON artifacts."""
+"""Build SCAE-003/SCAE-004 evidence delta candidate slices from JSON artifacts."""
 
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ def _load_payload(path: str | None) -> dict:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Build SCAE-003 candidate log-odds update slices.")
+    parser = argparse.ArgumentParser(description="Build guarded SCAE candidate log-odds update slices.")
     parser.add_argument("--input", help="JSON input path. Defaults to stdin.")
     parser.add_argument("--pretty", action="store_true", help="Pretty-print JSON output.")
     args = parser.parse_args()

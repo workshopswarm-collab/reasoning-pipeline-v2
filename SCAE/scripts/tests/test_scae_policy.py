@@ -105,6 +105,11 @@ class ScaePolicyTest(unittest.TestCase):
         with self.assertRaisesRegex(ScaePolicyError, "allow_sibling_softmax_reallocation"):
             validate_scae_policy(unsafe_family)
 
+        unsafe_guard = copy.deepcopy(policy)
+        unsafe_guard["cap_stack"]["correlated_quality_guard"]["multiplier_ceiling"] = 1.25
+        with self.assertRaisesRegex(ScaePolicyError, "correlated_quality_guard"):
+            validate_scae_policy(unsafe_guard)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -139,6 +139,8 @@ def validate_scae_policy(policy: dict[str, Any]) -> None:
         raise ScaePolicyError("calibration debt tail floor must be below tail ceiling")
 
     cap_stack = policy["cap_stack"]
+    if not isinstance(cap_stack, dict):
+        raise ScaePolicyError("cap_stack must be an object")
     for field in [
         "per_update_log_odds_cap",
         "per_cluster_log_odds_cap",
@@ -151,6 +153,23 @@ def validate_scae_policy(policy: dict[str, Any]) -> None:
             raise ScaePolicyError(f"cap_stack.{field} must be a positive number")
     if cap_stack["debt_mode_total_evidence_log_odds_cap"] > cap_stack["total_evidence_log_odds_cap"]:
         raise ScaePolicyError("debt-mode total cap must not be looser than the normal total cap")
+    if cap_stack.get("representative_selector") != "policy_bounded_signed_representative_v1":
+        raise ScaePolicyError("cap_stack.representative_selector is not canonical")
+    guard = cap_stack.get("correlated_quality_guard")
+    if not isinstance(guard, dict):
+        raise ScaePolicyError("cap_stack.correlated_quality_guard must be an object")
+    if not isinstance(guard.get("enabled"), bool):
+        raise ScaePolicyError("correlated_quality_guard.enabled must be a boolean")
+    min_count = guard.get("repeated_group_min_count")
+    if isinstance(min_count, bool) or not isinstance(min_count, int) or min_count < 2:
+        raise ScaePolicyError("correlated_quality_guard.repeated_group_min_count must be an integer >= 2")
+    multiplier_ceiling = guard.get("multiplier_ceiling")
+    if (
+        isinstance(multiplier_ceiling, bool)
+        or not isinstance(multiplier_ceiling, (int, float))
+        or not 0.0 < multiplier_ceiling <= 1.0
+    ):
+        raise ScaePolicyError("correlated_quality_guard.multiplier_ceiling must be in (0, 1]")
 
     prior_reliability = policy["prior_reliability"]
     for field in [

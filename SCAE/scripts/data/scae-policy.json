@@ -39,7 +39,12 @@
     "per_branch_log_odds_cap": 0.9,
     "total_evidence_log_odds_cap": 1.5,
     "debt_mode_total_evidence_log_odds_cap": 1.0,
-    "representative_selector": "policy_bounded_signed_representative_v1"
+    "representative_selector": "policy_bounded_signed_representative_v1",
+    "correlated_quality_guard": {
+      "enabled": true,
+      "repeated_group_min_count": 2,
+      "multiplier_ceiling": 0.65
+    }
   },
   "prior_reliability": {
     "epsilon": 0.001,

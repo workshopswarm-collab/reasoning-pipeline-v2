@@ -89,9 +89,46 @@ class ScaeEvidenceDeltaTest(unittest.TestCase):
         self.assertEqual(candidate["pre_cap_signed_log_odds_delta"], 0.45)
         self.assertEqual(candidate["signed_log_odds_delta"], self.policy["cap_stack"]["per_update_log_odds_cap"])
         self.assertTrue(candidate["bounded_by_per_update_cap"])
+        self.assertFalse(candidate["correlated_quality_guard_applied"])
+        self.assertEqual(candidate["correlated_quality_guard_status"], "passed_no_repeated_quality_correlation_group")
+        self.assertEqual(candidate["quality_multiplier_after_correlated_guard"], 1.0)
+        self.assertEqual(candidate["cap_stack"]["applied_stage"], "candidate_per_update_cap_only")
+        self.assertEqual(
+            candidate["cap_stack"]["per_cluster_log_odds_cap"],
+            self.policy["cap_stack"]["per_cluster_log_odds_cap"],
+        )
+        self.assertIn("per_branch_log_odds_cap", candidate["cap_stack"]["later_cap_stages_not_applied"])
         self.assertEqual(candidate["ledger_input_authority"], NO_LIVE_AUTHORITY)
         self.assertFalse(candidate["writes_scae_ledger"])
         self.assertFalse(candidate["writes_production_forecast"])
+
+    def test_correlated_quality_guard_lowers_repeated_group_multiplier(self):
+        first = self.classification(strength="strong", slice_id="classification-slice-1")
+        second = self.classification(strength="strong", slice_id="classification-slice-2")
+
+        result = build_evidence_delta_candidate_slices(
+            {"classification_slices": [first, second]},
+            direction_verification_slices=[self.direction(first), self.direction(second)],
+            quality_verification_slices=[
+                self.quality(first, multiplier=1.0),
+                self.quality(second, multiplier=1.0),
+            ],
+            policy=self.policy,
+        )
+
+        ceiling = self.policy["cap_stack"]["correlated_quality_guard"]["multiplier_ceiling"]
+        by_classification = {candidate["classification_slice_ref"]: candidate for candidate in result.candidate_slices}
+        for classification in (first, second):
+            candidate = by_classification[classification["slice_id"]]
+            self.assertEqual(candidate["candidate_status"], "accepted_candidate")
+            self.assertEqual(candidate["quality_multiplier_before_correlated_guard"], 1.0)
+            self.assertEqual(candidate["quality_multiplier_after_correlated_guard"], ceiling)
+            self.assertTrue(candidate["correlated_quality_guard_applied"])
+            self.assertEqual(candidate["correlated_quality_guard_status"], "capped_repeated_quality_correlation_group")
+            self.assertIn("source_family:source-family-1", candidate["correlated_quality_guard_repeated_groups"])
+            self.assertEqual(candidate["correlated_quality_group_counts"]["source_family:source-family-1"], 2)
+            self.assertEqual(candidate["pre_cap_signed_log_odds_delta"], round(0.3 * ceiling, 9))
+            self.assertFalse(candidate["bounded_by_per_update_cap"])
 
     def test_verified_direction_controls_sign_after_claimed_impact(self):
         classification = self.classification(direction="supports_yes", strength="strong")

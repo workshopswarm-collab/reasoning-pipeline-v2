@@ -1,8 +1,9 @@
-"""SCAE-003 evidence delta candidate mapping.
+"""SCAE-003/SCAE-004 evidence delta candidate mapping.
 
 This module converts verified Session 4 classification rows into bounded
-signed log-odds candidate records. It does not aggregate a ledger, apply the
-SCAE-004 correlated-quality guard, or author any production probability.
+signed log-odds candidate records, including the SCAE-004 correlated-quality
+guard and first cap-stack stage. It does not aggregate a ledger or author any
+production probability.
 """
 
 from __future__ import annotations
@@ -19,8 +20,15 @@ from scae.policy import default_scae_policy
 SCAE_EVIDENCE_DELTA_CANDIDATE_SCHEMA_VERSION = "scae-log-odds-update-candidate-slice/v1"
 SCAE_EVIDENCE_DELTA_BUNDLE_SCHEMA_VERSION = "scae-evidence-delta-candidate-bundle/v1"
 SCAE_LOG_ODDS_UPDATE_SURFACE = "scae_log_odds_update_slices"
-SCAE_003_MAPPER_VERSION = "ads-scae-003-evidence-delta-mapper/v1"
+SCAE_EVIDENCE_MAPPER_VERSION = "ads-scae-004-correlated-quality-cap-stack/v1"
 NO_LIVE_AUTHORITY = "candidate_ledger_input_only_no_live_forecast_authority"
+CAP_STACK_FIELDS = [
+    "per_update_log_odds_cap",
+    "per_cluster_log_odds_cap",
+    "per_branch_log_odds_cap",
+    "total_evidence_log_odds_cap",
+    "debt_mode_total_evidence_log_odds_cap",
+]
 
 ACCEPTED_CANDIDATE_STATUSES = {
     "accepted_candidate",
@@ -132,6 +140,117 @@ def _numeric_multiplier(value: Any, field_name: str) -> float:
     return number
 
 
+def _quality_correlation_groups(row: dict[str, Any]) -> list[str]:
+    groups = row.get("quality_correlation_groups") or []
+    if not isinstance(groups, list):
+        raise ScaeEvidenceDeltaError("quality_correlation_groups must be a list")
+    normalized: list[str] = []
+    for group in groups:
+        if not _is_non_empty_string(group):
+            raise ScaeEvidenceDeltaError("quality_correlation_groups must contain non-empty strings")
+        normalized.append(str(group))
+    return sorted(set(normalized))
+
+
+def _is_quality_accepted(row: dict[str, Any]) -> bool:
+    return row.get("accepted_for_scae") is True and row.get("quality_status") == "accepted"
+
+
+def _quality_correlation_group_counts(
+    classifications: list[dict[str, Any]],
+    quality_by_classification: dict[str, dict[str, Any]],
+) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for classification in classifications:
+        quality_row = quality_by_classification.get(_classification_key(classification))
+        if quality_row is None or not _is_quality_accepted(quality_row):
+            continue
+        for group in _quality_correlation_groups(quality_row):
+            counts[group] = counts.get(group, 0) + 1
+    return counts
+
+
+def _cap_stack_context(cap_stack: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(cap_stack, dict):
+        raise ScaeEvidenceDeltaError("cap_stack must be an object")
+    context = {field: _numeric_multiplier(cap_stack.get(field), field) for field in CAP_STACK_FIELDS}
+    selector = cap_stack.get("representative_selector")
+    if not _is_non_empty_string(selector):
+        raise ScaeEvidenceDeltaError("cap_stack.representative_selector must be a non-empty string")
+    context["representative_selector"] = str(selector)
+    context["applied_stage"] = "candidate_per_update_cap_only"
+    context["later_cap_stages_not_applied"] = [
+        "per_cluster_log_odds_cap",
+        "per_branch_log_odds_cap",
+        "total_evidence_log_odds_cap",
+        "debt_mode_total_evidence_log_odds_cap",
+    ]
+    return context
+
+
+def _correlated_quality_guard_policy(cap_stack: dict[str, Any]) -> dict[str, Any]:
+    guard = cap_stack.get("correlated_quality_guard")
+    if not isinstance(guard, dict):
+        raise ScaeEvidenceDeltaError("cap_stack.correlated_quality_guard must be an object")
+    if not isinstance(guard.get("enabled"), bool):
+        raise ScaeEvidenceDeltaError("correlated_quality_guard.enabled must be a boolean")
+    min_count = guard.get("repeated_group_min_count")
+    if isinstance(min_count, bool) or not isinstance(min_count, int) or min_count < 2:
+        raise ScaeEvidenceDeltaError("correlated_quality_guard.repeated_group_min_count must be an integer >= 2")
+    ceiling = _numeric_multiplier(guard.get("multiplier_ceiling"), "correlated_quality_guard.multiplier_ceiling")
+    if ceiling <= 0.0 or ceiling > 1.0:
+        raise ScaeEvidenceDeltaError("correlated_quality_guard.multiplier_ceiling must be in (0, 1]")
+    return {
+        "enabled": guard["enabled"],
+        "repeated_group_min_count": min_count,
+        "multiplier_ceiling": ceiling,
+    }
+
+
+def _apply_correlated_quality_guard(
+    *,
+    verified_quality_multiplier: float,
+    quality_correlation_groups: list[str],
+    group_counts: dict[str, int],
+    guard_policy: dict[str, Any],
+) -> dict[str, Any]:
+    if not guard_policy["enabled"]:
+        return {
+            "multiplier": verified_quality_multiplier,
+            "applied": False,
+            "status": "disabled_by_policy",
+            "repeated_groups": [],
+            "group_counts": {group: group_counts.get(group, 0) for group in quality_correlation_groups},
+        }
+
+    repeated_groups = [
+        group
+        for group in quality_correlation_groups
+        if group_counts.get(group, 0) >= guard_policy["repeated_group_min_count"]
+    ]
+    local_counts = {group: group_counts.get(group, 0) for group in quality_correlation_groups}
+    if not quality_correlation_groups:
+        status = "no_quality_correlation_groups"
+    elif not repeated_groups:
+        status = "passed_no_repeated_quality_correlation_group"
+    else:
+        status = "repeated_quality_correlation_group_within_cap"
+
+    guarded = verified_quality_multiplier
+    if repeated_groups:
+        guarded = min(verified_quality_multiplier, guard_policy["multiplier_ceiling"])
+        if guarded < verified_quality_multiplier:
+            status = "capped_repeated_quality_correlation_group"
+
+    return {
+        "multiplier": round(guarded, 9),
+        "applied": guarded < verified_quality_multiplier,
+        "status": status,
+        "repeated_groups": repeated_groups,
+        "group_counts": local_counts,
+    }
+
+
 def _cap_signed_delta(value: float, cap: float) -> tuple[float, bool]:
     bounded = max(-cap, min(cap, value))
     return round(bounded, 9), bounded != value
@@ -169,13 +288,16 @@ def build_evidence_delta_candidate_slices(
     market_assimilation_contexts: list[dict[str, Any]] | None = None,
     policy: dict[str, Any] | None = None,
 ) -> EvidenceDeltaCandidateResult:
-    """Build SCAE-003 signed log-odds candidate slices from verified rows."""
+    """Build guarded SCAE signed log-odds candidate slices from verified rows."""
 
     active_policy = copy.deepcopy(policy or default_scae_policy())
     delta_policy = active_policy["evidence_delta_mapping"]
     strength_map = delta_policy["strength_log_odds"]
     direction_multipliers = delta_policy["direction_multipliers"]
-    per_update_cap = _numeric_multiplier(active_policy["cap_stack"]["per_update_log_odds_cap"], "per_update_log_odds_cap")
+    cap_stack = active_policy["cap_stack"]
+    cap_stack_context = _cap_stack_context(cap_stack)
+    per_update_cap = cap_stack_context["per_update_log_odds_cap"]
+    guard_policy = _correlated_quality_guard_policy(cap_stack)
 
     classifications = _rows_from(classification_matrix, "classification_slices")
     direction_by_classification = _index_verifications(
@@ -187,6 +309,7 @@ def build_evidence_delta_candidate_slices(
         "quality verification",
     )
     assimilation_by_evidence = _index_assimilation(market_assimilation_contexts)
+    quality_group_counts = _quality_correlation_group_counts(classifications, quality_by_classification)
 
     candidate_slices: list[dict[str, Any]] = []
     for classification in classifications:
@@ -208,8 +331,7 @@ def build_evidence_delta_candidate_slices(
             and direction_row.get("verification_status") == "accepted"
         )
         quality_accepted = (
-            quality_row.get("accepted_for_scae") is True
-            and quality_row.get("quality_status") == "accepted"
+            _is_quality_accepted(quality_row)
         )
 
         raw_quality_multiplier = _numeric_multiplier(
@@ -220,6 +342,14 @@ def build_evidence_delta_candidate_slices(
             quality_row.get("final_quality_multiplier"),
             "final_quality_multiplier",
         )
+        quality_correlation_groups = _quality_correlation_groups(quality_row)
+        guard_result = _apply_correlated_quality_guard(
+            verified_quality_multiplier=final_quality_multiplier,
+            quality_correlation_groups=quality_correlation_groups,
+            group_counts=quality_group_counts,
+            guard_policy=guard_policy,
+        )
+        guarded_quality_multiplier = float(guard_result["multiplier"])
         evidence_ref = classification.get("evidence_ref")
         assimilation_context = assimilation_by_evidence.get(str(evidence_ref)) if _is_non_empty_string(evidence_ref) else None
         if assimilation_context is not None:
@@ -244,7 +374,7 @@ def build_evidence_delta_candidate_slices(
         bounded_delta = 0.0
         bounded_by_cap = False
         if status in ACCEPTED_CANDIDATE_STATUSES:
-            pre_cap_delta = strength_log_odds * direction_multiplier * final_quality_multiplier * market_assimilation_multiplier
+            pre_cap_delta = strength_log_odds * direction_multiplier * guarded_quality_multiplier * market_assimilation_multiplier
             bounded_delta, bounded_by_cap = _cap_signed_delta(pre_cap_delta, per_update_cap)
 
         seed = {
@@ -253,6 +383,9 @@ def build_evidence_delta_candidate_slices(
             "quality_verification_ref": quality_row.get("quality_verification_slice_id"),
             "evidence_strength": evidence_strength,
             "verified_direction": verified_direction,
+            "quality_multiplier_after_correlated_guard": guarded_quality_multiplier,
+            "correlated_quality_guard_status": guard_result["status"],
+            "correlated_quality_group_counts": guard_result["group_counts"],
             "candidate_status": status,
         }
         candidate = {
@@ -285,16 +418,22 @@ def build_evidence_delta_candidate_slices(
             "quality_verification_slice_ref": quality_row.get("quality_verification_slice_id"),
             "quality_status": quality_row.get("quality_status"),
             "accepted_quality_fields": copy.deepcopy(quality_row.get("accepted_quality_fields") or {}),
-            "quality_correlation_groups": copy.deepcopy(quality_row.get("quality_correlation_groups") or []),
+            "quality_correlation_groups": quality_correlation_groups,
             "raw_quality_multiplier": raw_quality_multiplier,
             "verified_quality_multiplier": final_quality_multiplier,
-            "correlated_quality_guard_applied": False,
-            "correlated_quality_guard_status": "not_applied_scae004_not_implemented",
+            "quality_multiplier_before_correlated_guard": final_quality_multiplier,
+            "quality_multiplier_after_correlated_guard": guarded_quality_multiplier,
+            "correlated_quality_guard_applied": bool(guard_result["applied"]),
+            "correlated_quality_guard_status": guard_result["status"],
+            "correlated_quality_guard_repeated_groups": guard_result["repeated_groups"],
+            "correlated_quality_group_counts": guard_result["group_counts"],
+            "correlated_quality_guard_policy": copy.deepcopy(guard_policy),
             "market_assimilation_context_ref": assimilation_context.get("evidence_ref") if assimilation_context else None,
             "market_assimilation_multiplier": market_assimilation_multiplier,
             "market_assimilation_reason_codes": copy.deepcopy((assimilation_context or {}).get("reason_codes") or []),
             "pre_cap_signed_log_odds_delta": round(pre_cap_delta, 9),
             "per_update_log_odds_cap": per_update_cap,
+            "cap_stack": copy.deepcopy(cap_stack_context),
             "signed_log_odds_delta": bounded_delta,
             "bounded_by_per_update_cap": bounded_by_cap,
             "candidate_status": status,
@@ -306,12 +445,13 @@ def build_evidence_delta_candidate_slices(
             "writes_production_forecast": False,
             "allowed_downstream_effect": "scae_ledger_input_candidate_only",
             "not_implemented_scope": [
-                "SCAE-004_correlated_quality_guard_and_cap_stack",
                 "SCAE-005_cluster_netting",
                 "SCAE-006_cross_leaf_dependence",
+                "SCAE-007_branch_subledgers",
                 "SCAE-011_final_probability_fields",
             ],
-            "mapper_version": SCAE_003_MAPPER_VERSION,
+            "implemented_feature_ids": ["SCAE-003", "SCAE-004"],
+            "mapper_version": SCAE_EVIDENCE_MAPPER_VERSION,
         }
         candidate["candidate_slice_digest"] = _prefixed_sha256(candidate)
         candidate_slices.append(candidate)
@@ -337,7 +477,7 @@ def build_evidence_delta_candidate_bundle(
     market_assimilation_contexts: list[dict[str, Any]] | None = None,
     policy: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Return the external SCAE-003 candidate bundle artifact."""
+    """Return the external candidate bundle artifact after SCAE-004 guards."""
 
     result = build_evidence_delta_candidate_slices(
         classification_matrix,
@@ -361,5 +501,6 @@ def build_evidence_delta_candidate_bundle(
         "candidate_status_counts": dict(sorted(status_counts.items())),
         "candidate_bundle_digest": result.candidate_bundle_digest,
         "candidate_slices": result.candidate_slices,
-        "mapper_version": SCAE_003_MAPPER_VERSION,
+        "implemented_feature_ids": ["SCAE-003", "SCAE-004"],
+        "mapper_version": SCAE_EVIDENCE_MAPPER_VERSION,
     }
