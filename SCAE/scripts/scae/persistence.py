@@ -1,8 +1,8 @@
-"""MIG-007 SCAE ledger and probability audit persistence.
+"""SCAE persistence surfaces for ledger audit and forecast decisions.
 
-This module stores SCAE-owned ledger artifacts and diagnostic slices. It does
-not bridge to forecast decisions, market_predictions, scoring, replay, or
-calibration tuning surfaces.
+MIG-007 stores SCAE-owned ledger artifacts and diagnostic slices. PERSIST-001
+adds the SCAE-only forecast decision record. It does not bridge to
+market_predictions, scoring, replay, or calibration tuning surfaces.
 """
 
 from __future__ import annotations
@@ -10,13 +10,16 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import re
 import sqlite3
 from pathlib import Path
 from typing import Any
 
 
 MIG007_SCHEMA_VERSION = "scae-ledger-probability-audit-persistence/v1"
+PERSIST001_SCHEMA_VERSION = "scae-forecast-decision-persistence/v1"
 SCAE_LEDGER_OUTPUT_TABLE = "scae_ledger_outputs"
+FORECAST_DECISION_TABLE = "forecast_decision_records"
 SCAE_LOG_ODDS_UPDATE_TABLE = "scae_log_odds_update_slices"
 SCAE_CROSS_LEAF_DEPENDENCY_TABLE = "scae_cross_leaf_dependency_slices"
 SCAE_BRANCH_SUBLEDGER_TABLE = "scae_branch_subledger_slices"
@@ -47,8 +50,12 @@ SCAE_LEDGER_MIGRATION = (
 )
 
 VALIDITY_INVALID = "invalid_for_forecast"
+VALIDITY_READY = "valid_for_forecast"
+VALIDITY_WATCH_ONLY = "valid_for_forecast_watch_only"
 FINAL_READY_STATUS = "final_probability_fields_ready"
 FINAL_BLOCKED_STATUS = "blocked_invalid_for_forecast"
+FORECAST_DECISION_PERSISTED_STATUS = "production_forecast_persisted_from_scae"
+FORECAST_DECISION_BLOCKED_STATUS = "blocked_invalid_scae_forecast"
 FINAL_PROBABILITY_FIELDS = (
     "debt_adjusted_probability",
     "production_forecast_prob",
@@ -65,6 +72,99 @@ PROTECTED_DOWNSTREAM_TABLES = (
     "v2_replay_result_records",
     "training_trace_minimal_pointers",
     "training_trace_full_materializations",
+)
+PERSIST001_PROTECTED_TABLES = (
+    "market_predictions",
+    "outcome_scoring_records",
+    "evaluator_scorecards",
+    "calibration_candidate_records",
+    "calibration_lane_pointer_records",
+    "v2_replay_manifests",
+    "v2_replay_result_records",
+)
+
+FORECAST_VALIDITY_RANK = {
+    VALIDITY_INVALID: 0,
+    VALIDITY_WATCH_ONLY: 1,
+    VALIDITY_READY: 2,
+}
+EXECUTION_AUTHORITY_RANK = {
+    "forbidden": 0,
+    "needs_refresh": 1,
+    "watch_only": 2,
+    "low_size_only": 3,
+    "normal_execution_allowed": 4,
+}
+MAX_EXECUTION_BY_VALIDITY = {
+    VALIDITY_INVALID: "forbidden",
+    VALIDITY_WATCH_ONLY: "watch_only",
+    VALIDITY_READY: "normal_execution_allowed",
+}
+ACTIONABILITY_RANK = {
+    "non_actionable": 0,
+    "refresh_required": 1,
+    "watch_only": 2,
+    "actionable_low_size": 3,
+    "actionable": 4,
+}
+DEFAULT_ACTIONABILITY_BY_EXECUTION = {
+    "forbidden": "non_actionable",
+    "needs_refresh": "refresh_required",
+    "watch_only": "watch_only",
+    "low_size_only": "actionable_low_size",
+    "normal_execution_allowed": "actionable",
+}
+FORBIDDEN_DECISION_AUTHORITY_FIELDS = {
+    "brier",
+    "brier_score",
+    "calibration_debt_cleared",
+    "calibration_debt_clearance",
+    "canonical_probability",
+    "clear_calibration_debt",
+    "confidence_interval",
+    "debt_adjusted_probability",
+    "decision_probability",
+    "desired_probability",
+    "fair_value",
+    "fair_value_probability",
+    "forecast_interval",
+    "forecast_prob",
+    "forecast_probability",
+    "interval",
+    "interval_override",
+    "market_prediction",
+    "market_predictions",
+    "market_predictions_row",
+    "persist_forecast",
+    "persistence_write",
+    "post_ledger_probability",
+    "predicted_probability",
+    "prediction_brier",
+    "probability",
+    "probability_estimate",
+    "probability_interval",
+    "probability_override",
+    "probability_range",
+    "probability_recommendation",
+    "probability_signal",
+    "production_forecast_prob",
+    "raw_ledger_probability",
+    "replacement_probability",
+    "scae_delta",
+    "scae_log_odds_delta",
+    "scoreable_forecast_output",
+    "scoreable_prediction",
+    "target_probability",
+    "write_forecast_decision",
+    "writes_market_prediction",
+    "writes_production_forecast",
+}
+FORBIDDEN_DECISION_AUTHORITY_KEYS = {
+    re.sub(r"[^a-z0-9]", "", name.lower()) for name in FORBIDDEN_DECISION_AUTHORITY_FIELDS
+}
+FORBIDDEN_NUMERIC_TEXT_PATTERN = re.compile(
+    r"(?i)\b(?:probability|fair\s*value|forecast\s*prob|canonical\s*probability|production\s*forecast)"
+    r"\b[^.\n]{0,80}(?:\d{1,3}(?:\.\d+)?\s*%|\b0\.\d+\b)"
 )
 
 GENERIC_SLICE_TABLES = frozenset(MIG007_TABLES) - {SCAE_LEDGER_OUTPUT_TABLE}
@@ -116,6 +216,10 @@ def _is_non_empty_string(value: Any) -> bool:
     return isinstance(value, str) and bool(value.strip())
 
 
+def _normalize_key(key: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", key.lower())
+
+
 def _bool_int(value: Any) -> int:
     return 1 if value is True else 0
 
@@ -146,6 +250,34 @@ def _required_string(field_name: str, value: Any) -> str:
     return str(value)
 
 
+def _optional_string(value: Any) -> str | None:
+    if value is None:
+        return None
+    if not _is_non_empty_string(value):
+        raise ScaePersistenceError("optional string fields must be non-empty strings")
+    return str(value)
+
+
+def _assert_no_decision_probability_authority(value: Any, path: str) -> None:
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if not isinstance(key, str) or not key:
+                raise ScaePersistenceError(f"{path} contains an invalid key")
+            if _normalize_key(key) in FORBIDDEN_DECISION_AUTHORITY_KEYS:
+                raise ScaePersistenceError(f"{path}.{key} is forbidden for PERSIST-001")
+            _assert_no_decision_probability_authority(child, f"{path}.{key}")
+    elif isinstance(value, list):
+        for idx, child in enumerate(value):
+            _assert_no_decision_probability_authority(child, f"{path}[{idx}]")
+    elif isinstance(value, str):
+        if FORBIDDEN_NUMERIC_TEXT_PATTERN.search(value):
+            raise ScaePersistenceError(f"{path} appears to author a numeric probability")
+    elif value is None or isinstance(value, (bool, int, float)):
+        return
+    else:
+        raise ScaePersistenceError(f"{path} contains unsupported type {type(value).__name__}")
+
+
 def _first_non_empty(row: dict[str, Any], fields: tuple[str, ...]) -> str | None:
     for field in fields:
         value = row.get(field)
@@ -169,6 +301,60 @@ def table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
 
 def ensure_scae_ledger_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(SCAE_LEDGER_MIGRATION.read_text(encoding="utf-8"))
+
+
+def ensure_forecast_decision_schema(conn: sqlite3.Connection) -> None:
+    """Create the PERSIST-001 forecast decision table."""
+
+    conn.executescript(
+        f"""
+        PRAGMA foreign_keys = ON;
+
+        CREATE TABLE IF NOT EXISTS {FORECAST_DECISION_TABLE} (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          forecast_decision_id TEXT NOT NULL UNIQUE,
+          schema_version TEXT NOT NULL,
+          case_id TEXT NOT NULL,
+          case_key TEXT,
+          dispatch_id TEXT NOT NULL,
+          run_id TEXT,
+          forecast_timestamp TEXT,
+          scae_ledger_id TEXT NOT NULL,
+          scae_ledger_digest TEXT NOT NULL,
+          decision_gate_id TEXT NOT NULL,
+          decision_gate_digest TEXT NOT NULL,
+          synthesis_annotation_ref TEXT,
+          synthesis_annotation_digest TEXT,
+          production_forecast_prob REAL,
+          canonical_probability REAL,
+          forecast_validity_status TEXT NOT NULL,
+          execution_authority_status TEXT NOT NULL,
+          actionability_status TEXT NOT NULL,
+          final_probability_fields_status TEXT NOT NULL,
+          production_persistence_status TEXT NOT NULL,
+          production_forecast_persisted INTEGER NOT NULL DEFAULT 0,
+          scoreable_forecast_output INTEGER NOT NULL DEFAULT 0,
+          writes_market_prediction INTEGER NOT NULL DEFAULT 0,
+          probability_source TEXT NOT NULL,
+          decision_effect_status TEXT NOT NULL,
+          non_scoreable_reason_code TEXT,
+          metadata_json TEXT NOT NULL DEFAULT '{{}}',
+          artifact_payload_json TEXT NOT NULL,
+          artifact_sha256 TEXT NOT NULL,
+          scae_ledger_payload_sha256 TEXT NOT NULL,
+          decision_gate_payload_sha256 TEXT NOT NULL,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_forecast_decision_case
+          ON {FORECAST_DECISION_TABLE}(case_id, dispatch_id);
+        CREATE INDEX IF NOT EXISTS idx_forecast_decision_scae
+          ON {FORECAST_DECISION_TABLE}(scae_ledger_id, decision_gate_id);
+        CREATE INDEX IF NOT EXISTS idx_forecast_decision_status
+          ON {FORECAST_DECISION_TABLE}(forecast_validity_status, actionability_status);
+        """
+    )
 
 
 def _rows_from(value: Any, field_name: str) -> list[dict[str, Any]]:
@@ -560,6 +746,385 @@ def _ledger_values(ledger: dict[str, Any]) -> dict[str, Any]:
         ),
         "artifact_payload_json": canonical_json(payload),
         "artifact_sha256": _prefixed_sha256(payload),
+    }
+
+
+def _forecast_probability_fields(ledger: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(ledger, dict):
+        raise ScaePersistenceError("scae_ledger must be an object")
+    _case_id(ledger)
+    _dispatch_id(ledger)
+    validity = _required_string("forecast_validity_status", ledger.get("forecast_validity_status"))
+    if validity not in FORECAST_VALIDITY_RANK:
+        raise ScaePersistenceError(f"unknown forecast_validity_status {validity}")
+    execution = _required_string("execution_authority_status", ledger.get("execution_authority_status"))
+    if execution not in EXECUTION_AUTHORITY_RANK:
+        raise ScaePersistenceError(f"unknown execution_authority_status {execution}")
+    max_execution = MAX_EXECUTION_BY_VALIDITY[validity]
+    if EXECUTION_AUTHORITY_RANK[execution] > EXECUTION_AUTHORITY_RANK[max_execution]:
+        raise ScaePersistenceError("SCAE execution authority exceeds forecast validity")
+    if ledger.get("writes_persistence") is True:
+        raise ScaePersistenceError("SCAE ledger input must not claim persistence write authority")
+    if ledger.get("writes_production_forecast") is True:
+        raise ScaePersistenceError("SCAE ledger input must not claim production forecast write authority")
+
+    final_status = _required_string(
+        "final_probability_fields_status",
+        ledger.get("final_probability_fields_status"),
+    )
+    if validity == VALIDITY_INVALID:
+        forbidden_present = sorted(field for field in FINAL_PROBABILITY_FIELDS if field in ledger)
+        if forbidden_present:
+            raise ScaePersistenceError(
+                "invalid SCAE forecast must not carry final probability fields: "
+                + ", ".join(forbidden_present)
+            )
+        if final_status != FINAL_BLOCKED_STATUS:
+            raise ScaePersistenceError("invalid SCAE forecast must have blocked final probability status")
+        return {
+            "forecast_validity_status": validity,
+            "execution_authority_status": execution,
+            "final_probability_fields_status": final_status,
+            "production_forecast_prob": None,
+            "canonical_probability": None,
+        }
+
+    if validity not in {VALIDITY_READY, VALIDITY_WATCH_ONLY}:
+        raise ScaePersistenceError(f"unknown forecast_validity_status {validity}")
+    if final_status != FINAL_READY_STATUS:
+        raise ScaePersistenceError("valid SCAE forecasts must have ready final probability status")
+    production = _required_float(ledger.get("production_forecast_prob"), "production_forecast_prob")
+    canonical = _required_float(ledger.get("canonical_probability"), "canonical_probability")
+    if not 0.0 <= production <= 1.0:
+        raise ScaePersistenceError("production_forecast_prob must be in [0, 1]")
+    if not 0.0 <= canonical <= 1.0:
+        raise ScaePersistenceError("canonical_probability must be in [0, 1]")
+    if round(production, 9) != round(canonical, 9):
+        raise ScaePersistenceError("canonical_probability must equal SCAE production_forecast_prob")
+    return {
+        "forecast_validity_status": validity,
+        "execution_authority_status": execution,
+        "final_probability_fields_status": final_status,
+        "production_forecast_prob": round(production, 9),
+        "canonical_probability": round(canonical, 9),
+    }
+
+
+def _decision_gate_id(decision_gate: dict[str, Any]) -> str:
+    value = _first_non_empty(decision_gate, ("decision_gate_id", "forecast_decision_id", "artifact_id"))
+    if value:
+        return value
+    return _sha_id("decision-gate", decision_gate)
+
+
+def _decision_gate_digest(decision_gate: dict[str, Any]) -> str:
+    value = _first_non_empty(decision_gate, ("decision_gate_digest", "artifact_sha256"))
+    if value:
+        return value
+    return _prefixed_sha256(decision_gate)
+
+
+def _scae_ledger_digest(ledger: dict[str, Any]) -> str:
+    value = _first_non_empty(
+        ledger,
+        (
+            "final_probability_ledger_digest",
+            "artifact_sha256",
+            "scae_ledger_digest",
+            "research_sufficiency_guarded_ledger_digest",
+            "pre_debt_ledger_output_digest",
+        ),
+    )
+    if value:
+        return value
+    return _prefixed_sha256(ledger)
+
+
+def _synthesis_ref(decision_gate: dict[str, Any]) -> str | None:
+    context = decision_gate.get("synthesis_context")
+    if not isinstance(context, dict):
+        return None
+    return _optional_string(context.get("synthesis_annotation_ref"))
+
+
+def _synthesis_digest(decision_gate: dict[str, Any]) -> str | None:
+    context = decision_gate.get("synthesis_context")
+    if not isinstance(context, dict):
+        return None
+    return _optional_string(context.get("synthesis_annotation_digest"))
+
+
+def _assert_decision_gate_false_flags(decision_gate: dict[str, Any]) -> None:
+    false_fields = (
+        "probability_authority",
+        "replacement_probability_authority",
+        "synthesis_upgrade_authority",
+        "persistence_authority",
+        "market_prediction_authority",
+        "scoring_authority",
+        "calibration_debt_clearance_authority",
+        "writes_production_forecast",
+        "writes_persistence",
+        "writes_market_prediction",
+        "scoreable_forecast_output",
+        "clears_calibration_debt",
+    )
+    for field_name in false_fields:
+        if decision_gate.get(field_name) not in (False, 0):
+            raise ScaePersistenceError(f"decision_gate.{field_name} must be false for PERSIST-001")
+
+
+def _validate_decision_gate_for_persistence(
+    decision_gate: dict[str, Any],
+    *,
+    ledger: dict[str, Any],
+    forecast_fields: dict[str, Any],
+) -> dict[str, Any]:
+    if not isinstance(decision_gate, dict):
+        raise ScaePersistenceError("decision_gate must be an object")
+    if decision_gate.get("artifact_type") != "decision_execution_gate":
+        raise ScaePersistenceError("decision_gate must be a DEC-001 artifact")
+    if decision_gate.get("feature_id") != "DEC-001":
+        raise ScaePersistenceError("decision_gate.feature_id must be DEC-001")
+    _assert_decision_gate_false_flags(decision_gate)
+    for key, child in decision_gate.items():
+        if key in {"scae_context", "forbidden_outputs", "allowed_outputs"}:
+            continue
+        if key in {
+            "probability_authority",
+            "replacement_probability_authority",
+            "synthesis_upgrade_authority",
+            "persistence_authority",
+            "market_prediction_authority",
+            "scoring_authority",
+            "calibration_debt_clearance_authority",
+            "writes_production_forecast",
+            "writes_persistence",
+            "writes_market_prediction",
+            "scoreable_forecast_output",
+            "clears_calibration_debt",
+        }:
+            continue
+        if _normalize_key(key) in FORBIDDEN_DECISION_AUTHORITY_KEYS:
+            raise ScaePersistenceError(f"decision_gate.{key} is forbidden for PERSIST-001")
+        _assert_no_decision_probability_authority(child, f"decision_gate.{key}")
+
+    context = decision_gate.get("scae_context")
+    if not isinstance(context, dict):
+        raise ScaePersistenceError("decision_gate.scae_context must be an object")
+    if context.get("case_id") not in (None, ledger.get("case_id")):
+        raise ScaePersistenceError("decision_gate.scae_context.case_id does not match SCAE ledger")
+    if context.get("dispatch_id") not in (None, ledger.get("dispatch_id")):
+        raise ScaePersistenceError("decision_gate.scae_context.dispatch_id does not match SCAE ledger")
+    if context.get("scae_ledger_ref") not in (None, _ledger_id(ledger)):
+        raise ScaePersistenceError("decision_gate.scae_context.scae_ledger_ref does not match SCAE ledger")
+    if context.get("scae_ledger_digest") not in (None, _scae_ledger_digest(ledger)):
+        raise ScaePersistenceError("decision_gate.scae_context.scae_ledger_digest does not match SCAE ledger")
+
+    scae_validity = forecast_fields["forecast_validity_status"]
+    decision_validity = _required_string(
+        "decision_gate.forecast_validity_status",
+        decision_gate.get("forecast_validity_status"),
+    )
+    if decision_validity not in FORECAST_VALIDITY_RANK:
+        raise ScaePersistenceError(f"unknown decision forecast_validity_status {decision_validity}")
+    if FORECAST_VALIDITY_RANK[decision_validity] > FORECAST_VALIDITY_RANK[scae_validity]:
+        raise ScaePersistenceError("decision gate cannot upgrade SCAE forecast validity")
+    if context.get("forecast_validity_status") not in (None, scae_validity):
+        raise ScaePersistenceError("decision_gate.scae_context forecast validity does not match SCAE ledger")
+
+    scae_execution = forecast_fields["execution_authority_status"]
+    decision_execution = _required_string(
+        "decision_gate.execution_authority_status",
+        decision_gate.get("execution_authority_status"),
+    )
+    if decision_execution not in EXECUTION_AUTHORITY_RANK:
+        raise ScaePersistenceError(f"unknown decision execution_authority_status {decision_execution}")
+    max_execution_rank = min(
+        EXECUTION_AUTHORITY_RANK[scae_execution],
+        EXECUTION_AUTHORITY_RANK[MAX_EXECUTION_BY_VALIDITY[decision_validity]],
+    )
+    if EXECUTION_AUTHORITY_RANK[decision_execution] > max_execution_rank:
+        raise ScaePersistenceError("decision gate cannot upgrade SCAE execution authority")
+    if context.get("execution_authority_status") not in (None, scae_execution):
+        raise ScaePersistenceError("decision_gate.scae_context execution authority does not match SCAE ledger")
+
+    actionability = _required_string("actionability_status", decision_gate.get("actionability_status"))
+    if actionability not in ACTIONABILITY_RANK:
+        raise ScaePersistenceError(f"unknown actionability_status {actionability}")
+    default_actionability = DEFAULT_ACTIONABILITY_BY_EXECUTION[decision_execution]
+    if ACTIONABILITY_RANK[actionability] > ACTIONABILITY_RANK[default_actionability]:
+        raise ScaePersistenceError("actionability cannot exceed selected execution authority")
+
+    production = forecast_fields["production_forecast_prob"]
+    canonical = forecast_fields["canonical_probability"]
+    if scae_validity == VALIDITY_INVALID:
+        if "production_forecast_prob" in context or "canonical_probability" in context:
+            raise ScaePersistenceError("invalid DEC/SCAE context must not carry production probability fields")
+        if decision_validity != VALIDITY_INVALID or decision_execution != "forbidden" or actionability != "non_actionable":
+            raise ScaePersistenceError("invalid SCAE forecasts must remain non-actionable")
+    else:
+        context_production = _required_float(context.get("production_forecast_prob"), "decision_gate.scae_context.production_forecast_prob")
+        context_canonical = _required_float(context.get("canonical_probability"), "decision_gate.scae_context.canonical_probability")
+        if round(context_production, 9) != production:
+            raise ScaePersistenceError("decision gate cannot replace SCAE production_forecast_prob")
+        if round(context_canonical, 9) != canonical:
+            raise ScaePersistenceError("decision gate cannot replace SCAE canonical_probability")
+
+    return {
+        "decision_gate_id": _decision_gate_id(decision_gate),
+        "decision_gate_digest": _decision_gate_digest(decision_gate),
+        "forecast_validity_status": decision_validity,
+        "execution_authority_status": decision_execution,
+        "actionability_status": actionability,
+        "synthesis_annotation_ref": _synthesis_ref(decision_gate),
+        "synthesis_annotation_digest": _synthesis_digest(decision_gate),
+    }
+
+
+def _metadata_json(metadata: dict[str, Any] | None) -> str:
+    value = copy.deepcopy(metadata or {})
+    if not isinstance(value, dict):
+        raise ScaePersistenceError("metadata must be an object")
+    _assert_no_decision_probability_authority(value, "metadata")
+    return canonical_json(value)
+
+
+def _decision_effect_status(
+    *,
+    forecast_fields: dict[str, Any],
+    decision_values: dict[str, Any],
+) -> str:
+    if forecast_fields["forecast_validity_status"] == VALIDITY_INVALID:
+        return "blocked_invalid_scae_forecast"
+    if (
+        decision_values["forecast_validity_status"] != forecast_fields["forecast_validity_status"]
+        or decision_values["execution_authority_status"] != forecast_fields["execution_authority_status"]
+        or decision_values["actionability_status"]
+        != DEFAULT_ACTIONABILITY_BY_EXECUTION[forecast_fields["execution_authority_status"]]
+    ):
+        return "decision_downgraded_execution_or_actionability"
+    return "decision_preserved_scae_execution"
+
+
+def _forecast_decision_values(
+    ledger: dict[str, Any],
+    decision_gate: dict[str, Any],
+    *,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    forecast_fields = _forecast_probability_fields(ledger)
+    decision_values = _validate_decision_gate_for_persistence(
+        decision_gate,
+        ledger=ledger,
+        forecast_fields=forecast_fields,
+    )
+    should_persist_probability = forecast_fields["forecast_validity_status"] != VALIDITY_INVALID
+    payload = {
+        "artifact_type": "forecast_decision_record",
+        "schema_version": PERSIST001_SCHEMA_VERSION,
+        "feature_id": "PERSIST-001",
+        "case_id": _case_id(ledger),
+        "case_key": ledger.get("case_key"),
+        "dispatch_id": _dispatch_id(ledger),
+        "run_id": ledger.get("run_id"),
+        "forecast_timestamp": ledger.get("forecast_timestamp"),
+        "scae_ledger_id": _ledger_id(ledger),
+        "scae_ledger_digest": _scae_ledger_digest(ledger),
+        "decision_gate_id": decision_values["decision_gate_id"],
+        "decision_gate_digest": decision_values["decision_gate_digest"],
+        "synthesis_annotation_ref": decision_values["synthesis_annotation_ref"],
+        "synthesis_annotation_digest": decision_values["synthesis_annotation_digest"],
+        "production_forecast_prob": (
+            forecast_fields["production_forecast_prob"] if should_persist_probability else None
+        ),
+        "canonical_probability": forecast_fields["canonical_probability"] if should_persist_probability else None,
+        "forecast_validity_status": decision_values["forecast_validity_status"],
+        "execution_authority_status": decision_values["execution_authority_status"],
+        "actionability_status": decision_values["actionability_status"],
+        "final_probability_fields_status": forecast_fields["final_probability_fields_status"],
+        "production_persistence_status": (
+            FORECAST_DECISION_PERSISTED_STATUS if should_persist_probability else FORECAST_DECISION_BLOCKED_STATUS
+        ),
+        "production_forecast_persisted": should_persist_probability,
+        "scoreable_forecast_output": False,
+        "writes_market_prediction": False,
+        "probability_source": "SCAE-012.production_forecast_prob",
+        "decision_effect_status": _decision_effect_status(
+            forecast_fields=forecast_fields,
+            decision_values=decision_values,
+        ),
+        "non_scoreable_reason_code": (
+            "forecast_validity_invalid_for_forecast" if not should_persist_probability else None
+        ),
+        "metadata": copy.deepcopy(metadata or {}),
+    }
+    payload["forecast_decision_id"] = _sha_id(
+        "forecast-decision",
+        {
+            "scae_ledger_id": payload["scae_ledger_id"],
+            "decision_gate_id": payload["decision_gate_id"],
+            "feature_id": "PERSIST-001",
+        },
+    )
+    payload["forecast_decision_digest"] = _prefixed_sha256(payload)
+    return {
+        "forecast_decision_id": payload["forecast_decision_id"],
+        "schema_version": PERSIST001_SCHEMA_VERSION,
+        "case_id": payload["case_id"],
+        "case_key": payload["case_key"],
+        "dispatch_id": payload["dispatch_id"],
+        "run_id": payload["run_id"],
+        "forecast_timestamp": payload["forecast_timestamp"],
+        "scae_ledger_id": payload["scae_ledger_id"],
+        "scae_ledger_digest": payload["scae_ledger_digest"],
+        "decision_gate_id": payload["decision_gate_id"],
+        "decision_gate_digest": payload["decision_gate_digest"],
+        "synthesis_annotation_ref": payload["synthesis_annotation_ref"],
+        "synthesis_annotation_digest": payload["synthesis_annotation_digest"],
+        "production_forecast_prob": payload["production_forecast_prob"],
+        "canonical_probability": payload["canonical_probability"],
+        "forecast_validity_status": payload["forecast_validity_status"],
+        "execution_authority_status": payload["execution_authority_status"],
+        "actionability_status": payload["actionability_status"],
+        "final_probability_fields_status": payload["final_probability_fields_status"],
+        "production_persistence_status": payload["production_persistence_status"],
+        "production_forecast_persisted": _bool_int(payload["production_forecast_persisted"]),
+        "scoreable_forecast_output": 0,
+        "writes_market_prediction": 0,
+        "probability_source": payload["probability_source"],
+        "decision_effect_status": payload["decision_effect_status"],
+        "non_scoreable_reason_code": payload["non_scoreable_reason_code"],
+        "metadata_json": _metadata_json(metadata),
+        "artifact_payload_json": canonical_json(payload),
+        "artifact_sha256": _prefixed_sha256(payload),
+        "scae_ledger_payload_sha256": _prefixed_sha256(ledger),
+        "decision_gate_payload_sha256": _prefixed_sha256(decision_gate),
+    }
+
+
+def write_forecast_decision(
+    conn: sqlite3.Connection,
+    scae_ledger: dict[str, Any],
+    decision_gate: dict[str, Any],
+    *,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Persist the PERSIST-001 SCAE-only forecast decision record."""
+
+    ensure_forecast_decision_schema(conn)
+    values = _forecast_decision_values(scae_ledger, decision_gate, metadata=metadata)
+    _insert_or_update(conn, FORECAST_DECISION_TABLE, values, "forecast_decision_id")
+    return {
+        "forecast_decision_id": values["forecast_decision_id"],
+        "schema_version": PERSIST001_SCHEMA_VERSION,
+        "production_persistence_status": values["production_persistence_status"],
+        "production_forecast_prob": values["production_forecast_prob"],
+        "forecast_validity_status": values["forecast_validity_status"],
+        "execution_authority_status": values["execution_authority_status"],
+        "actionability_status": values["actionability_status"],
+        "scoreable_forecast_output": False,
+        "protected_downstream_tables_not_written": list(PERSIST001_PROTECTED_TABLES),
     }
 
 

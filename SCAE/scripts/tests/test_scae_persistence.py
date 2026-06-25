@@ -1,7 +1,9 @@
 import copy
 import json
 import sqlite3
+import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -11,8 +13,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from scae.intervals import build_pre_debt_ledger_output  # noqa: E402
 from scae.ledger import apply_research_sufficiency_guard, finalize_scae_probability_fields  # noqa: E402
 from scae.persistence import (  # noqa: E402
+    FORECAST_DECISION_TABLE,
     MIG007_TABLES,
     MISSINGNESS_SIGNAL_TABLE,
+    PERSIST001_SCHEMA_VERSION,
     RESEARCH_SUFFICIENCY_RECONCILIATION_TABLE,
     SCAE_BRANCH_SUBLEDGER_TABLE,
     SCAE_CALIBRATION_DIAGNOSTIC_TABLE,
@@ -23,7 +27,9 @@ from scae.persistence import (  # noqa: E402
     SCAE_MECHANISM_FAMILY_ASSIGNMENT_TABLE,
     SCAE_RESEARCH_SUFFICIENCY_INPUT_TABLE,
     ScaePersistenceError,
+    ensure_forecast_decision_schema,
     ensure_scae_ledger_schema,
+    write_forecast_decision,
     write_scae_ledger,
     write_scae_log_odds_update_slices,
     write_scae_research_sufficiency_inputs,
@@ -132,6 +138,119 @@ class ScaePersistenceTest(unittest.TestCase):
             "writes_scae_ledger": False,
             "writes_production_forecast": False,
         }
+
+    def decision_gate(self, ledger=None, **overrides):
+        ledger = ledger or self.finalized_ledger()
+        scae_context = {
+            "scae_ledger_ref": ledger["final_probability_ledger_id"],
+            "scae_ledger_digest": ledger["final_probability_ledger_digest"],
+            "case_id": ledger["case_id"],
+            "case_key": ledger.get("case_key"),
+            "dispatch_id": ledger["dispatch_id"],
+            "run_id": ledger.get("run_id"),
+            "forecast_timestamp": ledger.get("forecast_timestamp"),
+            "forecast_validity_status": ledger["forecast_validity_status"],
+            "execution_authority_status": ledger["execution_authority_status"],
+            "final_probability_fields_status": ledger["final_probability_fields_status"],
+            "probability_source": "SCAE-012_final_probability_fields",
+        }
+        if ledger["forecast_validity_status"] != "invalid_for_forecast":
+            scae_context["production_forecast_prob"] = ledger["production_forecast_prob"]
+            scae_context["canonical_probability"] = ledger["canonical_probability"]
+        execution = overrides.pop("execution_authority_status", ledger["execution_authority_status"])
+        actionability = overrides.pop(
+            "actionability_status",
+            {
+                "forbidden": "non_actionable",
+                "needs_refresh": "refresh_required",
+                "watch_only": "watch_only",
+                "low_size_only": "actionable_low_size",
+                "normal_execution_allowed": "actionable",
+            }[execution],
+        )
+        gate = {
+            "artifact_type": "decision_execution_gate",
+            "schema_version": "decision-execution-gate/v1",
+            "feature_id": "DEC-001",
+            "builder_version": "ads-dec-001-decision-gate/v1",
+            "authority": "execution_downgrade_only_no_probability_authority",
+            "probability_authority": False,
+            "replacement_probability_authority": False,
+            "synthesis_upgrade_authority": False,
+            "persistence_authority": False,
+            "market_prediction_authority": False,
+            "scoring_authority": False,
+            "calibration_debt_clearance_authority": False,
+            "writes_production_forecast": False,
+            "writes_persistence": False,
+            "writes_market_prediction": False,
+            "scoreable_forecast_output": False,
+            "clears_calibration_debt": False,
+            "generated_at": "2026-06-25T12:01:00+00:00",
+            "case_id": ledger["case_id"],
+            "case_key": ledger.get("case_key"),
+            "dispatch_id": ledger["dispatch_id"],
+            "scae_context": scae_context,
+            "synthesis_context": {
+                "synthesis_annotation_ref": "synthesis-annotation:1",
+                "synthesis_annotation_digest": "sha256:" + "b" * 64,
+                "non_authoritative_context_only": True,
+                "can_change_probability": False,
+                "can_upgrade_execution": False,
+            },
+            "forecast_validity_status": overrides.pop(
+                "forecast_validity_status",
+                ledger["forecast_validity_status"],
+            ),
+            "execution_authority_status": execution,
+            "actionability_status": actionability,
+            "decision_request_summary": {
+                "rationale": "Use SCAE probability and preserve or downgrade actionability only.",
+                "reason_codes": ["dec001_preserve_or_downgrade_scae_authority"],
+            },
+            "downgrade_context": {
+                "can_upgrade_scae_validity": False,
+                "can_replace_scae_probability": False,
+                "synthesis_can_upgrade_execution": False,
+            },
+            "allowed_outputs": [
+                "forecast_validity_downgrade",
+                "execution_authority_downgrade",
+                "non_actionable_status",
+                "qualitative_rationale",
+            ],
+            "forbidden_outputs": [
+                "calibration_debt_clearance",
+                "canonical_probability_override",
+                "fair_value",
+                "forecast_validity_upgrade",
+                "interval_override",
+                "market_prediction_write",
+                "persistence_write",
+                "probability_range",
+                "production_forecast_prob_override",
+                "replacement_probability",
+                "scae_delta",
+                "scoreable_forecast_output",
+            ],
+            "metadata": {},
+            "decision_gate_id": "decision-gate:case-1",
+            "decision_gate_digest": "sha256:" + "c" * 64,
+        }
+        gate.update(overrides)
+        return gate
+
+    def invalid_ledger(self):
+        invalid = copy.deepcopy(self.finalized_ledger())
+        invalid["forecast_validity_status"] = "invalid_for_forecast"
+        invalid["execution_authority_status"] = "forbidden"
+        invalid["final_probability_fields_status"] = "blocked_invalid_for_forecast"
+        invalid["production_forecast_authority"] = False
+        for field in ("debt_adjusted_probability", "production_forecast_prob", "canonical_probability"):
+            invalid.pop(field, None)
+        invalid["final_probability_ledger_id"] = "scae-final-probability-ledger:invalid"
+        invalid["final_probability_ledger_digest"] = "sha256:" + "d" * 64
+        return invalid
 
     def auxiliary_slices(self):
         base = {
@@ -340,6 +459,178 @@ class ScaePersistenceTest(unittest.TestCase):
                 self.finalized_ledger(),
                 mechanism_family_assignment_slices=[row],
             )
+
+    def test_forecast_decision_schema_is_separate_from_market_predictions(self):
+        ensure_forecast_decision_schema(self.conn)
+
+        tables = {
+            row[0]
+            for row in self.conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+        }
+        self.assertIn(FORECAST_DECISION_TABLE, tables)
+        self.assertNotIn("market_predictions", tables)
+
+    def test_write_forecast_decision_uses_only_scae_probability_and_is_idempotent(self):
+        self.conn.execute("CREATE TABLE market_predictions (id TEXT PRIMARY KEY, marker TEXT NOT NULL)")
+        self.conn.execute("INSERT INTO market_predictions (id, marker) VALUES (?, ?)", ("existing", "unchanged"))
+        before_market = self.conn.execute(
+            "SELECT COUNT(*), MIN(marker), MAX(marker) FROM market_predictions"
+        ).fetchone()
+        ledger = self.finalized_ledger()
+        gate = self.decision_gate(ledger)
+
+        first = write_forecast_decision(self.conn, ledger, gate, metadata={"forecast_artifact_id": "forecast:1"})
+        second = write_forecast_decision(self.conn, ledger, gate, metadata={"forecast_artifact_id": "forecast:1"})
+
+        self.assertEqual(first["forecast_decision_id"], second["forecast_decision_id"])
+        self.assertEqual(first["schema_version"], PERSIST001_SCHEMA_VERSION)
+        self.assertEqual(first["production_forecast_prob"], ledger["production_forecast_prob"])
+        self.assertFalse(first["scoreable_forecast_output"])
+        self.assertIn("market_predictions", first["protected_downstream_tables_not_written"])
+
+        row = self.conn.execute(
+            f"""
+            SELECT production_forecast_prob, canonical_probability, probability_source,
+                   production_persistence_status, production_forecast_persisted,
+                   scoreable_forecast_output, writes_market_prediction, decision_effect_status,
+                   metadata_json
+            FROM {FORECAST_DECISION_TABLE}
+            """
+        ).fetchone()
+        self.assertEqual(row[0], ledger["production_forecast_prob"])
+        self.assertEqual(row[1], ledger["canonical_probability"])
+        self.assertEqual(row[2], "SCAE-012.production_forecast_prob")
+        self.assertEqual(row[3], "production_forecast_persisted_from_scae")
+        self.assertEqual(row[4:7], (1, 0, 0))
+        self.assertEqual(row[7], "decision_preserved_scae_execution")
+        self.assertEqual(json.loads(row[8])["forecast_artifact_id"], "forecast:1")
+        self.assertEqual(self.conn.execute(f"SELECT COUNT(*) FROM {FORECAST_DECISION_TABLE}").fetchone()[0], 1)
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*), MIN(marker), MAX(marker) FROM market_predictions").fetchone(),
+            before_market,
+        )
+
+    def test_forecast_decision_records_decision_downgrade_without_modifying_probability(self):
+        ledger = self.finalized_ledger()
+        gate = self.decision_gate(
+            ledger,
+            forecast_validity_status="valid_for_forecast_watch_only",
+            execution_authority_status="watch_only",
+            actionability_status="non_actionable",
+        )
+
+        result = write_forecast_decision(self.conn, ledger, gate)
+
+        self.assertEqual(result["production_forecast_prob"], ledger["production_forecast_prob"])
+        row = self.conn.execute(
+            f"""
+            SELECT forecast_validity_status, execution_authority_status,
+                   actionability_status, decision_effect_status
+            FROM {FORECAST_DECISION_TABLE}
+            """
+        ).fetchone()
+        self.assertEqual(
+            row,
+            (
+                "valid_for_forecast_watch_only",
+                "watch_only",
+                "non_actionable",
+                "decision_downgraded_execution_or_actionability",
+            ),
+        )
+
+    def test_invalid_forecast_decision_writes_blocked_status_without_probability(self):
+        ledger = self.invalid_ledger()
+        gate = self.decision_gate(ledger)
+
+        result = write_forecast_decision(self.conn, ledger, gate)
+
+        self.assertEqual(result["production_persistence_status"], "blocked_invalid_scae_forecast")
+        self.assertIsNone(result["production_forecast_prob"])
+        row = self.conn.execute(
+            f"""
+            SELECT production_forecast_prob, canonical_probability,
+                   production_forecast_persisted, forecast_validity_status,
+                   execution_authority_status, actionability_status,
+                   non_scoreable_reason_code
+            FROM {FORECAST_DECISION_TABLE}
+            """
+        ).fetchone()
+        self.assertEqual(
+            row,
+            (
+                None,
+                None,
+                0,
+                "invalid_for_forecast",
+                "forbidden",
+                "non_actionable",
+                "forecast_validity_invalid_for_forecast",
+            ),
+        )
+
+    def test_forecast_decision_rejects_decision_replacement_probability(self):
+        ledger = self.finalized_ledger()
+        gate = self.decision_gate(ledger)
+        gate["replacement_probability"] = 0.72
+        with self.assertRaisesRegex(ScaePersistenceError, "replacement_probability"):
+            write_forecast_decision(self.conn, ledger, gate)
+
+        mismatched = self.decision_gate(ledger)
+        mismatched["scae_context"]["production_forecast_prob"] = 0.72
+        with self.assertRaisesRegex(ScaePersistenceError, "replace SCAE production_forecast_prob"):
+            write_forecast_decision(self.conn, ledger, mismatched)
+
+    def test_forecast_decision_rejects_market_prediction_and_scoring_authority(self):
+        ledger = self.finalized_ledger()
+        gate = self.decision_gate(ledger)
+        gate["writes_market_prediction"] = True
+        with self.assertRaisesRegex(ScaePersistenceError, "writes_market_prediction"):
+            write_forecast_decision(self.conn, ledger, gate)
+
+        gate = self.decision_gate(ledger)
+        gate["scoreable_forecast_output"] = True
+        with self.assertRaisesRegex(ScaePersistenceError, "scoreable_forecast_output"):
+            write_forecast_decision(self.conn, ledger, gate)
+
+    def test_persist_scae_forecast_cli_writes_forecast_decision(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            db_path = tmp_path / "forecast.sqlite3"
+            ledger_path = tmp_path / "ledger.json"
+            gate_path = tmp_path / "decision.json"
+            output_path = tmp_path / "result.json"
+            ledger = self.finalized_ledger()
+            gate = self.decision_gate(ledger)
+            ledger_path.write_text(json.dumps(ledger), encoding="utf-8")
+            gate_path.write_text(json.dumps(gate), encoding="utf-8")
+
+            subprocess.run(
+                [
+                    sys.executable,
+                    "SCAE/scripts/bin/persist_scae_forecast.py",
+                    "--db-path",
+                    str(db_path),
+                    "--scae-ledger",
+                    str(ledger_path),
+                    "--decision-gate",
+                    str(gate_path),
+                    "--metadata-json",
+                    '{"forecast_artifact_id":"forecast:cli"}',
+                    "--output",
+                    str(output_path),
+                ],
+                check=True,
+            )
+
+            result = json.loads(output_path.read_text(encoding="utf-8"))
+            self.assertEqual(result["production_forecast_prob"], ledger["production_forecast_prob"])
+            with sqlite3.connect(db_path) as conn:
+                row = conn.execute(
+                    f"SELECT production_forecast_prob, metadata_json FROM {FORECAST_DECISION_TABLE}"
+                ).fetchone()
+            self.assertEqual(row[0], ledger["production_forecast_prob"])
+            self.assertEqual(json.loads(row[1])["forecast_artifact_id"], "forecast:cli")
 
 
 if __name__ == "__main__":
