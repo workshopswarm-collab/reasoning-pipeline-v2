@@ -18,6 +18,7 @@ from predquant.amrg import (
     build_amrg_model_assist_packet,
     build_related_live_market_context_or_waiver,
     build_unavailable_vector_source_diagnostic,
+    apply_strict_precedence_anchor_validation,
     build_model_assist_provenance,
     enrich_related_live_market_context,
     ensure_amrg_context_schema,
@@ -410,6 +411,12 @@ class AMRGContextTest(unittest.TestCase):
         with self.assertRaisesRegex(Exception, "forbidden"):
             validate_amrg_model_assist_output(output)
 
+        qdt_repair_output = json.loads(json.dumps(output))
+        qdt_repair_output["edge_annotations"][0].pop("probability")
+        qdt_repair_output["edge_annotations"][0]["qdt_repair"] = {"action": "add_leaf"}
+        with self.assertRaisesRegex(Exception, "qdt_repair"):
+            validate_amrg_model_assist_output(qdt_repair_output)
+
     def test_model_assist_remains_advisory_and_model_only_candidate_stays_weak(self):
         artifact = self.build_artifact(
             [
@@ -612,6 +619,148 @@ class AMRGContextTest(unittest.TestCase):
                 },
                 refresh_results={edge_id: {"ok": True, "scae_evidence_delta": 0.2}},
             )
+
+    def qdt_anchor_contract(self, edge_id, *, condition_scoped_leaf_ids=None, anchor_mode="anchor_required"):
+        return {
+            "schema_version": "amrg-anchor-dependency-contract/v1",
+            "anchor_dependency_contract_id": f"anchor-contract:{edge_id}",
+            "edge_id": edge_id,
+            "edge_status": "strict_precedence_anchor_candidate",
+            "conditional_branch_group_id": f"conditional-branch:{edge_id}",
+            "anchor_mode": anchor_mode,
+            "condition_scoped_leaf_ids": condition_scoped_leaf_ids if condition_scoped_leaf_ids is not None else ["leaf-upstream"],
+            "required_before_leaf_ids": condition_scoped_leaf_ids if condition_scoped_leaf_ids is not None else ["leaf-upstream"],
+            "fallback_policy": {
+                "fallback_policy_id": f"fallback:{edge_id}",
+                "fallback_mode": "fail_dispatch_preparation",
+                "fallback_leaf_ids": [],
+                "fallback_reason_codes": ["anchor_required"],
+            },
+            "max_anchor_repair_attempts": 1,
+            "max_anchor_repair_wall_clock_seconds": 10,
+            "repair_exhaustion_policy": "fail_dispatch_preparation",
+        }
+
+    def strict_anchor_context(self, *, upstream_time="2026-06-24T17:00:00+00:00", target_time="2026-06-24T19:00:00+00:00"):
+        enriched = enrich_related_live_market_context(
+            self.build_artifact([self.market(2)]),
+            evidence_packet=self.evidence_packet(),
+        )
+        edge = enriched["relationship_edges"][0]
+        edge.update(
+            {
+                "relationship_status": "strict_precedence_anchor_candidate",
+                "relationship_types": ["causal_upstream"],
+                "strict_precedence_basis": "event_time",
+                "strict_precedence_proof_ref": "artifact:amrg-strict-precedence-proof",
+                "upstream_event_time": upstream_time,
+                "target_event_time": target_time,
+            }
+        )
+        return enriched
+
+    def test_strict_precedence_anchor_validates_with_qdt_condition_scoped_leaves(self):
+        context = self.strict_anchor_context()
+        edge_id = context["relationship_edges"][0]["edge_id"]
+
+        validated = apply_strict_precedence_anchor_validation(
+            context,
+            qdt_anchor_contracts=[self.qdt_anchor_contract(edge_id)],
+        )
+
+        edge = validated["relationship_edges"][0]
+        self.assertEqual(edge["relationship_status"], "validated_strict_precedence_anchor")
+        self.assertEqual(edge["anchor_validation_status"], "validated")
+        self.assertEqual(edge["cycle_status"], "acyclic")
+        self.assertIn("condition_scoped_anchor_validation_input", edge["allowed_effects"])
+        self.assertIn("probability_authority", edge["forbidden_effects"])
+        self.assertIn("scae_delta", edge["forbidden_effects"])
+        self.assertIn("qdt_selection", edge["forbidden_effects"])
+
+        anchor_slice = validated["prior_anchor_slices"][0]
+        self.assertEqual(anchor_slice["validation_status"], "validated")
+        self.assertEqual(anchor_slice["raw_upstream_probability"], None)
+        self.assertEqual(anchor_slice["adjusted_upstream_probability"], None)
+        self.assertEqual(anchor_slice["upstream_probability_as_of"], None)
+        self.assertTrue(anchor_slice["metadata"]["qdt_contract_read_only"])
+
+    def test_concurrent_or_cyclic_anchor_candidate_is_rejected_and_downgraded(self):
+        concurrent = self.strict_anchor_context(target_time="2026-06-24T17:00:00+00:00")
+        edge_id = concurrent["relationship_edges"][0]["edge_id"]
+        rejected = apply_strict_precedence_anchor_validation(
+            concurrent,
+            qdt_anchor_contracts=[self.qdt_anchor_contract(edge_id)],
+        )
+        edge = rejected["relationship_edges"][0]
+        self.assertEqual(edge["anchor_validation_status"], "rejected")
+        self.assertEqual(edge["relationship_status"], "timing_mismatch_weak_context_only")
+        self.assertIn("concurrent_event_time", edge["anchor_validation_reason_codes"])
+        self.assertEqual(rejected["prior_anchor_slices"][0]["validation_status"], "rejected")
+
+        cyclic = self.strict_anchor_context()
+        cyclic_edge_id = cyclic["relationship_edges"][0]["edge_id"]
+        cycle_rejected = apply_strict_precedence_anchor_validation(
+            cyclic,
+            qdt_anchor_contracts=[self.qdt_anchor_contract(cyclic_edge_id)],
+            graph_edges=[{"upstream_market_id": "1", "target_market_id": "2"}],
+        )
+        cycle_edge = cycle_rejected["relationship_edges"][0]
+        self.assertEqual(cycle_edge["relationship_status"], WEAK_CONTEXT_ONLY)
+        self.assertEqual(cycle_edge["causal_graph_status"], "blocked_cycle_or_concurrent_timing")
+        self.assertIn("causal_graph_cycle_rejected", cycle_edge["anchor_validation_reason_codes"])
+
+    def test_anchor_candidate_without_qdt_condition_scoped_leaves_is_rejected(self):
+        context = self.strict_anchor_context()
+        edge_id = context["relationship_edges"][0]["edge_id"]
+
+        rejected = apply_strict_precedence_anchor_validation(
+            context,
+            qdt_anchor_contracts=[self.qdt_anchor_contract(edge_id, condition_scoped_leaf_ids=[])],
+        )
+
+        edge = rejected["relationship_edges"][0]
+        self.assertEqual(edge["relationship_status"], WEAK_CONTEXT_ONLY)
+        self.assertEqual(edge["anchor_validation_status"], "rejected")
+        self.assertIn("missing_qdt_condition_scoped_leaf_support", edge["anchor_validation_reason_codes"])
+        self.assertEqual(rejected["prior_anchor_slices"][0]["allowed_use"], "validation_audit_only")
+
+    def test_anchor_persistence_writes_validation_audit_without_probability_or_scae_rows(self):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        try:
+            artifact = self.strict_anchor_context()
+            edge_id = artifact["relationship_edges"][0]["edge_id"]
+            result = write_related_market_context(
+                conn,
+                artifact,
+                evidence_packet=self.evidence_packet(),
+                qdt_anchor_contracts=[self.qdt_anchor_contract(edge_id)],
+            )
+
+            self.assertEqual(len(result["prior_anchor_slice_ids"]), 1)
+            row = conn.execute(
+                """
+                SELECT validation_status, raw_upstream_probability,
+                       adjusted_upstream_probability, upstream_probability_as_of,
+                       reason_codes, metadata
+                FROM related_market_prior_anchor_slices
+                """
+            ).fetchone()
+            self.assertEqual(row["validation_status"], "validated")
+            self.assertIsNone(row["raw_upstream_probability"])
+            self.assertIsNone(row["adjusted_upstream_probability"])
+            self.assertIsNone(row["upstream_probability_as_of"])
+            self.assertIn("strict_precedence_anchor_validated", json.loads(row["reason_codes"]))
+            self.assertTrue(json.loads(row["metadata"])["no_scae_delta_written"])
+            scae_tables = [
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'scae_%'"
+                ).fetchall()
+            ]
+            self.assertEqual(scae_tables, [])
+        finally:
+            conn.close()
 
     def test_amrg_persistence_schema_and_write_rows(self):
         conn = sqlite3.connect(":memory:")

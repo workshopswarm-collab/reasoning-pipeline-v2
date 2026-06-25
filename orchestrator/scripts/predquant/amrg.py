@@ -54,6 +54,7 @@ AMRG_PRODUCER = "session-02-amrg"
 DEFAULT_AMRG_CANDIDATE_CAP = 8
 WEAK_CONTEXT_ONLY = "weak_context_only"
 RELATIONSHIP_TYPES = {
+    "causal_upstream",
     "same_platform_family_sibling",
     "shared_named_entity",
     "shared_contract_source",
@@ -67,6 +68,8 @@ RELATIONSHIP_STATUSES = {
     "deterministic_context_candidate",
     "timing_mismatch_weak_context_only",
     "model_assisted_weak_context_only",
+    "strict_precedence_anchor_candidate",
+    "validated_strict_precedence_anchor",
 }
 TIMING_ALIGNMENT_STATUSES = {
     "aligned",
@@ -78,8 +81,16 @@ TIMING_ALIGNMENT_STATUSES = {
 GRAPH_SAFETY_STATUSES = {
     "not_applicable_weak_context",
     "acyclic_placeholder",
+    "acyclic_validated",
     "blocked_cycle_or_concurrent_timing",
 }
+STRICT_PRECEDENCE_ANCHOR_STATUSES = {
+    "strict_precedence_anchor_candidate",
+    "validated_strict_precedence_anchor",
+}
+ANCHOR_VALIDATION_STATUSES = {"not_evaluated", "validated", "rejected"}
+QDT_ANCHOR_DEPENDENCY_CONTRACT_SCHEMA_VERSION = "amrg-anchor-dependency-contract/v1"
+QDT_ANCHOR_MODES_REQUIRING_CONDITION_SCOPE = {"anchor_optional", "anchor_required"}
 REFRESH_STATUSES = {
     "not_requested_phase7_placeholder",
     "refresh_required_later",
@@ -104,6 +115,13 @@ AMRG_ALLOWED_EFFECTS_BY_STATUS = {
     "model_assisted_weak_context_only": ["decomposition_context_hint"],
     "timing_mismatch_weak_context_only": ["decomposition_context_hint"],
     "deterministic_context_candidate": ["decomposition_context_hint", "retrieval_query_hint"],
+    "strict_precedence_anchor_candidate": ["decomposition_context_hint", "qdt_anchor_dependency_hint"],
+    "validated_strict_precedence_anchor": [
+        "decomposition_context_hint",
+        "retrieval_query_hint",
+        "qdt_anchor_dependency_hint",
+        "condition_scoped_anchor_validation_input",
+    ],
 }
 AMRG_WEAK_ALLOWED_EFFECTS = set(AMRG_ALLOWED_EFFECTS_BY_STATUS[WEAK_CONTEXT_ONLY])
 AMRG_FORBIDDEN_EFFECTS = [
@@ -114,6 +132,13 @@ AMRG_FORBIDDEN_EFFECTS = [
     "edge_promotion",
     "retrieval_sufficiency",
     "qdt_selection",
+    "qdt_repair",
+    "scae_evidence_delta",
+    "fair_value_authority",
+    "interval_authority",
+]
+AMRG_FORBIDDEN_ANCHOR_VALIDATED_EFFECTS = [
+    effect for effect in AMRG_FORBIDDEN_EFFECTS if effect != "prior_anchor"
 ]
 OPEN_STATUSES = {"open", "active"}
 POST_CUTOFF_FIELDS = {"observed_at", "updated_at", "last_seen_at", "captured_at", "snapshot_observed_at"}
@@ -172,6 +197,10 @@ AMRG_FORBIDDEN_ARTIFACT_KEYS = UNSAFE_MARKET_FIELDS | {
     "production_forecast_prob",
     "scae_delta",
     "scae_evidence_delta",
+    "qdt_repair",
+    "qdt_repairs",
+    "repair_action",
+    "repair_patch",
 }
 AMRG_FORBIDDEN_MODEL_OUTPUT_KEYS = AMRG_FORBIDDEN_ARTIFACT_KEYS | {
     "probability",
@@ -184,6 +213,10 @@ AMRG_FORBIDDEN_MODEL_OUTPUT_KEYS = AMRG_FORBIDDEN_ARTIFACT_KEYS | {
     "scae_delta",
     "scae_evidence_delta",
     "qdt_selection",
+    "qdt_repair",
+    "qdt_repairs",
+    "repair_action",
+    "repair_patch",
     "edge_promotion",
     "active_graph_promotion",
     "production_forecast_prob",
@@ -212,6 +245,12 @@ class AMRGError(ValueError):
 class PullResult:
     ok: bool
     reason: str | None = None
+
+
+def forbidden_effects_for_status(status: str) -> list[str]:
+    if status == "validated_strict_precedence_anchor":
+        return list(AMRG_FORBIDDEN_ANCHOR_VALIDATED_EFFECTS)
+    return list(AMRG_FORBIDDEN_EFFECTS)
 
 
 def utc_now_iso() -> str:
@@ -1378,7 +1417,7 @@ def make_weak_edge(candidate_set_id: str, candidate: dict[str, Any]) -> dict[str
         "relationship_status": WEAK_CONTEXT_ONLY,
         "relationship_label": "weak_context_untyped_phase6",
         "allowed_effects": AMRG_ALLOWED_EFFECTS_BY_STATUS[WEAK_CONTEXT_ONLY],
-        "forbidden_effects": AMRG_FORBIDDEN_EFFECTS,
+        "forbidden_effects": forbidden_effects_for_status(WEAK_CONTEXT_ONLY),
         "concept_authority": "none_candidate_input_only",
     }
     ensure_no_raw_amrg_fields(edge, "relationship_edge")
@@ -1627,14 +1666,28 @@ def status_for_typed_candidate(candidate: dict[str, Any], relationship_types: li
 def graph_safety_for_edge(edge: dict[str, Any]) -> dict[str, Any]:
     status = edge.get("relationship_status")
     timing = edge.get("timing_alignment_status")
-    if status == "deterministic_context_candidate" and timing == "aligned":
+    if status == "validated_strict_precedence_anchor":
+        graph_status = "acyclic_validated"
+        cycle_status = "acyclic"
+        causal_edge_role = "validated_strict_precedence_anchor"
+        downgrade_applied = False
+        downgrade_reasons = []
+    elif status == "strict_precedence_anchor_candidate" and timing == "aligned":
+        graph_status = "acyclic_placeholder"
+        cycle_status = "anchor_validation_required"
+        causal_edge_role = "causal_upstream_candidate"
+        downgrade_applied = False
+        downgrade_reasons = []
+    elif status == "deterministic_context_candidate" and timing == "aligned":
         graph_status = "acyclic_placeholder"
         cycle_status = "not_evaluated_phase7_no_anchor_authority"
+        causal_edge_role = "not_validated_anchor"
         downgrade_applied = False
         downgrade_reasons: list[str] = []
     else:
         graph_status = "not_applicable_weak_context"
         cycle_status = "not_applicable_weak_context"
+        causal_edge_role = "not_validated_anchor"
         downgrade_applied = status != WEAK_CONTEXT_ONLY
         downgrade_reasons = ["weak_context_or_timing_mismatch"]
     return {
@@ -1642,14 +1695,428 @@ def graph_safety_for_edge(edge: dict[str, Any]) -> dict[str, Any]:
         "graph_component_id": stable_id("amrg-graph-component", edge["edge_id"]),
         "causal_graph_status": graph_status,
         "cycle_status": cycle_status,
-        "causal_edge_role": "not_validated_anchor",
+        "causal_edge_role": causal_edge_role,
         "event_time_ordering_basis": edge.get("timing_alignment_status"),
-        "strict_precedence_proof_ref": None,
+        "strict_precedence_proof_ref": edge.get("strict_precedence_proof_ref"),
         "max_refresh_hop_depth": 0,
         "refresh_generation_id": stable_id("amrg-refresh-generation", edge["edge_id"], "phase7"),
         "downgrade_applied": downgrade_applied,
         "downgrade_reason_codes": downgrade_reasons,
     }
+
+
+def normalize_qdt_anchor_contracts(qdt_contract: Any) -> list[dict[str, Any]]:
+    if qdt_contract is None:
+        return []
+    if isinstance(qdt_contract, dict):
+        for key in ("amrg_anchor_dependency_contracts", "anchor_dependency_contracts", "contracts"):
+            if key in qdt_contract:
+                return normalize_qdt_anchor_contracts(qdt_contract[key])
+        if "anchor_dependency_contract_id" in qdt_contract:
+            ensure_no_raw_amrg_fields(qdt_contract, "qdt_anchor_contract")
+            return [dict(qdt_contract)]
+        raise AMRGError("qdt anchor contract input must be a contract, contract list, or QDT artifact")
+    if isinstance(qdt_contract, (list, tuple)):
+        contracts: list[dict[str, Any]] = []
+        for contract in qdt_contract:
+            if not isinstance(contract, dict):
+                raise AMRGError("qdt anchor contracts must be objects")
+            ensure_no_raw_amrg_fields(contract, "qdt_anchor_contract")
+            contracts.append(dict(contract))
+        return contracts
+    raise AMRGError("qdt anchor contract input must be an object or list")
+
+
+def relationship_types_for_edge(edge: dict[str, Any]) -> list[str]:
+    if isinstance(edge.get("relationship_types"), list):
+        return validate_relationship_type_list(edge["relationship_types"])
+    if edge.get("relationship_type"):
+        return validate_relationship_type_list([str(edge["relationship_type"])])
+    return []
+
+
+def matching_qdt_anchor_contract(edge: dict[str, Any], qdt_contract: Any) -> tuple[dict[str, Any] | None, list[str]]:
+    contracts = normalize_qdt_anchor_contracts(qdt_contract)
+    if not contracts:
+        return None, ["missing_qdt_anchor_dependency_contract"]
+    edge_id = edge.get("edge_id")
+    matches = [contract for contract in contracts if contract.get("edge_id") == edge_id]
+    if not matches:
+        return None, ["missing_qdt_anchor_dependency_contract_for_edge"]
+    contract = matches[0]
+    reasons: list[str] = []
+    if contract.get("schema_version") != QDT_ANCHOR_DEPENDENCY_CONTRACT_SCHEMA_VERSION:
+        reasons.append("qdt_anchor_dependency_contract_schema_invalid")
+    if contract.get("anchor_mode") not in QDT_ANCHOR_MODES_REQUIRING_CONDITION_SCOPE:
+        reasons.append("qdt_anchor_dependency_contract_not_condition_scoped")
+    condition_scoped_leaf_ids = contract.get("condition_scoped_leaf_ids")
+    if not isinstance(condition_scoped_leaf_ids, list) or not condition_scoped_leaf_ids:
+        reasons.append("missing_qdt_condition_scoped_leaf_support")
+    return contract, reasons
+
+
+def first_present(edge: dict[str, Any], fields: tuple[str, ...]) -> Any:
+    for field in fields:
+        value = edge.get(field)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def strict_event_time_or_contractual_precedence(edge: dict[str, Any]) -> tuple[bool, str | None, str | None, list[str]]:
+    proof_ref = first_present(
+        edge,
+        (
+            "strict_precedence_proof_ref",
+            "contractual_precedence_proof_ref",
+            "event_time_ordering_proof_ref",
+        ),
+    )
+    basis = edge.get("strict_precedence_basis") or edge.get("event_time_ordering_basis")
+    contractual_basis = basis in {"contractual", "contractual_precedence", "strict_contractual_precedence"}
+    if edge.get("contractual_precedence") is True or contractual_basis:
+        if proof_ref:
+            return True, "contractual_precedence", str(proof_ref), []
+        return False, None, None, ["contractual_precedence_missing_proof_ref"]
+
+    upstream_time = first_present(
+        edge,
+        (
+            "upstream_event_time",
+            "related_event_time",
+            "upstream_resolve_timestamp",
+            "related_market_event_time",
+        ),
+    )
+    target_time = first_present(
+        edge,
+        (
+            "target_event_time",
+            "selected_event_time",
+            "target_resolve_timestamp",
+            "selected_market_event_time",
+        ),
+    )
+    if upstream_time and target_time:
+        try:
+            upstream_at = parse_timestamp(str(upstream_time), "upstream_event_time")
+            target_at = parse_timestamp(str(target_time), "target_event_time")
+        except Exception:
+            return False, None, None, ["invalid_strict_precedence_event_time"]
+        if upstream_at < target_at:
+            return True, "strict_event_time_precedence", str(proof_ref) if proof_ref else None, []
+        if upstream_at == target_at:
+            return False, None, None, ["concurrent_event_time"]
+        return False, None, None, ["upstream_event_not_before_target"]
+
+    if basis in {"strict_event_time_precedence", "event_time_precedence"} and proof_ref:
+        return True, "strict_event_time_precedence", str(proof_ref), []
+    return False, None, None, ["strict_precedence_not_proven"]
+
+
+def graph_edge_nodes(edge: Any) -> tuple[str | None, str | None]:
+    if isinstance(edge, (list, tuple)) and len(edge) == 2:
+        return str(edge[0]), str(edge[1])
+    if not isinstance(edge, dict):
+        return None, None
+    upstream = first_present(
+        edge,
+        (
+            "upstream_market_id",
+            "related_market_id",
+            "source_market_id",
+            "from_market_id",
+            "market_id",
+        ),
+    )
+    target = first_present(
+        edge,
+        (
+            "target_market_id",
+            "selected_market_id",
+            "to_market_id",
+            "downstream_market_id",
+        ),
+    )
+    if upstream is None or target is None:
+        return None, None
+    return str(upstream), str(target)
+
+
+def path_exists(adjacency: dict[str, set[str]], start: str, target: str) -> bool:
+    stack = [start]
+    seen: set[str] = set()
+    while stack:
+        node = stack.pop()
+        if node == target:
+            return True
+        if node in seen:
+            continue
+        seen.add(node)
+        stack.extend(sorted(adjacency.get(node, set()) - seen))
+    return False
+
+
+def graph_is_acyclic_for_edge(edge: dict[str, Any], graph_edges: Any = None) -> tuple[bool, list[str]]:
+    if edge.get("causal_graph_status") == "blocked_cycle_or_concurrent_timing":
+        return False, ["causal_graph_cycle_rejected"]
+    if str(edge.get("cycle_status", "")).lower() in {"cycle_detected", "cyclic", "cycle_rejected"}:
+        return False, ["causal_graph_cycle_rejected"]
+
+    upstream, target = graph_edge_nodes(edge)
+    if not upstream or not target:
+        return False, ["causal_graph_nodes_missing"]
+    if upstream == target:
+        return False, ["reflexive_causal_edge_rejected"]
+
+    adjacency: dict[str, set[str]] = {}
+    for existing in graph_edges or []:
+        existing_upstream, existing_target = graph_edge_nodes(existing)
+        if not existing_upstream or not existing_target:
+            continue
+        if isinstance(existing, dict) and existing.get("edge_id") == edge.get("edge_id"):
+            continue
+        adjacency.setdefault(existing_upstream, set()).add(existing_target)
+    if path_exists(adjacency, target, upstream):
+        return False, ["causal_graph_cycle_rejected"]
+    return True, []
+
+
+def validate_prior_anchor_slice(slice_row: dict[str, Any]) -> None:
+    if slice_row.get("validation_status") not in ANCHOR_VALIDATION_STATUSES:
+        raise AMRGError("prior anchor validation_status is unknown")
+    if slice_row.get("raw_upstream_probability") is not None:
+        raise AMRGError("AMRG anchor validation must not write raw_upstream_probability")
+    if slice_row.get("adjusted_upstream_probability") is not None:
+        raise AMRGError("AMRG anchor validation must not write adjusted_upstream_probability")
+    if slice_row.get("upstream_probability_as_of") is not None:
+        raise AMRGError("AMRG anchor validation must not write upstream_probability_as_of")
+    ensure_no_raw_amrg_fields(slice_row.get("metadata") or {}, "prior_anchor_slice.metadata")
+
+
+def make_prior_anchor_slice(
+    edge: dict[str, Any],
+    *,
+    qdt_contract: dict[str, Any] | None,
+    validation_status: str,
+    reason_codes: list[str],
+) -> dict[str, Any]:
+    contract_id = (
+        qdt_contract.get("anchor_dependency_contract_id")
+        if qdt_contract and qdt_contract.get("anchor_dependency_contract_id")
+        else stable_id("missing-anchor-contract", edge["edge_id"])
+    )
+    slice_row = {
+        "prior_anchor_slice_id": stable_id(
+            "amrg-prior-anchor",
+            edge["edge_id"],
+            contract_id,
+            validation_status,
+            sorted(set(reason_codes)),
+        ),
+        "case_id": edge.get("case_id") or "unknown_case",
+        "market_id": str(edge.get("selected_market_id") or edge.get("target_market_id") or edge.get("market_id")),
+        "dispatch_id": edge.get("dispatch_id") or "unknown_dispatch",
+        "edge_id": edge["edge_id"],
+        "upstream_market_id": str(edge.get("upstream_market_id") or edge.get("related_market_id") or edge.get("market_id")),
+        "upstream_probability_source": "not_written_by_amrg_anchor_validation",
+        "raw_upstream_probability": None,
+        "adjusted_upstream_probability": None,
+        "upstream_probability_as_of": None,
+        "allowed_use": "condition_scoped_anchor_validation_input" if validation_status == "validated" else "validation_audit_only",
+        "conditional_model": "qdt_condition_scoped_leaves_required" if validation_status == "validated" else None,
+        "upstream_prior_reliability_context": {
+            "authority": "none_no_probability_written_by_amrg",
+            "qdt_anchor_contract_schema_version": qdt_contract.get("schema_version") if qdt_contract else None,
+        },
+        "dependence_adjustment": {"authority": "none_no_scae_delta_written_by_amrg"},
+        "double_counting_risk": "not_independent_evidence_anchor_only",
+        "not_independent_evidence": True,
+        "conditional_branch_group_id": qdt_contract.get("conditional_branch_group_id") if qdt_contract else None,
+        "anchor_dependency_contract_id": contract_id,
+        "graph_safety_slice_id": edge.get("graph_safety_slice_id"),
+        "validation_status": validation_status,
+        "reason_codes": sorted(set(reason_codes)),
+        "metadata": {
+            "condition_scoped_leaf_ids": qdt_contract.get("condition_scoped_leaf_ids", []) if qdt_contract else [],
+            "no_probability_fields_written": True,
+            "no_scae_delta_written": True,
+            "qdt_contract_read_only": True,
+        },
+    }
+    validate_prior_anchor_slice(slice_row)
+    return slice_row
+
+
+def reject_strict_precedence_anchor_edge(edge: dict[str, Any], reason_codes: list[str]) -> dict[str, Any]:
+    timing_or_precedence_reasons = {
+        "timing_alignment_not_aligned",
+        "concurrent_event_time",
+        "upstream_event_not_before_target",
+        "strict_precedence_not_proven",
+        "invalid_strict_precedence_event_time",
+    }
+    status = "timing_mismatch_weak_context_only" if timing_or_precedence_reasons & set(reason_codes) else WEAK_CONTEXT_ONLY
+    updated = {
+        **edge,
+        "relationship_status": status,
+        "allowed_effects": AMRG_ALLOWED_EFFECTS_BY_STATUS[status],
+        "forbidden_effects": forbidden_effects_for_status(status),
+        "anchor_validation_status": "rejected",
+        "anchor_validation_reason_codes": sorted(set(reason_codes)),
+        "downgrade_applied": True,
+        "downgrade_reason_codes": sorted(set(edge.get("downgrade_reason_codes", []) + reason_codes)),
+        "causal_edge_role": "rejected_strict_precedence_anchor",
+    }
+    if {"causal_graph_cycle_rejected", "reflexive_causal_edge_rejected", "concurrent_event_time"} & set(reason_codes):
+        updated["causal_graph_status"] = "blocked_cycle_or_concurrent_timing"
+        updated["cycle_status"] = "cycle_or_concurrent_rejected"
+    else:
+        updated.update(graph_safety_for_edge(updated))
+        updated["anchor_validation_status"] = "rejected"
+        updated["anchor_validation_reason_codes"] = sorted(set(reason_codes))
+        updated["downgrade_applied"] = True
+        updated["downgrade_reason_codes"] = sorted(set(edge.get("downgrade_reason_codes", []) + reason_codes))
+        updated["causal_edge_role"] = "rejected_strict_precedence_anchor"
+    validate_relationship_edge(updated)
+    return updated
+
+
+def validate_strict_precedence_anchor(
+    edge: dict[str, Any],
+    qdt_contract: Any,
+    *,
+    graph_edges: Any = None,
+) -> dict[str, Any]:
+    if not isinstance(edge, dict):
+        raise AMRGError("edge must be an object")
+    if "edge_id" not in edge:
+        raise AMRGError("edge.edge_id is required")
+
+    reasons: list[str] = []
+    if edge.get("relationship_status") not in STRICT_PRECEDENCE_ANCHOR_STATUSES:
+        reasons.append("edge_not_strict_precedence_anchor_candidate")
+    if "causal_upstream" not in relationship_types_for_edge(edge):
+        reasons.append("missing_causal_upstream_relationship")
+    if edge.get("timing_alignment_status") != "aligned":
+        reasons.append("timing_alignment_not_aligned")
+
+    precedence_ok, precedence_basis, proof_ref, precedence_reasons = strict_event_time_or_contractual_precedence(edge)
+    if not precedence_ok:
+        reasons.extend(precedence_reasons)
+
+    graph_ok, graph_reasons = graph_is_acyclic_for_edge(edge, graph_edges)
+    if not graph_ok:
+        reasons.extend(graph_reasons)
+
+    contract, contract_reasons = matching_qdt_anchor_contract(edge, qdt_contract)
+    reasons.extend(contract_reasons)
+
+    if reasons:
+        rejected = reject_strict_precedence_anchor_edge(edge, reasons)
+        slice_row = make_prior_anchor_slice(
+            rejected,
+            qdt_contract=contract,
+            validation_status="rejected",
+            reason_codes=reasons,
+        )
+        return {"edge": rejected, "prior_anchor_slice": slice_row}
+
+    validated = {
+        **edge,
+        "relationship_status": "validated_strict_precedence_anchor",
+        "relationship_types": validate_relationship_type_list(relationship_types_for_edge(edge)),
+        "allowed_effects": AMRG_ALLOWED_EFFECTS_BY_STATUS["validated_strict_precedence_anchor"],
+        "forbidden_effects": forbidden_effects_for_status("validated_strict_precedence_anchor"),
+        "causal_graph_status": "acyclic_validated",
+        "cycle_status": "acyclic",
+        "causal_edge_role": "validated_strict_precedence_anchor",
+        "event_time_ordering_basis": precedence_basis,
+        "strict_precedence_proof_ref": proof_ref,
+        "anchor_validation_status": "validated",
+        "anchor_validation_reason_codes": ["strict_precedence_anchor_validated"],
+        "anchor_dependency_contract_id": contract["anchor_dependency_contract_id"],
+        "conditional_branch_group_id": contract.get("conditional_branch_group_id"),
+        "condition_scoped_leaf_ids": list(contract.get("condition_scoped_leaf_ids") or []),
+        "downgrade_applied": False,
+        "downgrade_reason_codes": [],
+    }
+    validated.update(
+        {
+            "graph_safety_slice_id": edge.get("graph_safety_slice_id")
+            or stable_id("amrg-graph-safety", edge["edge_id"]),
+            "graph_component_id": edge.get("graph_component_id")
+            or stable_id("amrg-graph-component", edge["edge_id"]),
+            "max_refresh_hop_depth": edge.get("max_refresh_hop_depth", 0),
+            "refresh_generation_id": edge.get("refresh_generation_id")
+            or stable_id("amrg-refresh-generation", edge["edge_id"], "anchor-validation"),
+        }
+    )
+    validate_relationship_edge(validated)
+    slice_row = make_prior_anchor_slice(
+        validated,
+        qdt_contract=contract,
+        validation_status="validated",
+        reason_codes=["strict_precedence_anchor_validated"],
+    )
+    return {"edge": validated, "prior_anchor_slice": slice_row}
+
+
+def context_edges_requiring_anchor_validation(context: dict[str, Any], qdt_anchor_contracts: Any) -> set[str]:
+    edge_ids = {
+        edge["edge_id"]
+        for edge in context.get("relationship_edges", [])
+        if edge.get("relationship_status") in STRICT_PRECEDENCE_ANCHOR_STATUSES
+    }
+    for contract in normalize_qdt_anchor_contracts(qdt_anchor_contracts):
+        if contract.get("edge_id"):
+            edge_ids.add(contract["edge_id"])
+    return edge_ids
+
+
+def apply_strict_precedence_anchor_validation(
+    context: dict[str, Any],
+    *,
+    qdt_anchor_contracts: Any = None,
+    graph_edges: Any = None,
+) -> dict[str, Any]:
+    validate_related_live_market_context(context)
+    if context["artifact_type"] != "related_live_market_context":
+        return dict(context)
+    edge_ids = context_edges_requiring_anchor_validation(context, qdt_anchor_contracts)
+    if not edge_ids:
+        return {**context, "prior_anchor_slices": list(context.get("prior_anchor_slices", []))}
+
+    validated_edges: list[dict[str, Any]] = []
+    prior_anchor_slices: list[dict[str, Any]] = []
+    for edge in context["relationship_edges"]:
+        if edge["edge_id"] not in edge_ids:
+            validated_edges.append(edge)
+            continue
+        edge_context = {
+            **edge,
+            "case_id": context["case_id"],
+            "dispatch_id": context["dispatch_id"],
+            "selected_market_id": str(context["market_id"]),
+            "target_market_id": str(context["market_id"]),
+            "related_market_id": str(edge.get("market_id")),
+            "candidate_set_id": context["candidate_set_id"],
+        }
+        result = validate_strict_precedence_anchor(
+            edge_context,
+            qdt_anchor_contracts,
+            graph_edges=graph_edges,
+        )
+        validated_edges.append(result["edge"])
+        prior_anchor_slices.append(result["prior_anchor_slice"])
+
+    validated_context = {
+        **context,
+        "relationship_edges": validated_edges,
+        "prior_anchor_slices": prior_anchor_slices,
+    }
+    validate_related_live_market_context(validated_context)
+    return validated_context
 
 
 def normalize_refresh_policy(context: dict[str, Any], refresh_policy: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -1912,6 +2379,7 @@ def apply_refresh_state_to_edge(edge: dict[str, Any], state: dict[str, Any], *, 
     if state["stale_effect_downgrade_applied"]:
         updated["relationship_status"] = WEAK_CONTEXT_ONLY
         updated["allowed_effects"] = AMRG_ALLOWED_EFFECTS_BY_STATUS[WEAK_CONTEXT_ONLY]
+        updated["forbidden_effects"] = forbidden_effects_for_status(WEAK_CONTEXT_ONLY)
     updated["refresh_lifecycle_state"] = state
     updated["refresh_generation_id"] = state["refresh_generation_id"]
     updated.update(graph_safety_for_edge(updated))
@@ -2131,9 +2599,17 @@ def type_and_validate_edge(
     candidate: dict[str, Any],
     model_assist_status: str = "not_requested",
 ) -> dict[str, Any]:
-    relationship_types = relationship_types_for_candidate(candidate)
+    explicit_relationship_types = edge.get("relationship_types")
+    relationship_types = (
+        validate_relationship_type_list(list(explicit_relationship_types))
+        if explicit_relationship_types is not None
+        else relationship_types_for_candidate(candidate)
+    )
     timing = timing_alignment_for_candidate(evidence_packet, candidate)
     status = status_for_typed_candidate(candidate, relationship_types, timing["timing_alignment_status"])
+    explicit_status = edge.get("relationship_status")
+    if explicit_status == "strict_precedence_anchor_candidate":
+        status = explicit_status if timing["timing_alignment_status"] == "aligned" else "timing_mismatch_weak_context_only"
     if model_assist_status == "advisory_validated" and status == WEAK_CONTEXT_ONLY:
         status = "model_assisted_weak_context_only"
     enriched = {
@@ -2147,7 +2623,7 @@ def type_and_validate_edge(
         "max_snapshot_skew_seconds": timing["max_snapshot_skew_seconds"],
         "snapshot_skew_seconds": timing["snapshot_skew_seconds"],
         "allowed_effects": AMRG_ALLOWED_EFFECTS_BY_STATUS[status],
-        "forbidden_effects": AMRG_FORBIDDEN_EFFECTS,
+        "forbidden_effects": forbidden_effects_for_status(status),
         "model_assist_status": model_assist_status,
         "model_assist_context": {},
     }
@@ -2179,6 +2655,15 @@ def validate_relationship_edge(edge: dict[str, Any]) -> None:
             raise AMRGError("deterministic_context_candidate requires aligned timing")
         if not relationship_types:
             raise AMRGError("deterministic_context_candidate requires relationship_types")
+    if status == "validated_strict_precedence_anchor":
+        if timing_status != "aligned":
+            raise AMRGError("validated strict-precedence anchor requires aligned timing")
+        if "causal_upstream" not in (relationship_types or []):
+            raise AMRGError("validated strict-precedence anchor requires causal_upstream")
+        if edge.get("anchor_validation_status") != "validated":
+            raise AMRGError("validated strict-precedence anchor requires validated audit status")
+        if "condition_scoped_anchor_validation_input" not in edge.get("allowed_effects", []):
+            raise AMRGError("validated strict-precedence anchor requires condition-scoped allowed use")
     ensure_no_raw_amrg_fields(edge, "relationship_edge")
 
 
@@ -2682,6 +3167,10 @@ def write_model_assist_provenance(conn: sqlite3.Connection, provenance: dict[str
 
 
 def relationship_strength_for_status(status: str) -> str:
+    if status == "validated_strict_precedence_anchor":
+        return "validated_strict_precedence_anchor"
+    if status == "strict_precedence_anchor_candidate":
+        return "strict_precedence_anchor_candidate"
     return "context_candidate" if status == "deterministic_context_candidate" else "weak_context"
 
 
@@ -2691,6 +3180,8 @@ def guardrail_reason_codes_for_edge(edge: dict[str, Any]) -> list[str]:
         reasons.append(edge["timing_alignment_status"])
     if edge.get("relationship_status") in {"timing_mismatch_weak_context_only", WEAK_CONTEXT_ONLY}:
         reasons.append("weak_context_only")
+    if edge.get("anchor_validation_status") == "rejected":
+        reasons.extend(edge.get("anchor_validation_reason_codes", []))
     return sorted(set(reasons))
 
 
@@ -2705,6 +3196,8 @@ def write_related_market_context(
     refresh_policy: dict[str, Any] | None = None,
     refresh_results: Any = None,
     active_market_index: list[dict[str, Any] | Any] | None = None,
+    qdt_anchor_contracts: Any = None,
+    anchor_graph_edges: Any = None,
 ) -> dict[str, Any]:
     ensure_amrg_context_schema(conn)
     model_assist_status = model_assist_provenance["model_assist_status"] if model_assist_provenance else "not_requested"
@@ -2716,6 +3209,15 @@ def write_related_market_context(
         refresh_results=refresh_results,
         active_market_index=active_market_index,
     )
+    if qdt_anchor_contracts is not None or any(
+        edge.get("relationship_status") in STRICT_PRECEDENCE_ANCHOR_STATUSES
+        for edge in enriched.get("relationship_edges", [])
+    ):
+        enriched = apply_strict_precedence_anchor_validation(
+            enriched,
+            qdt_anchor_contracts=qdt_anchor_contracts,
+            graph_edges=anchor_graph_edges,
+        )
     selected_market_id = selected_market_id_for_context(enriched, evidence_packet)
     generated_at = utc_now_iso()
 
@@ -2759,6 +3261,11 @@ def write_related_market_context(
     relationship_row_ids: list[str] = []
     graph_row_ids: list[str] = []
     refresh_row_ids: list[str] = []
+    prior_anchor_row_ids: list[str] = []
+    prior_anchor_slices_by_edge = {
+        slice_row["edge_id"]: slice_row
+        for slice_row in enriched.get("prior_anchor_slices", [])
+    }
 
     for edge in enriched["relationship_edges"]:
         validate_relationship_edge(edge)
@@ -2971,6 +3478,55 @@ def write_related_market_context(
         )
         refresh_row_ids.append(refresh_event_id)
 
+        prior_anchor_slice = prior_anchor_slices_by_edge.get(edge["edge_id"])
+        if prior_anchor_slice:
+            validate_prior_anchor_slice(prior_anchor_slice)
+            conn.execute(
+                """
+                INSERT INTO related_market_prior_anchor_slices (
+                  prior_anchor_slice_id, case_id, market_id, dispatch_id, edge_id,
+                  upstream_market_id, upstream_probability_source, raw_upstream_probability,
+                  adjusted_upstream_probability, upstream_probability_as_of, allowed_use,
+                  conditional_model, upstream_prior_reliability_context,
+                  dependence_adjustment, double_counting_risk, not_independent_evidence,
+                  conditional_branch_group_id, anchor_dependency_contract_id,
+                  graph_safety_slice_id, validation_status, reason_codes,
+                  generated_at, metadata
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(prior_anchor_slice_id) DO UPDATE SET
+                  validation_status=excluded.validation_status,
+                  reason_codes=excluded.reason_codes,
+                  metadata=excluded.metadata
+                """,
+                (
+                    prior_anchor_slice["prior_anchor_slice_id"],
+                    prior_anchor_slice["case_id"],
+                    str(prior_anchor_slice["market_id"]),
+                    prior_anchor_slice["dispatch_id"],
+                    prior_anchor_slice["edge_id"],
+                    prior_anchor_slice.get("upstream_market_id"),
+                    prior_anchor_slice.get("upstream_probability_source"),
+                    prior_anchor_slice.get("raw_upstream_probability"),
+                    prior_anchor_slice.get("adjusted_upstream_probability"),
+                    prior_anchor_slice.get("upstream_probability_as_of"),
+                    prior_anchor_slice["allowed_use"],
+                    prior_anchor_slice.get("conditional_model"),
+                    canonical_json(prior_anchor_slice.get("upstream_prior_reliability_context") or {}),
+                    canonical_json(prior_anchor_slice.get("dependence_adjustment") or {}),
+                    prior_anchor_slice["double_counting_risk"],
+                    1 if prior_anchor_slice["not_independent_evidence"] else 0,
+                    prior_anchor_slice.get("conditional_branch_group_id"),
+                    prior_anchor_slice["anchor_dependency_contract_id"],
+                    prior_anchor_slice.get("graph_safety_slice_id"),
+                    prior_anchor_slice["validation_status"],
+                    canonical_json(prior_anchor_slice["reason_codes"]),
+                    generated_at,
+                    canonical_json(prior_anchor_slice.get("metadata") or {}),
+                ),
+            )
+            prior_anchor_row_ids.append(prior_anchor_slice["prior_anchor_slice_id"])
+
     model_assist_id = write_model_assist_provenance(conn, model_assist_provenance) if model_assist_provenance else None
     return {
         "candidate_set_id": enriched["candidate_set_id"],
@@ -2978,6 +3534,7 @@ def write_related_market_context(
         "relationship_slice_ids": relationship_row_ids,
         "graph_safety_slice_ids": graph_row_ids,
         "refresh_event_ids": refresh_row_ids,
+        "prior_anchor_slice_ids": prior_anchor_row_ids,
         "model_assist_id": model_assist_id,
         "context": enriched,
     }
