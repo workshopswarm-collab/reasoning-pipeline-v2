@@ -28,11 +28,16 @@ from ads_decomposer.qdt import (  # noqa: E402
     build_anchor_dependency_contract,
     build_fixture_qdt_candidate,
     build_leaf_budget_decision,
+    build_research_sufficiency_requirements,
     dump_question_decomposition,
     repair_anchor_dependency_contracts,
     select_qdt_candidate,
     validate_anchor_dependency_contract,
     validate_question_decomposition,
+)
+from ads_decomposer.sufficiency_requirements import (  # noqa: E402
+    RESEARCH_SUFFICIENCY_REQUIREMENTS_SCHEMA_VERSION,
+    RESEARCH_SUFFICIENCY_TEMPLATE_VERSION,
 )
 
 
@@ -66,6 +71,14 @@ class QDTContractTest(unittest.TestCase):
             },
         }
 
+    def _refresh_leaf_sufficiency(self, leaf: dict) -> None:
+        leaf["research_sufficiency_requirements"] = build_research_sufficiency_requirements(
+            purpose=leaf["purpose"],
+            static_information_weight=leaf["bayesian_weighting"]["static_information_weight"],
+            condition_scope=leaf["leaf_condition_scope"],
+            required_value_fields=leaf["required_evidence_fields"],
+        )
+
     def test_selects_valid_candidate_and_records_rejection_audit(self):
         invalid = build_fixture_qdt_candidate(self.handoff, candidate_id="qdt-candidate-bad")
         del invalid["required_leaf_questions"][0]["research_sufficiency_requirements"]
@@ -96,6 +109,63 @@ class QDTContractTest(unittest.TestCase):
         self.assertEqual(model_context["resolved_model_id"], DECOMPOSER_MODEL_ID)
         self.assertEqual(model_context["output_schema_version"], "question-decomposition/v1")
         self.assertTrue(model_context["prompt_template_sha256"].startswith("sha256:"))
+
+    def test_selected_qdt_has_canonical_research_sufficiency_template_per_leaf(self):
+        selected = select_qdt_candidate([build_fixture_qdt_candidate(self.handoff)])
+
+        for leaf in selected["required_leaf_questions"]:
+            requirements = leaf["research_sufficiency_requirements"]
+            weighting = leaf["bayesian_weighting"]
+            self.assertEqual(
+                requirements["schema_version"],
+                RESEARCH_SUFFICIENCY_REQUIREMENTS_SCHEMA_VERSION,
+            )
+            self.assertEqual(requirements["template_version"], RESEARCH_SUFFICIENCY_TEMPLATE_VERSION)
+            self.assertTrue(requirements["requirement_id"].startswith("qdt-sufficiency:"))
+            self.assertEqual(requirements["leaf_purpose"], leaf["purpose"])
+            self.assertEqual(
+                requirements["static_information_weight"],
+                weighting["static_information_weight"],
+            )
+            self.assertEqual(requirements["leaf_condition_scope"], leaf["leaf_condition_scope"])
+            self.assertTrue(
+                set(leaf["required_evidence_fields"]).issubset(requirements["required_value_fields"])
+            )
+            self.assertTrue(requirements["required_negative_checks"])
+            self.assertTrue(requirements["classification_dispatch_requires_sufficiency_certificate"])
+
+    def test_sufficiency_requirement_must_match_leaf_scope_and_weight(self):
+        selected = select_qdt_candidate([build_fixture_qdt_candidate(self.handoff)])
+        broken = copy.deepcopy(selected)
+        requirements = broken["required_leaf_questions"][1]["research_sufficiency_requirements"]
+        requirements["leaf_condition_scope"] = "target_given_upstream"
+
+        result = validate_question_decomposition(broken)
+
+        self.assertFalse(result.valid)
+        self.assertIn("leaf_condition_scope must match", "; ".join(result.errors))
+
+    def test_sufficiency_requirement_must_include_leaf_required_evidence_fields(self):
+        selected = select_qdt_candidate([build_fixture_qdt_candidate(self.handoff)])
+        broken = copy.deepcopy(selected)
+        requirements = broken["required_leaf_questions"][1]["research_sufficiency_requirements"]
+        requirements["required_value_fields"] = ["event_status"]
+
+        result = validate_question_decomposition(broken)
+
+        self.assertFalse(result.valid)
+        self.assertIn("required_evidence_fields", "; ".join(result.errors))
+
+    def test_source_of_truth_sufficiency_requires_canonical_primary_source_classes(self):
+        selected = select_qdt_candidate([build_fixture_qdt_candidate(self.handoff)])
+        broken = copy.deepcopy(selected)
+        requirements = broken["required_leaf_questions"][0]["research_sufficiency_requirements"]
+        requirements["required_source_classes"] = ["independent_secondary"]
+
+        result = validate_question_decomposition(broken)
+
+        self.assertFalse(result.valid)
+        self.assertIn("required_source_classes must match canonical purpose template", "; ".join(result.errors))
 
     def test_depth_three_tree_is_rejected_without_waiver(self):
         selected = select_qdt_candidate([build_fixture_qdt_candidate(self.handoff)])
@@ -137,6 +207,7 @@ class QDTContractTest(unittest.TestCase):
         selected = select_qdt_candidate([build_fixture_qdt_candidate(self.handoff)])
         broken = copy.deepcopy(selected)
         broken["required_leaf_questions"][1]["leaf_condition_scope"] = "target_given_upstream"
+        self._refresh_leaf_sufficiency(broken["required_leaf_questions"][1])
 
         result = validate_question_decomposition(broken)
 
@@ -148,6 +219,7 @@ class QDTContractTest(unittest.TestCase):
         scoped = copy.deepcopy(selected)
         leaf_id = scoped["required_leaf_questions"][1]["leaf_id"]
         scoped["required_leaf_questions"][1]["leaf_condition_scope"] = "target_given_upstream"
+        self._refresh_leaf_sufficiency(scoped["required_leaf_questions"][1])
         scoped["branches"][0]["anchor_mode"] = "anchor_required"
         scoped["amrg_anchor_dependency_contracts"] = [
             build_anchor_dependency_contract(
@@ -172,6 +244,7 @@ class QDTContractTest(unittest.TestCase):
         selected = select_qdt_candidate([build_fixture_qdt_candidate(self.handoff)])
         scoped = copy.deepcopy(selected)
         scoped["required_leaf_questions"][1]["leaf_condition_scope"] = "target_given_upstream"
+        self._refresh_leaf_sufficiency(scoped["required_leaf_questions"][1])
         scoped["branches"][0]["anchor_mode"] = "anchor_required"
 
         contract = build_anchor_dependency_contract(
@@ -200,6 +273,7 @@ class QDTContractTest(unittest.TestCase):
         selected = select_qdt_candidate([build_fixture_qdt_candidate(self.handoff)])
         scoped = copy.deepcopy(selected)
         scoped["required_leaf_questions"][1]["leaf_condition_scope"] = "target_given_not_upstream"
+        self._refresh_leaf_sufficiency(scoped["required_leaf_questions"][1])
         contract = build_anchor_dependency_contract(
             {"edge_id": "edge-candidate", "status": "strict_precedence_anchor_candidate"},
             scoped["branches"][0],
@@ -215,6 +289,7 @@ class QDTContractTest(unittest.TestCase):
         selected = select_qdt_candidate([build_fixture_qdt_candidate(self.handoff)])
         scoped = copy.deepcopy(selected)
         scoped["required_leaf_questions"][1]["leaf_condition_scope"] = "target_given_upstream"
+        self._refresh_leaf_sufficiency(scoped["required_leaf_questions"][1])
         scoped["branches"][0]["anchor_mode"] = "anchor_required"
         contract = build_anchor_dependency_contract(
             {"edge_id": "edge-1", "status": "validated_strict_precedence_anchor"},
@@ -242,6 +317,7 @@ class QDTContractTest(unittest.TestCase):
         selected = select_qdt_candidate([build_fixture_qdt_candidate(self.handoff)])
         broken = copy.deepcopy(selected)
         broken["required_leaf_questions"][1]["leaf_condition_scope"] = "target_given_upstream"
+        self._refresh_leaf_sufficiency(broken["required_leaf_questions"][1])
         broken["branches"][0]["anchor_mode"] = "anchor_required"
         self.assertFalse(validate_question_decomposition(broken).valid)
 
@@ -269,6 +345,7 @@ class QDTContractTest(unittest.TestCase):
         selected = select_qdt_candidate([build_fixture_qdt_candidate(self.handoff)])
         broken = copy.deepcopy(selected)
         broken["required_leaf_questions"][1]["leaf_condition_scope"] = "target_given_upstream"
+        self._refresh_leaf_sufficiency(broken["required_leaf_questions"][1])
         broken["branches"][0]["anchor_mode"] = "anchor_required"
         with tempfile.TemporaryDirectory() as temp:
             qdt_path = Path(temp) / "question-decomposition.json"

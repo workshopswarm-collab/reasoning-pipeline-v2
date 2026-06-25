@@ -24,6 +24,10 @@ from .qdt import (
     validate_qdt_structure,
     validate_question_decomposition,
 )
+from .sufficiency_requirements import (
+    RESEARCH_SUFFICIENCY_REQUIREMENTS_SCHEMA_VERSION,
+    RESEARCH_SUFFICIENCY_TEMPLATE_VERSION,
+)
 
 __all__ = [
     "DECOMPOSER_HANDOFF_SCHEMA_VERSION",
@@ -33,6 +37,8 @@ __all__ = [
     "ANCHOR_DEPENDENCY_CONTRACT_SCHEMA_VERSION",
     "QDTError",
     "QUESTION_DECOMPOSITION_ARTIFACT_TYPE",
+    "RESEARCH_SUFFICIENCY_REQUIREMENTS_SCHEMA_VERSION",
+    "RESEARCH_SUFFICIENCY_TEMPLATE_VERSION",
     "build_anchor_dependency_contract",
     "build_decomposer_handoff",
     "build_fixture_qdt_candidate",

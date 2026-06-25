@@ -36,6 +36,12 @@ from .handoff import (
     DECOMPOSER_PROMPT_TEMPLATE_ID,
     QUESTION_DECOMPOSITION_SCHEMA_VERSION,
 )
+from .sufficiency_requirements import (
+    REQUIRED_SUFFICIENCY_FIELDS,
+    SUFFICIENCY_PROFILE_ID,
+    build_research_sufficiency_requirements as _build_research_sufficiency_requirements,
+    validate_research_sufficiency_requirements,
+)
 
 
 QUESTION_DECOMPOSITION_ARTIFACT_TYPE = "question_decomposition"
@@ -138,24 +144,6 @@ REQUIRED_LEAF_FIELDS = (
     "research_sufficiency_requirements",
     "market_component_terms",
     "structural_validation",
-)
-REQUIRED_SUFFICIENCY_FIELDS = (
-    "sufficiency_profile_id",
-    "target_answerability",
-    "retrieval_breadth_profile_ref",
-    "required_source_classes",
-    "protected_primary_required",
-    "min_independent_claim_families",
-    "min_independent_source_families",
-    "min_temporally_fresh_sources",
-    "required_value_fields",
-    "required_negative_checks",
-    "contradiction_search_required",
-    "recency_window_seconds",
-    "max_targeted_expansion_attempts",
-    "allow_macro_fallback_for_leaf",
-    "unanswerability_proof_required",
-    "classification_dispatch_requires_sufficiency_certificate",
 )
 REQUIRED_MODEL_FIELDS = (
     "model_lane_id",
@@ -548,32 +536,13 @@ def build_research_sufficiency_requirements(
     required_value_fields: list[str] | None = None,
     required_negative_checks: list[str] | None = None,
 ) -> dict[str, Any]:
-    protected_primary_required = purpose == "source_of_truth"
-    critical_or_source = static_information_weight == "critical" or purpose == "source_of_truth"
-    required_classes = ["official_or_primary", "independent_secondary"]
-    if purpose == "market_pricing":
-        required_classes = ["market_or_exchange", "independent_secondary"]
-    claim_family_minimum = 2 if static_information_weight in {"critical", "high"} else 1
-    source_family_minimum = 2 if static_information_weight in {"critical", "high"} else 1
-    fresh_sources = 1 if purpose in {"direct_evidence", "source_of_truth", "catalyst", "market_pricing"} else 0
-    return {
-        "sufficiency_profile_id": "high-certainty-default/v1",
-        "target_answerability": "high_confidence_or_structurally_unanswerable",
-        "retrieval_breadth_profile_ref": f"breadth-profile-template:{purpose}:{static_information_weight}:{condition_scope}",
-        "required_source_classes": required_classes,
-        "protected_primary_required": protected_primary_required,
-        "min_independent_claim_families": claim_family_minimum,
-        "min_independent_source_families": source_family_minimum,
-        "min_temporally_fresh_sources": fresh_sources,
-        "required_value_fields": list(required_value_fields or []),
-        "required_negative_checks": list(required_negative_checks or []),
-        "contradiction_search_required": True,
-        "recency_window_seconds": 259200,
-        "max_targeted_expansion_attempts": 3,
-        "allow_macro_fallback_for_leaf": False,
-        "unanswerability_proof_required": critical_or_source,
-        "classification_dispatch_requires_sufficiency_certificate": True,
-    }
+    return _build_research_sufficiency_requirements(
+        purpose=purpose,
+        static_information_weight=static_information_weight,
+        condition_scope=condition_scope,
+        required_value_fields=required_value_fields,
+        required_negative_checks=required_negative_checks,
+    )
 
 
 def _model_execution_context_from_handoff(handoff: dict[str, Any]) -> dict[str, Any]:
@@ -622,6 +591,9 @@ def build_qdt_candidate(
                 purpose=leaf.get("purpose", "other"),
                 static_information_weight=weighting.get("static_information_weight", "medium"),
                 condition_scope=leaf.get("leaf_condition_scope", "unconditional"),
+                required_value_fields=leaf.get("required_evidence_fields")
+                if isinstance(leaf.get("required_evidence_fields"), list)
+                else None,
             )
     purposes = sorted({leaf.get("purpose") for leaf in leaves if leaf.get("purpose")})
     if leaf_budget_decision is None:
@@ -874,8 +846,8 @@ def _validate_sufficiency(requirements: Any, leaf: dict[str, Any], path: str, er
     for field in REQUIRED_SUFFICIENCY_FIELDS:
         if field not in requirements:
             errors.append(f"{path}.research_sufficiency_requirements missing {field}")
-    if requirements.get("sufficiency_profile_id") != "high-certainty-default/v1":
-        errors.append(f"{path}.sufficiency_profile_id must be high-certainty-default/v1")
+    if requirements.get("sufficiency_profile_id") != SUFFICIENCY_PROFILE_ID:
+        errors.append(f"{path}.sufficiency_profile_id must be {SUFFICIENCY_PROFILE_ID}")
     if requirements.get("target_answerability") not in ALLOWED_TARGET_ANSWERABILITY:
         errors.append(f"{path}.target_answerability is invalid")
     if not _is_non_empty_string(requirements.get("retrieval_breadth_profile_ref")):
@@ -920,6 +892,19 @@ def _validate_sufficiency(requirements: Any, leaf: dict[str, Any], path: str, er
         errors.append(f"{path} critical/source-of-truth leaves require protected primary or unanswerability proof")
     if critical_or_source and requirements.get("allow_macro_fallback_for_leaf") is True:
         errors.append(f"{path} critical/source-of-truth leaves cannot allow macro fallback as sufficient research")
+    if isinstance(weighting, dict):
+        required_evidence_fields = leaf.get("required_evidence_fields")
+        template_errors = validate_research_sufficiency_requirements(
+            requirements,
+            purpose=str(leaf.get("purpose")),
+            static_information_weight=str(weighting.get("static_information_weight")),
+            condition_scope=str(leaf.get("leaf_condition_scope")),
+            required_evidence_fields=list(required_evidence_fields)
+            if _string_list(required_evidence_fields)
+            else [],
+        )
+        for error in template_errors:
+            errors.append(f"{path}.{error}")
 
 
 def _validate_leaf_structural_validation(
