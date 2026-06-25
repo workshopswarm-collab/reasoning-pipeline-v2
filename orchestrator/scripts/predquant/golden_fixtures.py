@@ -38,8 +38,7 @@ from .ads_stage_logging import (
 )
 from .training_trace import (
     TrainingTraceContext,
-    build_minimal_training_trace,
-    write_minimal_training_trace,
+    write_session5_minimal_training_trace,
 )
 
 
@@ -1181,23 +1180,28 @@ def artifact_manifest_refs_for_trace(conn: sqlite3.Connection, result: FixtureRu
     placeholders = ", ".join("?" for _ in result.artifact_manifest_ids)
     rows = conn.execute(
         f"""
-        SELECT artifact_id, artifact_sha256
+        SELECT artifact_id, artifact_sha256, stage, artifact_type
         FROM case_artifact_manifest
         WHERE artifact_id IN ({placeholders})
         """,
         tuple(result.artifact_manifest_ids),
     ).fetchall()
-    hashes_by_id = {artifact_id: artifact_sha256 for artifact_id, artifact_sha256 in rows}
+    manifests_by_id = {
+        artifact_id: {"artifact_id": artifact_id, "sha256": artifact_sha256, "stage": stage, "artifact_type": artifact_type}
+        for artifact_id, artifact_sha256, stage, artifact_type in rows
+    }
+    hashes_by_id = {artifact_id: manifest["sha256"] for artifact_id, manifest in manifests_by_id.items()}
     missing = [artifact_id for artifact_id in result.artifact_manifest_ids if artifact_id not in hashes_by_id]
     if missing:
         raise GoldenFixtureError(f"{result.fixture_id}: missing artifact hashes for trace pointer: {missing}")
-    return [{"artifact_id": artifact_id, "sha256": hashes_by_id[artifact_id]} for artifact_id in result.artifact_manifest_ids]
+    return [manifests_by_id[artifact_id] for artifact_id in result.artifact_manifest_ids]
 
 
 def write_fixture_training_trace_pointer(conn: sqlite3.Connection, result: FixtureRunResult) -> str | None:
     if result.fixture_id != "FIX-001" or result.status != "passed":
         return None
-    trace = build_minimal_training_trace(
+    trace_id = write_session5_minimal_training_trace(
+        conn,
         context=TrainingTraceContext(
             case_id=result.case_id,
             case_key=result.case_key,
@@ -1213,7 +1217,6 @@ def write_fixture_training_trace_pointer(conn: sqlite3.Connection, result: Fixtu
             "minimal_pointer_only": True,
         },
     )
-    trace_id = write_minimal_training_trace(conn, trace)
     result.metadata["training_trace_id"] = trace_id
     return trace_id
 

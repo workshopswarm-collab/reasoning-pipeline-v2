@@ -12,9 +12,11 @@ from predquant.training_trace import (
     TrainingTraceContext,
     TrainingTraceContractError,
     build_minimal_training_trace,
+    build_session5_minimal_training_trace,
     ensure_training_trace_schema,
     validate_minimal_training_trace,
     write_minimal_training_trace,
+    write_session5_minimal_training_trace,
 )
 
 
@@ -35,6 +37,28 @@ class TrainingTraceTest(unittest.TestCase):
 
     def tearDown(self):
         self.conn.close()
+
+    def session5_manifests(self):
+        return [
+            {
+                "artifact_id": "artifact:research",
+                "sha256": "sha256:" + "c" * 64,
+                "stage": "researcher_classification",
+                "artifact_type": "researcher-sidecar",
+            },
+            {
+                "artifact_id": "artifact:scae",
+                "sha256": "sha256:" + "d" * 64,
+                "stage": "scae",
+                "artifact_type": "scae-ledger",
+            },
+            {
+                "artifact_id": "artifact:decision",
+                "sha256": "sha256:" + "e" * 64,
+                "stage": "decision",
+                "artifact_type": "decision-context",
+            },
+        ]
 
     def test_trace_requires_artifact_pointers_and_hashes(self):
         with self.assertRaisesRegex(TrainingTraceContractError, "at least one manifest pointer"):
@@ -64,28 +88,65 @@ class TrainingTraceTest(unittest.TestCase):
                 metadata={"replacement_probability": 0.74},
             )
 
+    def test_session5_trace_requires_research_scae_and_decision_artifact_refs(self):
+        with self.assertRaisesRegex(TrainingTraceContractError, "decision"):
+            build_session5_minimal_training_trace(
+                context=self.context,
+                artifact_manifests=self.session5_manifests()[:-1],
+            )
+
+        broken = self.session5_manifests()
+        broken[0]["payload"] = {"production_forecast_prob": 0.61}
+        with self.assertRaisesRegex(TrainingTraceContractError, "production_forecast_prob"):
+            build_session5_minimal_training_trace(context=self.context, artifact_manifests=broken)
+
+    def test_session5_trace_metadata_records_required_roles_without_authority(self):
+        trace = build_session5_minimal_training_trace(
+            context=self.context,
+            artifact_manifests=self.session5_manifests(),
+            metadata={"handoff_surface": "session5"},
+        )
+
+        validate_minimal_training_trace(trace)
+        self.assertEqual(trace["live_authority"], "none")
+        self.assertFalse(trace["live_forecast_authority"])
+        self.assertEqual(trace["materialization_status"], "not_materialized")
+        handoff = trace["metadata"]["session5_handoff"]
+        self.assertTrue(handoff["non_authoritative"])
+        self.assertTrue(handoff["no_production_probability_authoring"])
+        self.assertTrue(handoff["no_replay_scoring_or_calibration_writes"])
+        self.assertEqual(set(handoff["artifact_role_refs"]), {"research", "scae", "decision"})
+        self.assertEqual(
+            handoff["artifact_role_refs"]["scae"],
+            [{"artifact_id": "artifact:scae", "sha256": "sha256:" + "d" * 64}],
+        )
+        self.assertEqual(trace["metadata"]["caller_metadata"], {"handoff_surface": "session5"})
+
     def test_persistence_writes_only_trace_pointer_table(self):
-        for table in (
+        protected_tables = (
             "retrieval_evidence_items",
             "scae_ledger_outputs",
             "synthesis_context_records",
             "forecast_decision_records",
             "market_predictions",
-        ):
+            "pipeline_replay_manifests",
+            "v2_replay_manifests",
+            "pipeline_replay_result_records",
+            "v2_replay_result_records",
+            "outcome_scoring_records",
+            "evaluator_scorecards",
+            "calibration_candidate_records",
+            "training_trace_full_materializations",
+        )
+        for table in protected_tables:
             self.conn.execute(f"CREATE TABLE {table} (id TEXT PRIMARY KEY, marker TEXT NOT NULL)")
             self.conn.execute(f"INSERT INTO {table} (id, marker) VALUES (?, ?)", (f"{table}:1", "unchanged"))
         before = {
             table: self.conn.execute(f"SELECT COUNT(*), MIN(marker), MAX(marker) FROM {table}").fetchone()
-            for table in (
-                "retrieval_evidence_items",
-                "scae_ledger_outputs",
-                "synthesis_context_records",
-                "forecast_decision_records",
-                "market_predictions",
-            )
+            for table in protected_tables
         }
 
-        trace = build_minimal_training_trace(context=self.context, artifact_manifests=self.manifests)
+        trace = build_session5_minimal_training_trace(context=self.context, artifact_manifests=self.session5_manifests())
         trace_id = write_minimal_training_trace(self.conn, trace)
 
         self.assertEqual(trace_id, trace["trace_id"])
@@ -99,6 +160,18 @@ class TrainingTraceTest(unittest.TestCase):
                     self.conn.execute(f"SELECT COUNT(*), MIN(marker), MAX(marker) FROM {table}").fetchone(),
                     prior,
                 )
+
+    def test_session5_write_uses_fnd_pointer_persistence(self):
+        trace_id = write_session5_minimal_training_trace(
+            self.conn,
+            context=self.context,
+            artifact_manifests=self.session5_manifests(),
+        )
+
+        row = self.conn.execute(
+            f"SELECT trace_id, trace_status, live_authority, live_forecast_authority FROM {TRAINING_TRACE_MINIMAL_TABLE}"
+        ).fetchone()
+        self.assertEqual(row, (trace_id, "minimal_pointer_written", "none", 0))
 
     def test_persisted_pointer_keeps_minimal_contract_fields(self):
         ensure_training_trace_schema(self.conn)

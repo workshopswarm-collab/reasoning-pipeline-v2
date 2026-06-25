@@ -188,7 +188,7 @@ These migration groups are the data backbone for replay, scoring, calibration, a
 
 | Feature ID | Stage | Component | Blocking | Owner | Dependencies | Output | Status |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| TRACE-001 | v2_live_cutover | Training trace | cutover_blocker | Session 5 | FND-007, FND-003 | Synchronous minimal trace pointer | not_started |
+| TRACE-001 | v2_live_cutover | Training trace | cutover_blocker | Session 5 | FND-007, FND-003 | Synchronous minimal trace pointer requiring research/SCAE/decision artifact refs and hashes; tested non-authoritative and state-isolated | ready_for_integration |
 | TRACE-002 | autonomous_optimization_maturity | Training trace | maturity_only | Session 6 | TRACE-001, REPLAY-001 | Async full trace materialization | not_started |
 | REPLAY-001 | calibration_debt_clearance | Replay | foundation_blocker | Session 5 | TRACE-001, FND-004 | First-100 replay manifests and result records | not_started |
 | SCORE-001 | calibration_debt_clearance | Outcome scoring | foundation_blocker | Session 5 | PERSIST-002, REPLAY-001 | Brier scoring and prediction-time market baseline comparison via existing `market_predictions` and `brier_score_report()` | not_started |

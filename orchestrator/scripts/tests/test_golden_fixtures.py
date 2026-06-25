@@ -78,7 +78,7 @@ class GoldenFixturesTest(unittest.TestCase):
             f"""
             SELECT trace_id, case_id, dispatch_id, run_id, forecast_timestamp,
                    artifact_manifest_ids, artifact_hashes, trace_status,
-                   live_authority, live_forecast_authority
+                   live_authority, live_forecast_authority, metadata
             FROM {TRAINING_TRACE_MINIMAL_TABLE}
             WHERE case_id = ? AND run_id = ?
             """,
@@ -90,7 +90,13 @@ class GoldenFixturesTest(unittest.TestCase):
         self.assertEqual(trace_row[1:5], (result.case_id, result.dispatch_id, result.run_id, result.started_at))
         self.assertEqual(json.loads(trace_row[5]), result.artifact_manifest_ids[:-1])
         self.assertEqual(set(json.loads(trace_row[6])), set(result.artifact_manifest_ids[:-1]))
-        self.assertEqual(trace_row[7:], ("minimal_pointer_written", "none", 0))
+        self.assertEqual(trace_row[7:10], ("minimal_pointer_written", "none", 0))
+        trace_metadata = json.loads(trace_row[10])
+        self.assertEqual(
+            set(trace_metadata["session5_handoff"]["artifact_role_refs"]),
+            {"research", "scae", "decision"},
+        )
+        self.assertTrue(trace_metadata["session5_handoff"]["no_replay_scoring_or_calibration_writes"])
 
     def test_missing_artifact_fails_closed_with_error_event(self):
         result = self.run_fixture("FIX-001", simulate_missing_artifact_stage="retrieval")

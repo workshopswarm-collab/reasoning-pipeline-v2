@@ -22,6 +22,8 @@ TRAINING_TRACE_MINIMAL_MIGRATION = (
 TRACE_STATUS_MINIMAL_POINTER_WRITTEN = "minimal_pointer_written"
 MATERIALIZATION_STATUS_NOT_MATERIALIZED = "not_materialized"
 NO_LIVE_AUTHORITY = "none"
+SESSION5_TRACE_HANDOFF_SCHEMA_VERSION = "session5-minimal-trace-handoff/v1"
+SESSION5_TRACE_REQUIRED_ARTIFACT_ROLES = ("research", "scae", "decision")
 
 FORBIDDEN_TRACE_AUTHORITY_FIELDS = frozenset(
     {
@@ -217,6 +219,111 @@ def normalize_artifact_manifests(artifact_manifests: list[dict[str, Any]] | tupl
         artifact_ids.append(artifact_id)
         artifact_hashes[artifact_id] = artifact_hash
     return artifact_ids, artifact_hashes
+
+
+def infer_session5_trace_artifact_role(manifest: dict[str, Any]) -> str | None:
+    explicit_role = manifest.get("trace_role") or manifest.get("artifact_role") or manifest.get("role")
+    if explicit_role:
+        role = str(explicit_role).lower().replace("_", "-")
+        if role in {"research", "research-artifact", "research-handoff", "researcher"}:
+            return "research"
+        if role in {"scae", "scae-ledger", "scae-artifact"}:
+            return "scae"
+        if role in {"decision", "decision-gate", "forecast-decision"}:
+            return "decision"
+        raise TrainingTraceContractError(f"unknown Session 5 trace artifact role: {explicit_role}")
+
+    for field in ("stage", "artifact_type"):
+        value = manifest.get(field)
+        if not value:
+            continue
+        text = str(value).lower().replace("_", "-")
+        if "scae" in text:
+            return "scae"
+        if "decision" in text:
+            return "decision"
+        if any(token in text for token in ("research", "retrieval", "evidence", "classification", "verification")):
+            return "research"
+    return None
+
+
+def session5_artifact_role_refs(
+    artifact_manifests: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+) -> dict[str, list[dict[str, str]]]:
+    """Validate the bounded Session 5 trace handoff surface.
+
+    This adapter keeps the FND-007 trace pointer contract authoritative while
+    adding Session 5's synchronous handoff requirement that research, SCAE, and
+    decision artifacts are represented by manifest IDs and hashes.
+    """
+
+    ensure_no_forbidden_trace_fields(artifact_manifests, "artifact_manifests")
+    _, artifact_hashes = normalize_artifact_manifests(artifact_manifests)
+    role_refs: dict[str, list[dict[str, str]]] = {role: [] for role in SESSION5_TRACE_REQUIRED_ARTIFACT_ROLES}
+    for idx, manifest in enumerate(artifact_manifests):
+        artifact_id = require_non_empty(f"artifact_manifests[{idx}].artifact_id", manifest.get("artifact_id"))
+        role = infer_session5_trace_artifact_role(manifest)
+        if role in role_refs:
+            role_refs[role].append({"artifact_id": artifact_id, "sha256": artifact_hashes[artifact_id]})
+
+    missing = [role for role in SESSION5_TRACE_REQUIRED_ARTIFACT_ROLES if not role_refs[role]]
+    if missing:
+        raise TrainingTraceContractError(
+            "Session 5 minimal trace pointer missing required artifact roles: " + ", ".join(missing)
+        )
+    return role_refs
+
+
+def build_session5_minimal_training_trace(
+    *,
+    context: TrainingTraceContext,
+    artifact_manifests: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+    trace_id: str | None = None,
+    created_at: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    role_refs = session5_artifact_role_refs(artifact_manifests)
+    base_metadata = ensure_safe_metadata(metadata)
+    trace_metadata: dict[str, Any] = {
+        "session5_handoff": {
+            "schema_version": SESSION5_TRACE_HANDOFF_SCHEMA_VERSION,
+            "trace_scope": "synchronous_minimal_trace_pointer",
+            "required_artifact_roles": list(SESSION5_TRACE_REQUIRED_ARTIFACT_ROLES),
+            "artifact_role_refs": role_refs,
+            "non_authoritative": True,
+            "no_live_authority": True,
+            "no_production_probability_authoring": True,
+            "no_replay_scoring_or_calibration_writes": True,
+        }
+    }
+    if base_metadata:
+        trace_metadata["caller_metadata"] = base_metadata
+    return build_minimal_training_trace(
+        context=context,
+        artifact_manifests=artifact_manifests,
+        trace_id=trace_id,
+        created_at=created_at,
+        metadata=trace_metadata,
+    )
+
+
+def write_session5_minimal_training_trace(
+    conn: sqlite3.Connection,
+    *,
+    context: TrainingTraceContext,
+    artifact_manifests: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+    trace_id: str | None = None,
+    created_at: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> str:
+    trace = build_session5_minimal_training_trace(
+        context=context,
+        artifact_manifests=artifact_manifests,
+        trace_id=trace_id,
+        created_at=created_at,
+        metadata=metadata,
+    )
+    return write_minimal_training_trace(conn, trace)
 
 
 def make_trace_id(context: TrainingTraceContext, artifact_hashes: dict[str, str]) -> str:

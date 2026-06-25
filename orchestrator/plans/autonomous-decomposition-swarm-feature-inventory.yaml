@@ -268,7 +268,7 @@
     {"id": "PERSIST-001", "stage": "v2_live_cutover", "owner": "Session 5", "status": "not_started", "dependencies": ["DEC-001", "SCAE-012"]},
     {"id": "PERSIST-002", "stage": "v2_live_cutover", "owner": "Session 5", "status": "not_started", "dependencies": ["PERSIST-001", "CASE-002"]},
 
-    {"id": "TRACE-001", "stage": "v2_live_cutover", "owner": "Session 5", "status": "not_started", "dependencies": ["FND-007", "FND-003"]},
+    {"id": "TRACE-001", "stage": "v2_live_cutover", "owner": "Session 5", "status": "ready_for_integration", "dependencies": ["FND-007", "FND-003"], "acceptance_evidence": "2026-06-25 Session 05 TRACE-001 added a bounded Session 5 adapter on the FND-007 minimal trace pointer helper plus FIX-001 handoff wiring; tests require research/SCAE/decision artifact refs and hashes, reject production probability authoring, preserve no live authority, and prove only training_trace_minimal_pointers changes while SCAE/synthesis/decision/forecast/replay/scoring/calibration/full-materialization state stays unchanged."},
     {"id": "TRACE-002", "stage": "autonomous_optimization_maturity", "owner": "Session 6", "status": "not_started", "dependencies": ["TRACE-001", "REPLAY-001"]},
     {"id": "REPLAY-001", "stage": "calibration_debt_clearance", "owner": "Session 5", "status": "not_started", "dependencies": ["TRACE-001", "FND-004"]},
     {"id": "SCORE-001", "stage": "calibration_debt_clearance", "owner": "Session 5", "status": "not_started", "dependencies": ["PERSIST-002", "REPLAY-001"]},
