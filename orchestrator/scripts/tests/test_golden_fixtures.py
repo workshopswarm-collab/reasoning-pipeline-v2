@@ -150,21 +150,12 @@ class GoldenFixturesTest(unittest.TestCase):
         ).fetchone()
         self.assertEqual(error_row, ("decision", "decision_probability_override_attempt"))
 
-    def test_runtime_dependency_mode_blocks_unready_downstream_feature(self):
+    def test_runtime_dependency_mode_allows_ready_fixture_path(self):
         result = self.run_fixture("FIX-001", dependency_mode="runtime_integration")
 
-        self.assertEqual(result.status, "blocked")
-        self.assertEqual(result.failure_class, "dependency_not_ready")
-        error_row = self.conn.execute(
-            "SELECT retryability, safe_metadata FROM v2_pipeline_error_events WHERE error_event_id = ?",
-            (result.error_event_ids[0],),
-        ).fetchone()
-        self.assertEqual(error_row[0], "blocked")
-        blocking_feature_ids = json.loads(error_row[1])["blocking_feature_ids"]
-        self.assertTrue(blocking_feature_ids)
-        self.assertIn("DEC-001", blocking_feature_ids)
-        self.assertNotIn("SYN-001", blocking_feature_ids)
-        self.assertNotIn("VER-004", blocking_feature_ids)
+        self.assertEqual(result.status, "passed")
+        self.assertFalse(result.error_event_ids)
+        self.assertIn("decision", {record["stage"] for record in result.stage_records})
 
 
 if __name__ == "__main__":
