@@ -22,6 +22,7 @@ leaf-research preparation, and downstream classification/verification helpers.
 - `researcher_swarm/classification_matrix.py`: `CLS-003` materializes schema-valid `researcher-sidecar/v2` artifacts into classification, provenance, and CLS-003 support-only coverage proof slices with deterministic matrix digests.
 - `researcher_swarm/model_context.py`: `MODEL-003` deterministic metadata-only researcher leaf NLI model lane resolution for `gpt-5.5-high`.
 - `researcher_swarm/assignments.py`: `CLS-006` compact `leaf-research-assignment/v1` builder/validator for RET-008 dispatchable QDT leaves, carrying refs, digests, context-isolation refs, model context, sidecar output contract, and budget caps without embedding QDT leaf blobs, evidence bodies, probabilities, fair values, intervals, or decision recommendations.
+- `researcher_swarm/isolation.py`: `CLS-008` compact prelaunch `researcher-context-isolation/v1` audit builder/validator for fresh context, visible-ref allowlists, forbidden-ref scans, peer-output exclusion, allowed shared schema/prompt refs, launch blocking, and deterministic audit digests without spawning subagents.
 - `researcher_swarm/verification.py`: `VER-001` direction verification slices and `VER-002` evidence-quality verification slices over materialized CLS-003 rows, with no SCAE ledger writes, model calls, or production forecasts.
 - `bin/build_retrieval_packet.py`: builds a schema-only `retrieval-packet/v1` from a validated QDT.
 

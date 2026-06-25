@@ -668,7 +668,7 @@ Completion checklist:
 - [ ] `leaf-research-assignment/v1` schema written.
 - [ ] Assignment builder written.
 - [ ] Assignment storage/ref compaction checks written.
-- [ ] Context-isolation audit schema and validator written.
+- [x] Context-isolation audit schema and validator written.
 - [ ] Escalation assignment fields written.
 - [ ] Prompt contract written.
 - [ ] Researcher model lane resolution written.
