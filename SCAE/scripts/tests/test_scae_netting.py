@@ -12,9 +12,11 @@ from scae.netting import (  # noqa: E402
     CROSS_LEAF_REPRESENTATIVE_SELECTOR,
     NO_LIVE_AUTHORITY,
     REPRESENTATIVE_SELECTOR,
+    SCAE_BRANCH_SUBLEDGER_BUNDLE_SCHEMA_VERSION,
     SCAE_CLUSTER_NETTING_BUNDLE_SCHEMA_VERSION,
     SCAE_CROSS_LEAF_DEPENDENCE_BUNDLE_SCHEMA_VERSION,
     ScaeNettingError,
+    build_branch_subledger_bundle,
     build_cross_leaf_dependence_bundle,
     build_leaf_cluster_netting_bundle,
     build_leaf_cluster_netting_slices,
@@ -39,6 +41,7 @@ class ScaeNettingTest(unittest.TestCase):
         source_class="official_or_primary",
         mechanism_family_id=None,
         claim_family_status=None,
+        parent_branch_id="branch-1",
     ):
         candidate = {
             "artifact_type": "scae_log_odds_update_candidate_slice",
@@ -46,6 +49,7 @@ class ScaeNettingTest(unittest.TestCase):
             "case_id": "case-1",
             "dispatch_id": "dispatch-1",
             "leaf_id": leaf_id,
+            "parent_branch_id": parent_branch_id,
             "source_family_id": source_family_id,
             "claim_family_id": claim_family_id,
             "source_ref": f"source-{candidate_id}",
@@ -61,6 +65,27 @@ class ScaeNettingTest(unittest.TestCase):
         if claim_family_status is not None:
             candidate["claim_family_resolution_status"] = claim_family_status
         return candidate
+
+    def qdt(self, leaf_to_branch, *, hierarchical_branch_ledger_required=True):
+        branch_ids = sorted(set(leaf_to_branch.values()))
+        return {
+            "artifact_type": "question_decomposition",
+            "schema_version": "question-decomposition/v1",
+            "case_id": "case-1",
+            "dispatch_id": "dispatch-1",
+            "leaf_budget_decision": {
+                "hierarchical_branch_ledger_required": hierarchical_branch_ledger_required,
+                "effective_leaf_budget": len(leaf_to_branch),
+            },
+            "branches": [
+                {"branch_id": branch_id, "branch_label": f"Branch {branch_id}"}
+                for branch_id in branch_ids
+            ],
+            "required_leaf_questions": [
+                {"leaf_id": leaf_id, "parent_branch_id": branch_id}
+                for leaf_id, branch_id in sorted(leaf_to_branch.items())
+            ],
+        }
 
     def test_repeated_same_claim_source_family_contributes_once_by_default(self):
         result = build_leaf_cluster_netting_slices(
@@ -309,6 +334,191 @@ class ScaeNettingTest(unittest.TestCase):
             "canonical_probability",
         ]:
             self.assertNotIn(forbidden_field, serialized)
+
+    def test_expanded_decomposition_uses_branch_subledgers_not_flat_summation(self):
+        intra_leaf_bundle = build_leaf_cluster_netting_bundle(
+            [
+                self.candidate(
+                    "candidate-branch-evidence-a",
+                    delta=0.18,
+                    leaf_id="leaf-a",
+                    parent_branch_id="branch-evidence",
+                    claim_family_id="claim-family-a",
+                ),
+                self.candidate(
+                    "candidate-branch-evidence-b",
+                    delta=0.32,
+                    leaf_id="leaf-b",
+                    parent_branch_id="branch-evidence",
+                    claim_family_id="claim-family-b",
+                ),
+                self.candidate(
+                    "candidate-branch-pricing",
+                    delta=-0.20,
+                    leaf_id="leaf-c",
+                    parent_branch_id="branch-pricing",
+                    claim_family_id="claim-family-c",
+                ),
+            ],
+            policy=self.policy,
+        )
+        cross_leaf_bundle = build_cross_leaf_dependence_bundle(intra_leaf_bundle)
+        qdt = self.qdt(
+            {
+                "leaf-a": "branch-evidence",
+                "leaf-b": "branch-evidence",
+                "leaf-c": "branch-pricing",
+            }
+        )
+
+        branch_bundle = build_branch_subledger_bundle(cross_leaf_bundle, qdt=qdt, policy=self.policy)
+
+        self.assertEqual(branch_bundle["schema_version"], SCAE_BRANCH_SUBLEDGER_BUNDLE_SCHEMA_VERSION)
+        self.assertEqual(branch_bundle["authority"], NO_LIVE_AUTHORITY)
+        self.assertFalse(branch_bundle["writes_scae_ledger"])
+        self.assertFalse(branch_bundle["writes_production_forecast"])
+        self.assertEqual(branch_bundle["branch_subledger_count"], 2)
+        by_branch = {
+            branch_slice["parent_branch_id"]: branch_slice
+            for branch_slice in branch_bundle["branch_subledger_slices"]
+        }
+        evidence_branch = by_branch["branch-evidence"]
+        self.assertEqual(evidence_branch["feature_id"], "SCAE-007")
+        self.assertEqual(evidence_branch["branch_input_count"], 2)
+        self.assertEqual(evidence_branch["raw_additive_branch_signed_log_odds_delta"], 0.50)
+        self.assertEqual(
+            evidence_branch["sign_partitioned_covariance_penalties"]["positive"]["penalty_multiplier"],
+            0.707106781,
+        )
+        self.assertEqual(evidence_branch["branch_subledger_signed_log_odds_delta"], 0.353553391)
+        self.assertNotEqual(
+            evidence_branch["branch_subledger_signed_log_odds_delta"],
+            evidence_branch["raw_additive_branch_signed_log_odds_delta"],
+        )
+        self.assertEqual(
+            branch_bundle["branch_subledger_summary"]["branch_subledger_application_status"],
+            "built",
+        )
+
+    def test_branch_covariance_applies_sign_partitioned_penalties(self):
+        intra_leaf_bundle = build_leaf_cluster_netting_bundle(
+            [
+                self.candidate(
+                    "candidate-pos-a",
+                    delta=0.16,
+                    leaf_id="leaf-pos-a",
+                    parent_branch_id="branch-mixed",
+                    claim_family_id="claim-family-pos-a",
+                ),
+                self.candidate(
+                    "candidate-pos-b",
+                    delta=0.09,
+                    leaf_id="leaf-pos-b",
+                    parent_branch_id="branch-mixed",
+                    claim_family_id="claim-family-pos-b",
+                ),
+                self.candidate(
+                    "candidate-neg-a",
+                    delta=-0.12,
+                    leaf_id="leaf-neg-a",
+                    parent_branch_id="branch-mixed",
+                    claim_family_id="claim-family-neg-a",
+                ),
+                self.candidate(
+                    "candidate-neg-b",
+                    delta=-0.04,
+                    leaf_id="leaf-neg-b",
+                    parent_branch_id="branch-mixed",
+                    claim_family_id="claim-family-neg-b",
+                ),
+            ],
+            policy=self.policy,
+        )
+        cross_leaf_bundle = build_cross_leaf_dependence_bundle(intra_leaf_bundle)
+        qdt = self.qdt(
+            {
+                "leaf-pos-a": "branch-mixed",
+                "leaf-pos-b": "branch-mixed",
+                "leaf-neg-a": "branch-mixed",
+                "leaf-neg-b": "branch-mixed",
+            }
+        )
+
+        branch_slice = build_branch_subledger_bundle(cross_leaf_bundle, qdt=qdt, policy=self.policy)[
+            "branch_subledger_slices"
+        ][0]
+
+        positive_penalty = branch_slice["sign_partitioned_covariance_penalties"]["positive"]
+        negative_penalty = branch_slice["sign_partitioned_covariance_penalties"]["negative"]
+        self.assertEqual(positive_penalty["input_count"], 2)
+        self.assertEqual(negative_penalty["input_count"], 2)
+        self.assertEqual(positive_penalty["raw_signed_log_odds_sum"], 0.25)
+        self.assertEqual(negative_penalty["raw_signed_log_odds_sum"], -0.16)
+        self.assertEqual(positive_penalty["penalty_multiplier"], 0.707106781)
+        self.assertEqual(negative_penalty["penalty_multiplier"], 0.707106781)
+        self.assertEqual(branch_slice["raw_additive_branch_signed_log_odds_delta"], 0.09)
+        self.assertEqual(branch_slice["covariance_adjusted_pre_cap_signed_log_odds_delta"], 0.06363961)
+        self.assertEqual(branch_slice["branch_subledger_signed_log_odds_delta"], 0.06363961)
+        self.assertFalse(branch_slice["bounded_by_branch_cap"])
+
+    def test_branch_cap_is_candidate_only_with_no_probability_fields(self):
+        policy = copy.deepcopy(self.policy)
+        policy["cap_stack"]["per_branch_log_odds_cap"] = 0.20
+        intra_leaf_bundle = build_leaf_cluster_netting_bundle(
+            [
+                self.candidate(
+                    f"candidate-large-{index}",
+                    delta=0.35,
+                    leaf_id=f"leaf-large-{index}",
+                    parent_branch_id="branch-capped",
+                    claim_family_id=f"claim-family-large-{index}",
+                )
+                for index in range(3)
+            ],
+            policy=policy,
+        )
+        cross_leaf_bundle = build_cross_leaf_dependence_bundle(intra_leaf_bundle)
+        qdt = self.qdt({f"leaf-large-{index}": "branch-capped" for index in range(3)})
+
+        branch_bundle = build_branch_subledger_bundle(cross_leaf_bundle, qdt=qdt, policy=policy)
+
+        branch_slice = branch_bundle["branch_subledger_slices"][0]
+        self.assertEqual(branch_slice["per_branch_log_odds_cap"], 0.20)
+        self.assertEqual(branch_slice["branch_subledger_signed_log_odds_delta"], 0.20)
+        self.assertTrue(branch_slice["bounded_by_branch_cap"])
+        self.assertEqual(branch_slice["cap_application_scope"], "candidate_branch_subledger_input_only")
+        self.assertTrue(branch_slice["mechanism_family_diagnostics"]["diagnostic_dependence_only"])
+        self.assertFalse(branch_slice["mechanism_family_diagnostics"]["can_increase_evidence_strength"])
+        serialized = json.dumps(branch_bundle, sort_keys=True)
+        for forbidden_field in [
+            "raw_ledger_probability",
+            "post_ledger_probability",
+            "debt_adjusted_probability",
+            "production_forecast_prob",
+            "canonical_probability",
+        ]:
+            self.assertNotIn(forbidden_field, serialized)
+
+    def test_branch_subledger_requires_parent_branch_id(self):
+        intra_leaf_bundle = build_leaf_cluster_netting_bundle(
+            [
+                self.candidate(
+                    "candidate-missing-branch",
+                    delta=0.18,
+                    leaf_id="leaf-missing-branch",
+                    parent_branch_id=None,
+                )
+            ],
+            policy=self.policy,
+        )
+        cross_leaf_bundle = build_cross_leaf_dependence_bundle(intra_leaf_bundle)
+
+        with self.assertRaisesRegex(ScaeNettingError, "parent_branch_id"):
+            build_branch_subledger_bundle(
+                cross_leaf_bundle,
+                qdt=self.qdt({"leaf-missing-branch": "branch-expected"}),
+                policy=self.policy,
+            )
 
 
 if __name__ == "__main__":

@@ -1,8 +1,8 @@
-"""SCAE-005/SCAE-006 candidate-only netting guards.
+"""SCAE-005/SCAE-006/SCAE-007 candidate-only netting guards.
 
 This module consumes bounded SCAE candidate update slices and emits
-candidate-only cluster netting and cross-leaf dependence slices. It does not
-apply branch sub-ledgers, final ledger aggregation, probability fields, or
+candidate-only cluster netting, cross-leaf dependence, and branch sub-ledger
+slices. It does not apply final ledger aggregation, probability fields, or
 forecast persistence.
 """
 
@@ -23,11 +23,16 @@ SCAE_CLUSTER_NETTING_SUMMARY_SCHEMA_VERSION = "scae-intra-leaf-cluster-netting-s
 SCAE_CROSS_LEAF_DEPENDENCE_SLICE_SCHEMA_VERSION = "scae-cross-leaf-dependence-slice/v1"
 SCAE_CROSS_LEAF_DEPENDENCE_BUNDLE_SCHEMA_VERSION = "scae-cross-leaf-dependence-bundle/v1"
 SCAE_MECHANISM_FAMILY_DIAGNOSTIC_SCHEMA_VERSION = "scae-mechanism-family-dependence-diagnostic/v1"
+SCAE_BRANCH_SUBLEDGER_SLICE_SCHEMA_VERSION = "scae-branch-subledger-slice/v1"
+SCAE_BRANCH_SUBLEDGER_BUNDLE_SCHEMA_VERSION = "scae-branch-subledger-bundle/v1"
+SCAE_BRANCH_SUBLEDGER_SUMMARY_SCHEMA_VERSION = "scae-branch-subledger-summary/v1"
 SCAE_005_NETTING_VERSION = "ads-scae-005-intra-leaf-cluster-netting/v1"
 SCAE_006_DEPENDENCE_VERSION = "ads-scae-006-cross-leaf-dependence-guard/v1"
+SCAE_007_BRANCH_SUBLEDGER_VERSION = "ads-scae-007-branch-subledger/v1"
 NO_LIVE_AUTHORITY = "candidate_ledger_input_only_no_live_forecast_authority"
 REPRESENTATIVE_SELECTOR = "policy_bounded_signed_representative_v1"
 CROSS_LEAF_REPRESENTATIVE_SELECTOR = "shared_claim_union_signed_representative_v1"
+COVARIANCE_PENALTY_VERSION = "sign_partitioned_inverse_sqrt_count_v1"
 AMBIGUOUS_CLAIM_FAMILY_UNION_ID = "ambiguous_claim_family_conservative_union"
 AMBIGUOUS_CLAIM_FAMILY_VALUES = {
     "ambiguous",
@@ -48,7 +53,7 @@ ACCEPTED_CLAIM_FAMILY_STATUSES = {
 
 
 class ScaeNettingError(ValueError):
-    """Raised when SCAE-005 netting cannot safely continue."""
+    """Raised when SCAE netting cannot safely continue."""
 
 
 @dataclass(frozen=True)
@@ -66,6 +71,14 @@ class CrossLeafDependenceResult:
     mechanism_family_diagnostics: list[dict[str, Any]]
     cross_leaf_summary: dict[str, Any]
     cross_leaf_dependence_bundle_digest: str
+
+
+@dataclass(frozen=True)
+class BranchSubledgerResult:
+    branch_subledger_slices: list[dict[str, Any]]
+    branch_subledger_summary: dict[str, Any]
+    excluded_dependency_input_refs: list[str]
+    branch_subledger_bundle_digest: str
 
 
 def _canonical_json(value: Any) -> str:
@@ -150,6 +163,13 @@ def _cluster_identity(candidate: dict[str, Any]) -> tuple[str, str, str]:
     if not _is_non_empty_string(claim_family_id):
         raise ScaeNettingError(f"{_candidate_id(candidate)} is missing claim_family_id")
     return str(leaf_id), str(source_family_id), str(claim_family_id)
+
+
+def _candidate_parent_branch_id(candidate: dict[str, Any]) -> str | None:
+    value = candidate.get("parent_branch_id")
+    if _is_non_empty_string(value):
+        return str(value)
+    return None
 
 
 def _candidate_mechanism_family_ids(candidate: dict[str, Any]) -> list[str]:
@@ -301,6 +321,17 @@ def _cluster_slice(
     pre_cap_delta = round(positive_delta + negative_delta, 9)
     netted_delta, bounded_by_cap = _cap_signed_delta(pre_cap_delta, per_cluster_cap)
     candidate_refs = [_candidate_id(candidate) for candidate in sorted_candidates]
+    parent_branch_ids = sorted(
+        {
+            branch_id
+            for candidate in sorted_candidates
+            for branch_id in [_candidate_parent_branch_id(candidate)]
+            if branch_id is not None
+        }
+    )
+    if len(parent_branch_ids) > 1:
+        raise ScaeNettingError(f"{cluster_key} spans multiple parent_branch_id values")
+    parent_branch_id = parent_branch_ids[0] if parent_branch_ids else None
     positive_refs = [_candidate_id(candidate) for candidate in positive_candidates]
     negative_refs = [_candidate_id(candidate) for candidate in negative_candidates]
     representative_refs = [
@@ -332,6 +363,7 @@ def _cluster_slice(
         "case_id": sorted_candidates[0].get("case_id"),
         "dispatch_id": sorted_candidates[0].get("dispatch_id"),
         "leaf_id": leaf_id,
+        "parent_branch_id": parent_branch_id,
         "source_family_id": source_family_id,
         "claim_family_id": claim_family_id,
         "claim_family_statuses": claim_family_statuses,
@@ -529,6 +561,13 @@ def _cluster_leaf_id(cluster: dict[str, Any]) -> str:
     return str(leaf_id)
 
 
+def _cluster_parent_branch_id(cluster: dict[str, Any]) -> str | None:
+    branch_id = cluster.get("parent_branch_id")
+    if _is_non_empty_string(branch_id):
+        return str(branch_id)
+    return None
+
+
 def _cluster_mechanism_family_ids(cluster: dict[str, Any]) -> list[str]:
     values: list[Any] = []
     for field in (
@@ -579,6 +618,29 @@ def _select_cluster_representative(clusters: list[dict[str, Any]]) -> dict[str, 
     return max(clusters, key=_cross_leaf_representative_key)
 
 
+def _representative_branch_inputs(
+    representatives: list[dict[str, Any] | None],
+    *,
+    dependence_group_type: str,
+    dependence_group_id: str,
+) -> list[dict[str, Any]]:
+    inputs: list[dict[str, Any]] = []
+    for cluster in representatives:
+        if cluster is None:
+            continue
+        branch_input = {
+            "cluster_slice_ref": _cluster_id(cluster),
+            "leaf_id": _cluster_leaf_id(cluster),
+            "parent_branch_id": _cluster_parent_branch_id(cluster),
+            "signed_log_odds_delta": _cluster_delta(cluster),
+            "sign": "positive" if _cluster_delta(cluster) > 0.0 else "negative",
+            "dependence_group_type": dependence_group_type,
+            "dependence_group_id": dependence_group_id,
+        }
+        inputs.append(branch_input)
+    return sorted(inputs, key=lambda item: (str(item["parent_branch_id"]), item["cluster_slice_ref"]))
+
+
 def _cross_leaf_dependence_slice(group_key: tuple[str, str], clusters: list[dict[str, Any]]) -> dict[str, Any]:
     group_type, group_id = group_key
     sorted_clusters = sorted((copy.deepcopy(cluster) for cluster in clusters), key=_cluster_id)
@@ -595,6 +657,14 @@ def _cross_leaf_dependence_slice(group_key: tuple[str, str], clusters: list[dict
     excluded_refs = sorted(set(cluster_refs) - set(representative_refs))
     source_family_ids = sorted({_cluster_source_family_id(cluster) for cluster in sorted_clusters})
     leaf_ids = sorted({_cluster_leaf_id(cluster) for cluster in sorted_clusters})
+    parent_branch_ids = sorted(
+        {
+            branch_id
+            for cluster in sorted_clusters
+            for branch_id in [_cluster_parent_branch_id(cluster)]
+            if branch_id is not None
+        }
+    )
     claim_family_ids = sorted({_cluster_claim_family_id(cluster) for cluster in sorted_clusters})
     mechanism_family_ids = sorted(
         {
@@ -605,6 +675,11 @@ def _cross_leaf_dependence_slice(group_key: tuple[str, str], clusters: list[dict
     )
     positive_delta = _cluster_delta(positive_representative) if positive_representative else 0.0
     negative_delta = _cluster_delta(negative_representative) if negative_representative else 0.0
+    representative_branch_inputs = _representative_branch_inputs(
+        [positive_representative, negative_representative],
+        dependence_group_type=group_type,
+        dependence_group_id=group_id,
+    )
     raw_additive_delta = round(sum(_cluster_delta(cluster) for cluster in sorted_clusters), 9)
     guarded_delta = round(positive_delta + negative_delta, 9)
     prevented_duplicate_delta = round(raw_additive_delta - guarded_delta, 9)
@@ -623,6 +698,7 @@ def _cross_leaf_dependence_slice(group_key: tuple[str, str], clusters: list[dict
         "source_family_ids": source_family_ids,
         "mechanism_family_ids": mechanism_family_ids,
         "leaf_ids": leaf_ids,
+        "parent_branch_ids": parent_branch_ids,
         "cluster_slice_refs": cluster_refs,
         "cluster_count": len(cluster_refs),
         "cross_leaf_representative_selector": CROSS_LEAF_REPRESENTATIVE_SELECTOR,
@@ -634,6 +710,7 @@ def _cross_leaf_dependence_slice(group_key: tuple[str, str], clusters: list[dict
         ),
         "posterior_force_inputs": {
             "representative_cluster_refs": representative_refs,
+            "representative_branch_inputs": representative_branch_inputs,
             "positive_representative_delta": positive_delta,
             "negative_representative_delta": negative_delta,
             "non_representative_cluster_refs_excluded_from_force": excluded_refs,
@@ -808,4 +885,406 @@ def build_cross_leaf_dependence_bundle(
         "mechanism_family_diagnostics": result.mechanism_family_diagnostics,
         "cross_leaf_summary": result.cross_leaf_summary,
         "dependence_version": SCAE_006_DEPENDENCE_VERSION,
+    }
+
+
+def _qdt_branch_context(qdt: dict[str, Any] | None) -> dict[str, Any]:
+    if qdt is None:
+        return {
+            "qdt_provided": False,
+            "hierarchical_branch_ledger_required": None,
+            "branches": {},
+            "leaf_to_branch": {},
+        }
+    if not isinstance(qdt, dict):
+        raise ScaeNettingError("qdt must be an object")
+
+    leaf_budget_decision = qdt.get("leaf_budget_decision") or {}
+    if not isinstance(leaf_budget_decision, dict):
+        raise ScaeNettingError("qdt.leaf_budget_decision must be an object")
+    required = leaf_budget_decision.get("hierarchical_branch_ledger_required")
+    if required is not None and not isinstance(required, bool):
+        raise ScaeNettingError("qdt.leaf_budget_decision.hierarchical_branch_ledger_required must be boolean")
+
+    branches: dict[str, dict[str, Any]] = {}
+    for branch in qdt.get("branches") or []:
+        if not isinstance(branch, dict):
+            raise ScaeNettingError("qdt.branches must contain objects")
+        branch_id = branch.get("branch_id")
+        if not _is_non_empty_string(branch_id):
+            raise ScaeNettingError("qdt branch is missing branch_id")
+        branches[str(branch_id)] = copy.deepcopy(branch)
+
+    leaf_to_branch: dict[str, str] = {}
+    for leaf in qdt.get("required_leaf_questions") or []:
+        if not isinstance(leaf, dict):
+            raise ScaeNettingError("qdt.required_leaf_questions must contain objects")
+        leaf_id = leaf.get("leaf_id")
+        branch_id = leaf.get("parent_branch_id")
+        if _is_non_empty_string(leaf_id) and _is_non_empty_string(branch_id):
+            leaf_to_branch[str(leaf_id)] = str(branch_id)
+
+    return {
+        "qdt_provided": True,
+        "hierarchical_branch_ledger_required": required,
+        "branches": branches,
+        "leaf_to_branch": leaf_to_branch,
+    }
+
+
+def _dependency_slice_id(slice_row: dict[str, Any]) -> str:
+    value = slice_row.get("cross_leaf_dependency_slice_id") or slice_row.get("slice_id")
+    if _is_non_empty_string(value):
+        return str(value)
+    raise ScaeNettingError("cross-leaf dependency slice is missing cross_leaf_dependency_slice_id")
+
+
+def _representative_dependency_inputs(slice_row: dict[str, Any]) -> list[dict[str, Any]]:
+    posterior_force_inputs = slice_row.get("posterior_force_inputs")
+    if not isinstance(posterior_force_inputs, dict):
+        raise ScaeNettingError(f"{_dependency_slice_id(slice_row)} is missing posterior_force_inputs")
+    representative_inputs = posterior_force_inputs.get("representative_branch_inputs")
+    if not isinstance(representative_inputs, list):
+        raise ScaeNettingError(f"{_dependency_slice_id(slice_row)} is missing representative_branch_inputs")
+
+    normalized_inputs: list[dict[str, Any]] = []
+    for index, branch_input in enumerate(representative_inputs):
+        if not isinstance(branch_input, dict):
+            raise ScaeNettingError("representative_branch_inputs must contain objects")
+        parent_branch_id = branch_input.get("parent_branch_id")
+        if not _is_non_empty_string(parent_branch_id):
+            raise ScaeNettingError(
+                f"{_dependency_slice_id(slice_row)} representative input {index} is missing parent_branch_id"
+            )
+        cluster_ref = branch_input.get("cluster_slice_ref")
+        if not _is_non_empty_string(cluster_ref):
+            raise ScaeNettingError(
+                f"{_dependency_slice_id(slice_row)} representative input {index} is missing cluster_slice_ref"
+            )
+        signed_delta = round(_numeric(branch_input.get("signed_log_odds_delta"), "signed_log_odds_delta"), 9)
+        if signed_delta == 0.0:
+            continue
+        normalized = {
+            "source_dependency_slice_ref": _dependency_slice_id(slice_row),
+            "case_id": slice_row.get("case_id"),
+            "dispatch_id": slice_row.get("dispatch_id"),
+            "cluster_slice_ref": str(cluster_ref),
+            "leaf_id": str(branch_input.get("leaf_id")) if _is_non_empty_string(branch_input.get("leaf_id")) else None,
+            "parent_branch_id": str(parent_branch_id),
+            "signed_log_odds_delta": signed_delta,
+            "sign": "positive" if signed_delta > 0.0 else "negative",
+            "dependence_group_type": str(slice_row.get("dependence_group_type")),
+            "dependence_group_id": str(slice_row.get("dependence_group_id")),
+            "claim_family_ids": copy.deepcopy(slice_row.get("claim_family_ids") or []),
+            "source_family_ids": copy.deepcopy(slice_row.get("source_family_ids") or []),
+            "mechanism_family_ids": copy.deepcopy(slice_row.get("mechanism_family_ids") or []),
+            "independent_corroboration_status": slice_row.get("independent_corroboration_status"),
+        }
+        normalized_inputs.append(normalized)
+    return sorted(
+        normalized_inputs,
+        key=lambda item: (
+            item["parent_branch_id"],
+            item["source_dependency_slice_ref"],
+            item["cluster_slice_ref"],
+            item["sign"],
+        ),
+    )
+
+
+def _validate_branch_input_against_qdt(branch_input: dict[str, Any], qdt_context: dict[str, Any]) -> None:
+    leaf_id = branch_input.get("leaf_id")
+    branch_id = branch_input["parent_branch_id"]
+    leaf_to_branch = qdt_context["leaf_to_branch"]
+    if leaf_id is not None and leaf_id in leaf_to_branch and leaf_to_branch[leaf_id] != branch_id:
+        raise ScaeNettingError(f"{leaf_id} parent_branch_id does not match QDT branch contract")
+
+
+def _covariance_penalty(sign_inputs: list[dict[str, Any]], *, branch_id: str, sign: str) -> dict[str, Any]:
+    raw_sum = round(sum(item["signed_log_odds_delta"] for item in sign_inputs), 9)
+    input_count = len(sign_inputs)
+    if input_count <= 1:
+        multiplier = 1.0
+        reason_codes = ["single_input_no_covariance_penalty"]
+    else:
+        multiplier = round(input_count ** -0.5, 9)
+        reason_codes = ["same_sign_multi_input_covariance_penalty_applied"]
+    adjusted_sum = round(raw_sum * multiplier, 9)
+    return {
+        "branch_id": branch_id,
+        "sign": sign,
+        "covariance_penalty_version": COVARIANCE_PENALTY_VERSION,
+        "input_count": input_count,
+        "input_refs": [item["cluster_slice_ref"] for item in sign_inputs],
+        "source_dependency_slice_refs": sorted({item["source_dependency_slice_ref"] for item in sign_inputs}),
+        "raw_signed_log_odds_sum": raw_sum,
+        "penalty_multiplier": multiplier,
+        "adjusted_signed_log_odds_sum": adjusted_sum,
+        "reason_codes": reason_codes,
+        "can_increase_evidence_strength": False,
+    }
+
+
+def _branch_subledger_slice(
+    branch_id: str,
+    branch_inputs: list[dict[str, Any]],
+    *,
+    qdt_context: dict[str, Any],
+    per_branch_cap: float,
+) -> dict[str, Any]:
+    sorted_inputs = sorted(
+        (copy.deepcopy(item) for item in branch_inputs),
+        key=lambda item: (
+            item["source_dependency_slice_ref"],
+            item["cluster_slice_ref"],
+            item["sign"],
+        ),
+    )
+    positive_inputs = [item for item in sorted_inputs if item["signed_log_odds_delta"] > 0.0]
+    negative_inputs = [item for item in sorted_inputs if item["signed_log_odds_delta"] < 0.0]
+    positive_penalty = _covariance_penalty(positive_inputs, branch_id=branch_id, sign="positive")
+    negative_penalty = _covariance_penalty(negative_inputs, branch_id=branch_id, sign="negative")
+    raw_additive_delta = round(sum(item["signed_log_odds_delta"] for item in sorted_inputs), 9)
+    pre_cap_delta = round(
+        positive_penalty["adjusted_signed_log_odds_sum"]
+        + negative_penalty["adjusted_signed_log_odds_sum"],
+        9,
+    )
+    branch_delta, bounded_by_branch_cap = _cap_signed_delta(pre_cap_delta, per_branch_cap)
+    branch_metadata = copy.deepcopy(qdt_context["branches"].get(branch_id) or {})
+    branch_slice = {
+        "artifact_type": "scae_branch_subledger_slice",
+        "schema_version": SCAE_BRANCH_SUBLEDGER_SLICE_SCHEMA_VERSION,
+        "feature_id": "SCAE-007",
+        "surface_name": "scae_branch_subledger_slices",
+        "case_id": sorted_inputs[0].get("case_id"),
+        "dispatch_id": sorted_inputs[0].get("dispatch_id"),
+        "parent_branch_id": branch_id,
+        "branch_metadata": branch_metadata,
+        "qdt_hierarchical_branch_ledger_required": qdt_context["hierarchical_branch_ledger_required"],
+        "source_dependency_slice_refs": sorted({item["source_dependency_slice_ref"] for item in sorted_inputs}),
+        "representative_cluster_refs": [item["cluster_slice_ref"] for item in sorted_inputs],
+        "leaf_ids": sorted({item["leaf_id"] for item in sorted_inputs if item["leaf_id"] is not None}),
+        "claim_family_ids": sorted(
+            {
+                str(claim_family_id)
+                for item in sorted_inputs
+                for claim_family_id in item.get("claim_family_ids", [])
+                if _is_non_empty_string(claim_family_id)
+            }
+        ),
+        "source_family_ids": sorted(
+            {
+                str(source_family_id)
+                for item in sorted_inputs
+                for source_family_id in item.get("source_family_ids", [])
+                if _is_non_empty_string(source_family_id)
+            }
+        ),
+        "mechanism_family_diagnostics": {
+            "diagnostic_dependence_only": True,
+            "can_increase_evidence_strength": False,
+            "mechanism_family_ids": sorted(
+                {
+                    str(mechanism_family_id)
+                    for item in sorted_inputs
+                    for mechanism_family_id in item.get("mechanism_family_ids", [])
+                    if _is_non_empty_string(mechanism_family_id)
+                }
+            ),
+            "signed_log_odds_delta_added_by_mechanism_family": 0.0,
+        },
+        "sign_partitioned_covariance_penalties": {
+            "positive": positive_penalty,
+            "negative": negative_penalty,
+        },
+        "branch_input_count": len(sorted_inputs),
+        "positive_input_count": len(positive_inputs),
+        "negative_input_count": len(negative_inputs),
+        "raw_additive_branch_signed_log_odds_delta": raw_additive_delta,
+        "covariance_adjusted_pre_cap_signed_log_odds_delta": pre_cap_delta,
+        "prevented_by_covariance_penalty_signed_log_odds_delta": round(raw_additive_delta - pre_cap_delta, 9),
+        "per_branch_log_odds_cap": per_branch_cap,
+        "branch_subledger_signed_log_odds_delta": branch_delta,
+        "bounded_by_branch_cap": bounded_by_branch_cap,
+        "cap_application_scope": "candidate_branch_subledger_input_only",
+        "accepted_for_candidate_ledger_input": True,
+        "ledger_input_authority": NO_LIVE_AUTHORITY,
+        "live_forecast_authority": False,
+        "writes_scae_ledger": False,
+        "writes_production_forecast": False,
+        "not_implemented_scope": [
+            "SCAE-010_conditional_branch_recombination",
+            "SCAE-011_final_probability_fields",
+        ],
+        "branch_subledger_version": SCAE_007_BRANCH_SUBLEDGER_VERSION,
+    }
+    branch_slice["branch_subledger_slice_id"] = _sha_id("scae-branch-subledger", branch_slice)
+    branch_slice["branch_subledger_slice_digest"] = _prefixed_sha256(branch_slice)
+    return branch_slice
+
+
+def _branch_subledger_summary(
+    branch_slices: list[dict[str, Any]],
+    *,
+    qdt_context: dict[str, Any],
+    application_status: str,
+    skipped_reason: str | None,
+) -> dict[str, Any]:
+    raw_additive_delta = round(
+        sum(slice_row["raw_additive_branch_signed_log_odds_delta"] for slice_row in branch_slices),
+        9,
+    )
+    covariance_adjusted_delta = round(
+        sum(slice_row["covariance_adjusted_pre_cap_signed_log_odds_delta"] for slice_row in branch_slices),
+        9,
+    )
+    branch_subledger_delta = round(
+        sum(slice_row["branch_subledger_signed_log_odds_delta"] for slice_row in branch_slices),
+        9,
+    )
+    summary = {
+        "artifact_type": "scae_branch_subledger_summary",
+        "schema_version": SCAE_BRANCH_SUBLEDGER_SUMMARY_SCHEMA_VERSION,
+        "feature_id": "SCAE-007",
+        "branch_subledger_slice_refs": [
+            slice_row["branch_subledger_slice_id"] for slice_row in branch_slices
+        ],
+        "branch_count": len(branch_slices),
+        "qdt_provided": qdt_context["qdt_provided"],
+        "qdt_hierarchical_branch_ledger_required": qdt_context["hierarchical_branch_ledger_required"],
+        "branch_subledger_application_status": application_status,
+        "skipped_reason": skipped_reason,
+        "raw_additive_signed_log_odds_delta": raw_additive_delta,
+        "covariance_adjusted_signed_log_odds_delta": covariance_adjusted_delta,
+        "branch_subledger_signed_log_odds_delta": branch_subledger_delta,
+        "prevented_by_covariance_penalty_signed_log_odds_delta": round(
+            raw_additive_delta - covariance_adjusted_delta,
+            9,
+        ),
+        "prevented_by_branch_cap_signed_log_odds_delta": round(
+            covariance_adjusted_delta - branch_subledger_delta,
+            9,
+        ),
+        "ledger_input_authority": NO_LIVE_AUTHORITY,
+        "writes_scae_ledger": False,
+        "writes_production_forecast": False,
+    }
+    summary["summary_id"] = _sha_id("scae-branch-subledger-summary", summary)
+    summary["summary_digest"] = _prefixed_sha256(summary)
+    return summary
+
+
+def build_branch_subledger_slices(
+    cross_leaf_dependency_slices: dict[str, Any] | list[dict[str, Any]],
+    *,
+    qdt: dict[str, Any] | None = None,
+    policy: dict[str, Any] | None = None,
+) -> BranchSubledgerResult:
+    """Build candidate-only SCAE-007 branch sub-ledgers from SCAE-006 slices."""
+
+    active_policy = copy.deepcopy(policy or default_scae_policy())
+    cap_stack = active_policy.get("cap_stack")
+    if not isinstance(cap_stack, dict):
+        raise ScaeNettingError("policy.cap_stack is required")
+    per_branch_cap = _numeric(cap_stack.get("per_branch_log_odds_cap"), "per_branch_log_odds_cap", allow_zero=False)
+    qdt_context = _qdt_branch_context(qdt)
+    if qdt_context["qdt_provided"] and qdt_context["hierarchical_branch_ledger_required"] is False:
+        summary = _branch_subledger_summary(
+            [],
+            qdt_context=qdt_context,
+            application_status="skipped",
+            skipped_reason="qdt_hierarchical_branch_ledger_not_required",
+        )
+        bundle_digest = _prefixed_sha256(
+            {
+                "schema_version": "scae-branch-subledger-digest/v1",
+                "slice_schema_version": SCAE_BRANCH_SUBLEDGER_SLICE_SCHEMA_VERSION,
+                "summary_schema_version": SCAE_BRANCH_SUBLEDGER_SUMMARY_SCHEMA_VERSION,
+                "branch_subledger_slices": [],
+                "branch_subledger_summary": summary,
+                "excluded_dependency_input_refs": [],
+            }
+        )
+        summary["branch_subledger_bundle_digest"] = bundle_digest
+        return BranchSubledgerResult(
+            [],
+            summary,
+            [],
+            bundle_digest,
+        )
+
+    rows = _rows_from(cross_leaf_dependency_slices, "cross_leaf_dependency_slices")
+    branch_inputs_by_branch: dict[str, list[dict[str, Any]]] = {}
+    excluded_dependency_input_refs: list[str] = []
+    for slice_row in rows:
+        slice_copy = copy.deepcopy(slice_row)
+        if slice_copy.get("accepted_for_candidate_ledger_input") is not True:
+            excluded_dependency_input_refs.append(_dependency_slice_id(slice_copy))
+            continue
+        representative_inputs = _representative_dependency_inputs(slice_copy)
+        if not representative_inputs:
+            excluded_dependency_input_refs.append(_dependency_slice_id(slice_copy))
+            continue
+        for branch_input in representative_inputs:
+            _validate_branch_input_against_qdt(branch_input, qdt_context)
+            branch_inputs_by_branch.setdefault(branch_input["parent_branch_id"], []).append(branch_input)
+
+    branch_slices = [
+        _branch_subledger_slice(
+            branch_id,
+            branch_inputs,
+            qdt_context=qdt_context,
+            per_branch_cap=per_branch_cap,
+        )
+        for branch_id, branch_inputs in sorted(branch_inputs_by_branch.items())
+    ]
+    summary = _branch_subledger_summary(
+        branch_slices,
+        qdt_context=qdt_context,
+        application_status="built",
+        skipped_reason=None,
+    )
+    digest_payload = {
+        "schema_version": "scae-branch-subledger-digest/v1",
+        "slice_schema_version": SCAE_BRANCH_SUBLEDGER_SLICE_SCHEMA_VERSION,
+        "summary_schema_version": SCAE_BRANCH_SUBLEDGER_SUMMARY_SCHEMA_VERSION,
+        "branch_subledger_slices": branch_slices,
+        "branch_subledger_summary": summary,
+        "excluded_dependency_input_refs": sorted(excluded_dependency_input_refs),
+    }
+    bundle_digest = _prefixed_sha256(digest_payload)
+    for branch_slice in branch_slices:
+        branch_slice["branch_subledger_bundle_digest"] = bundle_digest
+    summary["branch_subledger_bundle_digest"] = bundle_digest
+    return BranchSubledgerResult(
+        branch_slices,
+        summary,
+        sorted(excluded_dependency_input_refs),
+        bundle_digest,
+    )
+
+
+def build_branch_subledger_bundle(
+    cross_leaf_dependency_slices: dict[str, Any] | list[dict[str, Any]],
+    *,
+    qdt: dict[str, Any] | None = None,
+    policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return the external SCAE-007 branch sub-ledger bundle artifact."""
+
+    result = build_branch_subledger_slices(cross_leaf_dependency_slices, qdt=qdt, policy=policy)
+    return {
+        "artifact_type": "scae_branch_subledger_bundle",
+        "schema_version": SCAE_BRANCH_SUBLEDGER_BUNDLE_SCHEMA_VERSION,
+        "feature_id": "SCAE-007",
+        "authority": NO_LIVE_AUTHORITY,
+        "writes_scae_ledger": False,
+        "writes_production_forecast": False,
+        "branch_subledger_bundle_digest": result.branch_subledger_bundle_digest,
+        "branch_subledger_count": len(result.branch_subledger_slices),
+        "excluded_dependency_input_refs": result.excluded_dependency_input_refs,
+        "branch_subledger_slices": result.branch_subledger_slices,
+        "branch_subledger_summary": result.branch_subledger_summary,
+        "branch_subledger_version": SCAE_007_BRANCH_SUBLEDGER_VERSION,
     }
