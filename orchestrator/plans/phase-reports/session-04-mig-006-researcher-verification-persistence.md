@@ -1,0 +1,20 @@
+# Session 04 MIG-006: Researcher Verification Persistence
+
+- Session: Session 04, Researcher Classification and Verification
+- Phase: MIG-006 persistence gate
+- Owner: ADS Researcher Swarm, `/Users/agent2/.openclaw/researcher-swarm/scripts`
+- Feature IDs: `CLS-001`, `CLS-006`, `CLS-008`, `CLS-002`, `CLS-003`, `CLS-004`, `CLS-005`, `CLS-007`, `MODEL-003`, `VER-001`, `VER-002`, `VER-003`, `VER-004`
+- Migration Groups: `MIG-006`
+- Status: ready_for_integration pending coordinator inventory reconciliation
+- Acceptance Evidence: Added `researcher-swarm/scripts/migrations/006_researcher_verification_persistence.sql` and `researcher_swarm/persistence.py` for compact/ref-only Session 4 persistence. The helpers cover researcher prompt artifact refs, compact leaf assignments, context-isolation audits, researcher classification and provenance slices, coverage proofs, escalation decisions, normalized supplemental evidence, direction and quality verification slices, SCAE-readiness reconciliation refs, and research sufficiency reconciliation slices. Writers reject embedded evidence/QDT/prompt/research transcript payloads plus researcher-authored probability, fair-value, interval, SCAE delta, and decision recommendation authority fields. SCAE-readiness persistence stores row digests/leaf refs rather than duplicating readiness row bodies.
+- Checks Run:
+  - `python3 orchestrator/plans/check_dependency_gates.py` -> `inventory valid`
+  - `python3 orchestrator/plans/check_dependency_gates.py --all --mode runtime_integration --report-only` -> expected downstream blockers only (`AUTO-003+`, `SCAE-012`, `SCAE-013`, `SYN-001`, `DEC-001`, `PERSIST-*`, `SCORE-001`, `CAL-*`); Session 4 rows all `OK`
+  - `python3 -m unittest discover -s orchestrator/plans/tests` -> `Ran 13 tests`, `OK`
+  - `python3 -m unittest discover -s orchestrator/scripts/tests` -> `Ran 115 tests`, `OK`
+  - `PYTHONPATH=researcher-swarm/scripts:decomposer/scripts python3 -m unittest discover -s researcher-swarm/scripts/tests` -> `Ran 129 tests`, `OK`
+  - Focused `PYTHONPATH=researcher-swarm/scripts:decomposer/scripts python3 -m unittest researcher-swarm/scripts/tests/test_persistence.py` -> `Ran 3 tests`, `OK`
+- Shared Inventory Updates Requested: Mark `MIG-006` `ready_for_integration` with this acceptance evidence. Reconcile the executable migration write-path list to the Session 04 plan's explicit paths: `write_researcher_prompt_artifact`, `write_leaf_research_assignments`, `write_researcher_context_isolation_audits`, `write_researcher_classifications`, `write_classification_provenance_slices`, `write_researcher_coverage_proofs`, `write_researcher_escalation_decisions`, `write_normalized_supplemental_evidence`, `write_direction_verification_slices`, `write_evidence_quality_verification_slices`, `write_scae_readiness_reconciliation`, and `write_research_sufficiency_reconciliation`. Existing aggregate aliases `write_researcher_classifications` and `write_verification_slices` remain implemented for compatibility.
+- Shared Map/Matrix Updates Requested: Add schema-name/map coverage for `researcher_prompt_artifacts` and `scae_readiness_reconciliation_refs`; confirm `leaf_research_assignments`, `researcher_context_isolation_audits`, `classification_lane_evidence_classification_slices`, `classification_lane_evidence_provenance_slices`, `researcher_leaf_coverage_proofs`, `researcher_escalation_decisions`, `normalized_supplemental_evidence`, `evidence_direction_verification_slices`, `evidence_quality_verification_slices`, and `research_sufficiency_reconciliation_slices` are mapped to `MIG-006`. No shared map files were edited directly because Session 5 is active concurrently.
+- Blockers: No Session 4 implementation blocker. Coordinator reconciliation is still needed to mark `MIG-006` ready. Downstream `MIG-007` remains blocked on `SCAE-012` and `SCAE-013`; `SCAE-013` remains blocked on `SCAE-011` in the current inventory.
+- Commit SHA: Local detached commit SHA reported in final handoff; push held.
