@@ -33,11 +33,13 @@ from predquant.ads_pipeline_runner import (
     read_pipeline_control_state,
     read_pipeline_loop_iteration,
     read_pipeline_run,
+    read_pipeline_stop_signal,
     recover_stuck_case_leases,
     run_ads_pipeline_loop,
     validate_pipeline_run,
     write_pipeline_control_state,
 )
+from predquant.ads_pipeline_control import request_pipeline_stop
 from predquant.ads_case_selector import CASE_LEASE_TABLE, CaseSelectionPolicy, read_case_lease
 from predquant.ads_stage_logging import (
     PIPELINE_ERROR_EVENT_TABLE,
@@ -535,6 +537,123 @@ class AdsPipelineRunnerTest(unittest.TestCase):
         self.assertEqual(run["status"], "failed")
         self.assertIsNone(run["active_case_lease_id"])
         self.assertEqual(run["terminal_reason"], TERMINAL_REASON_STUCK_LEASE_RECOVERED)
+
+    def test_auto005_continuous_fixture_runs_two_unique_cases_and_stops_after_current_request(self):
+        self.initialize_intake_case("poly-auto005-a")
+        self.initialize_intake_case("poly-auto005-b")
+        self.enable_fixture_pipeline()
+        calls = []
+        decision_record_ids = []
+
+        def make_handler(stage):
+            def handler(**kwargs):
+                context = kwargs["context"]
+                lease = kwargs["lease"]
+                calls.append((lease["case_key"], stage))
+                result = {
+                    "output_artifact_refs": [f"artifact:{stage}:{lease['case_id']}"],
+                    "validation_result_refs": [f"validation:{stage}:{lease['case_id']}"],
+                    "safe_metadata": {"stage": stage, "handler_scope": "AUTO-005"},
+                }
+                if stage == "decision":
+                    record_id = f"forecast-decision:auto005:{lease['case_id']}"
+                    decision_record_ids.append(record_id)
+                    result["forecast_decision_record_id"] = record_id
+                    if len(decision_record_ids) == 2:
+                        request_pipeline_stop(
+                            kwargs["conn"],
+                            stop_policy="stop_after_current_case",
+                            reason="AUTO-005 fixture stops after second case",
+                            requested_by="fixture",
+                            pipeline_run_id=context.pipeline_run_id,
+                            metadata={"scope": "AUTO-005", "decision_count": 2},
+                        )
+                return result
+
+            return handler
+
+        handlers = {stage: make_handler(stage) for stage in ADS_PIPELINE_STAGE_ORDER[1:]}
+
+        result = run_ads_pipeline_loop(
+            self.conn,
+            self.auto003_policy(max_cases=2),
+            downstream_stage_handlers=handlers,
+            case_selection_policy=CaseSelectionPolicy(
+                forecast_timestamp="2026-06-24T18:00:00+00:00",
+                lease_duration_seconds=900,
+                metadata={"test_scope": "AUTO-005"},
+            ),
+        )
+
+        self.assertEqual(result.terminal_status, TERMINAL_REASON_STOP_AFTER_CURRENT)
+        self.assertEqual(result.completed_stage_count, len(ADS_PIPELINE_STAGE_ORDER))
+        self.assertEqual(len(decision_record_ids), 2)
+        self.assertEqual(len(set(decision_record_ids)), 2)
+
+        run = read_pipeline_run(self.conn, result.pipeline_run_id)
+        self.assertEqual(run["status"], "stopped")
+        self.assertEqual(run["terminal_reason"], TERMINAL_REASON_STOP_AFTER_CURRENT)
+        self.assertIsNone(run["active_case_lease_id"])
+        self.assertEqual(run["metadata"]["processed_case_count"], 2)
+        self.assertEqual(len(run["metadata"]["completed_case_lease_ids"]), 2)
+        self.assertEqual(len(set(run["metadata"]["completed_case_keys"])), 2)
+        self.assertEqual(run["metadata"]["forecast_decision_record_ids"], decision_record_ids)
+
+        lease_rows = self.conn.execute(
+            f"""
+            SELECT case_lease_id, case_key, lease_status, release_reason
+            FROM {CASE_LEASE_TABLE}
+            ORDER BY lease_acquired_at, case_lease_id
+            """
+        ).fetchall()
+        self.assertEqual(len(lease_rows), 2)
+        self.assertEqual({row[2] for row in lease_rows}, {"released"})
+        self.assertEqual(len({row[1] for row in lease_rows}), 2)
+        self.assertEqual(lease_rows[0][3], "auto005_iteration_complete")
+        self.assertEqual(lease_rows[1][3], "auto004_stop_after_current_case")
+        self.assertEqual(
+            self.conn.execute(
+                f"SELECT COUNT(*) FROM {CASE_LEASE_TABLE} WHERE lease_status = 'leased'"
+            ).fetchone()[0],
+            0,
+        )
+
+        loop_rows = self.conn.execute(
+            f"""
+            SELECT loop_iteration_id, iteration_number, case_lease_id,
+                   terminal_status, completed_stage_count, forecast_decision_record_id
+            FROM {PIPELINE_LOOP_ITERATION_TABLE}
+            WHERE pipeline_run_id = ?
+            ORDER BY iteration_number
+            """,
+            (result.pipeline_run_id,),
+        ).fetchall()
+        self.assertEqual(len(loop_rows), 2)
+        self.assertEqual([row[1] for row in loop_rows], [1, 2])
+        self.assertEqual(len({row[2] for row in loop_rows}), 2)
+        self.assertEqual(loop_rows[0][3], TERMINAL_REASON_AUTO003_COMPLETE)
+        self.assertEqual(loop_rows[1][3], TERMINAL_REASON_STOP_AFTER_CURRENT)
+        self.assertEqual([row[4] for row in loop_rows], [len(ADS_PIPELINE_STAGE_ORDER)] * 2)
+        self.assertEqual([row[5] for row in loop_rows], decision_record_ids)
+        second_loop = read_pipeline_loop_iteration(self.conn, loop_rows[1][0])
+        self.assertTrue(second_loop["metadata"]["stop_after_current_requested"])
+
+        self.assertEqual(
+            self.conn.execute(f"SELECT COUNT(*) FROM {STAGE_STATUS_TABLE} WHERE status = 'complete'").fetchone()[0],
+            len(ADS_PIPELINE_STAGE_ORDER) * 2,
+        )
+        self.assertEqual(
+            [case_key for case_key, stage in calls if stage == "decision"],
+            run["metadata"]["completed_case_keys"],
+        )
+
+        control = read_pipeline_control_state(self.conn)
+        self.assertFalse(control["pipeline_enabled"])
+        self.assertEqual(control["acknowledged_by_run_id"], result.pipeline_run_id)
+        signal = read_pipeline_stop_signal(self.conn, control["metadata"]["stop_signal"]["stop_signal_id"])
+        self.assertEqual(signal["signal_status"], "acknowledged")
+        self.assertEqual(signal["acknowledged_by_run_id"], result.pipeline_run_id)
+        self.assertEqual(signal["stop_policy"], "stop_after_current_case")
 
     def test_auto003_quarantines_lease_and_logs_structured_failure(self):
         self.initialize_intake_case()
