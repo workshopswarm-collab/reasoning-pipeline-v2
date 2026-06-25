@@ -66,6 +66,27 @@
     "structural_prior_overlap_multiplier": 0.0,
     "base_rate_overlap_multiplier": 0.0
   },
+  "evidence_delta_mapping": {
+    "schema_version": "scae-evidence-delta-mapping-policy/v1",
+    "strength_log_odds": {
+      "definitive": 0.45,
+      "strong": 0.3,
+      "moderate": 0.18,
+      "weak": 0.08,
+      "none": 0.0,
+      "unanswerable": 0.0
+    },
+    "direction_multipliers": {
+      "supports_yes": 1.0,
+      "supports_no": -1.0,
+      "neutral": 0.0
+    },
+    "quality_multiplier_source": "evidence_quality_verification_slices.final_quality_multiplier",
+    "market_assimilation_multiplier_source": "market_assimilation_context.suggested_signed_delta_multiplier",
+    "per_update_cap_source": "cap_stack.per_update_log_odds_cap",
+    "missing_verification_behavior": "fail_closed",
+    "output_authority": "candidate_ledger_input_only_no_live_forecast_authority"
+  },
   "family_diagnostics": {
     "schema_version": "scae-family-diagnostics-policy/v1",
     "sibling_prices_context_only": true,

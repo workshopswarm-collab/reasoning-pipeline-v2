@@ -89,6 +89,7 @@ def validate_scae_policy(policy: dict[str, Any]) -> None:
         "cap_stack",
         "prior_reliability",
         "market_assimilation",
+        "evidence_delta_mapping",
         "family_diagnostics",
         "probability_taxonomy",
         "validity_and_execution",
@@ -211,6 +212,44 @@ def validate_scae_policy(policy: dict[str, Any]) -> None:
         raise ScaePolicyError("structural prior overlap must contribute zero signed delta")
     if market_assimilation["base_rate_overlap_multiplier"] != 0.0:
         raise ScaePolicyError("base-rate overlap must contribute zero signed delta")
+
+    evidence_delta_mapping = policy["evidence_delta_mapping"]
+    if evidence_delta_mapping.get("schema_version") != "scae-evidence-delta-mapping-policy/v1":
+        raise ScaePolicyError("evidence delta mapping policy schema is invalid")
+    strength_log_odds = evidence_delta_mapping.get("strength_log_odds")
+    required_strengths = {"definitive", "strong", "moderate", "weak", "none", "unanswerable"}
+    if not isinstance(strength_log_odds, dict) or set(strength_log_odds) != required_strengths:
+        raise ScaePolicyError("evidence_delta_mapping.strength_log_odds is not canonical")
+    for strength, value in strength_log_odds.items():
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0.0:
+            raise ScaePolicyError(f"evidence_delta_mapping.strength_log_odds.{strength} must be non-negative")
+    if strength_log_odds["none"] != 0.0 or strength_log_odds["unanswerable"] != 0.0:
+        raise ScaePolicyError("none and unanswerable evidence strengths must map to zero")
+    if not (
+        strength_log_odds["definitive"]
+        >= strength_log_odds["strong"]
+        >= strength_log_odds["moderate"]
+        >= strength_log_odds["weak"]
+        >= strength_log_odds["none"]
+    ):
+        raise ScaePolicyError("evidence strength log-odds mapping must be monotonic")
+
+    direction_multipliers = evidence_delta_mapping.get("direction_multipliers")
+    if direction_multipliers != {"supports_yes": 1.0, "supports_no": -1.0, "neutral": 0.0}:
+        raise ScaePolicyError("evidence_delta_mapping.direction_multipliers is not canonical")
+    if evidence_delta_mapping.get("quality_multiplier_source") != "evidence_quality_verification_slices.final_quality_multiplier":
+        raise ScaePolicyError("quality multiplier source must be VER-002 final quality multiplier")
+    if (
+        evidence_delta_mapping.get("market_assimilation_multiplier_source")
+        != "market_assimilation_context.suggested_signed_delta_multiplier"
+    ):
+        raise ScaePolicyError("market assimilation multiplier source is invalid")
+    if evidence_delta_mapping.get("per_update_cap_source") != "cap_stack.per_update_log_odds_cap":
+        raise ScaePolicyError("per-update cap source must be cap_stack.per_update_log_odds_cap")
+    if evidence_delta_mapping.get("missing_verification_behavior") != "fail_closed":
+        raise ScaePolicyError("missing SCAE verification inputs must fail closed")
+    if evidence_delta_mapping.get("output_authority") != "candidate_ledger_input_only_no_live_forecast_authority":
+        raise ScaePolicyError("SCAE evidence deltas must remain candidate ledger inputs only")
 
     family_diagnostics = policy["family_diagnostics"]
     if family_diagnostics.get("schema_version") != "scae-family-diagnostics-policy/v1":
