@@ -1,4 +1,4 @@
-"""AUTO-001 safe pipeline runner contract and control-state helpers."""
+"""ADS pipeline runner contract, controls, and AUTO-003 dispatch state machine."""
 
 from __future__ import annotations
 
@@ -11,6 +11,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from predquant.ads_stage_logging import (
+    StageContext,
+    build_pipeline_error_event,
+    build_stage_execution_event,
+    build_stage_status_snapshot,
+    command_sha256,
+    ensure_stage_logging_schema,
+    write_pipeline_error_event,
+    write_stage_execution_event,
+    write_stage_status_snapshot,
+)
 
 PIPELINE_CONTROL_STATE_TABLE = "ads_pipeline_control_state"
 PIPELINE_RUN_TABLE = "ads_pipeline_runs"
@@ -41,6 +52,9 @@ DEFAULT_DISABLE_ACTION = "no_new_leases"
 DEFAULT_DEPENDENCY_GATE_MODE = "runtime_integration"
 TERMINAL_REASON_DISABLED = "pipeline_disabled"
 TERMINAL_REASON_NON_EXECUTING = "auto001_non_executing_runner_skeleton"
+TERMINAL_REASON_NO_ELIGIBLE_CASE = "no_eligible_case"
+TERMINAL_REASON_AUTO003_COMPLETE = "auto003_single_case_complete"
+TERMINAL_REASON_AUTO003_FAILED = "auto003_stage_failed"
 
 ADS_PIPELINE_STAGE_ORDER = (
     "case_selection",
@@ -57,6 +71,28 @@ ADS_PIPELINE_STAGE_ORDER = (
     "training_trace",
     "replay_record",
 )
+AUTO003_HANDLER_STAGES = ADS_PIPELINE_STAGE_ORDER[1:]
+AUTO003_REQUIRED_FORECAST_PERSISTENCE_STAGE = "decision"
+RUNNER_SCRIPT_PATH = "/Users/agent2/.openclaw/orchestrator/scripts/bin/run_ads_pipeline_loop.py"
+RUNNER_REPLAY_COMMAND = "python3 run_ads_pipeline_loop.py --execute-one-case"
+RUNNER_COMMAND_SHA256 = command_sha256(RUNNER_REPLAY_COMMAND)
+
+STAGE_COMPONENT_REFS = {
+    "case_selection": "orchestrator",
+    "evidence_packet": "orchestrator",
+    "policy_context": "orchestrator",
+    "related_market_context": "orchestrator",
+    "decomposition": "decomposer",
+    "retrieval": "researcher-swarm",
+    "researcher_classification": "researcher-swarm",
+    "classification_verification": "researcher-swarm",
+    "scae": "scae",
+    "synthesis": "orchestrator",
+    "decision": "orchestrator",
+    "training_trace": "orchestrator",
+    "replay_record": "orchestrator",
+    "terminal": "orchestrator",
+}
 
 FORBIDDEN_RUNNER_METADATA_KEYS = {
     "raw_payload",
@@ -79,7 +115,7 @@ MAX_SAFE_METADATA_STRING_BYTES = 4096
 
 
 class PipelineRunnerContractError(ValueError):
-    """Raised when the AUTO-001 runner/control contract is unsafe or invalid."""
+    """Raised when the runner/control contract is unsafe or invalid."""
 
 
 @dataclass(frozen=True)
@@ -116,6 +152,37 @@ class PipelineRunnerPolicy:
 
 
 @dataclass(frozen=True)
+class StageHandlerResult:
+    output_artifact_refs: tuple[str, ...] = ()
+    validation_result_refs: tuple[str, ...] = ()
+    safe_metadata: dict[str, Any] = field(default_factory=dict)
+    script_path: str = RUNNER_SCRIPT_PATH
+    command: str = RUNNER_REPLAY_COMMAND
+    agent_or_component_ref: str | None = None
+    forecast_decision_record_id: str | None = None
+    forecast_decision_record_ref: str | None = None
+
+    def to_record(self, stage: str) -> dict[str, Any]:
+        output_refs = require_string_tuple("output_artifact_refs", self.output_artifact_refs)
+        validation_refs = require_string_tuple("validation_result_refs", self.validation_result_refs)
+        metadata = ensure_safe_metadata(self.safe_metadata)
+        if self.forecast_decision_record_id is not None:
+            require_non_empty("forecast_decision_record_id", self.forecast_decision_record_id)
+        if self.forecast_decision_record_ref is not None:
+            require_non_empty("forecast_decision_record_ref", self.forecast_decision_record_ref)
+        return {
+            "output_artifact_refs": output_refs,
+            "validation_result_refs": validation_refs,
+            "safe_metadata": metadata,
+            "script_path": require_non_empty("script_path", self.script_path),
+            "command": require_non_empty("command", self.command),
+            "agent_or_component_ref": self.agent_or_component_ref or STAGE_COMPONENT_REFS[stage],
+            "forecast_decision_record_id": self.forecast_decision_record_id,
+            "forecast_decision_record_ref": self.forecast_decision_record_ref,
+        }
+
+
+@dataclass(frozen=True)
 class PipelineRunnerResult:
     started: bool
     terminal_status: str
@@ -125,6 +192,9 @@ class PipelineRunnerResult:
     downstream_execution_enabled: bool
     forecast_persistence_enabled: bool
     reason: str
+    case_lease_id: str | None = None
+    completed_stage_count: int = 0
+    forecast_decision_record_id: str | None = None
 
     def to_record(self) -> dict[str, Any]:
         return {
@@ -137,6 +207,9 @@ class PipelineRunnerResult:
             "downstream_execution_enabled": self.downstream_execution_enabled,
             "forecast_persistence_enabled": self.forecast_persistence_enabled,
             "reason": self.reason,
+            "case_lease_id": self.case_lease_id,
+            "completed_stage_count": self.completed_stage_count,
+            "forecast_decision_record_id": self.forecast_decision_record_id,
         }
 
 
@@ -152,6 +225,14 @@ def require_non_empty(field: str, value: str | None) -> str:
     if not isinstance(value, str) or not value:
         raise PipelineRunnerContractError(f"{field} is required")
     return value
+
+
+def require_string_tuple(field: str, value: list[str] | tuple[str, ...] | None) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, (list, tuple)) or not all(isinstance(item, str) and item for item in value):
+        raise PipelineRunnerContractError(f"{field} must be a list of non-empty strings")
+    return tuple(value)
 
 
 def require_choice(field: str, value: str, choices: tuple[str, ...]) -> str:
@@ -209,6 +290,10 @@ def validate_stage_order(stage_order: tuple[str, ...] | list[str]) -> tuple[str,
 def make_pipeline_run_id(runner_mode: str, started_at: str) -> str:
     seed = canonical_json({"runner_mode": runner_mode, "started_at": started_at, "nonce": uuid.uuid4().hex})
     return "ads-pipeline-run:" + hashlib.sha256(seed.encode("utf-8")).hexdigest()
+
+
+def stable_id(prefix: str, *parts: Any, length: int = 24) -> str:
+    return f"{prefix}:" + hashlib.sha256(canonical_json(parts).encode("utf-8")).hexdigest()[:length]
 
 
 def build_pipeline_control_state(
@@ -348,10 +433,32 @@ def validate_pipeline_runner_policy(policy: PipelineRunnerPolicy) -> None:
     if policy.max_cases is not None and (not isinstance(policy.max_cases, int) or policy.max_cases < 0):
         raise PipelineRunnerContractError("max_cases must be a non-negative integer")
     policy.idle_policy.to_record()
-    if policy.allow_downstream_execution:
-        raise PipelineRunnerContractError("AUTO-001 runner may not enable downstream stage execution")
-    if policy.allow_forecast_persistence:
-        raise PipelineRunnerContractError("AUTO-001 runner may not enable forecast persistence")
+    if policy.allow_forecast_persistence and not policy.allow_downstream_execution:
+        raise PipelineRunnerContractError("forecast persistence requires downstream stage execution")
+
+
+def validate_auto003_policy(
+    policy: PipelineRunnerPolicy,
+    downstream_stage_handlers: dict[str, Callable[..., Any]] | None,
+) -> dict[str, Callable[..., Any]]:
+    validate_pipeline_runner_policy(policy)
+    if not policy.allow_downstream_execution:
+        raise PipelineRunnerContractError("AUTO-003 requires downstream stage execution to be explicitly enabled")
+    if not policy.allow_forecast_persistence:
+        raise PipelineRunnerContractError(
+            "AUTO-003 downstream stage execution requires forecast persistence to be explicitly enabled"
+        )
+    if policy.max_cases not in (None, 1):
+        raise PipelineRunnerContractError("AUTO-003 executes exactly one leased case; AUTO-005 owns multi-case loops")
+    if not downstream_stage_handlers:
+        raise PipelineRunnerContractError("AUTO-003 requires downstream stage execution handlers")
+    unknown = sorted(set(downstream_stage_handlers) - set(AUTO003_HANDLER_STAGES))
+    if unknown:
+        raise PipelineRunnerContractError("unknown AUTO-003 stage handlers: " + ", ".join(unknown))
+    missing = [stage for stage in AUTO003_HANDLER_STAGES if stage not in downstream_stage_handlers]
+    if missing:
+        raise PipelineRunnerContractError("missing AUTO-003 stage handlers: " + ", ".join(missing))
+    return dict(downstream_stage_handlers)
 
 
 def build_pipeline_run(
@@ -362,12 +469,19 @@ def build_pipeline_run(
     started_at: str | None = None,
     stopped_at: str | None = None,
     terminal_reason: str | None = TERMINAL_REASON_NON_EXECUTING,
+    active_case_lease_id: str | None = None,
+    last_iteration_id: str | None = None,
     metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     validate_pipeline_runner_policy(policy)
     require_choice("status", status, RUN_STATUSES)
     started_at = started_at or utc_now_iso()
-    metadata_record = {"auto001_contract_only": True, "live_stage_execution": False}
+    is_auto003 = policy.allow_downstream_execution or policy.allow_forecast_persistence
+    metadata_record = {
+        "auto001_contract_only": not is_auto003,
+        "auto003_state_machine": is_auto003,
+        "live_stage_execution": bool(policy.allow_downstream_execution),
+    }
     metadata_record.update(ensure_safe_metadata(metadata))
     record = {
         "schema_version": PIPELINE_RUN_SCHEMA_VERSION,
@@ -382,11 +496,11 @@ def build_pipeline_run(
         "max_cases": policy.max_cases,
         "idle_policy": policy.idle_policy.to_record(),
         "dependency_gate_mode": policy.dependency_gate_mode,
-        "active_case_lease_id": None,
-        "last_iteration_id": None,
+        "active_case_lease_id": active_case_lease_id,
+        "last_iteration_id": last_iteration_id,
         "no_live_autostart": True,
-        "downstream_execution_enabled": False,
-        "forecast_persistence_enabled": False,
+        "downstream_execution_enabled": bool(policy.allow_downstream_execution),
+        "forecast_persistence_enabled": bool(policy.allow_forecast_persistence),
         "terminal_reason": terminal_reason,
         "metadata": metadata_record,
     }
@@ -412,19 +526,26 @@ def validate_pipeline_run(record: dict[str, Any]) -> None:
         raise PipelineRunnerContractError("max_cases must be a non-negative integer")
     IdlePolicy(**record.get("idle_policy", {})).to_record()
     require_choice("dependency_gate_mode", record.get("dependency_gate_mode"), DEPENDENCY_GATE_MODES)
+    metadata = ensure_safe_metadata(record.get("metadata"))
+    auto003_enabled = bool(metadata.get("auto003_state_machine"))
     if record.get("active_case_lease_id") is not None:
-        raise PipelineRunnerContractError("AUTO-001 may not attach an active case lease")
+        require_non_empty("active_case_lease_id", record.get("active_case_lease_id"))
+        if not auto003_enabled:
+            raise PipelineRunnerContractError("AUTO-001 may not attach an active case lease")
     if record.get("last_iteration_id") is not None:
-        raise PipelineRunnerContractError("AUTO-001 may not write loop iteration state")
+        require_non_empty("last_iteration_id", record.get("last_iteration_id"))
+        if not auto003_enabled:
+            raise PipelineRunnerContractError("AUTO-001 may not write loop iteration state")
     if record.get("no_live_autostart") is not True:
         raise PipelineRunnerContractError("no_live_autostart must be true")
-    if record.get("downstream_execution_enabled") is not False:
-        raise PipelineRunnerContractError("downstream_execution_enabled must be false")
-    if record.get("forecast_persistence_enabled") is not False:
-        raise PipelineRunnerContractError("forecast_persistence_enabled must be false")
+    if record.get("downstream_execution_enabled") is not False and not auto003_enabled:
+        raise PipelineRunnerContractError("AUTO-001 may not enable downstream stage execution")
+    if record.get("forecast_persistence_enabled") is not False and not auto003_enabled:
+        raise PipelineRunnerContractError("AUTO-001 may not enable forecast persistence")
+    if record.get("forecast_persistence_enabled") and not record.get("downstream_execution_enabled"):
+        raise PipelineRunnerContractError("forecast persistence requires downstream stage execution")
     if record.get("terminal_reason") is not None:
         require_non_empty("terminal_reason", record.get("terminal_reason"))
-    ensure_safe_metadata(record.get("metadata"))
 
 
 def write_pipeline_run(conn: sqlite3.Connection, record: dict[str, Any]) -> str:
@@ -527,10 +648,24 @@ def run_ads_pipeline_loop(
     policy: PipelineRunnerPolicy | None = None,
     *,
     downstream_stage_handlers: dict[str, Callable[..., Any]] | None = None,
+    case_selection_policy: Any | None = None,
 ) -> PipelineRunnerResult:
-    """Start the AUTO-001 runner skeleton without selecting cases or running stages."""
+    """Run the ADS pipeline.
+
+    The default path preserves AUTO-001: it writes only a safe non-executing
+    runner record. When both execution flags and all stage handlers are supplied,
+    AUTO-003 executes exactly one leased case through forecast-decision
+    persistence and releases the lease.
+    """
 
     policy = policy or PipelineRunnerPolicy()
+    if policy.allow_downstream_execution or policy.allow_forecast_persistence:
+        return _run_auto003_single_case(
+            conn,
+            policy,
+            downstream_stage_handlers=downstream_stage_handlers,
+            case_selection_policy=case_selection_policy,
+        )
     if downstream_stage_handlers:
         raise PipelineRunnerContractError("AUTO-001 runner may not receive downstream stage execution handlers")
     validate_pipeline_runner_policy(policy)
@@ -568,3 +703,443 @@ def run_ads_pipeline_loop(
         forecast_persistence_enabled=False,
         reason=TERMINAL_REASON_NON_EXECUTING,
     )
+
+
+def _active_inflight_work_exists(conn: sqlite3.Connection) -> bool:
+    ensure_pipeline_runner_schema(conn)
+    row = conn.execute(
+        f"""
+        SELECT 1
+        FROM {PIPELINE_RUN_TABLE}
+        WHERE status IN ('starting', 'running', 'draining')
+          AND active_case_lease_id IS NOT NULL
+        LIMIT 1
+        """
+    ).fetchone()
+    if row is not None:
+        return True
+    row = conn.execute(
+        """
+        SELECT 1
+        FROM ads_case_leases
+        WHERE lease_status = 'leased'
+        LIMIT 1
+        """
+    ).fetchone()
+    return row is not None
+
+
+def _update_pipeline_run(
+    conn: sqlite3.Connection,
+    record: dict[str, Any],
+    *,
+    status: str | None = None,
+    stopped_at: str | None = None,
+    terminal_reason: str | None = None,
+    active_case_lease_id: str | None | object = ...,
+    last_iteration_id: str | None | object = ...,
+    metadata_updates: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    updated = dict(record)
+    if status is not None:
+        updated["status"] = status
+    if stopped_at is not None:
+        updated["stopped_at"] = stopped_at
+    if terminal_reason is not None:
+        updated["terminal_reason"] = terminal_reason
+    if active_case_lease_id is not ...:
+        updated["active_case_lease_id"] = active_case_lease_id
+    if last_iteration_id is not ...:
+        updated["last_iteration_id"] = last_iteration_id
+    if metadata_updates:
+        metadata = dict(updated.get("metadata") or {})
+        metadata.update(metadata_updates)
+        updated["metadata"] = metadata
+    write_pipeline_run(conn, updated)
+    return updated
+
+
+def _stage_context(lease: dict[str, Any], *, pipeline_run_id: str, stage: str) -> StageContext:
+    return StageContext(
+        case_id=lease["case_id"],
+        case_key=lease["case_key"],
+        dispatch_id=lease["dispatch_id"],
+        stage=stage,
+        stage_attempt_id=stable_id("stage-attempt", pipeline_run_id, lease["case_lease_id"], stage, 1),
+        pipeline_run_id=pipeline_run_id,
+        case_lease_id=lease["case_lease_id"],
+    )
+
+
+def _stage_event_id(context: StageContext, event_type: str) -> str:
+    return stable_id("stage-exec-event", context.pipeline_run_id, context.case_lease_id, context.stage, event_type)
+
+
+def _stage_replay_command(stage: str, context: StageContext) -> str:
+    return (
+        f"{RUNNER_REPLAY_COMMAND} --stage {stage} --case-id {context.case_id} "
+        f"--dispatch-id {context.dispatch_id}"
+    )
+
+
+def _record_stage_started(conn: sqlite3.Connection, context: StageContext) -> str:
+    event_id = _stage_event_id(context, "stage_started")
+    replay_command = _stage_replay_command(context.stage, context)
+    event = build_stage_execution_event(
+        execution_event_id=event_id,
+        context=context,
+        event_type="stage_started",
+        event_status="info",
+        started_at=utc_now_iso(),
+        attempt_number=1,
+        max_attempts=1,
+        runner_ref=f"ads-runner:{context.pipeline_run_id}",
+        agent_or_component_ref=STAGE_COMPONENT_REFS[context.stage],
+        script_path=RUNNER_SCRIPT_PATH,
+        command_sha256_value=RUNNER_COMMAND_SHA256,
+        no_log_reason="auto003_stage_invocation_has_no_raw_log",
+        redaction_status="not_needed",
+        replay_command=replay_command,
+        safe_metadata={"feature_id": "AUTO-003"},
+    )
+    write_stage_execution_event(conn, event)
+    status = build_stage_status_snapshot(
+        context=context,
+        status="running",
+        started_at=event["started_at"],
+        latest_execution_event_ids=[event_id],
+        replay_command=replay_command,
+        metadata={"feature_id": "AUTO-003"},
+    )
+    write_stage_status_snapshot(conn, status)
+    return event_id
+
+
+def _record_stage_completed(
+    conn: sqlite3.Connection,
+    context: StageContext,
+    *,
+    started_event_id: str,
+    result: dict[str, Any],
+) -> str:
+    event_id = _stage_event_id(context, "stage_completed")
+    replay_command = _stage_replay_command(context.stage, context)
+    metadata = dict(result["safe_metadata"])
+    if result.get("forecast_decision_record_id"):
+        metadata["forecast_decision_record_id"] = result["forecast_decision_record_id"]
+    event = build_stage_execution_event(
+        execution_event_id=event_id,
+        context=context,
+        event_type="stage_completed",
+        event_status="info",
+        started_at=utc_now_iso(),
+        completed_at=utc_now_iso(),
+        duration_ms=0,
+        attempt_number=1,
+        max_attempts=1,
+        runner_ref=f"ads-runner:{context.pipeline_run_id}",
+        agent_or_component_ref=result["agent_or_component_ref"],
+        script_path=result["script_path"],
+        command_sha256_value=command_sha256(result["command"]),
+        output_artifact_refs=result["output_artifact_refs"],
+        validation_result_refs=result["validation_result_refs"],
+        no_log_reason="auto003_stage_completed_without_raw_log",
+        redaction_status="not_needed",
+        replay_command=replay_command,
+        safe_metadata=metadata,
+    )
+    write_stage_execution_event(conn, event)
+    status = build_stage_status_snapshot(
+        context=context,
+        status="complete",
+        completed_at=event["completed_at"],
+        duration_ms=0,
+        output_artifacts=result["output_artifact_refs"],
+        latest_execution_event_ids=[started_event_id, event_id],
+        replay_command=replay_command,
+        metadata=metadata,
+    )
+    write_stage_status_snapshot(conn, status)
+    return event_id
+
+
+def _record_stage_failed(
+    conn: sqlite3.Connection,
+    context: StageContext,
+    *,
+    started_event_id: str,
+    exc: BaseException,
+) -> str:
+    failed_event_id = _stage_event_id(context, "stage_failed")
+    error_event_id = stable_id("pipeline-error", context.pipeline_run_id, context.case_lease_id, context.stage)
+    replay_command = _stage_replay_command(context.stage, context)
+    error = build_pipeline_error_event(
+        error_event_id=error_event_id,
+        execution_event_id=failed_event_id,
+        context=context,
+        failure_class="missing_required_artifact",
+        failure_grouping_key=f"{context.stage}:auto003_stage_failed:{exc.__class__.__name__}",
+        retryability="terminal",
+        safe_message=str(exc)[:512] or exc.__class__.__name__,
+        safe_metadata={"feature_id": "AUTO-003"},
+        replay_command=replay_command,
+    )
+    event = build_stage_execution_event(
+        execution_event_id=failed_event_id,
+        context=context,
+        event_type="stage_failed",
+        event_status="error",
+        completed_at=utc_now_iso(),
+        duration_ms=0,
+        attempt_number=1,
+        max_attempts=1,
+        runner_ref=f"ads-runner:{context.pipeline_run_id}",
+        agent_or_component_ref=STAGE_COMPONENT_REFS[context.stage],
+        script_path=RUNNER_SCRIPT_PATH,
+        command_sha256_value=RUNNER_COMMAND_SHA256,
+        error_event_id=error_event_id,
+        failure_class="missing_required_artifact",
+        safe_exception_class=exc.__class__.__name__,
+        safe_exception_message=str(exc)[:512] or exc.__class__.__name__,
+        no_log_reason="auto003_stage_failed_without_raw_log",
+        redaction_status="not_needed",
+        replay_command=replay_command,
+        safe_metadata={"feature_id": "AUTO-003"},
+    )
+    write_stage_execution_event(conn, event)
+    write_pipeline_error_event(conn, error)
+    status = build_stage_status_snapshot(
+        context=context,
+        status="failed",
+        completed_at=event["completed_at"],
+        duration_ms=0,
+        latest_execution_event_ids=[started_event_id, failed_event_id],
+        error_event_ids=[error_event_id],
+        reason_codes=["auto003_stage_failed"],
+        replay_command=replay_command,
+        metadata={"feature_id": "AUTO-003", "safe_exception_class": exc.__class__.__name__},
+    )
+    write_stage_status_snapshot(conn, status)
+    return error_event_id
+
+
+def _coerce_stage_result(stage: str, value: Any) -> dict[str, Any]:
+    if value is None:
+        value = StageHandlerResult()
+    if isinstance(value, StageHandlerResult):
+        return value.to_record(stage)
+    if not isinstance(value, dict):
+        raise PipelineRunnerContractError(f"{stage} handler must return a result object")
+    result = StageHandlerResult(
+        output_artifact_refs=tuple(value.get("output_artifact_refs") or value.get("output_artifacts") or ()),
+        validation_result_refs=tuple(value.get("validation_result_refs") or ()),
+        safe_metadata=dict(value.get("safe_metadata") or value.get("metadata") or {}),
+        script_path=value.get("script_path", RUNNER_SCRIPT_PATH),
+        command=value.get("command", RUNNER_REPLAY_COMMAND),
+        agent_or_component_ref=value.get("agent_or_component_ref"),
+        forecast_decision_record_id=value.get("forecast_decision_record_id"),
+        forecast_decision_record_ref=value.get("forecast_decision_record_ref"),
+    )
+    return result.to_record(stage)
+
+
+def _call_stage_handler(
+    handler: Callable[..., Any],
+    *,
+    conn: sqlite3.Connection,
+    context: StageContext,
+    lease: dict[str, Any],
+    stage_outputs: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    return _coerce_stage_result(
+        context.stage,
+        handler(
+            conn=conn,
+            context=context,
+            lease=lease,
+            stage_outputs=stage_outputs,
+        ),
+    )
+
+
+def _run_auto003_single_case(
+    conn: sqlite3.Connection,
+    policy: PipelineRunnerPolicy,
+    *,
+    downstream_stage_handlers: dict[str, Callable[..., Any]] | None,
+    case_selection_policy: Any | None,
+) -> PipelineRunnerResult:
+    from predquant.ads_case_selector import CaseSelectionPolicy, acquire_next_case_lease, release_case_lease
+
+    handlers = validate_auto003_policy(policy, downstream_stage_handlers)
+    ensure_stage_logging_schema(conn)
+    control = read_pipeline_control_state(conn)
+    if not control["pipeline_enabled"]:
+        return PipelineRunnerResult(
+            started=False,
+            terminal_status=TERMINAL_REASON_DISABLED,
+            pipeline_run_id=None,
+            runner_mode=policy.runner_mode,
+            stage_order=ADS_PIPELINE_STAGE_ORDER,
+            downstream_execution_enabled=False,
+            forecast_persistence_enabled=False,
+            reason=TERMINAL_REASON_DISABLED,
+        )
+    if policy.runner_mode != control["desired_runner_mode"]:
+        raise PipelineRunnerContractError("runner_mode must match pipeline control desired_runner_mode")
+    if _active_inflight_work_exists(conn):
+        raise PipelineRunnerContractError("AUTO-003 refuses to start while another case lease is in flight")
+
+    started_at = utc_now_iso()
+    run_record = build_pipeline_run(
+        policy=policy,
+        status="running",
+        started_at=started_at,
+        terminal_reason="auto003_running",
+        metadata={"feature_id": "AUTO-003"},
+    )
+    write_pipeline_run(conn, run_record)
+
+    lease = acquire_next_case_lease(
+        conn,
+        pipeline_run_id=run_record["pipeline_run_id"],
+        policy=case_selection_policy or CaseSelectionPolicy(metadata={"feature_id": "AUTO-003"}),
+    )
+    if lease is None:
+        run_record = _update_pipeline_run(
+            conn,
+            run_record,
+            status="stopped",
+            stopped_at=utc_now_iso(),
+            terminal_reason=TERMINAL_REASON_NO_ELIGIBLE_CASE,
+        )
+        return PipelineRunnerResult(
+            started=True,
+            terminal_status=TERMINAL_REASON_NO_ELIGIBLE_CASE,
+            pipeline_run_id=run_record["pipeline_run_id"],
+            runner_mode=run_record["runner_mode"],
+            stage_order=ADS_PIPELINE_STAGE_ORDER,
+            downstream_execution_enabled=True,
+            forecast_persistence_enabled=True,
+            reason=TERMINAL_REASON_NO_ELIGIBLE_CASE,
+        )
+
+    loop_iteration_id = stable_id("ads-loop-iteration", run_record["pipeline_run_id"], lease["case_lease_id"], 1)
+    run_record = _update_pipeline_run(
+        conn,
+        run_record,
+        active_case_lease_id=lease["case_lease_id"],
+        last_iteration_id=loop_iteration_id,
+        metadata_updates={"case_lease_id": lease["case_lease_id"], "loop_iteration_id": loop_iteration_id},
+    )
+
+    stage_outputs: dict[str, dict[str, Any]] = {}
+    forecast_decision_record_id: str | None = None
+    completed_stage_count = 0
+    try:
+        context = _stage_context(lease, pipeline_run_id=run_record["pipeline_run_id"], stage="case_selection")
+        started_event_id = _record_stage_started(conn, context)
+        case_result = StageHandlerResult(
+            output_artifact_refs=(lease["case_lease_id"],),
+            safe_metadata={
+                "selected_snapshot_id": lease["selected_snapshot_id"],
+                "selection_policy_ref": lease["selection_policy_ref"],
+            },
+        ).to_record("case_selection")
+        _record_stage_completed(conn, context, started_event_id=started_event_id, result=case_result)
+        stage_outputs["case_selection"] = case_result
+        completed_stage_count += 1
+
+        for stage in AUTO003_HANDLER_STAGES:
+            context = _stage_context(lease, pipeline_run_id=run_record["pipeline_run_id"], stage=stage)
+            started_event_id = _record_stage_started(conn, context)
+            try:
+                result = _call_stage_handler(
+                    handlers[stage],
+                    conn=conn,
+                    context=context,
+                    lease=lease,
+                    stage_outputs=stage_outputs,
+                )
+                record_id = result.get("forecast_decision_record_id")
+                if record_id:
+                    if stage != AUTO003_REQUIRED_FORECAST_PERSISTENCE_STAGE:
+                        raise PipelineRunnerContractError(
+                            "forecast decision persistence must be reported by the decision stage"
+                        )
+                    if forecast_decision_record_id is not None:
+                        raise PipelineRunnerContractError("duplicate forecast decision persistence for leased case")
+                    forecast_decision_record_id = record_id
+                _record_stage_completed(conn, context, started_event_id=started_event_id, result=result)
+                stage_outputs[stage] = result
+                completed_stage_count += 1
+            except Exception as exc:
+                _record_stage_failed(conn, context, started_event_id=started_event_id, exc=exc)
+                raise
+
+        if forecast_decision_record_id is None:
+            exc = PipelineRunnerContractError("AUTO-003 requires one PERSIST-001 forecast decision record")
+            context = _stage_context(lease, pipeline_run_id=run_record["pipeline_run_id"], stage="terminal")
+            started_event_id = _record_stage_started(conn, context)
+            _record_stage_failed(conn, context, started_event_id=started_event_id, exc=exc)
+            raise exc
+
+        release_case_lease(
+            conn,
+            case_lease_id=lease["case_lease_id"],
+            release_reason="auto003_single_case_complete",
+        )
+        run_record = _update_pipeline_run(
+            conn,
+            run_record,
+            status="stopped",
+            stopped_at=utc_now_iso(),
+            terminal_reason=TERMINAL_REASON_AUTO003_COMPLETE,
+            active_case_lease_id=None,
+            metadata_updates={
+                "completed_stage_count": completed_stage_count,
+                "forecast_decision_record_id": forecast_decision_record_id,
+            },
+        )
+        return PipelineRunnerResult(
+            started=True,
+            terminal_status=TERMINAL_REASON_AUTO003_COMPLETE,
+            pipeline_run_id=run_record["pipeline_run_id"],
+            runner_mode=run_record["runner_mode"],
+            stage_order=ADS_PIPELINE_STAGE_ORDER,
+            downstream_execution_enabled=True,
+            forecast_persistence_enabled=True,
+            reason=TERMINAL_REASON_AUTO003_COMPLETE,
+            case_lease_id=lease["case_lease_id"],
+            completed_stage_count=completed_stage_count,
+            forecast_decision_record_id=forecast_decision_record_id,
+        )
+    except Exception:
+        release_case_lease(
+            conn,
+            case_lease_id=lease["case_lease_id"],
+            release_reason="auto003_stage_failed",
+            lease_status="quarantined",
+        )
+        _update_pipeline_run(
+            conn,
+            run_record,
+            status="failed",
+            stopped_at=utc_now_iso(),
+            terminal_reason=TERMINAL_REASON_AUTO003_FAILED,
+            active_case_lease_id=None,
+            metadata_updates={"completed_stage_count": completed_stage_count},
+        )
+        return PipelineRunnerResult(
+            started=True,
+            terminal_status=TERMINAL_REASON_AUTO003_FAILED,
+            pipeline_run_id=run_record["pipeline_run_id"],
+            runner_mode=run_record["runner_mode"],
+            stage_order=ADS_PIPELINE_STAGE_ORDER,
+            downstream_execution_enabled=True,
+            forecast_persistence_enabled=True,
+            reason=TERMINAL_REASON_AUTO003_FAILED,
+            case_lease_id=lease["case_lease_id"],
+            completed_stage_count=completed_stage_count,
+            forecast_decision_record_id=forecast_decision_record_id,
+        )
