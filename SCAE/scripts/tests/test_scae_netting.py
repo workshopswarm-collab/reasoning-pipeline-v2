@@ -8,10 +8,14 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from scae.netting import (  # noqa: E402
+    AMBIGUOUS_CLAIM_FAMILY_UNION_ID,
+    CROSS_LEAF_REPRESENTATIVE_SELECTOR,
     NO_LIVE_AUTHORITY,
     REPRESENTATIVE_SELECTOR,
     SCAE_CLUSTER_NETTING_BUNDLE_SCHEMA_VERSION,
+    SCAE_CROSS_LEAF_DEPENDENCE_BUNDLE_SCHEMA_VERSION,
     ScaeNettingError,
+    build_cross_leaf_dependence_bundle,
     build_leaf_cluster_netting_bundle,
     build_leaf_cluster_netting_slices,
 )
@@ -33,8 +37,10 @@ class ScaeNettingTest(unittest.TestCase):
         claim_family_id="claim-family-1",
         accepted=True,
         source_class="official_or_primary",
+        mechanism_family_id=None,
+        claim_family_status=None,
     ):
-        return {
+        candidate = {
             "artifact_type": "scae_log_odds_update_candidate_slice",
             "candidate_slice_id": candidate_id,
             "case_id": "case-1",
@@ -50,6 +56,11 @@ class ScaeNettingTest(unittest.TestCase):
             "accepted_for_ledger_input": accepted,
             "candidate_status": "accepted_candidate" if accepted else "rejected_quality_verification",
         }
+        if mechanism_family_id is not None:
+            candidate["mechanism_family_id"] = mechanism_family_id
+        if claim_family_status is not None:
+            candidate["claim_family_resolution_status"] = claim_family_status
+        return candidate
 
     def test_repeated_same_claim_source_family_contributes_once_by_default(self):
         result = build_leaf_cluster_netting_slices(
@@ -179,6 +190,125 @@ class ScaeNettingTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ScaeNettingError, "representative_selector"):
             build_leaf_cluster_netting_slices([self.candidate("candidate-a")], policy=policy)
+
+    def test_same_claim_across_leaves_contributes_once_through_shared_claim_union(self):
+        intra_leaf_bundle = build_leaf_cluster_netting_bundle(
+            [
+                self.candidate("candidate-leaf-a", delta=0.22, leaf_id="leaf-a"),
+                self.candidate("candidate-leaf-b", delta=0.31, leaf_id="leaf-b"),
+            ],
+            policy=self.policy,
+        )
+
+        cross_leaf_bundle = build_cross_leaf_dependence_bundle(intra_leaf_bundle)
+
+        self.assertEqual(
+            cross_leaf_bundle["schema_version"],
+            SCAE_CROSS_LEAF_DEPENDENCE_BUNDLE_SCHEMA_VERSION,
+        )
+        self.assertEqual(cross_leaf_bundle["authority"], NO_LIVE_AUTHORITY)
+        self.assertFalse(cross_leaf_bundle["writes_scae_ledger"])
+        self.assertFalse(cross_leaf_bundle["writes_production_forecast"])
+        self.assertEqual(len(cross_leaf_bundle["cross_leaf_dependency_slices"]), 1)
+        dependence = cross_leaf_bundle["cross_leaf_dependency_slices"][0]
+        self.assertEqual(dependence["feature_id"], "SCAE-006")
+        self.assertEqual(dependence["cross_leaf_representative_selector"], CROSS_LEAF_REPRESENTATIVE_SELECTOR)
+        self.assertTrue(dependence["same_claim_union_applied"])
+        self.assertEqual(dependence["raw_additive_signed_log_odds_delta"], 0.53)
+        self.assertEqual(dependence["cross_leaf_guarded_signed_log_odds_delta"], 0.31)
+        self.assertEqual(dependence["prevented_duplicate_or_dependent_signed_log_odds_delta"], 0.22)
+        self.assertEqual(
+            dependence["posterior_force_inputs"]["non_representative_cluster_refs_excluded_from_force"],
+            [intra_leaf_bundle["cluster_slices"][0]["cluster_slice_id"]],
+        )
+        self.assertEqual(
+            cross_leaf_bundle["cross_leaf_summary"]["cross_leaf_guarded_signed_log_odds_delta"],
+            0.31,
+        )
+
+    def test_ambiguous_claim_family_defaults_conservative_not_independent(self):
+        intra_leaf_bundle = build_leaf_cluster_netting_bundle(
+            [
+                self.candidate(
+                    "candidate-ambiguous-a",
+                    delta=0.20,
+                    leaf_id="leaf-a",
+                    claim_family_id="parser-proposed-family-a",
+                    claim_family_status="unknown_not_counted",
+                ),
+                self.candidate(
+                    "candidate-ambiguous-b",
+                    delta=0.16,
+                    leaf_id="leaf-b",
+                    source_family_id="source-family-2",
+                    claim_family_id="parser-proposed-family-b",
+                    claim_family_status="spanless_model_proposal",
+                ),
+            ],
+            policy=self.policy,
+        )
+
+        dependence = build_cross_leaf_dependence_bundle(intra_leaf_bundle)["cross_leaf_dependency_slices"][0]
+
+        self.assertEqual(dependence["dependence_group_type"], "ambiguous_claim_family")
+        self.assertEqual(dependence["dependence_group_id"], AMBIGUOUS_CLAIM_FAMILY_UNION_ID)
+        self.assertTrue(dependence["ambiguous_claim_family_conservative_union_applied"])
+        self.assertEqual(dependence["independent_corroboration_status"], "blocked_ambiguous_claim_family")
+        self.assertEqual(dependence["raw_additive_signed_log_odds_delta"], 0.36)
+        self.assertEqual(dependence["cross_leaf_guarded_signed_log_odds_delta"], 0.20)
+
+    def test_mechanism_family_tags_are_diagnostic_and_cannot_increase_strength(self):
+        intra_leaf_bundle = build_leaf_cluster_netting_bundle(
+            [
+                self.candidate(
+                    "candidate-mechanism-a",
+                    delta=0.12,
+                    leaf_id="leaf-a",
+                    claim_family_id="claim-family-a",
+                    mechanism_family_id="official-source-silence",
+                ),
+                self.candidate(
+                    "candidate-mechanism-b",
+                    delta=0.14,
+                    leaf_id="leaf-b",
+                    claim_family_id="claim-family-b",
+                    mechanism_family_id="official-source-silence",
+                ),
+            ],
+            policy=self.policy,
+        )
+
+        cross_leaf_bundle = build_cross_leaf_dependence_bundle(intra_leaf_bundle)
+
+        diagnostics = cross_leaf_bundle["mechanism_family_diagnostics"]
+        self.assertEqual(len(diagnostics), 1)
+        diagnostic = diagnostics[0]
+        self.assertEqual(diagnostic["mechanism_family_id"], "official-source-silence")
+        self.assertTrue(diagnostic["diagnostic_dependence_only"])
+        self.assertFalse(diagnostic["can_increase_evidence_strength"])
+        self.assertEqual(diagnostic["signed_log_odds_delta_added_by_mechanism_family"], 0.0)
+        self.assertEqual(diagnostic["downstream_effect_scope"], "dependence_or_interval_only")
+
+    def test_cross_leaf_bundle_has_no_probability_or_forecast_authority_fields(self):
+        intra_leaf_bundle = build_leaf_cluster_netting_bundle(
+            [
+                self.candidate("candidate-leaf-a", delta=0.22, leaf_id="leaf-a"),
+                self.candidate("candidate-leaf-b", delta=-0.13, leaf_id="leaf-b"),
+            ],
+            policy=self.policy,
+        )
+
+        cross_leaf_bundle = build_cross_leaf_dependence_bundle(intra_leaf_bundle)
+
+        serialized = json.dumps(cross_leaf_bundle, sort_keys=True)
+        for forbidden_field in [
+            "raw_ledger_probability",
+            "post_ledger_probability",
+            "debt_adjusted_probability",
+            "production_forecast_prob",
+            "canonical_probability",
+        ]:
+            self.assertNotIn(forbidden_field, serialized)
 
 
 if __name__ == "__main__":

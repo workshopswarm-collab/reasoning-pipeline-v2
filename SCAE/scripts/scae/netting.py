@@ -1,9 +1,9 @@
-"""SCAE-005 intra-leaf representative cluster netting.
+"""SCAE-005/SCAE-006 candidate-only netting guards.
 
 This module consumes bounded SCAE candidate update slices and emits
-candidate-only cluster netting slices. It does not apply cross-leaf dependence,
-branch sub-ledgers, final ledger aggregation, probability fields, or forecast
-persistence.
+candidate-only cluster netting and cross-leaf dependence slices. It does not
+apply branch sub-ledgers, final ledger aggregation, probability fields, or
+forecast persistence.
 """
 
 from __future__ import annotations
@@ -20,9 +20,31 @@ from scae.policy import default_scae_policy
 SCAE_CLUSTER_NETTING_SLICE_SCHEMA_VERSION = "scae-intra-leaf-cluster-netting-slice/v1"
 SCAE_CLUSTER_NETTING_BUNDLE_SCHEMA_VERSION = "scae-intra-leaf-cluster-netting-bundle/v1"
 SCAE_CLUSTER_NETTING_SUMMARY_SCHEMA_VERSION = "scae-intra-leaf-cluster-netting-summary/v1"
+SCAE_CROSS_LEAF_DEPENDENCE_SLICE_SCHEMA_VERSION = "scae-cross-leaf-dependence-slice/v1"
+SCAE_CROSS_LEAF_DEPENDENCE_BUNDLE_SCHEMA_VERSION = "scae-cross-leaf-dependence-bundle/v1"
+SCAE_MECHANISM_FAMILY_DIAGNOSTIC_SCHEMA_VERSION = "scae-mechanism-family-dependence-diagnostic/v1"
 SCAE_005_NETTING_VERSION = "ads-scae-005-intra-leaf-cluster-netting/v1"
+SCAE_006_DEPENDENCE_VERSION = "ads-scae-006-cross-leaf-dependence-guard/v1"
 NO_LIVE_AUTHORITY = "candidate_ledger_input_only_no_live_forecast_authority"
 REPRESENTATIVE_SELECTOR = "policy_bounded_signed_representative_v1"
+CROSS_LEAF_REPRESENTATIVE_SELECTOR = "shared_claim_union_signed_representative_v1"
+AMBIGUOUS_CLAIM_FAMILY_UNION_ID = "ambiguous_claim_family_conservative_union"
+AMBIGUOUS_CLAIM_FAMILY_VALUES = {
+    "ambiguous",
+    "ambiguous_claim_family",
+    "unknown",
+    "unknown_claim_family",
+    "unknown_not_counted",
+    "unresolved",
+}
+ACCEPTED_CLAIM_FAMILY_STATUSES = {
+    "",
+    "accepted",
+    "claim_family_resolved",
+    "deterministically_resolved",
+    "known",
+    "resolved",
+}
 
 
 class ScaeNettingError(ValueError):
@@ -36,6 +58,14 @@ class LeafClusterNettingResult:
     excluded_candidate_refs: list[str]
     zero_delta_candidate_refs: list[str]
     netting_bundle_digest: str
+
+
+@dataclass(frozen=True)
+class CrossLeafDependenceResult:
+    cross_leaf_dependency_slices: list[dict[str, Any]]
+    mechanism_family_diagnostics: list[dict[str, Any]]
+    cross_leaf_summary: dict[str, Any]
+    cross_leaf_dependence_bundle_digest: str
 
 
 def _canonical_json(value: Any) -> str:
@@ -101,6 +131,14 @@ def _candidate_id(candidate: dict[str, Any]) -> str:
     raise ScaeNettingError("candidate slice is missing candidate_slice_id")
 
 
+def _cluster_id(cluster: dict[str, Any]) -> str:
+    for field in ("cluster_slice_id", "cross_leaf_dependency_slice_id", "slice_id"):
+        value = cluster.get(field)
+        if _is_non_empty_string(value):
+            return str(value)
+    raise ScaeNettingError("cluster slice is missing cluster_slice_id")
+
+
 def _cluster_identity(candidate: dict[str, Any]) -> tuple[str, str, str]:
     leaf_id = candidate.get("leaf_id")
     source_family_id = candidate.get("event_source_family") or candidate.get("source_family_id")
@@ -112,6 +150,51 @@ def _cluster_identity(candidate: dict[str, Any]) -> tuple[str, str, str]:
     if not _is_non_empty_string(claim_family_id):
         raise ScaeNettingError(f"{_candidate_id(candidate)} is missing claim_family_id")
     return str(leaf_id), str(source_family_id), str(claim_family_id)
+
+
+def _candidate_mechanism_family_ids(candidate: dict[str, Any]) -> list[str]:
+    values: list[Any] = []
+    for field in (
+        "mechanism_family_id",
+        "absence_mechanism_family_id",
+        "missingness_mechanism_family_id",
+        "no_catalyst_mechanism_family_id",
+    ):
+        values.append(candidate.get(field))
+    mechanism_family_ids = candidate.get("mechanism_family_ids")
+    if isinstance(mechanism_family_ids, list):
+        values.extend(mechanism_family_ids)
+    normalized = [str(value) for value in values if _is_non_empty_string(value)]
+    return sorted(set(normalized))
+
+
+def _candidate_claim_family_status(candidate: dict[str, Any]) -> str:
+    for field in (
+        "claim_family_equivalence_status",
+        "claim_family_resolution_status",
+        "claim_family_status",
+    ):
+        value = candidate.get(field)
+        if _is_non_empty_string(value):
+            return str(value)
+    return "accepted"
+
+
+def _claim_family_statuses(candidates: list[dict[str, Any]]) -> list[str]:
+    return sorted({_candidate_claim_family_status(candidate) for candidate in candidates})
+
+
+def _claim_family_is_ambiguous(claim_family_id: Any, statuses: list[str] | None = None) -> bool:
+    if not _is_non_empty_string(claim_family_id):
+        return True
+    normalized_claim = str(claim_family_id).strip().lower()
+    if normalized_claim in AMBIGUOUS_CLAIM_FAMILY_VALUES:
+        return True
+    for status in statuses or []:
+        normalized_status = str(status).strip().lower()
+        if normalized_status not in ACCEPTED_CLAIM_FAMILY_STATUSES:
+            return True
+    return False
 
 
 def _signed_delta(candidate: dict[str, Any]) -> float:
@@ -225,6 +308,15 @@ def _cluster_slice(
         for candidate in [positive_representative, negative_representative]
         if candidate is not None
     ]
+    mechanism_family_ids = sorted(
+        {
+            mechanism_family_id
+            for candidate in sorted_candidates
+            for mechanism_family_id in _candidate_mechanism_family_ids(candidate)
+        }
+    )
+    claim_family_statuses = _claim_family_statuses(sorted_candidates)
+    ambiguous_claim_family = _claim_family_is_ambiguous(claim_family_id, claim_family_statuses)
     positive_corroborating_refs = [
         ref for ref in positive_refs if positive_representative is not None and ref != _candidate_id(positive_representative)
     ]
@@ -242,6 +334,11 @@ def _cluster_slice(
         "leaf_id": leaf_id,
         "source_family_id": source_family_id,
         "claim_family_id": claim_family_id,
+        "claim_family_statuses": claim_family_statuses,
+        "claim_family_ambiguity_status": (
+            "ambiguous_or_unresolved_conservative" if ambiguous_claim_family else "resolved"
+        ),
+        "mechanism_family_ids": mechanism_family_ids,
         "cluster_key": {
             "leaf_id": leaf_id,
             "source_family_id": source_family_id,
@@ -284,6 +381,12 @@ def _cluster_slice(
             and negative_representative is not None,
             "positive_candidate_refs": positive_refs,
             "negative_candidate_refs": negative_refs,
+        },
+        "mechanism_family_diagnostics": {
+            "diagnostic_dependence_only": True,
+            "can_increase_evidence_strength": False,
+            "mechanism_family_ids": mechanism_family_ids,
+            "signed_log_odds_delta_added_by_mechanism_family": 0.0,
         },
         "pre_cap_cluster_signed_log_odds_delta": pre_cap_delta,
         "per_cluster_log_odds_cap": per_cluster_cap,
@@ -398,4 +501,311 @@ def build_leaf_cluster_netting_bundle(
         "cluster_slices": result.cluster_slices,
         "leaf_netting_summaries": result.leaf_netting_summaries,
         "netting_version": SCAE_005_NETTING_VERSION,
+    }
+
+
+def _cluster_delta(cluster: dict[str, Any]) -> float:
+    return round(_numeric(cluster.get("netted_signed_log_odds_delta"), "netted_signed_log_odds_delta"), 9)
+
+
+def _cluster_source_family_id(cluster: dict[str, Any]) -> str:
+    source_family_id = cluster.get("source_family_id") or cluster.get("event_source_family")
+    if not _is_non_empty_string(source_family_id):
+        raise ScaeNettingError(f"{_cluster_id(cluster)} is missing source_family_id")
+    return str(source_family_id)
+
+
+def _cluster_claim_family_id(cluster: dict[str, Any]) -> str:
+    claim_family_id = cluster.get("claim_family_id")
+    if not _is_non_empty_string(claim_family_id):
+        raise ScaeNettingError(f"{_cluster_id(cluster)} is missing claim_family_id")
+    return str(claim_family_id)
+
+
+def _cluster_leaf_id(cluster: dict[str, Any]) -> str:
+    leaf_id = cluster.get("leaf_id")
+    if not _is_non_empty_string(leaf_id):
+        raise ScaeNettingError(f"{_cluster_id(cluster)} is missing leaf_id")
+    return str(leaf_id)
+
+
+def _cluster_mechanism_family_ids(cluster: dict[str, Any]) -> list[str]:
+    values: list[Any] = []
+    for field in (
+        "mechanism_family_id",
+        "absence_mechanism_family_id",
+        "missingness_mechanism_family_id",
+        "no_catalyst_mechanism_family_id",
+    ):
+        values.append(cluster.get(field))
+    mechanism_family_ids = cluster.get("mechanism_family_ids")
+    if isinstance(mechanism_family_ids, list):
+        values.extend(mechanism_family_ids)
+    return sorted({str(value) for value in values if _is_non_empty_string(value)})
+
+
+def _cluster_claim_family_statuses(cluster: dict[str, Any]) -> list[str]:
+    statuses = cluster.get("claim_family_statuses")
+    if isinstance(statuses, list):
+        return sorted({str(status) for status in statuses if _is_non_empty_string(status)})
+    status = None
+    for field in (
+        "claim_family_equivalence_status",
+        "claim_family_resolution_status",
+        "claim_family_status",
+        "claim_family_ambiguity_status",
+    ):
+        if _is_non_empty_string(cluster.get(field)):
+            status = str(cluster[field])
+            break
+    return [status] if status else ["accepted"]
+
+
+def _cross_leaf_group_key(cluster: dict[str, Any]) -> tuple[str, str]:
+    claim_family_id = _cluster_claim_family_id(cluster)
+    statuses = _cluster_claim_family_statuses(cluster)
+    if _claim_family_is_ambiguous(claim_family_id, statuses):
+        return "ambiguous_claim_family", AMBIGUOUS_CLAIM_FAMILY_UNION_ID
+    return "resolved_claim_family", claim_family_id
+
+
+def _cross_leaf_representative_key(cluster: dict[str, Any]) -> tuple[float, str]:
+    return abs(_cluster_delta(cluster)), _cluster_id(cluster)
+
+
+def _select_cluster_representative(clusters: list[dict[str, Any]]) -> dict[str, Any] | None:
+    if not clusters:
+        return None
+    return max(clusters, key=_cross_leaf_representative_key)
+
+
+def _cross_leaf_dependence_slice(group_key: tuple[str, str], clusters: list[dict[str, Any]]) -> dict[str, Any]:
+    group_type, group_id = group_key
+    sorted_clusters = sorted((copy.deepcopy(cluster) for cluster in clusters), key=_cluster_id)
+    positive_clusters = [cluster for cluster in sorted_clusters if _cluster_delta(cluster) > 0.0]
+    negative_clusters = [cluster for cluster in sorted_clusters if _cluster_delta(cluster) < 0.0]
+    positive_representative = _select_cluster_representative(positive_clusters)
+    negative_representative = _select_cluster_representative(negative_clusters)
+    representative_refs = [
+        _cluster_id(cluster)
+        for cluster in [positive_representative, negative_representative]
+        if cluster is not None
+    ]
+    cluster_refs = [_cluster_id(cluster) for cluster in sorted_clusters]
+    excluded_refs = sorted(set(cluster_refs) - set(representative_refs))
+    source_family_ids = sorted({_cluster_source_family_id(cluster) for cluster in sorted_clusters})
+    leaf_ids = sorted({_cluster_leaf_id(cluster) for cluster in sorted_clusters})
+    claim_family_ids = sorted({_cluster_claim_family_id(cluster) for cluster in sorted_clusters})
+    mechanism_family_ids = sorted(
+        {
+            mechanism_family_id
+            for cluster in sorted_clusters
+            for mechanism_family_id in _cluster_mechanism_family_ids(cluster)
+        }
+    )
+    positive_delta = _cluster_delta(positive_representative) if positive_representative else 0.0
+    negative_delta = _cluster_delta(negative_representative) if negative_representative else 0.0
+    raw_additive_delta = round(sum(_cluster_delta(cluster) for cluster in sorted_clusters), 9)
+    guarded_delta = round(positive_delta + negative_delta, 9)
+    prevented_duplicate_delta = round(raw_additive_delta - guarded_delta, 9)
+    ambiguous_claim_family = group_type == "ambiguous_claim_family"
+    cross_leaf_reuse = len(leaf_ids) > 1
+    slice_row = {
+        "artifact_type": "scae_cross_leaf_dependence_slice",
+        "schema_version": SCAE_CROSS_LEAF_DEPENDENCE_SLICE_SCHEMA_VERSION,
+        "feature_id": "SCAE-006",
+        "surface_name": "scae_cross_leaf_dependency_slices",
+        "case_id": sorted_clusters[0].get("case_id"),
+        "dispatch_id": sorted_clusters[0].get("dispatch_id"),
+        "dependence_group_type": group_type,
+        "dependence_group_id": group_id,
+        "claim_family_ids": claim_family_ids,
+        "source_family_ids": source_family_ids,
+        "mechanism_family_ids": mechanism_family_ids,
+        "leaf_ids": leaf_ids,
+        "cluster_slice_refs": cluster_refs,
+        "cluster_count": len(cluster_refs),
+        "cross_leaf_representative_selector": CROSS_LEAF_REPRESENTATIVE_SELECTOR,
+        "positive_representative_cluster_ref": (
+            _cluster_id(positive_representative) if positive_representative else None
+        ),
+        "negative_representative_cluster_ref": (
+            _cluster_id(negative_representative) if negative_representative else None
+        ),
+        "posterior_force_inputs": {
+            "representative_cluster_refs": representative_refs,
+            "positive_representative_delta": positive_delta,
+            "negative_representative_delta": negative_delta,
+            "non_representative_cluster_refs_excluded_from_force": excluded_refs,
+        },
+        "raw_additive_signed_log_odds_delta": raw_additive_delta,
+        "cross_leaf_guarded_signed_log_odds_delta": guarded_delta,
+        "prevented_duplicate_or_dependent_signed_log_odds_delta": prevented_duplicate_delta,
+        "same_claim_union_applied": group_type == "resolved_claim_family" and cross_leaf_reuse,
+        "ambiguous_claim_family_conservative_union_applied": ambiguous_claim_family,
+        "independent_corroboration_status": (
+            "blocked_ambiguous_claim_family"
+            if ambiguous_claim_family
+            else ("shared_claim_union" if cross_leaf_reuse else "single_leaf_no_cross_leaf_reuse")
+        ),
+        "source_family_diagnostics": {
+            "source_family_ids": source_family_ids,
+            "same_source_family_across_leaves": cross_leaf_reuse and len(source_family_ids) < len(leaf_ids),
+            "separated_from_independent_corroboration": True,
+        },
+        "mechanism_family_diagnostics": {
+            "diagnostic_dependence_only": True,
+            "can_increase_evidence_strength": False,
+            "mechanism_family_ids": mechanism_family_ids,
+            "signed_log_odds_delta_added_by_mechanism_family": 0.0,
+        },
+        "accepted_for_candidate_ledger_input": True,
+        "ledger_input_authority": NO_LIVE_AUTHORITY,
+        "live_forecast_authority": False,
+        "writes_scae_ledger": False,
+        "writes_production_forecast": False,
+        "not_implemented_scope": [
+            "SCAE-007_branch_sub_ledgers",
+            "SCAE-011_final_probability_fields",
+        ],
+        "dependence_version": SCAE_006_DEPENDENCE_VERSION,
+    }
+    slice_row["cross_leaf_dependency_slice_id"] = _sha_id("scae-cross-leaf-dependence", slice_row)
+    slice_row["cross_leaf_dependency_slice_digest"] = _prefixed_sha256(slice_row)
+    return slice_row
+
+
+def _mechanism_family_diagnostics(cluster_slices: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    by_mechanism: dict[str, list[dict[str, Any]]] = {}
+    for cluster in cluster_slices:
+        for mechanism_family_id in _cluster_mechanism_family_ids(cluster):
+            by_mechanism.setdefault(mechanism_family_id, []).append(cluster)
+
+    diagnostics: list[dict[str, Any]] = []
+    for mechanism_family_id, clusters in sorted(by_mechanism.items()):
+        sorted_clusters = sorted(clusters, key=_cluster_id)
+        diagnostic = {
+            "artifact_type": "scae_mechanism_family_dependence_diagnostic",
+            "schema_version": SCAE_MECHANISM_FAMILY_DIAGNOSTIC_SCHEMA_VERSION,
+            "feature_id": "SCAE-006",
+            "surface_name": "scae_mechanism_family_assignment_slices",
+            "mechanism_family_id": mechanism_family_id,
+            "cluster_slice_refs": [_cluster_id(cluster) for cluster in sorted_clusters],
+            "leaf_ids": sorted({_cluster_leaf_id(cluster) for cluster in sorted_clusters}),
+            "claim_family_ids": sorted({_cluster_claim_family_id(cluster) for cluster in sorted_clusters}),
+            "diagnostic_dependence_only": True,
+            "can_increase_evidence_strength": False,
+            "signed_log_odds_delta_added_by_mechanism_family": 0.0,
+            "downstream_effect_scope": "dependence_or_interval_only",
+            "ledger_input_authority": NO_LIVE_AUTHORITY,
+            "writes_scae_ledger": False,
+            "writes_production_forecast": False,
+        }
+        diagnostic["mechanism_family_diagnostic_id"] = _sha_id("scae-mechanism-family-diagnostic", diagnostic)
+        diagnostic["mechanism_family_diagnostic_digest"] = _prefixed_sha256(diagnostic)
+        diagnostics.append(diagnostic)
+    return diagnostics
+
+
+def _cross_leaf_summary(cross_leaf_slices: list[dict[str, Any]]) -> dict[str, Any]:
+    raw_additive_delta = round(sum(slice_row["raw_additive_signed_log_odds_delta"] for slice_row in cross_leaf_slices), 9)
+    guarded_delta = round(
+        sum(slice_row["cross_leaf_guarded_signed_log_odds_delta"] for slice_row in cross_leaf_slices),
+        9,
+    )
+    summary = {
+        "artifact_type": "scae_cross_leaf_dependence_summary",
+        "schema_version": "scae-cross-leaf-dependence-summary/v1",
+        "feature_id": "SCAE-006",
+        "dependence_slice_refs": [
+            slice_row["cross_leaf_dependency_slice_id"] for slice_row in cross_leaf_slices
+        ],
+        "raw_additive_signed_log_odds_delta": raw_additive_delta,
+        "cross_leaf_guarded_signed_log_odds_delta": guarded_delta,
+        "prevented_duplicate_or_dependent_signed_log_odds_delta": round(raw_additive_delta - guarded_delta, 9),
+        "ambiguous_claim_family_group_count": sum(
+            1 for slice_row in cross_leaf_slices if slice_row["dependence_group_type"] == "ambiguous_claim_family"
+        ),
+        "same_claim_union_group_count": sum(
+            1 for slice_row in cross_leaf_slices if slice_row["same_claim_union_applied"]
+        ),
+        "ledger_input_authority": NO_LIVE_AUTHORITY,
+        "writes_scae_ledger": False,
+        "writes_production_forecast": False,
+    }
+    summary["summary_id"] = _sha_id("scae-cross-leaf-summary", summary)
+    summary["summary_digest"] = _prefixed_sha256(summary)
+    return summary
+
+
+def build_cross_leaf_dependence_slices(
+    cluster_netting_slices: dict[str, Any] | list[dict[str, Any]],
+) -> CrossLeafDependenceResult:
+    """Build candidate-only SCAE-006 cross-leaf dependence slices."""
+
+    rows = _rows_from(cluster_netting_slices, "cluster_slices")
+    accepted_clusters: list[dict[str, Any]] = []
+    for cluster in rows:
+        cluster_copy = copy.deepcopy(cluster)
+        if cluster_copy.get("accepted_for_ledger_input") is not True:
+            continue
+        if _cluster_delta(cluster_copy) == 0.0:
+            continue
+        _cluster_leaf_id(cluster_copy)
+        _cluster_source_family_id(cluster_copy)
+        _cluster_claim_family_id(cluster_copy)
+        accepted_clusters.append(cluster_copy)
+
+    groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for cluster in accepted_clusters:
+        groups.setdefault(_cross_leaf_group_key(cluster), []).append(cluster)
+
+    cross_leaf_slices = [
+        _cross_leaf_dependence_slice(group_key, clusters)
+        for group_key, clusters in sorted(groups.items())
+    ]
+    mechanism_diagnostics = _mechanism_family_diagnostics(accepted_clusters)
+    summary = _cross_leaf_summary(cross_leaf_slices)
+    digest_payload = {
+        "schema_version": "scae-cross-leaf-dependence-digest/v1",
+        "slice_schema_version": SCAE_CROSS_LEAF_DEPENDENCE_SLICE_SCHEMA_VERSION,
+        "diagnostic_schema_version": SCAE_MECHANISM_FAMILY_DIAGNOSTIC_SCHEMA_VERSION,
+        "cross_leaf_dependency_slices": cross_leaf_slices,
+        "mechanism_family_diagnostics": mechanism_diagnostics,
+        "cross_leaf_summary": summary,
+    }
+    bundle_digest = _prefixed_sha256(digest_payload)
+    for slice_row in cross_leaf_slices:
+        slice_row["cross_leaf_dependence_bundle_digest"] = bundle_digest
+    for diagnostic in mechanism_diagnostics:
+        diagnostic["cross_leaf_dependence_bundle_digest"] = bundle_digest
+    summary["cross_leaf_dependence_bundle_digest"] = bundle_digest
+    return CrossLeafDependenceResult(
+        cross_leaf_slices,
+        mechanism_diagnostics,
+        summary,
+        bundle_digest,
+    )
+
+
+def build_cross_leaf_dependence_bundle(
+    cluster_netting_slices: dict[str, Any] | list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Return the external SCAE-006 cross-leaf dependence bundle artifact."""
+
+    result = build_cross_leaf_dependence_slices(cluster_netting_slices)
+    return {
+        "artifact_type": "scae_cross_leaf_dependence_bundle",
+        "schema_version": SCAE_CROSS_LEAF_DEPENDENCE_BUNDLE_SCHEMA_VERSION,
+        "feature_id": "SCAE-006",
+        "authority": NO_LIVE_AUTHORITY,
+        "writes_scae_ledger": False,
+        "writes_production_forecast": False,
+        "cross_leaf_dependence_bundle_digest": result.cross_leaf_dependence_bundle_digest,
+        "dependence_group_count": len(result.cross_leaf_dependency_slices),
+        "mechanism_family_diagnostic_count": len(result.mechanism_family_diagnostics),
+        "cross_leaf_dependency_slices": result.cross_leaf_dependency_slices,
+        "mechanism_family_diagnostics": result.mechanism_family_diagnostics,
+        "cross_leaf_summary": result.cross_leaf_summary,
+        "dependence_version": SCAE_006_DEPENDENCE_VERSION,
     }
