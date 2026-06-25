@@ -131,7 +131,7 @@ Root-level runtime entrypoints should be avoided except for compatibility shims 
 | `/Users/agent2/.openclaw/SCAE/scripts/scae/prior.py` | `SCAE-002` | Prior odds, rolling microstructure reliability, structural/neutral shrink targets, and market-assimilation context. |
 | `/Users/agent2/.openclaw/SCAE/scripts/scae/evidence.py` | `SCAE-003`, `SCAE-004` | Verified classification to guarded, bounded signed log-odds candidate mapping with no ledger or forecast authority. |
 | `/Users/agent2/.openclaw/SCAE/scripts/scae/family.py` | `SCAE-009` | Family-aware binary child displacement and consistency diagnostics with sibling prices as context only. |
-| `/Users/agent2/.openclaw/SCAE/scripts/scae/netting.py` | `SCAE-005`, `SCAE-006`, `SCAE-007` | Intra-leaf, cross-leaf, branch, and dependence netting. |
+| `/Users/agent2/.openclaw/SCAE/scripts/scae/netting.py` | `SCAE-005`, `SCAE-006`, `SCAE-007` | SCAE-005 intra-leaf representative cluster netting; later cross-leaf dependence and branch netting remain future work. |
 | `/Users/agent2/.openclaw/SCAE/scripts/scae/intervals.py` | `SCAE-011` | Deterministic logit uncertainty interval builder. |
 | `/Users/agent2/.openclaw/SCAE/scripts/scae/persistence.py` | `PERSIST-001`, `PERSIST-002`, `SCORE-001` | Forecast and scoring persistence helpers. |
 
