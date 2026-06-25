@@ -74,6 +74,8 @@ Root-level runtime entrypoints should be avoided except for compatibility shims 
 | `/Users/agent2/.openclaw/decomposer/scripts/ads_decomposer/qdt.py` | `QDT-002`, `QDT-003`, `QDT-005` | QDT schema and construction helpers. |
 | `/Users/agent2/.openclaw/decomposer/scripts/ads_decomposer/handoff.py` | `QDT-001` | Handoff parser and artifact manifest checks. |
 | `/Users/agent2/.openclaw/decomposer/scripts/ads_decomposer/sufficiency_requirements.py` | `QDT-005` | Per-leaf research sufficiency requirement builder. |
+| `/Users/agent2/.openclaw/decomposer/scripts/ads_decomposer/persistence.py` | `MIG-003`, `QDT-001` to `QDT-005`, `MODEL-002` | Importable QDT persistence helpers for selected decomposition runs, required leaf questions, sufficiency requirements, and AMRG anchor dependency slices without probability, SCAE, synthesis, forecast, or decision authority. |
+| `/Users/agent2/.openclaw/decomposer/scripts/migrations/003_qdt_decomposition_persistence.sql` | `MIG-003` | Named decomposer-owned SQLite migration for QDT run compatibility, required leaf research questions, per-leaf research sufficiency requirements, and AMRG anchor dependency slices. |
 
 ### Researcher Swarm Scripts
 
