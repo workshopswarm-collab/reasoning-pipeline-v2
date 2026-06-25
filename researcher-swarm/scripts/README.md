@@ -20,6 +20,7 @@ leaf-research preparation, and downstream classification/verification helpers.
 - `researcher_swarm/model_preflight.py`: `RET-007` report-only local embedding/reranker preflight and resource-cap diagnostics.
 - `researcher_swarm/classification.py`: `CLS-001` fail-closed researcher NLI classification prompt contract rendering over finalized `retrieval-packet/v1` dispatch artifacts; `CLS-002` deterministic `researcher-sidecar/v2` builder/validator with recursive no-probability enforcement, leaf coverage checks, coverage proof checks, sufficiency certificate refs, digest refs, and model execution context metadata checks.
 - `researcher_swarm/model_context.py`: `MODEL-003` deterministic metadata-only researcher leaf NLI model lane resolution for `gpt-5.5-high`.
+- `researcher_swarm/assignments.py`: `CLS-006` compact `leaf-research-assignment/v1` builder/validator for RET-008 dispatchable QDT leaves, carrying refs, digests, context-isolation refs, model context, sidecar output contract, and budget caps without embedding QDT leaf blobs, evidence bodies, probabilities, fair values, intervals, or decision recommendations.
 - `bin/build_retrieval_packet.py`: builds a schema-only `retrieval-packet/v1` from a validated QDT.
 
 ## Expected Future Entrypoints
@@ -35,4 +36,4 @@ leaf-research preparation, and downstream classification/verification helpers.
 - `bin/validate_researcher_sidecars.py`
 - `bin/reconcile_research_sufficiency.py`
 
-Later `RET-*`, `CLS-*`, and `VER-*` rows add retrieval execution, provenance validation, breadth certification, researcher assignments, and verification behavior.
+Later `RET-*`, `CLS-*`, and `VER-*` rows add retrieval execution, provenance validation, breadth certification, context isolation launch behavior, escalation logic, and verification behavior.
