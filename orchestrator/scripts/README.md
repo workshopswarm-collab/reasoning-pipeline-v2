@@ -50,6 +50,7 @@ Root files should stay minimal. New runnable scripts belong in `bin/`; new reusa
 | `bin/report_brier_scores.py` | Summarize pipeline Brier scores against prediction-time market baselines. | Accuracy reporting. |
 | `bin/ingest_market.py` | Compatibility wrapper for the SQLite store ingestion CLI. | Legacy/manual single-market ingestion path. |
 | `bin/run_golden_fixture.py` | Run the ADS v2 golden fixture registry/result harness in fixture or runtime-dependency-check mode. | Fixture-first integration checks for Session 1-owned foundation contracts. |
+| `bin/run_ads_pipeline_loop.py` | Run the AUTO-001 ADS pipeline runner contract skeleton. | Safe control-plane check; refuses start while disabled and never selects cases or persists forecasts. |
 
 ## Source Index
 
@@ -62,8 +63,10 @@ Root files should stay minimal. New runnable scripts belong in `bin/`; new reusa
 | `predquant/sqlite_store.py` | SQLite schema, market snapshot storage, prediction recording, settlement, and Brier persistence. |
 | `predquant/foundation_schema.py` | Foundation schema dependency used by `sqlite_store.py`. |
 | `predquant/golden_fixtures.py` | Golden fixture matrix parser, starter fixture specs, fail-closed validation harness, and fixture registry/result writers. |
+| `predquant/ads_pipeline_runner.py` | AUTO-001 pipeline control-state, run identity, stage-order, no-live-autostart, and non-executing runner skeleton helpers. |
 | `migrations/001_foundation_persistence_and_artifacts.sql` | Ordered schema migration required by this bundle. |
 | `migrations/006_golden_fixture_harness.sql` | Typed golden fixture registry and result tables for ADS v2 fixture-first integration. |
+| `migrations/008_pipeline_runner_contract.sql` | Minimal AUTO-001 `ads_pipeline_runs` and `ads_pipeline_control_state` schema. |
 | `tests/test_prediction_provenance.py` | Regression coverage for prediction provenance, idempotent recording, stale snapshots, and Brier scoring metadata. |
 
 ## Adding Future Scripts

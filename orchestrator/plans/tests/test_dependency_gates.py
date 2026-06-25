@@ -88,10 +88,12 @@ class DependencyGateTests(unittest.TestCase):
     def test_unready_runtime_integration_is_blocked(self) -> None:
         inv = load_inventory()
         rows = rows_by_id(inv)
-        failures = gates.can_start(rows["AUTO-002"], rows, set(inv["ready_statuses"]), inv["waivers"], "runtime_integration")
-        self.assertIn("AUTO-001 status=not_started", failures)
-        self.assertNotIn("CASE-001 status=not_started", failures)
-        self.assertNotIn("FND-004 status=not_started", failures)
+        failures = gates.can_start(rows["AUTO-003"], rows, set(inv["ready_statuses"]), inv["waivers"], "runtime_integration")
+        self.assertIn("AUTO-002 status=not_started", failures)
+        self.assertIn("CLS-001 status=not_started", failures)
+        self.assertIn("SCAE-012 status=not_started", failures)
+        self.assertNotIn("CASE-002 status=not_started", failures)
+        self.assertNotIn("QDT-001 status=not_started", failures)
 
     def test_fixture_mode_allows_start_even_when_runtime_is_blocked(self) -> None:
         inv = load_inventory()
