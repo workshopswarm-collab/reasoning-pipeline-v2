@@ -22,6 +22,7 @@ RESEARCHER_SIDECAR_SCHEMA_VERSION = "researcher-sidecar/v2"
 RESEARCHER_CLASSIFICATION_SCHEMA_VERSION = "researcher-classification/v1"
 RESEARCHER_COVERAGE_PROOF_SCHEMA_VERSION = "researcher-coverage-proof/v1"
 CLS_001_CONTRACT_BUILDER_VERSION = "ads-cls-001-researcher-nli-prompt-contract/v1"
+CLS_002_SIDECAR_VALIDATOR_VERSION = "ads-cls-002-no-probability-sidecar/v1"
 
 ALLOWED_CLASSIFICATION_DISPATCH_STATUS = "allowed"
 FORBIDDEN_OUTPUT_FIELDS = (
@@ -42,6 +43,68 @@ FORBIDDEN_CONTEXT_REF_PATTERNS = (
     "outcome-scoring:*",
     "aggregate-research-summary:*",
 )
+FORBIDDEN_V2_SIDECAR_FIELDS = (
+    "own_probability",
+    "leaf_probability",
+    "researcher_reassembled_probability",
+    "researcher_macro_probability",
+    "macro_probability",
+    "final_macro_probability",
+    "forecast_probability",
+    "production_probability",
+    "probability",
+    "probability_estimate",
+    "probability_yes",
+    "probability_no",
+    "probability_interval",
+    "prob",
+    "p_yes",
+    "p_no",
+    "replacement_probability",
+    "replacement_probability_yes",
+    "replacement_probability_no",
+    "replacement_forecast",
+    "replacement_decision",
+    "fair_value",
+    "fair_value_low",
+    "fair_value_mid",
+    "fair_value_high",
+    "interval",
+    "odds",
+    "log_odds",
+    "confidence",
+    "confidence_score",
+    "confidence_as_probability",
+    "probability_confidence",
+    "confidence_probability",
+)
+FORBIDDEN_V2_SIDECAR_KEY_FRAGMENTS = (
+    "probability",
+    "fair_value",
+    "replacement",
+    "log_odds",
+)
+ALLOWED_FALSE_AUTHORITY_BOUNDARY_FIELDS = {
+    "model_outputs_may_author_probability",
+    "probability_authority",
+}
+ALLOWED_IMPACT_DIRECTIONS = {"supports_yes", "supports_no", "neutral"}
+ALLOWED_EVIDENCE_STRENGTHS = {"definitive", "strong", "moderate", "weak", "none", "unanswerable"}
+ALLOWED_CLASSIFICATION_CONFIDENCES = {"high", "medium", "low"}
+ALLOWED_LEAF_CONDITION_SCOPES = {
+    "unconditional",
+    "conditional",
+    "branch_local",
+    "target_given_upstream",
+    "target_given_not_upstream",
+    "shared_context",
+}
+ALLOWED_SOURCE_AUTHORITY_VALUES = {"high", "medium", "low", "unknown"}
+ALLOWED_DIRECTNESS_VALUES = {"direct", "indirect", "background", "unknown"}
+ALLOWED_RECENCY_VALUES = {"fresh", "stale", "timeless", "unknown"}
+ALLOWED_SPECIFICITY_VALUES = {"specific", "general", "ambiguous", "unknown"}
+ALLOWED_VALUE_NORMALIZATION_STATUSES = {"parsed", "not_applicable", "failed"}
+RESEARCHER_LEAF_NLI_MODEL_LANE_ID = "researcher_leaf_nli_classification"
 
 RESEARCHER_NLI_PROMPT_TEMPLATE = """You are a leaf evidence classification researcher.
 
@@ -78,6 +141,10 @@ class ClassificationPromptContractError(ValueError):
     """Raised when a CLS-001 prompt contract cannot be built or validated."""
 
 
+class ResearcherSidecarError(ValueError):
+    """Raised when a CLS-002 sidecar artifact cannot be built or validated."""
+
+
 @dataclass(frozen=True)
 class ClassificationPromptValidationResult:
     valid: bool
@@ -90,6 +157,21 @@ class ClassificationPromptValidationResult:
             "errors": list(self.errors),
             "warnings": list(self.warnings),
             "validator_version": CLS_001_CONTRACT_BUILDER_VERSION,
+        }
+
+
+@dataclass(frozen=True)
+class ResearcherSidecarValidationResult:
+    valid: bool
+    errors: tuple[str, ...]
+    warnings: tuple[str, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "valid": self.valid,
+            "errors": list(self.errors),
+            "warnings": list(self.warnings),
+            "validator_version": CLS_002_SIDECAR_VALIDATOR_VERSION,
         }
 
 
@@ -512,3 +594,584 @@ def validate_researcher_nli_prompt_contract(contract: Any) -> ClassificationProm
         errors.append("prompt_text_sha256 does not match prompt_text")
 
     return ClassificationPromptValidationResult(not errors, tuple(errors))
+
+
+def _normalized_field_name(value: Any) -> str:
+    normalized = "".join(ch.lower() if ch.isalnum() else "_" for ch in str(value))
+    while "__" in normalized:
+        normalized = normalized.replace("__", "_")
+    return normalized.strip("_")
+
+
+def _is_sha256_ref(value: Any) -> bool:
+    if not _is_non_empty_string(value):
+        return False
+    text = str(value)
+    return text.startswith("sha256:") and len(text) == 71 and all(ch in "0123456789abcdef" for ch in text[7:])
+
+
+def _string_refs_from(value: dict[str, Any], *fields: str) -> list[str]:
+    refs: list[str] = []
+    for field in fields:
+        raw = value.get(field)
+        if _is_non_empty_string(raw):
+            refs.append(str(raw))
+        elif isinstance(raw, list):
+            for item in raw:
+                if _is_non_empty_string(item):
+                    refs.append(str(item))
+                elif isinstance(item, dict):
+                    for key in ("evidence_ref", "supplemental_evidence_ref", "artifact_ref", "ref"):
+                        if _is_non_empty_string(item.get(key)):
+                            refs.append(str(item[key]))
+                            break
+    return refs
+
+
+def _classification_evidence_refs(classification: dict[str, Any]) -> list[str]:
+    return _string_refs_from(
+        classification,
+        "evidence_ref",
+        "retrieval_evidence_ref",
+        "supplemental_evidence_ref",
+        "evidence_refs",
+        "retrieval_evidence_refs",
+        "supplemental_evidence_refs",
+    )
+
+
+def _unanswerability_block(classification: dict[str, Any]) -> dict[str, Any]:
+    block = classification.get("unanswerability")
+    if isinstance(block, dict):
+        return block
+    block = classification.get("unanswerable_classification")
+    if isinstance(block, dict):
+        return block
+    return {}
+
+
+def _unanswerability_provenance_refs(classification: dict[str, Any]) -> list[str]:
+    block = _unanswerability_block(classification)
+    refs = _string_refs_from(classification, "provenance_refs", "unanswerability_provenance_refs")
+    refs.extend(_string_refs_from(block, "provenance_refs", "retrieval_gap_refs", "exhausted_expansion_refs"))
+    return refs
+
+
+def _unanswerability_gap_refs(classification: dict[str, Any]) -> list[str]:
+    block = _unanswerability_block(classification)
+    refs = _string_refs_from(
+        classification,
+        "retrieval_gap_refs",
+        "source_gap_flags",
+        "exhausted_expansion_refs",
+        "structural_unanswerability_refs",
+        "requirements_unanswered",
+    )
+    refs.extend(
+        _string_refs_from(
+            block,
+            "retrieval_gap_refs",
+            "source_gap_flags",
+            "exhausted_expansion_refs",
+            "structural_unanswerability_refs",
+            "requirements_unanswered",
+        )
+    )
+    return refs
+
+
+def _unanswerability_rationale(classification: dict[str, Any]) -> str:
+    block = _unanswerability_block(classification)
+    for value in (
+        classification.get("unanswerability_rationale"),
+        classification.get("rationale"),
+        block.get("rationale"),
+    ):
+        if _is_non_empty_string(value):
+            return str(value)
+    return ""
+
+
+def _collect_forbidden_sidecar_fields(value: Any, errors: list[str], path: str = "sidecar") -> None:
+    if isinstance(value, dict):
+        for key, child in value.items():
+            normalized = _normalized_field_name(key)
+            forbidden = False
+            if (
+                path.endswith(".authority_boundary")
+                and normalized in ALLOWED_FALSE_AUTHORITY_BOUNDARY_FIELDS
+                and child is False
+            ):
+                forbidden = False
+            elif normalized == "classification_confidence":
+                forbidden = False
+            elif normalized in FORBIDDEN_V2_SIDECAR_FIELDS:
+                forbidden = True
+            elif any(fragment in normalized for fragment in FORBIDDEN_V2_SIDECAR_KEY_FRAGMENTS):
+                forbidden = True
+            elif normalized.endswith("_interval") or normalized.endswith("_odds"):
+                forbidden = True
+            elif normalized in {"confidence", "confidence_score"}:
+                forbidden = True
+            if forbidden:
+                errors.append(f"{path}.{key} is forbidden in {RESEARCHER_SIDECAR_SCHEMA_VERSION}")
+            _collect_forbidden_sidecar_fields(child, errors, f"{path}.{key}")
+    elif isinstance(value, list):
+        for idx, child in enumerate(value):
+            _collect_forbidden_sidecar_fields(child, errors, f"{path}[{idx}]")
+
+
+def _required_leaf_ids(qdt: Any, errors: list[str]) -> set[str]:
+    if not isinstance(qdt, dict):
+        errors.append("qdt must be an object")
+        return set()
+    if qdt.get("schema_version") != "question-decomposition/v1":
+        errors.append("qdt.schema_version must be question-decomposition/v1")
+    leaves = qdt.get("required_leaf_questions")
+    if not isinstance(leaves, list) or not leaves:
+        errors.append("qdt.required_leaf_questions must be a non-empty list")
+        return set()
+    ids: set[str] = set()
+    for idx, leaf in enumerate(leaves):
+        if not isinstance(leaf, dict) or not _is_non_empty_string(leaf.get("leaf_id")):
+            errors.append(f"qdt.required_leaf_questions[{idx}].leaf_id is required")
+            continue
+        ids.add(str(leaf["leaf_id"]))
+    return ids
+
+
+def _canonical_classification_rows(classifications: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows = [copy.deepcopy(item) for item in classifications]
+    return sorted(
+        rows,
+        key=lambda item: (
+            str(item.get("leaf_id", "")),
+            str(item.get("classification_id", "")),
+            _canonical_json(item),
+        ),
+    )
+
+
+def compute_classification_matrix_digest(classifications: list[dict[str, Any]]) -> str:
+    """Return the deterministic digest CLS-002 requires before CLS-003 materializes rows."""
+
+    return _prefixed_sha256(
+        {
+            "schema_version": "classification-matrix-digest/v1",
+            "classification_schema_version": RESEARCHER_CLASSIFICATION_SCHEMA_VERSION,
+            "classifications": _canonical_classification_rows(classifications),
+        }
+    )
+
+
+def _sidecar_digest_payload(sidecar: dict[str, Any]) -> dict[str, Any]:
+    payload = copy.deepcopy(sidecar)
+    payload.pop("sidecar_digest", None)
+    return payload
+
+
+def compute_researcher_sidecar_digest(sidecar: dict[str, Any]) -> str:
+    return _prefixed_sha256(_sidecar_digest_payload(sidecar))
+
+
+def _validate_model_execution_context(
+    context: Any,
+    errors: list[str],
+    path: str,
+    *,
+    expected_hash: str | None = None,
+) -> None:
+    if not isinstance(context, dict):
+        errors.append(f"{path} must be an object")
+        return
+    for field in (
+        "model_lane_id",
+        "resolved_model_id",
+        "model_policy_ref",
+        "prompt_template_id",
+        "prompt_template_sha256",
+        "sidecar_schema_version",
+        "classification_output_schema_version",
+    ):
+        if not _is_non_empty_string(context.get(field)):
+            errors.append(f"{path}.{field} is required")
+    if context.get("model_lane_id") != RESEARCHER_LEAF_NLI_MODEL_LANE_ID:
+        errors.append(f"{path}.model_lane_id must be {RESEARCHER_LEAF_NLI_MODEL_LANE_ID}")
+    if context.get("prompt_template_id") != RESEARCHER_NLI_PROMPT_TEMPLATE_ID:
+        errors.append(f"{path}.prompt_template_id must be {RESEARCHER_NLI_PROMPT_TEMPLATE_ID}")
+    if not _is_sha256_ref(context.get("prompt_template_sha256")):
+        errors.append(f"{path}.prompt_template_sha256 must be a sha256 ref")
+    if context.get("sidecar_schema_version") != RESEARCHER_SIDECAR_SCHEMA_VERSION:
+        errors.append(f"{path}.sidecar_schema_version must be {RESEARCHER_SIDECAR_SCHEMA_VERSION}")
+    if context.get("classification_output_schema_version") != RESEARCHER_CLASSIFICATION_SCHEMA_VERSION:
+        errors.append(
+            f"{path}.classification_output_schema_version must be {RESEARCHER_CLASSIFICATION_SCHEMA_VERSION}"
+        )
+    if expected_hash and _prefixed_sha256(context) != expected_hash:
+        errors.append(f"{path} does not match model_execution_context_sha256")
+
+
+def _validate_answer_value_extraction(value: Any, errors: list[str], path: str) -> None:
+    if value is None:
+        return
+    if not isinstance(value, dict):
+        errors.append(f"{path} must be an object when present")
+        return
+    status = value.get("normalization_status")
+    if status not in ALLOWED_VALUE_NORMALIZATION_STATUSES:
+        errors.append(f"{path}.normalization_status is invalid")
+
+
+def _validate_evidence_quality_dimensions(value: Any, errors: list[str], path: str) -> None:
+    if not isinstance(value, dict):
+        errors.append(f"{path} must be an object")
+        return
+    expected = {
+        "source_authority": ALLOWED_SOURCE_AUTHORITY_VALUES,
+        "directness": ALLOWED_DIRECTNESS_VALUES,
+        "recency": ALLOWED_RECENCY_VALUES,
+        "specificity": ALLOWED_SPECIFICITY_VALUES,
+    }
+    for field, allowed in expected.items():
+        if value.get(field) not in allowed:
+            errors.append(f"{path}.{field} is invalid")
+
+
+def _validate_coverage_proof(
+    proof: Any,
+    errors: list[str],
+    path: str,
+    required_leaf_ids: set[str],
+) -> None:
+    if not isinstance(proof, dict):
+        errors.append(f"{path} must be an object")
+        return
+    if proof.get("schema_version") != RESEARCHER_COVERAGE_PROOF_SCHEMA_VERSION:
+        errors.append(f"{path}.schema_version must be {RESEARCHER_COVERAGE_PROOF_SCHEMA_VERSION}")
+    for field in (
+        "coverage_proof_id",
+        "leaf_id",
+        "research_sufficiency_certificate_ref",
+        "retrieval_breadth_coverage_ref",
+    ):
+        if not _is_non_empty_string(proof.get(field)):
+            errors.append(f"{path}.{field} is required")
+    if _is_non_empty_string(proof.get("leaf_id")) and str(proof["leaf_id"]) not in required_leaf_ids:
+        errors.append(f"{path}.leaf_id is not a required QDT leaf")
+    if proof.get("machine_readability_status") != "schema_valid":
+        errors.append(f"{path}.machine_readability_status must be schema_valid")
+    for field in (
+        "evidence_refs_assigned",
+        "evidence_refs_reviewed",
+        "source_class_ids_reviewed",
+        "claim_family_ids_reviewed",
+        "source_family_ids_reviewed",
+        "requirements_reviewed",
+        "requirements_answered",
+        "requirements_unanswered",
+        "required_value_fields_extracted",
+        "required_negative_checks_completed",
+        "source_gap_flags",
+    ):
+        if not isinstance(proof.get(field), list):
+            errors.append(f"{path}.{field} must be a list")
+
+
+def _validate_classification(
+    classification: Any,
+    errors: list[str],
+    path: str,
+    required_leaf_ids: set[str],
+    proofs_by_id: dict[str, dict[str, Any]],
+    top_model_context_hash: str,
+    top_model_context_ref: str,
+) -> str | None:
+    if not isinstance(classification, dict):
+        errors.append(f"{path} must be an object")
+        return None
+    if classification.get("schema_version") != RESEARCHER_CLASSIFICATION_SCHEMA_VERSION:
+        errors.append(f"{path}.schema_version must be {RESEARCHER_CLASSIFICATION_SCHEMA_VERSION}")
+    for field in ("classification_id", "leaf_id", "research_sufficiency_certificate_ref", "coverage_proof_ref"):
+        if not _is_non_empty_string(classification.get(field)):
+            errors.append(f"{path}.{field} is required")
+
+    leaf_id = str(classification.get("leaf_id", ""))
+    if leaf_id and leaf_id not in required_leaf_ids:
+        errors.append(f"{path}.leaf_id is not a required QDT leaf")
+
+    scope = classification.get("leaf_condition_scope")
+    if scope not in ALLOWED_LEAF_CONDITION_SCOPES:
+        errors.append(f"{path}.leaf_condition_scope is invalid")
+    impact_direction = classification.get("impact_direction")
+    if impact_direction not in ALLOWED_IMPACT_DIRECTIONS:
+        errors.append(f"{path}.impact_direction is invalid")
+    evidence_strength = classification.get("evidence_strength")
+    if evidence_strength not in ALLOWED_EVIDENCE_STRENGTHS:
+        errors.append(f"{path}.evidence_strength is invalid")
+    if classification.get("classification_confidence") not in ALLOWED_CLASSIFICATION_CONFIDENCES:
+        errors.append(f"{path}.classification_confidence is invalid")
+
+    model_context_ref = classification.get("model_execution_context_ref", top_model_context_ref)
+    if not _is_non_empty_string(model_context_ref):
+        errors.append(f"{path}.model_execution_context_ref is required")
+    elif model_context_ref != top_model_context_ref:
+        errors.append(f"{path}.model_execution_context_ref must match sidecar.model_execution_context_ref")
+    model_context_hash = classification.get("model_execution_context_sha256", top_model_context_hash)
+    if model_context_hash != top_model_context_hash:
+        errors.append(f"{path}.model_execution_context_sha256 must match sidecar.model_execution_context_sha256")
+    _validate_model_execution_context(
+        classification.get("model_execution_context"),
+        errors,
+        f"{path}.model_execution_context",
+        expected_hash=top_model_context_hash,
+    )
+
+    evidence_refs = _classification_evidence_refs(classification)
+    if not evidence_refs:
+        errors.append(f"{path} must include retrieval evidence refs or supplemental evidence refs")
+    _validate_answer_value_extraction(classification.get("answer_value_extraction"), errors, f"{path}.answer_value_extraction")
+    _validate_evidence_quality_dimensions(
+        classification.get("evidence_quality_dimensions"),
+        errors,
+        f"{path}.evidence_quality_dimensions",
+    )
+    if not isinstance(classification.get("provenance_refs", []), list):
+        errors.append(f"{path}.provenance_refs must be a list")
+
+    is_unanswerable = evidence_strength == "unanswerable"
+    if is_unanswerable:
+        if impact_direction != "neutral":
+            errors.append(f"{path}.impact_direction must be neutral for unanswerable classifications")
+        if not _unanswerability_rationale(classification):
+            errors.append(f"{path}.unanswerability.rationale is required")
+        if not _unanswerability_provenance_refs(classification):
+            errors.append(f"{path}.unanswerability.provenance_refs is required")
+        if not _unanswerability_gap_refs(classification):
+            errors.append(f"{path}.unanswerability gap refs or flags are required")
+
+    proof_ref = classification.get("coverage_proof_ref")
+    proof = proofs_by_id.get(str(proof_ref)) if _is_non_empty_string(proof_ref) else None
+    if not proof:
+        errors.append(f"{path}.coverage_proof_ref does not match a coverage proof")
+        return leaf_id or None
+    if proof.get("leaf_id") != leaf_id:
+        errors.append(f"{path}.coverage_proof_ref points to a different leaf")
+    if proof.get("research_sufficiency_certificate_ref") != classification.get("research_sufficiency_certificate_ref"):
+        errors.append(f"{path}.coverage_proof_ref has a different research_sufficiency_certificate_ref")
+    reviewed_refs = set(
+        _string_refs_from(
+            proof,
+            "evidence_refs_reviewed",
+            "supplemental_evidence_refs_reviewed",
+            "provenance_refs_reviewed",
+        )
+    )
+    missing_reviewed = sorted(set(evidence_refs) - reviewed_refs)
+    if missing_reviewed:
+        errors.append(f"{path}.coverage_proof_ref missing reviewed refs: {', '.join(missing_reviewed)}")
+    if is_unanswerable and proof.get("structural_unanswerability_acknowledged") is not True:
+        errors.append(f"{path}.coverage_proof_ref must acknowledge structural unanswerability")
+    return leaf_id or None
+
+
+def build_researcher_sidecar_v2(
+    *,
+    qdt: dict[str, Any],
+    required_question_classifications: list[dict[str, Any]],
+    coverage_proofs: list[dict[str, Any]],
+    model_execution_context_ref: str,
+    model_execution_context: dict[str, Any],
+    market_constraints_digest: str | None = None,
+    supplemental_evidence_refs: list[str] | None = None,
+) -> dict[str, Any]:
+    """Build a deterministic CLS-002 sidecar artifact around supplied rows."""
+
+    if not isinstance(required_question_classifications, list):
+        raise ResearcherSidecarError("required_question_classifications must be a list")
+    if not isinstance(coverage_proofs, list):
+        raise ResearcherSidecarError("coverage_proofs must be a list")
+    model_context_sha256 = _prefixed_sha256(model_execution_context)
+    classifications = []
+    for item in required_question_classifications:
+        classification = copy.deepcopy(item)
+        classification.setdefault("schema_version", RESEARCHER_CLASSIFICATION_SCHEMA_VERSION)
+        classification.setdefault("model_execution_context_ref", model_execution_context_ref)
+        classification.setdefault("model_execution_context_sha256", model_context_sha256)
+        classification.setdefault("model_execution_context", copy.deepcopy(model_execution_context))
+        classification.setdefault(
+            "classification_id",
+            _sha_id(
+                "researcher-classification",
+                {
+                    "case_id": qdt.get("case_id"),
+                    "dispatch_id": qdt.get("dispatch_id"),
+                    "leaf_id": classification.get("leaf_id"),
+                    "evidence_refs": _classification_evidence_refs(classification),
+                    "impact_direction": classification.get("impact_direction"),
+                    "evidence_strength": classification.get("evidence_strength"),
+                },
+            ),
+        )
+        classifications.append(classification)
+
+    proofs = []
+    for item in coverage_proofs:
+        proof = copy.deepcopy(item)
+        proof.setdefault("schema_version", RESEARCHER_COVERAGE_PROOF_SCHEMA_VERSION)
+        proofs.append(proof)
+
+    matrix_digest = compute_classification_matrix_digest(classifications)
+    market_digest = (
+        market_constraints_digest
+        or qdt.get("market_reality_constraints_digest")
+        or (qdt.get("market_context") if isinstance(qdt.get("market_context"), dict) else {}).get(
+            "market_reality_constraints_digest"
+        )
+    )
+    seed = {
+        "case_id": qdt.get("case_id"),
+        "dispatch_id": qdt.get("dispatch_id"),
+        "market_constraints_digest": market_digest,
+        "classification_matrix_digest": matrix_digest,
+        "model_execution_context_sha256": model_context_sha256,
+        "classification_ids": [item.get("classification_id") for item in _canonical_classification_rows(classifications)],
+    }
+    sidecar = {
+        "artifact_type": "researcher_sidecar",
+        "schema_version": RESEARCHER_SIDECAR_SCHEMA_VERSION,
+        "feature_id": "CLS-002",
+        "validator_version": CLS_002_SIDECAR_VALIDATOR_VERSION,
+        "sidecar_id": _sha_id("researcher-sidecar", seed),
+        "case_id": qdt.get("case_id"),
+        "dispatch_id": qdt.get("dispatch_id"),
+        "market_constraints_digest": market_digest,
+        "classification_matrix_digest": matrix_digest,
+        "model_execution_context_ref": model_execution_context_ref,
+        "model_execution_context_sha256": model_context_sha256,
+        "sidecar_contract_ref": "schema:researcher-sidecar/v2",
+        "classification_contract_ref": "schema:researcher-classification/v1",
+        "coverage_contract_ref": "schema:researcher-coverage-proof/v1",
+        "required_question_classifications": classifications,
+        "coverage_proofs": proofs,
+        "supplemental_evidence_refs": list(supplemental_evidence_refs or []),
+        "scope_boundaries": {
+            "implements": ["CLS-002"],
+            "not_implemented": ["CLS-003", "CLS-006", "CLS-007", "MODEL-003", "VER", "SCAE"],
+        },
+    }
+    sidecar["sidecar_digest"] = compute_researcher_sidecar_digest(sidecar)
+    validation = validate_researcher_sidecar_v2(sidecar, qdt)
+    if not validation.valid:
+        raise ResearcherSidecarError("; ".join(validation.errors))
+    return sidecar
+
+
+def validate_researcher_sidecar_v2(sidecar: Any, qdt: Any) -> ResearcherSidecarValidationResult:
+    """Validate the CLS-002 no-probability researcher sidecar contract."""
+
+    errors: list[str] = []
+    if not isinstance(sidecar, dict):
+        return ResearcherSidecarValidationResult(False, ("sidecar must be an object",))
+    _collect_forbidden_sidecar_fields(sidecar, errors)
+    required_leaf_ids = _required_leaf_ids(qdt, errors)
+
+    if sidecar.get("artifact_type") != "researcher_sidecar":
+        errors.append("artifact_type must be researcher_sidecar")
+    if sidecar.get("schema_version") != RESEARCHER_SIDECAR_SCHEMA_VERSION:
+        errors.append(f"schema_version must be {RESEARCHER_SIDECAR_SCHEMA_VERSION}")
+    if sidecar.get("sidecar_contract_ref") != "schema:researcher-sidecar/v2":
+        errors.append("sidecar_contract_ref must be schema:researcher-sidecar/v2")
+    if sidecar.get("classification_contract_ref") != "schema:researcher-classification/v1":
+        errors.append("classification_contract_ref must be schema:researcher-classification/v1")
+    if sidecar.get("coverage_contract_ref") != "schema:researcher-coverage-proof/v1":
+        errors.append("coverage_contract_ref must be schema:researcher-coverage-proof/v1")
+    for field in ("sidecar_id", "case_id", "dispatch_id", "market_constraints_digest"):
+        if not _is_non_empty_string(sidecar.get(field)):
+            errors.append(f"{field} is required")
+
+    if isinstance(qdt, dict):
+        if _is_non_empty_string(qdt.get("case_id")) and sidecar.get("case_id") != qdt.get("case_id"):
+            errors.append("case_id must match qdt.case_id")
+        if _is_non_empty_string(qdt.get("dispatch_id")) and sidecar.get("dispatch_id") != qdt.get("dispatch_id"):
+            errors.append("dispatch_id must match qdt.dispatch_id")
+        qdt_market_digest = qdt.get("market_reality_constraints_digest")
+        if not _is_non_empty_string(qdt_market_digest) and isinstance(qdt.get("market_context"), dict):
+            qdt_market_digest = qdt["market_context"].get("market_reality_constraints_digest")
+        if _is_non_empty_string(qdt_market_digest) and sidecar.get("market_constraints_digest") != qdt_market_digest:
+            errors.append("market_constraints_digest must match qdt market constraints digest")
+
+    model_context_ref = sidecar.get("model_execution_context_ref")
+    if not _is_non_empty_string(model_context_ref):
+        errors.append("model_execution_context_ref is required")
+        model_context_ref = ""
+    model_context_hash = sidecar.get("model_execution_context_sha256")
+    if not _is_sha256_ref(model_context_hash):
+        errors.append("model_execution_context_sha256 must be a sha256 ref")
+        model_context_hash = ""
+    if isinstance(sidecar.get("model_execution_context"), dict) and model_context_hash:
+        _validate_model_execution_context(
+            sidecar["model_execution_context"],
+            errors,
+            "model_execution_context",
+            expected_hash=str(model_context_hash),
+        )
+
+    classifications = sidecar.get("required_question_classifications")
+    if not isinstance(classifications, list) or not classifications:
+        errors.append("required_question_classifications must be a non-empty list")
+        classifications = []
+    proofs = sidecar.get("coverage_proofs")
+    if not isinstance(proofs, list) or not proofs:
+        errors.append("coverage_proofs must be a non-empty list")
+        proofs = []
+
+    proofs_by_id: dict[str, dict[str, Any]] = {}
+    for idx, proof in enumerate(proofs):
+        _validate_coverage_proof(proof, errors, f"coverage_proofs[{idx}]", required_leaf_ids)
+        if isinstance(proof, dict) and _is_non_empty_string(proof.get("coverage_proof_id")):
+            proof_id = str(proof["coverage_proof_id"])
+            if proof_id in proofs_by_id:
+                errors.append(f"coverage_proofs[{idx}].coverage_proof_id is duplicated")
+            proofs_by_id[proof_id] = proof
+
+    covered_leaf_ids: set[str] = set()
+    for idx, classification in enumerate(classifications):
+        leaf_id = _validate_classification(
+            classification,
+            errors,
+            f"required_question_classifications[{idx}]",
+            required_leaf_ids,
+            proofs_by_id,
+            str(model_context_hash),
+            str(model_context_ref),
+        )
+        if leaf_id:
+            covered_leaf_ids.add(leaf_id)
+
+    missing_leaf_ids = sorted(required_leaf_ids - covered_leaf_ids)
+    if missing_leaf_ids:
+        errors.append("classification_coverage_missing: " + ", ".join(missing_leaf_ids))
+
+    matrix_digest = sidecar.get("classification_matrix_digest")
+    if not _is_sha256_ref(matrix_digest):
+        errors.append("classification_matrix_digest must be a sha256 ref")
+    elif isinstance(classifications, list):
+        expected_matrix_digest = compute_classification_matrix_digest(
+            [item for item in classifications if isinstance(item, dict)]
+        )
+        if matrix_digest != expected_matrix_digest:
+            errors.append("classification_matrix_digest does not match classifications")
+
+    sidecar_digest = sidecar.get("sidecar_digest")
+    if not _is_sha256_ref(sidecar_digest):
+        errors.append("sidecar_digest must be a sha256 ref")
+    elif sidecar_digest != compute_researcher_sidecar_digest(sidecar):
+        errors.append("sidecar_digest does not match sidecar payload")
+
+    return ResearcherSidecarValidationResult(not errors, tuple(errors))
+
+
+def validate_sidecar_v2(sidecar: Any, qdt: Any) -> ResearcherSidecarValidationResult:
+    """Compatibility alias matching the Session 4 plan pseudocode."""
+
+    return validate_researcher_sidecar_v2(sidecar, qdt)

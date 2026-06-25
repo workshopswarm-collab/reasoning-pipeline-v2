@@ -18,7 +18,7 @@ leaf-research preparation, and downstream classification/verification helpers.
 - `researcher_swarm/retrieval.py`: `RET-001` retrieval packet schema and deterministic query planning.
 - `researcher_swarm/retrieval_quality.py`: `RET-003` deterministic retrieval quality slice/report scoring over `retrieval-packet/v1`.
 - `researcher_swarm/model_preflight.py`: `RET-007` report-only local embedding/reranker preflight and resource-cap diagnostics.
-- `researcher_swarm/classification.py`: `CLS-001` fail-closed researcher NLI classification prompt contract rendering over finalized `retrieval-packet/v1` dispatch artifacts.
+- `researcher_swarm/classification.py`: `CLS-001` fail-closed researcher NLI classification prompt contract rendering over finalized `retrieval-packet/v1` dispatch artifacts; `CLS-002` deterministic `researcher-sidecar/v2` builder/validator with recursive no-probability enforcement, leaf coverage checks, coverage proof checks, sufficiency certificate refs, digest refs, and model execution context metadata checks.
 - `researcher_swarm/model_context.py`: `MODEL-003` deterministic metadata-only researcher leaf NLI model lane resolution for `gpt-5.5-high`.
 - `bin/build_retrieval_packet.py`: builds a schema-only `retrieval-packet/v1` from a validated QDT.
 
