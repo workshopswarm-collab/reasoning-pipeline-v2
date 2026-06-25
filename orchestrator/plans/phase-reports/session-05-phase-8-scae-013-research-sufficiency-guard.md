@@ -1,0 +1,14 @@
+# Session 05 Phase 8: SCAE-013 Research Sufficiency Guard
+
+- Session: 05 SCAE, Synthesis/Decision Handoff, and Evaluator Spine
+- Phase: 8 first slice
+- Owner: Session 5
+- Feature IDs: `SCAE-013`
+- Migration Groups: `MIG-007`
+- Status: ready_for_integration pending coordinator review and inventory reconciliation
+- Acceptance Evidence: Implemented deterministic SCAE-owned research sufficiency intake and forecast-validity guard in `/Users/agent2/.openclaw/SCAE/scripts/scae/ledger.py`. The guard consumes Session 4 `VER-004` research sufficiency reconciliation slices, requires every SCAE-bound QDT leaf to be `scae_ready_high_certainty` or policy-permitted `structurally_unanswerable`, requires high-certainty leaves to carry retrieval breadth profile and coverage refs with certified breadth, requires completed required escalation decisions, records certificate/reconciliation/breadth/escalation refs, blocked leaves, structurally unanswerable leaves, policy snapshot IDs, and interval/debug insufficiency components, and annotates SCAE-011 pre-debt ledgers with `forecast_validity_status` only. Outputs explicitly do not apply calibration debt, create debt-adjusted/canonical/production forecast probabilities, persist forecasts, write decisions, replay scoring, or calibration tuning promotions.
+- Checks Run: `python3 orchestrator/plans/check_dependency_gates.py` PASS; `python3 orchestrator/plans/check_dependency_gates.py --feature-id SCAE-013 --mode runtime_integration --report-only` PASS; `python3 -m unittest discover -s orchestrator/plans/tests` PASS (13 tests); `python3 -m unittest discover -s orchestrator/scripts/tests` PASS (115 tests); `PYTHONPATH=SCAE/scripts python3 -m unittest discover -s SCAE/scripts/tests` PASS (71 tests); focused `PYTHONPATH=SCAE/scripts python3 -m unittest SCAE/scripts/tests/test_scae_ledger.py` PASS (7 tests); `git diff --check` PASS; `git diff --cached --check` PASS.
+- Shared Inventory Updates Requested: Mark `SCAE-013` `ready_for_integration` with acceptance evidence summarizing deterministic VER-004 sufficiency intake, high-certainty and structural-unanswerability validity transitions, breadth and escalation guards, replay/tuning refs, insufficiency debug components, and no calibration-debt/final probability/persistence/decision authority. After reconciliation, `SCAE-012` should become newly dependency-ready.
+- Shared Map/Matrix Updates Requested: No direct shared map edits requested. `BLK-026`, `BLK-028`, `BLK-035`, `BLK-037`, `BLK-038`, and `BLK-039` now have SCAE-013 implementation evidence but should be reconciled by Session 1/coordinator with their owning fixture/static validation rows.
+- Blockers: No implementation blocker for `SCAE-013`. Downstream `SCAE-012`, persistence, scoring, and calibration remain out of scope until coordinator reconciliation.
+- Commit SHA: Pending final detached-HEAD commit.
