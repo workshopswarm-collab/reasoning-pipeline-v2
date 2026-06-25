@@ -16,6 +16,8 @@ leaf-research preparation, and downstream classification/verification helpers.
 ## Implemented Surface
 
 - `researcher_swarm/retrieval.py`: `RET-001` retrieval packet schema and deterministic query planning.
+- `researcher_swarm/retrieval_quality.py`: `RET-003` deterministic retrieval quality slice/report scoring over `retrieval-packet/v1`.
+- `researcher_swarm/model_preflight.py`: `RET-007` report-only local embedding/reranker preflight and resource-cap diagnostics.
 - `bin/build_retrieval_packet.py`: builds a schema-only `retrieval-packet/v1` from a validated QDT.
 
 ## Expected Future Entrypoints

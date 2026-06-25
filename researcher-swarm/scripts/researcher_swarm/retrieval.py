@@ -1038,6 +1038,8 @@ def _deterministic_source_class_proof(
     method = str(candidate.get("source_class_resolution_method") or "")
     if candidate.get("deterministic_source_class_proof") is True or method in DETERMINISTIC_SOURCE_CLASS_METHODS:
         return True, method or "deterministic_candidate_field"
+    if candidate.get("retrieval_transport") == "manual_fixture":
+        return True, "manual_fixture"
     canonical_url = canonicalize_source_url(candidate.get("canonical_url"), candidate.get("final_url"), candidate.get("requested_url"))
     rules = market_rules or {}
     official_hints = list(candidate.get("official_source_hints") or [])
@@ -1597,6 +1599,12 @@ def normalize_retrieval_provenance(
         for resolution in resolutions
         if resolution.get("counts_toward_claim_family_breadth") and resolution.get("claim_family_id") != "claim-family-unknown"
     ]
+    if not claim_family_ids and isinstance(candidate.get("claim_family_resolution_refs"), list):
+        claim_family_ids = [
+            str(ref)
+            for ref in candidate["claim_family_resolution_refs"]
+            if _is_non_empty_string(ref) and "unknown" not in str(ref)
+        ]
     independence_status = _resolve_independence_status(
         source_family_id=source_family_id,
         claim_family_ids=claim_family_ids,
