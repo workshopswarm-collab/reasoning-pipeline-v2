@@ -1,0 +1,21 @@
+# Session 05 SYN-001: Qualitative Synthesis Annotation
+
+- Session: 05
+- Phase: SYN-001
+- Owner: Session 5
+- Feature IDs: `SYN-001`
+- Migration Groups: none
+- Status: local implementation complete; push held for coordinator review
+- Acceptance Evidence: Implemented deterministic post-SCAE qualitative synthesis annotation in `/Users/agent2/.openclaw/orchestrator/scripts/predquant/synthesis_annotation.py` with CLI entrypoint `/Users/agent2/.openclaw/orchestrator/scripts/bin/run_synthesis_annotation.py`. The artifact consumes SCAE ledger refs/statuses plus classification and research summaries as qualitative inputs only, records SCAE context by reference/digest, and emits non-authoritative qualitative annotations with all live forecast, probability, decision, persistence, and scoring authority flags false. The contract rejects synthesis-authored probability fields/ranges, fair value, interval overrides, SCAE deltas, canonical or production probability fields, decision/actionability overrides, persistence writes, scoreable forecast outputs, and numeric probability language. No `DEC-001`, `PERSIST-*`, `MIG-008`, scoring, calibration, production forecast persistence, or shared inventory/map updates are implemented in this slice.
+- Checks Run:
+  - `python3 orchestrator/plans/check_dependency_gates.py` -> `inventory valid`
+  - `python3 orchestrator/plans/check_dependency_gates.py --feature-id SYN-001 --mode runtime_integration --report-only` -> `OK SYN-001 mode=runtime_integration`
+  - `python3 -m unittest discover -s orchestrator/plans/tests` -> 13 tests, OK
+  - `python3 -m unittest discover -s orchestrator/scripts/tests` -> 125 tests, OK
+  - `python3 -m unittest orchestrator/scripts/tests/test_synthesis_annotation.py` -> 6 tests, OK
+  - `git diff --check` -> OK
+  - `git diff --cached --check` -> OK
+- Shared Inventory Updates Requested: Mark `SYN-001` `ready_for_integration` after coordinator review, with acceptance evidence covering qualitative-only annotation, SCAE-owned numeric context by reference, forbidden probability/decision/persistence/scoring outputs, and no post-SCAE authority expansion. After reconciliation, `DEC-001` should remain the next legal Session 5 dispatch; `PERSIST-001`, `PERSIST-002`, and `MIG-008` remain blocked by later decision/persistence rows.
+- Shared Map/Matrix Updates Requested: No direct edits. Reconcile any blocker evidence for `BLK-001` no non-SCAE probability authorship if coordinator chooses to record this implementation as supporting evidence.
+- Blockers: No implementation blocker. Push is held for the coordinator window.
+- Commit SHA: Pending final detached-HEAD commit.
