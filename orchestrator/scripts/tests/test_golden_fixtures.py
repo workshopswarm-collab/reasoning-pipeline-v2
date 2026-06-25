@@ -15,6 +15,7 @@ from predquant.golden_fixtures import (
     build_fixture_registry,
     run_fixture_case,
 )
+from predquant.training_trace import TRAINING_TRACE_MINIMAL_TABLE
 
 
 class GoldenFixturesTest(unittest.TestCase):
@@ -71,6 +72,25 @@ class GoldenFixturesTest(unittest.TestCase):
         report = json.loads((self.output_dir / "FIX-001" / "FIX-001-result-report.json").read_text(encoding="utf-8"))
         self.assertEqual(report["schema_version"], GOLDEN_FIXTURE_RESULT_SCHEMA_VERSION)
         self.assertEqual(report["status"], "passed")
+        self.assertIn("training_trace_id", report["metadata"])
+
+        trace_rows = self.conn.execute(
+            f"""
+            SELECT trace_id, case_id, dispatch_id, run_id, forecast_timestamp,
+                   artifact_manifest_ids, artifact_hashes, trace_status,
+                   live_authority, live_forecast_authority
+            FROM {TRAINING_TRACE_MINIMAL_TABLE}
+            WHERE case_id = ? AND run_id = ?
+            """,
+            (result.case_id, result.run_id),
+        ).fetchall()
+        self.assertEqual(len(trace_rows), 1)
+        trace_row = trace_rows[0]
+        self.assertEqual(trace_row[0], report["metadata"]["training_trace_id"])
+        self.assertEqual(trace_row[1:5], (result.case_id, result.dispatch_id, result.run_id, result.started_at))
+        self.assertEqual(json.loads(trace_row[5]), result.artifact_manifest_ids[:-1])
+        self.assertEqual(set(json.loads(trace_row[6])), set(result.artifact_manifest_ids[:-1]))
+        self.assertEqual(trace_row[7:], ("minimal_pointer_written", "none", 0))
 
     def test_missing_artifact_fails_closed_with_error_event(self):
         result = self.run_fixture("FIX-001", simulate_missing_artifact_stage="retrieval")
@@ -136,7 +156,7 @@ class GoldenFixturesTest(unittest.TestCase):
         self.assertEqual(error_row[0], "blocked")
         blocking_feature_ids = json.loads(error_row[1])["blocking_feature_ids"]
         self.assertTrue(blocking_feature_ids)
-        self.assertIn("RET-001", blocking_feature_ids)
+        self.assertIn("CLS-002", blocking_feature_ids)
 
 
 if __name__ == "__main__":

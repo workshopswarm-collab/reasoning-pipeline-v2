@@ -1017,20 +1017,34 @@ CREATE INDEX IF NOT EXISTS idx_launch_gate_results_case
   ON launch_gate_results(case_id, created_at);
 
 CREATE TABLE IF NOT EXISTS training_trace_minimal_pointers (
-  trace_pointer_id TEXT PRIMARY KEY,
+  trace_id TEXT PRIMARY KEY,
+  schema_version TEXT NOT NULL,
   case_id TEXT NOT NULL,
+  case_key TEXT,
+  dispatch_id TEXT NOT NULL,
   market_id TEXT,
   run_id TEXT NOT NULL,
+  forecast_timestamp TEXT NOT NULL,
+  artifact_manifest_ids TEXT NOT NULL DEFAULT '[]',
+  artifact_hashes TEXT NOT NULL DEFAULT '{}',
+  trace_status TEXT NOT NULL,
+  live_authority TEXT NOT NULL,
+  live_forecast_authority INTEGER NOT NULL DEFAULT 0,
+  materialization_status TEXT NOT NULL,
+  trace_pointer_id TEXT,
   pointer_artifact_id TEXT NOT NULL,
   stage_status_snapshot_ids TEXT NOT NULL DEFAULT '[]',
   forecast_authority TEXT NOT NULL,
-  materialization_status TEXT NOT NULL,
   created_at TEXT NOT NULL,
-  metadata TEXT NOT NULL DEFAULT '{}'
+  metadata TEXT NOT NULL DEFAULT '{}',
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE INDEX IF NOT EXISTS idx_training_trace_minimal_case
-  ON training_trace_minimal_pointers(case_id, run_id);
+  ON training_trace_minimal_pointers(case_id, dispatch_id, run_id);
+
+CREATE INDEX IF NOT EXISTS idx_training_trace_minimal_status
+  ON training_trace_minimal_pointers(trace_status, materialization_status);
 
 CREATE TABLE IF NOT EXISTS training_trace_full_materializations (
   trace_materialization_id TEXT PRIMARY KEY,

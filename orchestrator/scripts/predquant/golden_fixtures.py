@@ -36,6 +36,11 @@ from .ads_stage_logging import (
     write_stage_execution_event,
     write_stage_status_snapshot,
 )
+from .training_trace import (
+    TrainingTraceContext,
+    build_minimal_training_trace,
+    write_minimal_training_trace,
+)
 
 
 GOLDEN_FIXTURE_REGISTRY_TABLE = "golden_fixture_case_registry"
@@ -1170,6 +1175,49 @@ def write_result_report_artifact(conn: sqlite3.Connection, result: FixtureRunRes
     return artifact_id
 
 
+def artifact_manifest_refs_for_trace(conn: sqlite3.Connection, result: FixtureRunResult) -> list[dict[str, str]]:
+    if not result.artifact_manifest_ids:
+        raise GoldenFixtureError(f"{result.fixture_id}: training trace requires artifact manifest IDs")
+    placeholders = ", ".join("?" for _ in result.artifact_manifest_ids)
+    rows = conn.execute(
+        f"""
+        SELECT artifact_id, artifact_sha256
+        FROM case_artifact_manifest
+        WHERE artifact_id IN ({placeholders})
+        """,
+        tuple(result.artifact_manifest_ids),
+    ).fetchall()
+    hashes_by_id = {artifact_id: artifact_sha256 for artifact_id, artifact_sha256 in rows}
+    missing = [artifact_id for artifact_id in result.artifact_manifest_ids if artifact_id not in hashes_by_id]
+    if missing:
+        raise GoldenFixtureError(f"{result.fixture_id}: missing artifact hashes for trace pointer: {missing}")
+    return [{"artifact_id": artifact_id, "sha256": hashes_by_id[artifact_id]} for artifact_id in result.artifact_manifest_ids]
+
+
+def write_fixture_training_trace_pointer(conn: sqlite3.Connection, result: FixtureRunResult) -> str | None:
+    if result.fixture_id != "FIX-001" or result.status != "passed":
+        return None
+    trace = build_minimal_training_trace(
+        context=TrainingTraceContext(
+            case_id=result.case_id,
+            case_key=result.case_key,
+            dispatch_id=result.dispatch_id,
+            run_id=result.run_id,
+            forecast_timestamp=result.started_at,
+        ),
+        artifact_manifests=artifact_manifest_refs_for_trace(conn, result),
+        metadata={
+            "fixture_id": result.fixture_id,
+            "fixture_result_id": result.fixture_result_id,
+            "harness_version": GOLDEN_FIXTURE_HARNESS_VERSION,
+            "minimal_pointer_only": True,
+        },
+    )
+    trace_id = write_minimal_training_trace(conn, trace)
+    result.metadata["training_trace_id"] = trace_id
+    return trace_id
+
+
 def run_fixture_case(
     fixture_id: str,
     *,
@@ -1227,6 +1275,7 @@ def run_fixture_case(
         if not should_continue:
             break
     result.completed_at = utc_now_iso()
+    write_fixture_training_trace_pointer(conn, result)
     write_result_report_artifact(conn, result, output_dir)
     write_fixture_result(conn, result)
     return result
