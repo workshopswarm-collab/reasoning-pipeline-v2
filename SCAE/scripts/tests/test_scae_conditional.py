@@ -96,7 +96,7 @@ class ScaeConditionalBranchTest(unittest.TestCase):
             "amrg_anchor_dependency_contracts": [copy.deepcopy(contract or self.contract())],
         }
 
-    def amrg_anchor(self, *, validation_status="validated", relationship_status=None, reason_codes=None):
+    def amrg_anchor(self, *, validation_status="validated", relationship_status=None, reason_codes=None, **extra):
         anchor = {
             "prior_anchor_slice_id": "amrg-prior-anchor:edge-1",
             "edge_id": "edge-1",
@@ -117,6 +117,7 @@ class ScaeConditionalBranchTest(unittest.TestCase):
         }
         if relationship_status is not None:
             anchor["relationship_status"] = relationship_status
+        anchor.update(extra)
         return anchor
 
     def branch_slices(self, *, selected_market_prior_used=False):
@@ -194,7 +195,7 @@ class ScaeConditionalBranchTest(unittest.TestCase):
 
     def test_concurrent_anchor_rejection_remains_audit_only(self):
         anchor = self.amrg_anchor(
-            validation_status="rejected",
+            validation_status="validated",
             relationship_status="timing_mismatch_weak_context_only",
             reason_codes=["concurrent_event_time"],
         )
@@ -209,7 +210,33 @@ class ScaeConditionalBranchTest(unittest.TestCase):
         summary = bundle["conditional_branch_summary"]
         self.assertEqual(summary["conditional_recombined_probability_candidate"], None)
         self.assertIn("concurrent_event_time", summary["reason_codes"])
+        self.assertIn("timing_mismatch_weak_context_only", summary["reason_codes"])
         self.assertEqual(summary["fallback_audit"]["fallback_status"], summary["conditional_recombination_status"])
+
+    def test_cyclic_anchor_status_overrides_generic_validated_fields(self):
+        anchor = self.amrg_anchor(
+            validation_status="validated",
+            reason_codes=["strict_precedence_anchor_validated", "causal_graph_cycle_rejected"],
+            causal_graph_status="blocked_cycle_or_concurrent_timing",
+            cycle_status="cycle_or_concurrent_rejected",
+            causal_edge_role="rejected_strict_precedence_anchor",
+        )
+
+        bundle = build_conditional_branch_recombination_bundle(
+            self.branch_slices(),
+            qdt=self.qdt(),
+            amrg_anchor=anchor,
+            policy=self.policy,
+        )
+
+        summary = bundle["conditional_branch_summary"]
+        self.assertEqual(bundle["conditional_branch_count"], 0)
+        self.assertEqual(summary["conditional_recombined_probability_candidate"], None)
+        self.assertIn("causal_graph_cycle_rejected", summary["reason_codes"])
+        self.assertIn("blocked_cycle_or_concurrent_timing", summary["reason_codes"])
+        self.assertIn("cycle_or_concurrent_rejected", summary["reason_codes"])
+        self.assertIn("rejected_strict_precedence_anchor", summary["reason_codes"])
+        self.assertTrue(summary["conditional_recombination_status"].startswith("rejected_"))
 
     def test_missing_condition_scoped_leaves_are_rejected(self):
         contract = self.contract(condition_scoped_leaf_ids=[])

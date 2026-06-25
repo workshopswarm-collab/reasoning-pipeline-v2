@@ -32,6 +32,29 @@ ALLOWED_REPAIR_EXHAUSTION_POLICIES = {
     "watch_only_if_forecastable",
     "fail_dispatch_preparation",
 }
+BLOCKING_ANCHOR_STATUS_VALUES = {
+    "blocked_cycle_or_concurrent_timing",
+    "cycle_detected",
+    "cycle_or_concurrent_rejected",
+    "cycle_rejected",
+    "cyclic",
+    "rejected",
+    "rejected_strict_precedence_anchor",
+    "timing_mismatch_weak_context_only",
+    "weak_context_only",
+}
+BLOCKING_ANCHOR_REASON_CODES = {
+    "causal_graph_cycle_rejected",
+    "causal_graph_nodes_missing",
+    "concurrent_event_time",
+    "edge_not_strict_precedence_anchor_candidate",
+    "invalid_strict_precedence_event_time",
+    "missing_causal_upstream_relationship",
+    "reflexive_causal_edge_rejected",
+    "strict_precedence_not_proven",
+    "timing_alignment_not_aligned",
+    "upstream_event_not_before_target",
+}
 
 
 class ScaeConditionalBranchError(ValueError):
@@ -183,6 +206,8 @@ def _anchor_contract_rejection_reasons(contract: dict[str, Any] | None, leaves_b
 
 
 def _anchor_is_validated(amrg_anchor: dict[str, Any]) -> bool:
+    if _explicit_anchor_blocker_reasons(amrg_anchor):
+        return False
     status_values = [
         amrg_anchor.get("relationship_status"),
         amrg_anchor.get("edge_status"),
@@ -196,11 +221,43 @@ def _anchor_is_validated(amrg_anchor: dict[str, Any]) -> bool:
     )
 
 
+def _anchor_reason_codes(amrg_anchor: dict[str, Any]) -> list[str]:
+    codes: list[str] = []
+    for field in ("anchor_validation_reason_codes", "reason_codes", "validation_reason_codes"):
+        value = amrg_anchor.get(field)
+        if isinstance(value, list):
+            codes.extend(str(code) for code in value if _is_non_empty_string(code))
+    return sorted(set(codes))
+
+
+def _explicit_anchor_blocker_reasons(amrg_anchor: dict[str, Any]) -> list[str]:
+    reasons: set[str] = set()
+    for field in (
+        "relationship_status",
+        "edge_status",
+        "causal_graph_status",
+        "cycle_status",
+        "causal_edge_role",
+        "anchor_validation_status",
+        "validation_status",
+    ):
+        value = amrg_anchor.get(field)
+        if not _is_non_empty_string(value):
+            continue
+        normalized = str(value).strip()
+        if normalized in BLOCKING_ANCHOR_STATUS_VALUES:
+            reasons.add(normalized)
+    for code in _anchor_reason_codes(amrg_anchor):
+        if code in BLOCKING_ANCHOR_REASON_CODES:
+            reasons.add(code)
+    return sorted(reasons)
+
+
 def _anchor_rejection_reasons(amrg_anchor: dict[str, Any]) -> list[str]:
     if _anchor_is_validated(amrg_anchor):
         return []
-    reason_codes = amrg_anchor.get("anchor_validation_reason_codes") or amrg_anchor.get("reason_codes") or []
-    reasons = [str(reason) for reason in reason_codes if _is_non_empty_string(reason)]
+    reasons = _explicit_anchor_blocker_reasons(amrg_anchor)
+    reasons.extend(_anchor_reason_codes(amrg_anchor))
     status = (
         amrg_anchor.get("relationship_status")
         or amrg_anchor.get("edge_status")
