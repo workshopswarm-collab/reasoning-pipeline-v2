@@ -5,7 +5,7 @@
 - Owner: Session 5
 - Feature IDs: `PERSIST-001`
 - Migration Groups: none
-- Status: implementation complete; push pending final verification
+- Status: pushed; ready for coordinator reconciliation
 - Acceptance Evidence: Implemented deterministic SCAE-only forecast decision persistence in `/Users/agent2/.openclaw/SCAE/scripts/scae/persistence.py` with CLI entrypoint `/Users/agent2/.openclaw/SCAE/scripts/bin/persist_scae_forecast.py`. The new `write_forecast_decision()` path consumes a SCAE final ledger plus a DEC-001 decision/actionability artifact, persists only SCAE-owned `production_forecast_prob` and `canonical_probability` into `forecast_decision_records`, records forecast validity, execution authority, actionability status, SCAE/decision/synthesis refs and digests, stable provenance hashes, and a structured production persistence status. Invalid SCAE forecasts produce a blocked/non-scoreable record without production probability fields. Decision and synthesis context remain non-authoritative: decision-authored replacement probability, probability ranges, fair value, intervals, SCAE deltas, market prediction writes, scoreable forecast output, scoring, and calibration-debt clearance are rejected. No `PERSIST-002`, `MIG-008`, `market_predictions`, replay, scoring, calibration, AUTO rows, shared inventory edits, or shared map edits are implemented in this slice.
 - Checks Run:
   - `python3 orchestrator/plans/check_dependency_gates.py` -> `inventory valid`
@@ -19,4 +19,4 @@
 - Shared Inventory Updates Requested: Mark `PERSIST-001` `ready_for_integration` after coordinator review, with acceptance evidence covering SCAE-only production probability persistence, DEC-001 downgrade/actionability provenance, invalid forecast blocked records, idempotent `forecast_decision_records` writes, and no `market_predictions`/scoring/calibration bridge. After reconciliation, `PERSIST-002` should become dependency-ready; `MIG-008`, `AUTO-003`, `SCORE-001`, and calibration rows remain blocked by their own remaining dependencies.
 - Shared Map/Matrix Updates Requested: No direct edits. The existing script-placement map already lists `/Users/agent2/.openclaw/SCAE/scripts/bin/persist_scae_forecast.py` for `PERSIST-001`, `PERSIST-002`, and `MIG-008`; this commit implements only the PERSIST-001 forecast-decision subset.
 - Blockers: No implementation blocker.
-- Commit SHA: Implementation commit `5212385c89f645d08445e7c51b6220a2be2704ad`. This report-only bookkeeping correction is included before push.
+- Commit SHA: Implementation commit `5212385c89f645d08445e7c51b6220a2be2704ad`; final pushed report-correction commit `e19d333e4200a37033fa041df4ff4e6326825f09`.
