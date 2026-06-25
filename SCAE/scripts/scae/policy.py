@@ -91,6 +91,7 @@ def validate_scae_policy(policy: dict[str, Any]) -> None:
         "market_assimilation",
         "evidence_delta_mapping",
         "family_diagnostics",
+        "temporal_missingness",
         "probability_taxonomy",
         "validity_and_execution",
     ]
@@ -285,6 +286,58 @@ def validate_scae_policy(policy: dict[str, Any]) -> None:
     tolerance = family_diagnostics.get("exclusive_family_price_tolerance")
     if isinstance(tolerance, bool) or not isinstance(tolerance, (int, float)) or tolerance < 0.0:
         raise ScaePolicyError("family_diagnostics.exclusive_family_price_tolerance must be non-negative")
+
+    temporal_missingness = policy["temporal_missingness"]
+    if temporal_missingness.get("schema_version") != "scae-temporal-missingness-policy/v1":
+        raise ScaePolicyError("temporal missingness policy schema is invalid")
+    if (
+        temporal_missingness.get("output_authority")
+        != "temporal_candidate_diagnostics_only_no_live_forecast_authority"
+    ):
+        raise ScaePolicyError("temporal missingness output authority must remain diagnostic/candidate-only")
+    for field in [
+        "missingness_requires_explicit_mechanism_proof",
+        "no_catalyst_requires_source_coverage",
+        "no_catalyst_requires_unpriced_interval",
+        "no_catalyst_requires_distinct_absence_mechanism_proof",
+    ]:
+        if temporal_missingness.get(field) is not True:
+            raise ScaePolicyError(f"temporal_missingness.{field} must be true")
+    if temporal_missingness.get("allow_missingness_no_catalyst_same_mechanism_double_count") is not False:
+        raise ScaePolicyError("temporal missingness/no-catalyst same-mechanism double count must be blocked")
+
+    allowed_hazard_families = temporal_missingness.get("allowed_no_catalyst_hazard_families")
+    required_hazard_families = [
+        "continuous_arrival_hazard",
+        "deadline_survival_hazard",
+        "source_observable_arrival_hazard",
+    ]
+    if allowed_hazard_families != required_hazard_families:
+        raise ScaePolicyError("temporal missingness allowed no-catalyst hazard families are not canonical")
+    strength_map = temporal_missingness.get("missingness_strength_log_odds")
+    required_missingness_strengths = {"strong", "moderate", "weak", "none", "unanswerable"}
+    if not isinstance(strength_map, dict) or set(strength_map) != required_missingness_strengths:
+        raise ScaePolicyError("temporal_missingness.missingness_strength_log_odds is not canonical")
+    for strength, value in strength_map.items():
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0.0:
+            raise ScaePolicyError(f"temporal_missingness.missingness_strength_log_odds.{strength} must be non-negative")
+    if strength_map["none"] != 0.0 or strength_map["unanswerable"] != 0.0:
+        raise ScaePolicyError("none and unanswerable missingness strengths must map to zero")
+    if not (
+        strength_map["strong"]
+        >= strength_map["moderate"]
+        >= strength_map["weak"]
+        >= strength_map["none"]
+    ):
+        raise ScaePolicyError("missingness strength mapping must be monotonic")
+    if temporal_missingness.get("direction_multipliers") != {"supports_yes": 1.0, "supports_no": -1.0}:
+        raise ScaePolicyError("temporal_missingness.direction_multipliers is not canonical")
+    for field in ["max_missingness_log_odds_delta", "max_no_catalyst_log_odds_delta"]:
+        value = temporal_missingness.get(field)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0.0:
+            raise ScaePolicyError(f"temporal_missingness.{field} must be positive")
+        if value > cap_stack["per_update_log_odds_cap"]:
+            raise ScaePolicyError(f"temporal_missingness.{field} must not exceed per-update cap")
 
     taxonomy = policy["probability_taxonomy"]
     if taxonomy.get("fields") != PROBABILITY_FIELDS:

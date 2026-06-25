@@ -100,6 +100,33 @@
     "allow_sibling_price_probability_movement": false,
     "exclusive_family_price_tolerance": 0.02
   },
+  "temporal_missingness": {
+    "schema_version": "scae-temporal-missingness-policy/v1",
+    "output_authority": "temporal_candidate_diagnostics_only_no_live_forecast_authority",
+    "missingness_requires_explicit_mechanism_proof": true,
+    "no_catalyst_requires_source_coverage": true,
+    "no_catalyst_requires_unpriced_interval": true,
+    "no_catalyst_requires_distinct_absence_mechanism_proof": true,
+    "allow_missingness_no_catalyst_same_mechanism_double_count": false,
+    "allowed_no_catalyst_hazard_families": [
+      "continuous_arrival_hazard",
+      "deadline_survival_hazard",
+      "source_observable_arrival_hazard"
+    ],
+    "missingness_strength_log_odds": {
+      "strong": 0.12,
+      "moderate": 0.08,
+      "weak": 0.04,
+      "none": 0.0,
+      "unanswerable": 0.0
+    },
+    "direction_multipliers": {
+      "supports_yes": 1.0,
+      "supports_no": -1.0
+    },
+    "max_missingness_log_odds_delta": 0.12,
+    "max_no_catalyst_log_odds_delta": 0.18
+  },
   "probability_taxonomy": {
     "fields": [
       "raw_ledger_probability",
