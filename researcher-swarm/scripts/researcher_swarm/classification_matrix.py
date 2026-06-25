@@ -13,6 +13,12 @@ from .classification import (
     validate_researcher_sidecar_v2,
 )
 from .retrieval import validate_retrieval_packet
+from .supplemental import (
+    SupplementalEvidenceError,
+    normalized_supplemental_records_by_ref,
+    supplemental_record_as_classification_evidence,
+    supplemental_record_as_provenance,
+)
 
 
 CLASSIFICATION_MATRIX_SCHEMA_VERSION = "researcher-classification-matrix/v1"
@@ -166,6 +172,15 @@ def _build_retrieval_lookups(retrieval_packet: dict[str, Any]) -> RetrievalLooku
         certificate_by_id=certificate_by_id,
         breadth_coverage_by_id=breadth_coverage_by_id,
     )
+
+
+def _build_supplemental_lookups(records: list[dict[str, Any]] | None) -> dict[str, dict[str, Any]]:
+    if not records:
+        return {}
+    try:
+        return normalized_supplemental_records_by_ref(records)
+    except SupplementalEvidenceError as exc:
+        raise ClassificationMatrixError(str(exc)) from exc
 
 
 def _require_retrieval_packet(retrieval_packet: Any) -> dict[str, Any]:
@@ -513,6 +528,10 @@ def _classification_slice(
         },
         "materializer_version": CLS_003_MATRIX_MATERIALIZER_VERSION,
     }
+    if evidence.get("evidence_source_type") == "supplemental":
+        row["evidence_source_type"] = "supplemental"
+        row["supplemental_evidence_ref"] = evidence.get("supplemental_evidence_ref")
+        row["normalized_supplemental_evidence_ref"] = evidence.get("normalized_supplemental_evidence_ref")
     row["classification_slice_digest"] = _prefixed_sha256(row)
     return row
 
@@ -570,6 +589,10 @@ def _provenance_slice(
         "content_sha256": evidence.get("content_sha256"),
         "materializer_version": CLS_003_MATRIX_MATERIALIZER_VERSION,
     }
+    if classification_slice.get("evidence_source_type") == "supplemental":
+        row["evidence_source_type"] = "supplemental"
+        row["supplemental_evidence_ref"] = classification_slice.get("supplemental_evidence_ref")
+        row["normalized_supplemental_evidence_ref"] = classification_slice.get("normalized_supplemental_evidence_ref")
     row["provenance_slice_digest"] = _prefixed_sha256(row)
     return row
 
@@ -609,6 +632,7 @@ def materialize_classification_matrix(
     retrieval_packet: dict[str, Any],
     *,
     composite_claim_policy: str = "split",
+    normalized_supplemental_evidence: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Materialize CLS-003 classification/provenance rows from valid sidecars."""
 
@@ -621,6 +645,7 @@ def materialize_classification_matrix(
 
     packet = _require_retrieval_packet(retrieval_packet)
     lookups = _build_retrieval_lookups(packet)
+    supplemental_by_ref = _build_supplemental_lookups(normalized_supplemental_evidence)
     leaves_by_id = _lookup_qdt_leaves(qdt)
 
     classification_slices: list[dict[str, Any]] = []
@@ -629,6 +654,7 @@ def materialize_classification_matrix(
     proof_by_sidecar_and_id: dict[tuple[str, str], dict[str, Any]] = {}
     seen_grain: set[tuple[str, str, str, str, str, str]] = set()
     validated_sidecars: list[dict[str, Any]] = []
+    joined_supplemental_refs: set[str] = set()
 
     for raw_sidecar in sidecars:
         sidecar = _validate_sidecar(raw_sidecar, qdt)
@@ -671,7 +697,7 @@ def materialize_classification_matrix(
                     f"{classification.get('classification_id')}: invalid classification schema version"
                 )
             supplemental_refs = _supplemental_evidence_refs(classification)
-            if supplemental_refs:
+            if supplemental_refs and not supplemental_by_ref:
                 raise ClassificationMatrixError(
                     f"{classification.get('classification_id')}: supplemental evidence requires CLS-004 normalization"
                 )
@@ -745,6 +771,81 @@ def materialize_classification_matrix(
                     classification_slices.append(classification_slice)
                     provenance_slices.append(provenance_slice)
 
+            for supplemental_ref in supplemental_refs:
+                record = supplemental_by_ref.get(supplemental_ref)
+                if not record:
+                    raise ClassificationMatrixError(
+                        f"{classification.get('classification_id')}: missing normalized supplemental evidence {supplemental_ref}"
+                    )
+                if record.get("case_id") and record.get("case_id") != packet.get("case_id"):
+                    raise ClassificationMatrixError(
+                        f"{classification.get('classification_id')}: supplemental evidence case does not match retrieval packet"
+                    )
+                if record.get("dispatch_id") and record.get("dispatch_id") != packet.get("dispatch_id"):
+                    raise ClassificationMatrixError(
+                        f"{classification.get('classification_id')}: supplemental evidence dispatch does not match retrieval packet"
+                    )
+                if record.get("leaf_id") and record.get("leaf_id") != leaf_id:
+                    raise ClassificationMatrixError(
+                        f"{classification.get('classification_id')}: supplemental evidence leaf does not match classification leaf"
+                    )
+                try:
+                    supplemental_evidence = supplemental_record_as_classification_evidence(record)
+                    supplemental_provenance = supplemental_record_as_provenance(record)
+                except SupplementalEvidenceError as exc:
+                    raise ClassificationMatrixError(str(exc)) from exc
+                supplemental_evidence["leaf_id"] = supplemental_evidence.get("leaf_id") or leaf_id
+                supplemental_evidence["parent_branch_id"] = (
+                    supplemental_evidence.get("parent_branch_id")
+                    or leaf.get("parent_branch_id")
+                    or classification.get("parent_branch_id")
+                )
+                claim_family_ids, claim_split_status = _claim_family_ids_for_row(
+                    classification=classification,
+                    evidence=supplemental_evidence,
+                    composite_claim_policy=composite_claim_policy,
+                )
+                for claim_family_id in claim_family_ids:
+                    claim_family_resolution_ref = _claim_family_resolution_ref(supplemental_evidence, claim_family_id)
+                    classification_slice = _classification_slice(
+                        sidecar=sidecar,
+                        classification=classification,
+                        leaf=leaf,
+                        evidence=supplemental_evidence,
+                        certificate=certificate,
+                        proof=proof,
+                        claim_family_id=claim_family_id,
+                        claim_split_status=claim_split_status,
+                        claim_family_resolution_ref=claim_family_resolution_ref,
+                    )
+                    grain = (
+                        str(classification_slice["sidecar_id"]),
+                        str(classification_slice["leaf_id"]),
+                        str(classification_slice["condition_scope"]),
+                        str(classification_slice["evidence_ref"]),
+                        str(classification_slice["source_family_id"]),
+                        str(classification_slice["claim_family_id"]),
+                    )
+                    if grain in seen_grain:
+                        raise ClassificationMatrixError(
+                            f"{classification.get('classification_id')}: duplicate classification grain"
+                        )
+                    seen_grain.add(grain)
+                    provenance_slice = _provenance_slice(
+                        classification_slice=classification_slice,
+                        classification=classification,
+                        evidence=supplemental_evidence,
+                        certificate=certificate,
+                        proof=proof,
+                        retrieval_provenance=supplemental_provenance,
+                        claim_family_resolution_ref=claim_family_resolution_ref,
+                    )
+                    classification_slice["provenance_slice_ref"] = provenance_slice["slice_id"]
+                    classification_slice["classification_slice_digest"] = _prefixed_sha256(classification_slice)
+                    classification_slices.append(classification_slice)
+                    provenance_slices.append(provenance_slice)
+                    joined_supplemental_refs.add(supplemental_ref)
+
     classification_slices.sort(key=lambda item: (str(item["slice_id"]), _canonical_json(item)))
     provenance_slices.sort(key=lambda item: (str(item["slice_id"]), _canonical_json(item)))
     coverage_proof_slices.sort(key=lambda item: (str(item["slice_id"]), _canonical_json(item)))
@@ -765,6 +866,12 @@ def materialize_classification_matrix(
         "dispatch_id": packet.get("dispatch_id"),
         "matrix_digest": matrix_digest,
     }
+    implements = ["CLS-003"]
+    not_implemented = ["CLS-004", "CLS-005", "CLS-006", "CLS-007", "CLS-008", "VER", "SCAE"]
+    if joined_supplemental_refs:
+        implements.append("CLS-004")
+        not_implemented.remove("CLS-004")
+
     return {
         "artifact_type": "researcher_classification_matrix",
         "schema_version": CLASSIFICATION_MATRIX_SCHEMA_VERSION,
@@ -793,8 +900,9 @@ def materialize_classification_matrix(
         "retrieval_packet_ref": packet.get("retrieval_packet_id")
         or packet.get("packet_id")
         or packet.get("question_decomposition_artifact_id"),
+        "normalized_supplemental_evidence_refs": sorted(joined_supplemental_refs),
         "scope_boundaries": {
-            "implements": ["CLS-003"],
-            "not_implemented": ["CLS-004", "CLS-005", "CLS-006", "CLS-007", "CLS-008", "VER", "SCAE"],
+            "implements": implements,
+            "not_implemented": not_implemented,
         },
     }
