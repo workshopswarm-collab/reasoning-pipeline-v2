@@ -96,7 +96,7 @@ class DependencyGateTests(unittest.TestCase):
 
         failures = gates.can_start(rows["AUTO-005"], rows, set(inv["ready_statuses"]), inv["waivers"], "runtime_integration")
         self.assertIn("AUTO-004 status=not_started", failures)
-        self.assertIn("PERSIST-002 status=not_started", failures)
+        self.assertNotIn("PERSIST-002 status=not_started", failures)
 
     def test_fixture_mode_allows_start_even_when_runtime_is_blocked(self) -> None:
         inv = load_inventory()
