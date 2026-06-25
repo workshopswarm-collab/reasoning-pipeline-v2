@@ -11,4 +11,4 @@
 - Shared Inventory Updates Requested: Mark `SCAE-013` `ready_for_integration` with acceptance evidence summarizing deterministic VER-004 sufficiency intake, high-certainty and structural-unanswerability validity transitions, breadth and escalation guards, replay/tuning refs, insufficiency debug components, and no calibration-debt/final probability/persistence/decision authority. After reconciliation, `SCAE-012` should become newly dependency-ready.
 - Shared Map/Matrix Updates Requested: No direct shared map edits requested. `BLK-026`, `BLK-028`, `BLK-035`, `BLK-037`, `BLK-038`, and `BLK-039` now have SCAE-013 implementation evidence but should be reconciled by Session 1/coordinator with their owning fixture/static validation rows.
 - Blockers: No implementation blocker for `SCAE-013`. Downstream `SCAE-012`, persistence, scoring, and calibration remain out of scope until coordinator reconciliation.
-- Commit SHA: Pending final detached-HEAD commit.
+- Commit SHA: Implementation commit `2f2dee3f1d890fb7b944629880913123f116a5fd`; final pushed HEAD is the report-bookkeeping commit on top of that implementation commit.
