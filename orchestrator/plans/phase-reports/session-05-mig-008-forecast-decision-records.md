@@ -5,7 +5,7 @@
 - Owner: Session 5
 - Feature IDs: `SYN-001`, `DEC-001`, `PERSIST-001`, `PERSIST-002`
 - Migration Groups: `MIG-008`
-- Status: local implementation complete; push held for coordinator review
+- Status: implementation pushed; pending shared inventory/map reconciliation
 - Acceptance Evidence: Added explicit MIG-008 schema creation in `/Users/agent2/.openclaw/SCAE/scripts/migrations/008_forecast_decision_records.sql` and wired `/Users/agent2/.openclaw/SCAE/scripts/scae/persistence.py` so `write_forecast_decision()` creates `forecast_decision_records` from the durable migration file instead of an inline schema. The table persists only SCAE-owned `production_forecast_prob`/`canonical_probability`, SCAE/DEC/SYN refs and digests, forecast validity, execution authority, actionability, stable hashes, and blocked/non-scoreable invalid-forecast status. The existing PERSIST-002 bridge continues to write the same SCAE production probability into the existing `market_predictions` spine through `record_market_prediction()` or `record_prediction_with_snapshot()` with `ads-case-contract/v1` snapshot provenance. Decision and synthesis remain non-authoritative; this slice adds no scoring, calibration, replay, AUTO rows, or second probability authority.
 - Checks Run:
   - `python3 orchestrator/plans/check_dependency_gates.py` -> `inventory valid`
@@ -23,3 +23,4 @@
 - Shared Map/Matrix Updates Requested: Reconcile the schema-name map entry for `forecast_decision_records` from `needs_new_migration` to implemented SCAE-local SQLite migration. BLK-002 can use this MIG-008 evidence with PERSIST-001 evidence; BLK-031 still needs the later SCORE-001/MIG-010 resolution-scoring side before full scoring readiness.
 - Expected Reconciliation Effects: `MIG-008` should become `ready_for_integration`. `SYN-001`, `DEC-001`, `PERSIST-001`, and `PERSIST-002` remain ready and retain their authority boundaries. `SCORE-001`, `CAL-*`, `MIG-010`, and AUTO loop rows are not implemented or advanced by this migration.
 - Blockers: No implementation blocker. Coordinator reconciliation is required before shared inventory status changes.
+- Commit SHA: Final pushed implementation commit `90d44b00d9abfc0f3872de25d6f5f51a5a6a6a00`; original held commit `0ddf746eeb1fd3fda7241a62022cbb5d31eff008`; rebased on top of `76121ceecc525b31c478bd1ec5a88b56ca570cd8`.
