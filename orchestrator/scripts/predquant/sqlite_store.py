@@ -1553,6 +1553,7 @@ def existing_prediction_result_or_error(
     row: sqlite3.Row,
     *,
     predicted_probability,
+    market_snapshot_id: Optional[int] = None,
     prediction_run_id: Optional[str],
     forecast_artifact_id: Optional[str],
     case_key: Optional[str],
@@ -1577,6 +1578,8 @@ def existing_prediction_result_or_error(
             mismatches.append(field_name)
     if float(row["predicted_probability"]) != float(predicted_probability):
         mismatches.append("predicted_probability")
+    if market_snapshot_id is not None and row["market_snapshot_id"] != int(market_snapshot_id):
+        mismatches.append("market_snapshot_id")
     if row["prediction_source"] != prediction_source:
         mismatches.append("prediction_source")
     if (row["prediction_label"] or None) != (prediction_label or None):
@@ -1595,6 +1598,7 @@ def record_market_prediction(
     db_path: Path,
     predicted_probability,
     market_id: Optional[int] = None,
+    market_snapshot_id: Optional[int] = None,
     platform: str = "polymarket",
     external_market_id: Optional[str] = None,
     prediction_run_id: Optional[str] = None,
@@ -1644,6 +1648,7 @@ def record_market_prediction(
                 return existing_prediction_result_or_error(
                     existing_prediction,
                     predicted_probability=predicted_probability,
+                    market_snapshot_id=market_snapshot_id,
                     prediction_run_id=prediction_run_id,
                     forecast_artifact_id=forecast_artifact_id,
                     case_key=case_key,
@@ -1659,7 +1664,23 @@ def record_market_prediction(
             if not market:
                 raise ValueError("market not found")
 
-            snapshot = latest_snapshot_for_market(conn, int(market["id"]), predicted_at)
+            if market_snapshot_id is not None:
+                snapshot = conn.execute(
+                    """
+                    SELECT *
+                    FROM market_snapshots
+                    WHERE id = ? AND market_id = ?
+                    """,
+                    (int(market_snapshot_id), int(market["id"])),
+                ).fetchone()
+                if not snapshot:
+                    raise ValueError("market snapshot not found")
+                snapshot_time = parse_market_time(snapshot["observed_at"])
+                prediction_time = parse_market_time(predicted_at)
+                if snapshot_time is not None and prediction_time is not None and snapshot_time > prediction_time:
+                    raise ValueError("market snapshot is after prediction timestamp")
+            else:
+                snapshot = latest_snapshot_for_market(conn, int(market["id"]), predicted_at)
             if source_fetched_at is None and snapshot:
                 source_fetched_at = snapshot["observed_at"]
             if source_fetched_at:

@@ -9,6 +9,7 @@ from pathlib import Path
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "orchestrator" / "scripts"))
 
 from scae.intervals import build_pre_debt_ledger_output  # noqa: E402
 from scae.ledger import apply_research_sufficiency_guard, finalize_scae_probability_fields  # noqa: E402
@@ -17,6 +18,7 @@ from scae.persistence import (  # noqa: E402
     MIG007_TABLES,
     MISSINGNESS_SIGNAL_TABLE,
     PERSIST001_SCHEMA_VERSION,
+    PERSIST002_SCHEMA_VERSION,
     RESEARCH_SUFFICIENCY_RECONCILIATION_TABLE,
     SCAE_BRANCH_SUBLEDGER_TABLE,
     SCAE_CALIBRATION_DIAGNOSTIC_TABLE,
@@ -30,11 +32,13 @@ from scae.persistence import (  # noqa: E402
     ensure_forecast_decision_schema,
     ensure_scae_ledger_schema,
     write_forecast_decision,
+    write_scae_market_prediction,
     write_scae_ledger,
     write_scae_log_odds_update_slices,
     write_scae_research_sufficiency_inputs,
 )
 from scae.policy import default_scae_policy  # noqa: E402
+from predquant.sqlite_store import ensure_schema  # noqa: E402
 
 
 class ScaePersistenceTest(unittest.TestCase):
@@ -251,6 +255,108 @@ class ScaePersistenceTest(unittest.TestCase):
         invalid["final_probability_ledger_id"] = "scae-final-probability-ledger:invalid"
         invalid["final_probability_ledger_digest"] = "sha256:" + "d" * 64
         return invalid
+
+    def seed_prediction_market(self, db_path):
+        with sqlite3.connect(db_path) as conn:
+            ensure_schema(conn)
+            market_id = conn.execute(
+                """
+                INSERT INTO markets (
+                  platform, external_market_id, slug, title, status,
+                  outcome_type, metadata, current_price
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "polymarket",
+                    "scae-market-1",
+                    "scae-market-1",
+                    "Will the SCAE fixture resolve yes?",
+                    "open",
+                    "binary",
+                    "{}",
+                    0.49,
+                ),
+            ).lastrowid
+            snapshot_id = conn.execute(
+                """
+                INSERT INTO market_snapshots (
+                  market_id, observed_at, best_bid, best_ask, raw_payload
+                )
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    market_id,
+                    "2026-06-25T11:55:00+00:00",
+                    0.46,
+                    0.48,
+                    '{"book":"contract"}',
+                ),
+            ).lastrowid
+            later_snapshot_id = conn.execute(
+                """
+                INSERT INTO market_snapshots (
+                  market_id, observed_at, best_bid, best_ask, raw_payload
+                )
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    market_id,
+                    "2026-06-25T11:59:00+00:00",
+                    0.58,
+                    0.60,
+                    '{"book":"later"}',
+                ),
+            ).lastrowid
+        return int(market_id), int(snapshot_id), int(later_snapshot_id)
+
+    def ads_case_contract(self, ledger, market_id, snapshot_id, *, age_seconds=300, max_age_seconds=3600):
+        return {
+            "artifact_type": "ads_case_contract",
+            "schema_version": "ads-case-contract/v1",
+            "case_key": ledger["case_key"],
+            "case_id": ledger["case_id"],
+            "dispatch_id": ledger["dispatch_id"],
+            "prediction_run_id": "prediction-run:scae-1",
+            "forecast_artifact_id": "forecast-artifact:scae-1",
+            "forecast_timestamp": ledger["forecast_timestamp"],
+            "intake_source": {
+                "market_row_id": market_id,
+                "market_snapshot_id": snapshot_id,
+                "snapshot_observed_at": "2026-06-25T11:55:00+00:00",
+                "source_payload_hash": "sha256:" + "e" * 64,
+            },
+            "market_identity": {
+                "platform": "polymarket",
+                "internal_market_id": market_id,
+                "external_market_id": "scae-market-1",
+                "title": "Will the SCAE fixture resolve yes?",
+            },
+            "prediction_time_market_baseline": {
+                "market_snapshot_id": snapshot_id,
+                "source_fetched_at": "2026-06-25T11:55:00+00:00",
+                "snapshot_age_seconds_at_dispatch": age_seconds,
+                "max_snapshot_age_seconds": max_age_seconds,
+                "market_probability": 0.47,
+                "market_probability_method": "bid_ask_midpoint",
+            },
+        }
+
+    def fresh_snapshot_payload(self):
+        return {
+            "platform": "polymarket",
+            "external_market_id": "scae-market-1",
+            "slug": "scae-market-1",
+            "title": "Will the SCAE fixture resolve yes?",
+            "status": "open",
+            "outcome_type": "binary",
+            "snapshot": {
+                "observed_at": "2026-06-25T11:59:30+00:00",
+                "best_bid": 0.50,
+                "best_ask": 0.52,
+                "raw_payload": {"book": "fresh"},
+            },
+        }
 
     def auxiliary_slices(self):
         base = {
@@ -593,6 +699,151 @@ class ScaePersistenceTest(unittest.TestCase):
         with self.assertRaisesRegex(ScaePersistenceError, "scoreable_forecast_output"):
             write_forecast_decision(self.conn, ledger, gate)
 
+    def test_scae_market_prediction_bridge_uses_scae_probability_and_contract_snapshot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "predictions.sqlite3"
+            market_id, snapshot_id, later_snapshot_id = self.seed_prediction_market(db_path)
+            ledger = self.finalized_ledger()
+            gate = self.decision_gate(ledger)
+            contract = self.ads_case_contract(ledger, market_id, snapshot_id)
+
+            first = write_scae_market_prediction(
+                db_path,
+                ledger,
+                gate,
+                contract,
+                metadata={"forecast_decision_artifact_path": "artifacts/forecast-decision.json"},
+            )
+            second = write_scae_market_prediction(
+                db_path,
+                ledger,
+                gate,
+                contract,
+                metadata={"forecast_decision_artifact_path": "artifacts/forecast-decision.json"},
+            )
+
+            self.assertEqual(first["schema_version"], PERSIST002_SCHEMA_VERSION)
+            self.assertTrue(first["market_prediction_written"])
+            self.assertTrue(second["idempotent"])
+            self.assertEqual(first["production_forecast_prob"], ledger["production_forecast_prob"])
+            self.assertEqual(first["market_snapshot_id"], snapshot_id)
+            self.assertNotEqual(first["market_snapshot_id"], later_snapshot_id)
+            with sqlite3.connect(db_path) as conn:
+                row = conn.execute(
+                    """
+                    SELECT predicted_probability, market_snapshot_id, market_probability,
+                           market_probability_method, prediction_run_id, forecast_artifact_id,
+                           case_id, dispatch_id, engine_stage, prediction_source,
+                           source_payload_hash, scoring_version, metadata
+                    FROM market_predictions
+                    """
+                ).fetchone()
+                forecast_rows = conn.execute(
+                    f"SELECT COUNT(*) FROM {FORECAST_DECISION_TABLE}"
+                ).fetchone()[0]
+            self.assertEqual(row[0], ledger["production_forecast_prob"])
+            self.assertEqual(row[1], snapshot_id)
+            self.assertEqual(row[2], 0.47)
+            self.assertEqual(row[3], "bid_ask_midpoint")
+            self.assertEqual(row[4], "prediction-run:scae-1")
+            self.assertEqual(row[5], "forecast-artifact:scae-1")
+            self.assertEqual(row[6:10], ("case-1", "dispatch-1", "scae", "ads_pipeline"))
+            self.assertEqual(row[10], "sha256:" + "e" * 64)
+            self.assertIsNone(row[11])
+            self.assertEqual(forecast_rows, 1)
+            metadata = json.loads(row[12])
+            self.assertEqual(metadata["scoreable_prediction_source"], "scae.production_forecast_prob")
+            self.assertEqual(metadata["contract_market_snapshot_id"], snapshot_id)
+
+    def test_scae_market_prediction_bridge_blocks_invalid_forecast_without_prediction_row(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "predictions.sqlite3"
+            market_id, snapshot_id, _ = self.seed_prediction_market(db_path)
+            ledger = self.invalid_ledger()
+            gate = self.decision_gate(ledger)
+            contract = self.ads_case_contract(ledger, market_id, snapshot_id)
+
+            result = write_scae_market_prediction(db_path, ledger, gate, contract)
+
+            self.assertFalse(result["market_prediction_written"])
+            self.assertEqual(result["block_reason_code"], "forecast_decision_non_scoreable")
+            with sqlite3.connect(db_path) as conn:
+                prediction_count = conn.execute("SELECT COUNT(*) FROM market_predictions").fetchone()[0]
+                forecast_count = conn.execute(
+                    f"SELECT COUNT(*) FROM {FORECAST_DECISION_TABLE}"
+                ).fetchone()[0]
+            self.assertEqual(prediction_count, 0)
+            self.assertEqual(forecast_count, 1)
+
+    def test_scae_market_prediction_bridge_blocks_stale_snapshot_without_fresh_payload(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "predictions.sqlite3"
+            market_id, snapshot_id, _ = self.seed_prediction_market(db_path)
+            ledger = self.finalized_ledger()
+            gate = self.decision_gate(ledger)
+            contract = self.ads_case_contract(
+                ledger,
+                market_id,
+                snapshot_id,
+                age_seconds=7200,
+                max_age_seconds=3600,
+            )
+
+            result = write_scae_market_prediction(db_path, ledger, gate, contract)
+
+            self.assertFalse(result["market_prediction_written"])
+            self.assertEqual(result["block_reason_code"], "stale_market_snapshot")
+            with sqlite3.connect(db_path) as conn:
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM market_predictions").fetchone()[0], 0)
+
+    def test_scae_market_prediction_bridge_records_fresh_snapshot_repair(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "predictions.sqlite3"
+            market_id, snapshot_id, _ = self.seed_prediction_market(db_path)
+            ledger = self.finalized_ledger()
+            gate = self.decision_gate(ledger)
+            contract = self.ads_case_contract(
+                ledger,
+                market_id,
+                snapshot_id,
+                age_seconds=7200,
+                max_age_seconds=3600,
+            )
+
+            result = write_scae_market_prediction(
+                db_path,
+                ledger,
+                gate,
+                contract,
+                fresh_snapshot_payload=self.fresh_snapshot_payload(),
+            )
+
+            self.assertTrue(result["market_prediction_written"])
+            self.assertNotEqual(result["market_snapshot_id"], snapshot_id)
+            with sqlite3.connect(db_path) as conn:
+                prediction = conn.execute(
+                    "SELECT market_snapshot_id, source_payload_hash, snapshot_age_seconds FROM market_predictions"
+                ).fetchone()
+                snapshot_count = conn.execute("SELECT COUNT(*) FROM market_snapshots").fetchone()[0]
+            self.assertEqual(prediction[0], result["market_snapshot_id"])
+            self.assertRegex(prediction[1], r"^[0-9a-f]{64}$")
+            self.assertEqual(prediction[2], 30.0)
+            self.assertEqual(snapshot_count, 3)
+
+    def test_scae_market_prediction_bridge_rejects_decision_replacement_probability(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "predictions.sqlite3"
+            market_id, snapshot_id, _ = self.seed_prediction_market(db_path)
+            ledger = self.finalized_ledger()
+            gate = self.decision_gate(ledger)
+            gate["scae_context"]["production_forecast_prob"] = 0.72
+            contract = self.ads_case_contract(ledger, market_id, snapshot_id)
+
+            with self.assertRaisesRegex(ScaePersistenceError, "replace SCAE production_forecast_prob"):
+                write_scae_market_prediction(db_path, ledger, gate, contract)
+            with sqlite3.connect(db_path) as conn:
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM market_predictions").fetchone()[0], 0)
+
     def test_persist_scae_forecast_cli_writes_forecast_decision(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -631,6 +882,50 @@ class ScaePersistenceTest(unittest.TestCase):
                 ).fetchone()
             self.assertEqual(row[0], ledger["production_forecast_prob"])
             self.assertEqual(json.loads(row[1])["forecast_artifact_id"], "forecast:cli")
+
+    def test_persist_scae_forecast_cli_records_market_prediction_with_case_contract(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            db_path = tmp_path / "forecast.sqlite3"
+            market_id, snapshot_id, _ = self.seed_prediction_market(db_path)
+            ledger_path = tmp_path / "ledger.json"
+            gate_path = tmp_path / "decision.json"
+            contract_path = tmp_path / "contract.json"
+            output_path = tmp_path / "result.json"
+            ledger = self.finalized_ledger()
+            gate = self.decision_gate(ledger)
+            contract = self.ads_case_contract(ledger, market_id, snapshot_id)
+            ledger_path.write_text(json.dumps(ledger), encoding="utf-8")
+            gate_path.write_text(json.dumps(gate), encoding="utf-8")
+            contract_path.write_text(json.dumps(contract), encoding="utf-8")
+
+            subprocess.run(
+                [
+                    sys.executable,
+                    "SCAE/scripts/bin/persist_scae_forecast.py",
+                    "--db-path",
+                    str(db_path),
+                    "--scae-ledger",
+                    str(ledger_path),
+                    "--decision-gate",
+                    str(gate_path),
+                    "--ads-case-contract",
+                    str(contract_path),
+                    "--output",
+                    str(output_path),
+                ],
+                check=True,
+            )
+
+            result = json.loads(output_path.read_text(encoding="utf-8"))
+            self.assertEqual(result["schema_version"], PERSIST002_SCHEMA_VERSION)
+            self.assertTrue(result["market_prediction_written"])
+            with sqlite3.connect(db_path) as conn:
+                row = conn.execute(
+                    "SELECT predicted_probability, market_snapshot_id FROM market_predictions"
+                ).fetchone()
+            self.assertEqual(row[0], ledger["production_forecast_prob"])
+            self.assertEqual(row[1], snapshot_id)
 
 
 if __name__ == "__main__":

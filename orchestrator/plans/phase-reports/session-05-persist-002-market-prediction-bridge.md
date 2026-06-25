@@ -1,0 +1,22 @@
+# Session 05 PERSIST-002: Market Prediction Bridge
+
+- Session: 05
+- Phase: PERSIST-002
+- Owner: Session 5
+- Feature IDs: `PERSIST-002`
+- Migration Groups: none
+- Status: implementation complete; ready for coordinator reconciliation after push
+- Acceptance Evidence: Implemented the deterministic SCAE-owned scoreable prediction bridge in `/Users/agent2/.openclaw/SCAE/scripts/scae/persistence.py` and `/Users/agent2/.openclaw/SCAE/scripts/bin/persist_scae_forecast.py`. The new `write_scae_market_prediction()` path first preserves the PERSIST-001 `forecast_decision_records` write, then records exactly the SCAE `production_forecast_prob` into the existing `market_predictions` spine through `record_market_prediction()` or `record_prediction_with_snapshot()`. It carries `ads-case-contract/v1` prediction-time market snapshot provenance including `market_snapshot_id`, `market_probability`, `market_probability_method`, snapshot age/max age, source payload hash, case/dispatch refs, `prediction_run_id`, `forecast_artifact_id`, and artifact hashes. Stale, missing, or lookahead contract snapshots block scoreable persistence unless a fresh snapshot payload is atomically recorded with the prediction. Invalid/non-scoreable SCAE forecast-decision states create a structured blocked bridge result and do not write `market_predictions`. Decision and synthesis context remain non-authoritative and cannot replace or modify probability. No `MIG-008`, `SCORE-001`, scoring, replay, calibration, AUTO rows, shared inventory edits, or shared map edits are implemented in this slice.
+- Checks Run:
+  - `python3 orchestrator/plans/check_dependency_gates.py` -> `inventory valid`
+  - `python3 orchestrator/plans/check_dependency_gates.py --feature-id PERSIST-002 --mode runtime_integration --report-only` -> `OK PERSIST-002 mode=runtime_integration`
+  - `python3 -m unittest discover -s orchestrator/plans/tests` -> 13 tests, OK
+  - `python3 -m unittest discover -s orchestrator/scripts/tests` -> 132 tests, OK
+  - `PYTHONPATH=SCAE/scripts python3 -m unittest discover -s SCAE/scripts/tests` -> 95 tests, OK
+  - `PYTHONPATH=SCAE/scripts python3 -m unittest SCAE/scripts/tests/test_scae_persistence.py` -> 19 tests, OK
+  - `git diff --check` -> OK
+  - `git diff --cached --check` -> OK
+- Shared Inventory Updates Requested: Mark `PERSIST-002` `ready_for_integration` after coordinator review, with acceptance evidence covering SCAE-only probability bridging to `market_predictions`, exact case-contract snapshot provenance, idempotent prediction identity, invalid forecast blocked status, stale/missing/lookahead snapshot blocking, fresh snapshot atomic repair, and no scoring/calibration/replay/AUTO authority. After reconciliation, re-evaluate `MIG-008`, `SCORE-001`, and `AUTO-005`; `AUTO-004` still depends on `AUTO-003`.
+- Shared Map/Matrix Updates Requested: No direct edits. The existing script-placement map already lists `/Users/agent2/.openclaw/SCAE/scripts/bin/persist_scae_forecast.py` for `PERSIST-001`, `PERSIST-002`, and `MIG-008`; this commit implements only the `PERSIST-002` market prediction bridge subset.
+- Blockers: No implementation blocker.
+- Commit SHA: To be supplied in final subagent report after detached-HEAD commit and push.

@@ -12,12 +12,15 @@ import hashlib
 import json
 import re
 import sqlite3
+import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 
 MIG007_SCHEMA_VERSION = "scae-ledger-probability-audit-persistence/v1"
 PERSIST001_SCHEMA_VERSION = "scae-forecast-decision-persistence/v1"
+PERSIST002_SCHEMA_VERSION = "scae-market-prediction-bridge/v1"
 SCAE_LEDGER_OUTPUT_TABLE = "scae_ledger_outputs"
 FORECAST_DECISION_TABLE = "forecast_decision_records"
 SCAE_LOG_ODDS_UPDATE_TABLE = "scae_log_odds_update_slices"
@@ -56,6 +59,8 @@ FINAL_READY_STATUS = "final_probability_fields_ready"
 FINAL_BLOCKED_STATUS = "blocked_invalid_for_forecast"
 FORECAST_DECISION_PERSISTED_STATUS = "production_forecast_persisted_from_scae"
 FORECAST_DECISION_BLOCKED_STATUS = "blocked_invalid_scae_forecast"
+MARKET_PREDICTION_PERSISTED_STATUS = "market_prediction_recorded_from_scae"
+MARKET_PREDICTION_BLOCKED_STATUS = "blocked_non_scoreable_scae_forecast"
 FINAL_PROBABILITY_FIELDS = (
     "debt_adjusted_probability",
     "production_forecast_prob",
@@ -1125,6 +1130,383 @@ def write_forecast_decision(
         "actionability_status": values["actionability_status"],
         "scoreable_forecast_output": False,
         "protected_downstream_tables_not_written": list(PERSIST001_PROTECTED_TABLES),
+    }
+
+
+def _prediction_store_helpers():
+    scripts_path = Path(__file__).resolve().parents[3] / "orchestrator" / "scripts"
+    if str(scripts_path) not in sys.path:
+        sys.path.insert(0, str(scripts_path))
+    from predquant.sqlite_store import (  # noqa: PLC0415
+        ensure_schema,
+        record_market_prediction,
+        record_prediction_with_snapshot,
+    )
+
+    return ensure_schema, record_market_prediction, record_prediction_with_snapshot
+
+
+def _parse_timestamp(value: Any, field_name: str) -> datetime:
+    timestamp = _required_string(field_name, value)
+    normalized = timestamp.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError as exc:
+        raise ScaePersistenceError(f"{field_name} must be an ISO-8601 timestamp") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _optional_seconds(value: Any, field_name: str) -> float | None:
+    if value is None or value == "":
+        return None
+    number = _required_float(value, field_name)
+    if number < 0:
+        raise ScaePersistenceError(f"{field_name} must be non-negative")
+    return number
+
+
+def _ads_case_contract_values(contract: dict[str, Any], ledger: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(contract, dict):
+        raise ScaePersistenceError("ads_case_contract must be an object")
+    if contract.get("schema_version") != "ads-case-contract/v1":
+        raise ScaePersistenceError("ads_case_contract schema_version must be ads-case-contract/v1")
+    if contract.get("artifact_type") not in {None, "ads_case_contract"}:
+        raise ScaePersistenceError("ads_case_contract artifact_type must be ads_case_contract")
+
+    case_id = _required_string("ads_case_contract.case_id", contract.get("case_id"))
+    dispatch_id = _required_string("ads_case_contract.dispatch_id", contract.get("dispatch_id"))
+    if case_id != _case_id(ledger):
+        raise ScaePersistenceError("ads_case_contract case_id must match SCAE ledger")
+    if dispatch_id != _dispatch_id(ledger):
+        raise ScaePersistenceError("ads_case_contract dispatch_id must match SCAE ledger")
+
+    market_identity = contract.get("market_identity")
+    if not isinstance(market_identity, dict):
+        raise ScaePersistenceError("ads_case_contract.market_identity is required")
+    intake_source = contract.get("intake_source")
+    if not isinstance(intake_source, dict):
+        raise ScaePersistenceError("ads_case_contract.intake_source is required")
+    baseline = contract.get("prediction_time_market_baseline")
+    if not isinstance(baseline, dict):
+        raise ScaePersistenceError("ads_case_contract.prediction_time_market_baseline is required")
+
+    source_payload_hash = intake_source.get("source_payload_hash") or baseline.get("source_payload_hash")
+    if source_payload_hash is not None:
+        source_payload_hash = _required_string(
+            "ads_case_contract.intake_source.source_payload_hash",
+            source_payload_hash,
+        )
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", source_payload_hash):
+            raise ScaePersistenceError("ads_case_contract source_payload_hash must be sha256-prefixed")
+
+    market_snapshot_id = baseline.get("market_snapshot_id", intake_source.get("market_snapshot_id"))
+    if market_snapshot_id is not None and market_snapshot_id != "":
+        try:
+            market_snapshot_id = int(market_snapshot_id)
+        except (TypeError, ValueError) as exc:
+            raise ScaePersistenceError("ads_case_contract market_snapshot_id must be an integer") from exc
+    else:
+        market_snapshot_id = None
+
+    internal_market_id = market_identity.get("internal_market_id") or market_identity.get("market_id")
+    if internal_market_id is not None and internal_market_id != "":
+        try:
+            internal_market_id = int(internal_market_id)
+        except (TypeError, ValueError) as exc:
+            raise ScaePersistenceError("ads_case_contract internal_market_id must be an integer") from exc
+    else:
+        internal_market_id = None
+
+    forecast_timestamp = (
+        contract.get("forecast_timestamp")
+        or ledger.get("forecast_timestamp")
+        or baseline.get("prediction_timestamp")
+    )
+    forecast_dt = _parse_timestamp(forecast_timestamp, "ads_case_contract.forecast_timestamp")
+    source_fetched_at = (
+        baseline.get("source_fetched_at")
+        or baseline.get("snapshot_observed_at")
+        or intake_source.get("snapshot_observed_at")
+    )
+    source_dt = _parse_timestamp(source_fetched_at, "ads_case_contract.snapshot_observed_at")
+    snapshot_age = baseline.get(
+        "snapshot_age_seconds_at_dispatch",
+        baseline.get("snapshot_age_seconds"),
+    )
+    max_age = baseline.get(
+        "max_snapshot_age_seconds",
+        intake_source.get("max_snapshot_age_seconds"),
+    )
+    snapshot_age = _optional_seconds(snapshot_age, "ads_case_contract.snapshot_age_seconds")
+    max_age = _optional_seconds(max_age, "ads_case_contract.max_snapshot_age_seconds")
+
+    market_probability = _optional_float(baseline.get("market_probability"), "ads_case_contract.market_probability")
+    if market_probability is not None and not 0.0 <= market_probability <= 1.0:
+        raise ScaePersistenceError("ads_case_contract market_probability must be in [0, 1]")
+
+    snapshot_block_reason = None
+    if market_snapshot_id is None:
+        snapshot_block_reason = "missing_market_snapshot"
+    elif source_payload_hash is None:
+        snapshot_block_reason = "missing_source_payload_hash"
+    elif source_dt > forecast_dt:
+        snapshot_block_reason = "lookahead_market_snapshot"
+    elif snapshot_age is None:
+        snapshot_block_reason = "missing_snapshot_age"
+    elif max_age is not None and snapshot_age > max_age:
+        snapshot_block_reason = "stale_market_snapshot"
+
+    return {
+        "case_key": contract.get("case_key") or ledger.get("case_key"),
+        "case_id": case_id,
+        "dispatch_id": dispatch_id,
+        "prediction_run_id": _required_string(
+            "ads_case_contract.prediction_run_id",
+            contract.get("prediction_run_id"),
+        ),
+        "forecast_artifact_id": _required_string(
+            "ads_case_contract.forecast_artifact_id",
+            contract.get("forecast_artifact_id"),
+        ),
+        "forecast_timestamp": forecast_dt.isoformat(),
+        "market_id": internal_market_id,
+        "platform": market_identity.get("platform") or "polymarket",
+        "external_market_id": market_identity.get("external_market_id"),
+        "market_snapshot_id": market_snapshot_id,
+        "market_probability": market_probability,
+        "market_probability_method": baseline.get("market_probability_method"),
+        "source_fetched_at": source_dt.isoformat(),
+        "source_payload_hash": source_payload_hash,
+        "snapshot_age_seconds": snapshot_age,
+        "max_snapshot_age_seconds": max_age,
+        "snapshot_block_reason": snapshot_block_reason,
+    }
+
+
+def _forecast_decision_row(conn: sqlite3.Connection, forecast_decision_id: str) -> sqlite3.Row:
+    prior_factory = conn.row_factory
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute(
+            f"SELECT * FROM {FORECAST_DECISION_TABLE} WHERE forecast_decision_id = ?",
+            (forecast_decision_id,),
+        ).fetchone()
+    finally:
+        conn.row_factory = prior_factory
+    if row is None:
+        raise ScaePersistenceError("forecast decision record was not persisted")
+    return row
+
+
+def _ensure_market_is_unresolved(
+    db_path: Path,
+    *,
+    market_id: int | None,
+    platform: str,
+    external_market_id: str | None,
+) -> None:
+    ensure_schema, _, _ = _prediction_store_helpers()
+    if not db_path.exists():
+        return
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        with conn:
+            ensure_schema(conn)
+            row = None
+            if market_id is not None:
+                row = conn.execute("SELECT * FROM markets WHERE id = ?", (int(market_id),)).fetchone()
+            if row is None and external_market_id:
+                row = conn.execute(
+                    "SELECT * FROM markets WHERE platform = ? AND external_market_id = ?",
+                    (platform, str(external_market_id)),
+                ).fetchone()
+            if row is not None and row["resolution_outcome"] is not None:
+                raise ScaePersistenceError("PERSIST-002 does not score resolved markets")
+    finally:
+        conn.close()
+
+
+def _market_prediction_bridge_metadata(
+    *,
+    metadata: dict[str, Any] | None,
+    decision_result: dict[str, Any],
+    decision_row: sqlite3.Row,
+    contract_values: dict[str, Any],
+    used_fresh_snapshot_payload: bool,
+) -> dict[str, Any]:
+    payload = copy.deepcopy(metadata or {})
+    payload.update(
+        {
+            "persist_feature_id": "PERSIST-002",
+            "persist_schema_version": PERSIST002_SCHEMA_VERSION,
+            "forecast_decision_id": decision_result["forecast_decision_id"],
+            "forecast_decision_artifact_sha256": decision_row["artifact_sha256"],
+            "scae_probability_source": "SCAE-012.production_forecast_prob",
+            "decision_context_authority": "downgrade_only_non_probability",
+            "scoreable_prediction_source": "scae.production_forecast_prob",
+            "contract_market_snapshot_id": contract_values["market_snapshot_id"],
+            "contract_source_payload_hash": contract_values["source_payload_hash"],
+            "contract_snapshot_age_seconds": contract_values["snapshot_age_seconds"],
+            "contract_max_snapshot_age_seconds": contract_values["max_snapshot_age_seconds"],
+            "fresh_snapshot_payload_recorded": used_fresh_snapshot_payload,
+        }
+    )
+    return payload
+
+
+def _blocked_market_prediction_result(
+    *,
+    decision_result: dict[str, Any],
+    block_reason: str,
+    contract_values: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return {
+        "schema_version": PERSIST002_SCHEMA_VERSION,
+        "feature_id": "PERSIST-002",
+        "market_prediction_persistence_status": MARKET_PREDICTION_BLOCKED_STATUS,
+        "block_reason_code": block_reason,
+        "forecast_decision_id": decision_result["forecast_decision_id"],
+        "production_forecast_prob": None,
+        "prediction_id": None,
+        "market_prediction_written": False,
+        "scoreable_forecast_output": False,
+        "market_snapshot_id": contract_values.get("market_snapshot_id") if contract_values else None,
+    }
+
+
+def write_scae_market_prediction(
+    db_path: Path | str,
+    scae_ledger: dict[str, Any],
+    decision_gate: dict[str, Any],
+    ads_case_contract: dict[str, Any],
+    *,
+    fresh_snapshot_payload: dict[str, Any] | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Bridge a valid SCAE production forecast into market_predictions.
+
+    The bridge preserves PERSIST-001 semantics by writing the forecast-decision
+    record first. It then records only the SCAE-owned production_forecast_prob
+    through the existing market prediction helpers when the prediction-time
+    market snapshot contract is usable or atomically repaired with a fresh
+    snapshot payload.
+    """
+
+    db_path = Path(db_path)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(db_path)
+    try:
+        with conn:
+            decision_result = write_forecast_decision(
+                conn,
+                scae_ledger,
+                decision_gate,
+                metadata=metadata,
+            )
+            decision_row = _forecast_decision_row(conn, decision_result["forecast_decision_id"])
+    finally:
+        conn.close()
+
+    contract_values = _ads_case_contract_values(ads_case_contract, scae_ledger)
+    if decision_result["production_forecast_prob"] is None:
+        return _blocked_market_prediction_result(
+            decision_result=decision_result,
+            block_reason="forecast_decision_non_scoreable",
+            contract_values=contract_values,
+        )
+    if contract_values["snapshot_block_reason"] and fresh_snapshot_payload is None:
+        return _blocked_market_prediction_result(
+            decision_result=decision_result,
+            block_reason=contract_values["snapshot_block_reason"],
+            contract_values=contract_values,
+        )
+
+    _, record_market_prediction, record_prediction_with_snapshot = _prediction_store_helpers()
+    bridge_metadata = _market_prediction_bridge_metadata(
+        metadata=metadata,
+        decision_result=decision_result,
+        decision_row=decision_row,
+        contract_values=contract_values,
+        used_fresh_snapshot_payload=fresh_snapshot_payload is not None,
+    )
+    common_args = {
+        "db_path": db_path,
+        "predicted_probability": decision_result["production_forecast_prob"],
+        "prediction_run_id": contract_values["prediction_run_id"],
+        "forecast_artifact_id": contract_values["forecast_artifact_id"],
+        "case_key": contract_values["case_key"],
+        "case_id": contract_values["case_id"],
+        "dispatch_id": contract_values["dispatch_id"],
+        "engine_stage": "scae",
+        "prediction_source": "ads_pipeline",
+        "prediction_label": "v2_scae",
+        "predicted_at": contract_values["forecast_timestamp"],
+        "input_hash": _prefixed_sha256(scae_ledger),
+        "input_artifact_path": (metadata or {}).get("scae_ledger_artifact_path"),
+        "input_artifact_sha256": _prefixed_sha256(scae_ledger),
+        "prediction_artifact_path": (metadata or {}).get("forecast_decision_artifact_path"),
+        "prediction_artifact_sha256": decision_row["artifact_sha256"],
+        "max_snapshot_age_seconds": contract_values["max_snapshot_age_seconds"],
+        "rationale": "SCAE production_forecast_prob persisted by PERSIST-002 scoreable bridge.",
+        "metadata": bridge_metadata,
+    }
+
+    if fresh_snapshot_payload is None:
+        if contract_values["market_id"] is None:
+            raise ScaePersistenceError("ads_case_contract internal_market_id is required without fresh snapshot")
+        _ensure_market_is_unresolved(
+            db_path,
+            market_id=contract_values["market_id"],
+            platform=contract_values["platform"],
+            external_market_id=contract_values["external_market_id"],
+        )
+        prediction_result = record_market_prediction(
+            market_id=contract_values["market_id"],
+            market_snapshot_id=contract_values["market_snapshot_id"],
+            platform=contract_values["platform"],
+            external_market_id=contract_values["external_market_id"],
+            market_probability=contract_values["market_probability"],
+            market_probability_method=contract_values["market_probability_method"],
+            source_fetched_at=contract_values["source_fetched_at"],
+            source_payload_hash=contract_values["source_payload_hash"],
+            **common_args,
+        )
+    else:
+        if isinstance(fresh_snapshot_payload, dict):
+            fresh_platform = fresh_snapshot_payload.get("platform") or contract_values["platform"]
+            fresh_external_id = fresh_snapshot_payload.get("external_market_id") or contract_values["external_market_id"]
+        else:
+            fresh_platform = contract_values["platform"]
+            fresh_external_id = contract_values["external_market_id"]
+        _ensure_market_is_unresolved(
+            db_path,
+            market_id=contract_values["market_id"],
+            platform=fresh_platform,
+            external_market_id=fresh_external_id,
+        )
+        prediction_result = record_prediction_with_snapshot(
+            payload=fresh_snapshot_payload,
+            **common_args,
+        )
+
+    return {
+        "schema_version": PERSIST002_SCHEMA_VERSION,
+        "feature_id": "PERSIST-002",
+        "market_prediction_persistence_status": MARKET_PREDICTION_PERSISTED_STATUS,
+        "forecast_decision_id": decision_result["forecast_decision_id"],
+        "prediction_id": prediction_result["prediction_id"],
+        "prediction_run_id": prediction_result["prediction_run_id"],
+        "forecast_artifact_id": prediction_result["forecast_artifact_id"],
+        "production_forecast_prob": prediction_result["predicted_probability"],
+        "market_prediction_written": True,
+        "scoreable_forecast_output": True,
+        "market_snapshot_id": prediction_result["snapshot_id"],
+        "source_payload_hash": prediction_result["source_payload_hash"],
+        "snapshot_age_seconds": prediction_result["snapshot_age_seconds"],
+        "idempotent": bool(prediction_result.get("idempotent")),
     }
 
 
