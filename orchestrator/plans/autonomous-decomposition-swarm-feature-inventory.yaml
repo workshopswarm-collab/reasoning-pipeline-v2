@@ -152,10 +152,11 @@
       "MIG-009": {
         "implementation_stage": "v2_live_cutover_with_maturity_extension",
         "surface_contract_status": "ready_for_component_implementation",
-        "destinations": {"training_trace_minimal_pointers": "existing_table", "training_trace_full_materializations": "existing_table", "v2_replay_manifests": "table"},
+        "destinations": {"training_trace_minimal_pointers": "existing_table", "training_trace_full_materializations": "existing_table", "v2_replay_manifests": "table", "v2_replay_result_records": "table"},
         "write_path_destinations": {
           "write_minimal_training_trace": ["training_trace_minimal_pointers"],
           "write_replay_manifest": ["v2_replay_manifests"],
+          "write_replay_result_record": ["v2_replay_result_records"],
           "write_full_training_trace_materialization": ["training_trace_full_materializations"]
         },
         "idempotency_keys": ["case_id", "dispatch_id", "trace_run_id", "replay_manifest_id"]
@@ -270,7 +271,7 @@
 
     {"id": "TRACE-001", "stage": "v2_live_cutover", "owner": "Session 5", "status": "ready_for_integration", "dependencies": ["FND-007", "FND-003"], "acceptance_evidence": "2026-06-25 Session 05 TRACE-001 added a bounded Session 5 adapter on the FND-007 minimal trace pointer helper plus FIX-001 handoff wiring; tests require research/SCAE/decision artifact refs and hashes, reject production probability authoring, preserve no live authority, and prove only training_trace_minimal_pointers changes while SCAE/synthesis/decision/forecast/replay/scoring/calibration/full-materialization state stays unchanged."},
     {"id": "TRACE-002", "stage": "autonomous_optimization_maturity", "owner": "Session 6", "status": "not_started", "dependencies": ["TRACE-001", "REPLAY-001"]},
-    {"id": "REPLAY-001", "stage": "calibration_debt_clearance", "owner": "Session 5", "status": "not_started", "dependencies": ["TRACE-001", "FND-004"]},
+    {"id": "REPLAY-001", "stage": "calibration_debt_clearance", "owner": "Session 5", "status": "ready_for_integration", "dependencies": ["TRACE-001", "FND-004"], "acceptance_evidence": "2026-06-25 Session 05 Phase 10 added orchestrator/scripts/predquant/replay.py, migrations/009_replay_records.sql, and focused replay tests for first-100 manifests sourced only from TRACE-001 minimal pointers, ref-only replay result records, no live authority, no production forecast writes, no probability replacement, no calibration policy promotion, and protected non-replay tables staying unchanged."},
     {"id": "SCORE-001", "stage": "calibration_debt_clearance", "owner": "Session 5", "status": "not_started", "dependencies": ["PERSIST-002", "REPLAY-001"]},
     {"id": "CAL-001", "stage": "calibration_debt_clearance", "owner": "Session 5", "status": "not_started", "dependencies": ["REPLAY-001", "SCAE-012", "SCORE-001"]},
     {"id": "CAL-002", "stage": "autonomous_optimization_maturity", "owner": "Session 6", "status": "not_started", "dependencies": ["CAL-001", "POL-001"]},
@@ -290,7 +291,7 @@
     {"id": "MIG-006", "owner": "Session 4", "status": "not_started", "feature_ids": ["CLS-001", "CLS-006", "CLS-008", "CLS-002", "CLS-003", "CLS-004", "CLS-005", "CLS-007", "VER-001", "VER-002", "VER-003", "VER-004", "MODEL-003"], "dependencies": ["FND-004", "CLS-006", "CLS-008", "CLS-003", "CLS-005", "CLS-007", "VER-001", "VER-002", "VER-004"], "write_paths": ["write_leaf_research_assignments", "write_researcher_context_isolation_audits", "write_researcher_classifications", "write_verification_slices", "write_researcher_coverage_proofs", "write_researcher_escalation_decisions", "write_research_sufficiency_reconciliation"]},
     {"id": "MIG-007", "owner": "Session 5", "status": "not_started", "feature_ids": ["SCAE-001", "SCAE-002", "SCAE-003", "SCAE-004", "SCAE-005", "SCAE-006", "SCAE-007", "SCAE-008", "SCAE-009", "SCAE-010", "SCAE-011", "SCAE-012", "SCAE-013"], "dependencies": ["FND-004", "SCAE-012", "SCAE-013"], "write_paths": ["write_scae_ledger", "write_scae_research_sufficiency_inputs"]},
     {"id": "MIG-008", "owner": "Session 5", "status": "not_started", "feature_ids": ["SYN-001", "DEC-001", "PERSIST-001", "PERSIST-002"], "dependencies": ["PERSIST-002", "SCAE-012"], "write_paths": ["write_forecast_decision", "record_market_prediction", "record_prediction_with_snapshot"]},
-    {"id": "MIG-009", "owner": "Session 5", "status": "not_started", "feature_ids": ["TRACE-001", "TRACE-002", "MODEL-004", "REPLAY-001"], "dependencies": ["TRACE-001", "MODEL-004"], "write_paths": ["write_minimal_training_trace", "write_replay_manifest", "write_full_training_trace_materialization"]},
+    {"id": "MIG-009", "owner": "Session 5", "status": "not_started", "feature_ids": ["TRACE-001", "TRACE-002", "MODEL-004", "REPLAY-001"], "dependencies": ["TRACE-001", "MODEL-004"], "write_paths": ["write_minimal_training_trace", "write_replay_manifest", "write_replay_result_record", "write_full_training_trace_materialization"]},
     {"id": "MIG-010", "owner": "Session 5", "status": "not_started", "feature_ids": ["REPLAY-001", "SCORE-001", "CAL-001"], "dependencies": ["REPLAY-001", "SCORE-001", "CAL-001"], "write_paths": ["write_resolution_score", "settle_market_outcome", "brier_score_report"]},
     {"id": "MIG-011", "owner": "Session 6", "status": "not_started", "feature_ids": ["CAL-002", "CAL-003", "CAL-004", "CAL-005", "POL-001"], "dependencies": ["CAL-002", "POL-001"], "write_paths": ["write_calibration_candidate", "promote_policy_pointer", "write_policy_rollback_event"]}
   ]
