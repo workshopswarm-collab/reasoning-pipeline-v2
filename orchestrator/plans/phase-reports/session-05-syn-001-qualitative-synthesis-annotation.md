@@ -18,4 +18,4 @@
 - Shared Inventory Updates Requested: Mark `SYN-001` `ready_for_integration` after coordinator review, with acceptance evidence covering qualitative-only annotation, SCAE-owned numeric context by reference, forbidden probability/decision/persistence/scoring outputs, and no post-SCAE authority expansion. After reconciliation, `DEC-001` should remain the next legal Session 5 dispatch; `PERSIST-001`, `PERSIST-002`, and `MIG-008` remain blocked by later decision/persistence rows.
 - Shared Map/Matrix Updates Requested: No direct edits. Reconcile any blocker evidence for `BLK-001` no non-SCAE probability authorship if coordinator chooses to record this implementation as supporting evidence.
 - Blockers: No implementation blocker. Push is held for the coordinator window.
-- Commit SHA: Pending final detached-HEAD commit.
+- Commit SHA: Original held implementation commit `f483a9c1634e814449a50de529b8978b79b4486e`; rebased implementation commit `e3abcab13acd60004a546d99e2d825da245ccd86`. This report-only bookkeeping correction is included before push.
