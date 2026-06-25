@@ -22,12 +22,16 @@ from ads_decomposer.handoff import (  # noqa: E402
     QUESTION_DECOMPOSITION_SCHEMA_VERSION,
 )
 from ads_decomposer.qdt import (  # noqa: E402
+    ANCHOR_DEPENDENCY_CONTRACT_SCHEMA_VERSION,
     COMPACT_DEFAULT_LEAF_BUDGET,
     QDTError,
+    build_anchor_dependency_contract,
     build_fixture_qdt_candidate,
     build_leaf_budget_decision,
     dump_question_decomposition,
+    repair_anchor_dependency_contracts,
     select_qdt_candidate,
+    validate_anchor_dependency_contract,
     validate_question_decomposition,
 )
 
@@ -144,16 +148,167 @@ class QDTContractTest(unittest.TestCase):
         scoped = copy.deepcopy(selected)
         leaf_id = scoped["required_leaf_questions"][1]["leaf_id"]
         scoped["required_leaf_questions"][1]["leaf_condition_scope"] = "target_given_upstream"
+        scoped["branches"][0]["anchor_mode"] = "anchor_required"
         scoped["amrg_anchor_dependency_contracts"] = [
-            {
-                "contract_id": "anchor-contract-1",
-                "related_market_ref": "artifact:amrg-1",
-                "anchor_role": "anchor_required",
-                "required_before_leaf_ids": [leaf_id],
-            }
+            build_anchor_dependency_contract(
+                {"edge_id": "edge-1", "status": "validated_strict_precedence_anchor"},
+                scoped["branches"][0],
+                leaves=scoped["required_leaf_questions"],
+                related_market_ref="artifact:amrg-1",
+            )
         ]
 
+        contract = scoped["amrg_anchor_dependency_contracts"][0]
+        self.assertEqual(contract["schema_version"], ANCHOR_DEPENDENCY_CONTRACT_SCHEMA_VERSION)
+        self.assertEqual(contract["edge_id"], "edge-1")
+        self.assertEqual(contract["anchor_mode"], "anchor_required")
+        self.assertEqual(contract["condition_scoped_leaf_ids"], [leaf_id])
+        self.assertTrue(contract["fallback_policy"])
+        self.assertGreater(contract["max_anchor_repair_attempts"], 0)
+        self.assertGreater(contract["max_anchor_repair_wall_clock_seconds"], 0)
         self.assertTrue(validate_question_decomposition(scoped).valid)
+
+    def test_weak_amrg_edge_cannot_create_anchor_required_contract(self):
+        selected = select_qdt_candidate([build_fixture_qdt_candidate(self.handoff)])
+        scoped = copy.deepcopy(selected)
+        scoped["required_leaf_questions"][1]["leaf_condition_scope"] = "target_given_upstream"
+        scoped["branches"][0]["anchor_mode"] = "anchor_required"
+
+        contract = build_anchor_dependency_contract(
+            {"edge_id": "edge-weak", "relationship_status": "weak_context_only"},
+            scoped["branches"][0],
+            leaves=scoped["required_leaf_questions"],
+            related_market_ref="artifact:amrg-1",
+        )
+
+        self.assertEqual(contract["anchor_mode"], "diagnostic_only")
+        scoped["amrg_anchor_dependency_contracts"] = [contract]
+        result = validate_question_decomposition(scoped)
+        self.assertFalse(result.valid)
+        self.assertIn("requires valid anchor contract", "; ".join(result.errors))
+
+        forced_required = copy.deepcopy(contract)
+        forced_required["anchor_mode"] = "anchor_required"
+        forced_result = validate_anchor_dependency_contract(
+            forced_required,
+            leaves=scoped["required_leaf_questions"],
+        )
+        self.assertFalse(forced_result.valid)
+        self.assertIn("cannot use weak", "; ".join(forced_result.errors))
+
+    def test_strict_precedence_candidate_creates_anchor_optional_contract(self):
+        selected = select_qdt_candidate([build_fixture_qdt_candidate(self.handoff)])
+        scoped = copy.deepcopy(selected)
+        scoped["required_leaf_questions"][1]["leaf_condition_scope"] = "target_given_not_upstream"
+        contract = build_anchor_dependency_contract(
+            {"edge_id": "edge-candidate", "status": "strict_precedence_anchor_candidate"},
+            scoped["branches"][0],
+            leaves=scoped["required_leaf_questions"],
+            related_market_ref="artifact:amrg-1",
+        )
+
+        self.assertEqual(contract["anchor_mode"], "anchor_optional")
+        scoped["amrg_anchor_dependency_contracts"] = [contract]
+        self.assertTrue(validate_question_decomposition(scoped).valid)
+
+    def test_anchor_required_without_fallback_or_repair_policy_is_rejected(self):
+        selected = select_qdt_candidate([build_fixture_qdt_candidate(self.handoff)])
+        scoped = copy.deepcopy(selected)
+        scoped["required_leaf_questions"][1]["leaf_condition_scope"] = "target_given_upstream"
+        scoped["branches"][0]["anchor_mode"] = "anchor_required"
+        contract = build_anchor_dependency_contract(
+            {"edge_id": "edge-1", "status": "validated_strict_precedence_anchor"},
+            scoped["branches"][0],
+            leaves=scoped["required_leaf_questions"],
+            related_market_ref="artifact:amrg-1",
+        )
+
+        for field in (
+            "fallback_policy",
+            "max_anchor_repair_attempts",
+            "max_anchor_repair_wall_clock_seconds",
+            "repair_exhaustion_policy",
+        ):
+            with self.subTest(field=field):
+                broken = copy.deepcopy(scoped)
+                broken_contract = copy.deepcopy(contract)
+                broken_contract.pop(field)
+                broken["amrg_anchor_dependency_contracts"] = [broken_contract]
+                result = validate_question_decomposition(broken)
+                self.assertFalse(result.valid)
+                self.assertIn(field, "; ".join(result.errors))
+
+    def test_repair_helper_adds_contract_for_condition_scoped_branch(self):
+        selected = select_qdt_candidate([build_fixture_qdt_candidate(self.handoff)])
+        broken = copy.deepcopy(selected)
+        broken["required_leaf_questions"][1]["leaf_condition_scope"] = "target_given_upstream"
+        broken["branches"][0]["anchor_mode"] = "anchor_required"
+        self.assertFalse(validate_question_decomposition(broken).valid)
+
+        repaired = repair_anchor_dependency_contracts(
+            broken,
+            related_market_context={
+                "relationship_edges": [
+                    {
+                        "edge_id": "edge-anchor-1",
+                        "status": "validated_strict_precedence_anchor",
+                        "candidate_id": "amrg-candidate-1",
+                    }
+                ]
+            },
+        )
+
+        self.assertTrue(repaired["repair_summary"]["post_repair_valid"], repaired["repair_summary"])
+        self.assertEqual(repaired["repair_summary"]["edge_ids_used"], ["edge-anchor-1"])
+        artifact = repaired["artifact"]
+        self.assertTrue(validate_question_decomposition(artifact).valid)
+        self.assertEqual(artifact["related_market_context_usage"]["anchor_dependency_status"], "declared")
+        self.assertEqual(artifact["related_market_context_usage"]["amrg_usage_refs"], ["edge-anchor-1"])
+
+    def test_repair_cli_writes_valid_repaired_artifact(self):
+        selected = select_qdt_candidate([build_fixture_qdt_candidate(self.handoff)])
+        broken = copy.deepcopy(selected)
+        broken["required_leaf_questions"][1]["leaf_condition_scope"] = "target_given_upstream"
+        broken["branches"][0]["anchor_mode"] = "anchor_required"
+        with tempfile.TemporaryDirectory() as temp:
+            qdt_path = Path(temp) / "question-decomposition.json"
+            context_path = Path(temp) / "related-context.json"
+            output_path = Path(temp) / "repaired-question-decomposition.json"
+            qdt_path.write_text(json.dumps(broken), encoding="utf-8")
+            context_path.write_text(
+                json.dumps(
+                    {
+                        "relationship_edges": [
+                            {
+                                "edge_id": "edge-anchor-1",
+                                "status": "validated_strict_precedence_anchor",
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "decomposer" / "scripts" / "bin" / "repair_anchor_dependency.py"),
+                    str(qdt_path),
+                    "--related-market-context",
+                    str(context_path),
+                    "--output",
+                    str(output_path),
+                ],
+                check=False,
+                text=True,
+                capture_output=True,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr + completed.stdout)
+            summary = json.loads(completed.stdout)
+            self.assertTrue(summary["post_repair_valid"])
+            repaired = json.loads(output_path.read_text(encoding="utf-8"))
+            self.assertTrue(validate_question_decomposition(repaired).valid)
 
     def test_critical_or_source_of_truth_leaf_requires_primary_or_unanswerability_path(self):
         selected = select_qdt_candidate([build_fixture_qdt_candidate(self.handoff)])

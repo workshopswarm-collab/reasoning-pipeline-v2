@@ -41,8 +41,12 @@ from .handoff import (
 QUESTION_DECOMPOSITION_ARTIFACT_TYPE = "question_decomposition"
 QDT_SCHEMA_VALIDATOR_VERSION = "ads-qdt-schema/v1"
 QDT_SELECTION_HELPER_VERSION = "ads-qdt-selection/v1"
+ANCHOR_DEPENDENCY_CONTRACT_SCHEMA_VERSION = "amrg-anchor-dependency-contract/v1"
+ANCHOR_DEPENDENCY_REPAIR_HELPER_VERSION = "ads-qdt-anchor-repair/v1"
 COMPACT_DEFAULT_LEAF_BUDGET = 6
 MAX_REASON_CODE_LENGTH = 80
+DEFAULT_ANCHOR_REPAIR_ATTEMPTS = 2
+DEFAULT_ANCHOR_REPAIR_WALL_CLOCK_SECONDS = 120
 
 ALLOWED_PURPOSES = {
     "base_rate",
@@ -76,6 +80,21 @@ ALLOWED_UNANSWERABLE_POLICY_CONSEQUENCES = {
 }
 CONDITION_SCOPES_REQUIRING_ANCHOR_CONTRACT = {"target_given_upstream", "target_given_not_upstream"}
 APPROVED_WAIVER_STATUS = "approved"
+ALLOWED_ANCHOR_MODES = {"diagnostic_only", "anchor_optional", "anchor_required"}
+ANCHOR_MODES_SATISFYING_CONDITION_SCOPE = {"anchor_optional", "anchor_required"}
+STRICT_PRECEDENCE_ANCHOR_EDGE_STATUSES = {
+    "strict_precedence_anchor_candidate",
+    "validated_strict_precedence_anchor",
+}
+ALLOWED_ANCHOR_FALLBACK_MODES = {
+    "watch_only_if_forecastable",
+    "use_unconditional_fallback_leaf",
+    "fail_dispatch_preparation",
+}
+ALLOWED_REPAIR_EXHAUSTION_POLICIES = {
+    "watch_only_if_forecastable",
+    "fail_dispatch_preparation",
+}
 ALLOWED_RELATED_CONTEXT_USAGE_STATUS = {
     "related_context_used",
     "no_related_context_waiver",
@@ -147,6 +166,25 @@ REQUIRED_MODEL_FIELDS = (
     "input_manifest_ids",
     "output_schema_version",
 )
+REQUIRED_ANCHOR_CONTRACT_FIELDS = (
+    "schema_version",
+    "anchor_dependency_contract_id",
+    "edge_id",
+    "edge_status",
+    "conditional_branch_group_id",
+    "anchor_mode",
+    "condition_scoped_leaf_ids",
+    "fallback_policy",
+    "max_anchor_repair_attempts",
+    "max_anchor_repair_wall_clock_seconds",
+    "repair_exhaustion_policy",
+)
+REQUIRED_ANCHOR_FALLBACK_FIELDS = (
+    "fallback_policy_id",
+    "fallback_mode",
+    "fallback_leaf_ids",
+    "fallback_reason_codes",
+)
 
 
 class QDTError(ValueError):
@@ -166,6 +204,13 @@ class QDTValidationResult:
             "warnings": list(self.warnings),
             "validator_version": QDT_SCHEMA_VALIDATOR_VERSION,
         }
+
+
+@dataclass(frozen=True)
+class AnchorRepairPolicy:
+    max_anchor_repair_attempts: int = DEFAULT_ANCHOR_REPAIR_ATTEMPTS
+    max_anchor_repair_wall_clock_seconds: int = DEFAULT_ANCHOR_REPAIR_WALL_CLOCK_SECONDS
+    repair_exhaustion_policy: str = "fail_dispatch_preparation"
 
 
 def _prefixed_sha256(value: Any) -> str:
@@ -206,6 +251,221 @@ def _extract_string_list(value: Any) -> list[str] | None:
     if isinstance(value, list) and all(_is_non_empty_string(item) for item in value):
         return list(value)
     return None
+
+
+def _stable_id(prefix: str, *parts: Any) -> str:
+    digest = hashlib.sha256(canonical_json(parts).encode("utf-8")).hexdigest()
+    return f"{prefix}{digest[:24]}"
+
+
+def _normalize_leaf_collection(leaves: Any) -> list[dict[str, Any]]:
+    if isinstance(leaves, dict):
+        return [leaf for leaf in leaves.values() if isinstance(leaf, dict)]
+    if isinstance(leaves, list):
+        return [leaf for leaf in leaves if isinstance(leaf, dict)]
+    return []
+
+
+def _leaves_by_id(leaves: Any) -> dict[str, dict[str, Any]]:
+    indexed: dict[str, dict[str, Any]] = {}
+    for leaf in _normalize_leaf_collection(leaves):
+        leaf_id = leaf.get("leaf_id")
+        if _is_non_empty_string(leaf_id):
+            indexed[str(leaf_id)] = leaf
+    return indexed
+
+
+def _edge_status(edge: dict[str, Any]) -> str:
+    for field in ("anchor_validation_status", "edge_status", "status", "relationship_status"):
+        value = edge.get(field)
+        if _is_non_empty_string(value):
+            return str(value)
+    return "unknown"
+
+
+def _branch_ordered_leaf_ids(qdt_branch: dict[str, Any], leaves: Any) -> list[str]:
+    leaves_by_id = _leaves_by_id(leaves)
+    ordered: list[str] = []
+    branch_leaf_ids = qdt_branch.get("leaf_ids")
+    if isinstance(branch_leaf_ids, list):
+        ordered.extend(str(leaf_id) for leaf_id in branch_leaf_ids if str(leaf_id) in leaves_by_id)
+    branch_id = qdt_branch.get("branch_id")
+    for leaf in _normalize_leaf_collection(leaves):
+        leaf_id = leaf.get("leaf_id")
+        if (
+            _is_non_empty_string(leaf_id)
+            and leaf_id not in ordered
+            and _is_non_empty_string(branch_id)
+            and leaf.get("parent_branch_id") == branch_id
+        ):
+            ordered.append(str(leaf_id))
+    return ordered
+
+
+def find_condition_scoped_leaves(qdt_branch: dict[str, Any], leaves: Any) -> list[str]:
+    """Return branch leaves that need explicit AMRG anchor contracts."""
+
+    leaves_by_id = _leaves_by_id(leaves)
+    scoped: list[str] = []
+    for leaf_id in _branch_ordered_leaf_ids(qdt_branch, leaves):
+        leaf = leaves_by_id.get(leaf_id)
+        if leaf and leaf.get("leaf_condition_scope") in CONDITION_SCOPES_REQUIRING_ANCHOR_CONTRACT:
+            scoped.append(leaf_id)
+    return scoped
+
+
+def _unconditional_fallback_leaf_ids(qdt_branch: dict[str, Any], leaves: Any) -> list[str]:
+    leaves_by_id = _leaves_by_id(leaves)
+    fallback: list[str] = []
+    for leaf_id in _branch_ordered_leaf_ids(qdt_branch, leaves):
+        leaf = leaves_by_id.get(leaf_id)
+        if leaf and leaf.get("leaf_condition_scope") in {"unconditional", "shared_context"}:
+            fallback.append(leaf_id)
+    return fallback
+
+
+def choose_anchor_mode(
+    edge: dict[str, Any],
+    qdt_branch: dict[str, Any],
+    condition_scoped_leaf_ids: list[str] | None = None,
+) -> str:
+    edge_status = _edge_status(edge)
+    if edge_status not in STRICT_PRECEDENCE_ANCHOR_EDGE_STATUSES:
+        return "diagnostic_only"
+    if not condition_scoped_leaf_ids:
+        return "diagnostic_only"
+    explicit = qdt_branch.get("anchor_mode") or qdt_branch.get("anchor_dependency_mode")
+    if explicit in ALLOWED_ANCHOR_MODES:
+        return str(explicit)
+    if edge_status == "validated_strict_precedence_anchor":
+        return "anchor_required"
+    return "anchor_optional"
+
+
+def _normalize_repair_policy(policy: AnchorRepairPolicy | dict[str, Any] | None, anchor_mode: str) -> dict[str, Any]:
+    if isinstance(policy, AnchorRepairPolicy):
+        raw = {
+            "max_anchor_repair_attempts": policy.max_anchor_repair_attempts,
+            "max_anchor_repair_wall_clock_seconds": policy.max_anchor_repair_wall_clock_seconds,
+            "repair_exhaustion_policy": policy.repair_exhaustion_policy,
+        }
+    else:
+        raw = dict(policy or {})
+    if anchor_mode == "diagnostic_only":
+        default_attempts = 0
+        default_wall_clock = 0
+        default_exhaustion = "watch_only_if_forecastable"
+    else:
+        default_attempts = DEFAULT_ANCHOR_REPAIR_ATTEMPTS
+        default_wall_clock = DEFAULT_ANCHOR_REPAIR_WALL_CLOCK_SECONDS
+        default_exhaustion = "fail_dispatch_preparation" if anchor_mode == "anchor_required" else "watch_only_if_forecastable"
+    return {
+        "max_anchor_repair_attempts": int(raw.get("max_anchor_repair_attempts", default_attempts)),
+        "max_anchor_repair_wall_clock_seconds": int(
+            raw.get("max_anchor_repair_wall_clock_seconds", default_wall_clock)
+        ),
+        "repair_exhaustion_policy": raw.get("repair_exhaustion_policy", default_exhaustion),
+    }
+
+
+def derive_fallback_policy(
+    qdt_branch: dict[str, Any],
+    leaves: Any = None,
+    *,
+    anchor_mode: str = "anchor_required",
+) -> dict[str, Any]:
+    fallback = copy.deepcopy(qdt_branch.get("fallback_policy") or {})
+    if not isinstance(fallback, dict):
+        fallback = {}
+    fallback_leaf_ids = fallback.get("fallback_leaf_ids")
+    if not isinstance(fallback_leaf_ids, list):
+        fallback_leaf_ids = _unconditional_fallback_leaf_ids(qdt_branch, leaves)
+    fallback_leaf_ids = [str(leaf_id) for leaf_id in fallback_leaf_ids if _is_non_empty_string(leaf_id)]
+
+    fallback_mode = fallback.get("fallback_mode")
+    if fallback_mode not in ALLOWED_ANCHOR_FALLBACK_MODES:
+        if fallback_leaf_ids:
+            fallback_mode = "use_unconditional_fallback_leaf"
+        elif anchor_mode == "anchor_required":
+            fallback_mode = "fail_dispatch_preparation"
+        else:
+            fallback_mode = "watch_only_if_forecastable"
+
+    reason_codes = fallback.get("fallback_reason_codes")
+    if not _reason_codes_are_compact(reason_codes):
+        reason_codes = [
+            "anchor_required" if anchor_mode == "anchor_required" else "anchor_not_required",
+            "qdt_anchor_fallback_policy",
+        ]
+    return {
+        "fallback_policy_id": fallback.get("fallback_policy_id")
+        or _stable_id(
+            "anchor-fallback:",
+            qdt_branch.get("branch_id"),
+            fallback_mode,
+            fallback_leaf_ids,
+        ),
+        "fallback_mode": fallback_mode,
+        "fallback_leaf_ids": fallback_leaf_ids,
+        "fallback_reason_codes": list(reason_codes),
+    }
+
+
+def build_anchor_dependency_contract(
+    edge: dict[str, Any],
+    qdt_branch: dict[str, Any],
+    *,
+    leaves: Any = None,
+    related_market_ref: str | None = None,
+    repair_policy: AnchorRepairPolicy | dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if not isinstance(edge, dict):
+        raise QDTError("edge must be an object")
+    if not isinstance(qdt_branch, dict):
+        raise QDTError("qdt_branch must be an object")
+    edge_id = edge.get("edge_id")
+    if not _is_non_empty_string(edge_id):
+        raise QDTError("edge_id is required")
+    condition_scoped_leaf_ids = find_condition_scoped_leaves(qdt_branch, leaves)
+    anchor_mode = choose_anchor_mode(edge, qdt_branch, condition_scoped_leaf_ids)
+    normalized_policy = _normalize_repair_policy(repair_policy, anchor_mode)
+    branch_id = qdt_branch.get("branch_id")
+    fallback_policy = derive_fallback_policy(qdt_branch, leaves, anchor_mode=anchor_mode)
+    ref = (
+        related_market_ref
+        or edge.get("related_market_ref")
+        or edge.get("context_artifact_ref")
+        or edge.get("candidate_set_id")
+    )
+    contract = {
+        "schema_version": ANCHOR_DEPENDENCY_CONTRACT_SCHEMA_VERSION,
+        "anchor_dependency_contract_id": _stable_id(
+            "anchor-contract:",
+            edge_id,
+            branch_id,
+            anchor_mode,
+            condition_scoped_leaf_ids,
+        ),
+        "edge_id": str(edge_id),
+        "edge_status": _edge_status(edge),
+        "conditional_branch_group_id": _stable_id("conditional-branch-group:", edge_id, branch_id),
+        "anchor_mode": anchor_mode,
+        "condition_scoped_leaf_ids": condition_scoped_leaf_ids,
+        "required_before_leaf_ids": condition_scoped_leaf_ids,
+        "fallback_policy": fallback_policy,
+        "max_anchor_repair_attempts": normalized_policy["max_anchor_repair_attempts"],
+        "max_anchor_repair_wall_clock_seconds": normalized_policy["max_anchor_repair_wall_clock_seconds"],
+        "repair_exhaustion_policy": normalized_policy["repair_exhaustion_policy"],
+    }
+    if _is_non_empty_string(branch_id):
+        contract["qdt_branch_id"] = branch_id
+    if _is_non_empty_string(ref):
+        contract["related_market_ref"] = str(ref)
+    if _is_non_empty_string(edge.get("candidate_id")):
+        contract["edge_candidate_id"] = str(edge["candidate_id"])
+    if _is_non_empty_string(edge.get("related_market_id")):
+        contract["related_market_id"] = str(edge["related_market_id"])
+    return contract
 
 
 def _required_purposes_from_evidence_packet(evidence_packet: dict[str, Any] | None) -> list[str] | None:
@@ -790,30 +1050,138 @@ def _validate_related_context_usage(value: Any, errors: list[str]) -> None:
         errors.append("related_market_context_usage.anchor_dependency_status is required")
 
 
-def _validate_amrg_contracts(value: Any, leaf_ids: set[str], errors: list[str]) -> None:
+def _validate_anchor_fallback_policy(
+    fallback: Any,
+    path: str,
+    leaf_ids: set[str],
+    leaves_by_id: dict[str, dict[str, Any]],
+    errors: list[str],
+) -> None:
+    if not isinstance(fallback, dict):
+        errors.append(f"{path}.fallback_policy must be an object")
+        return
+    for field in REQUIRED_ANCHOR_FALLBACK_FIELDS:
+        if field not in fallback:
+            errors.append(f"{path}.fallback_policy missing {field}")
+    if not _is_non_empty_string(fallback.get("fallback_policy_id")):
+        errors.append(f"{path}.fallback_policy.fallback_policy_id is required")
+    if fallback.get("fallback_mode") not in ALLOWED_ANCHOR_FALLBACK_MODES:
+        errors.append(f"{path}.fallback_policy.fallback_mode is invalid")
+    fallback_leaf_ids = fallback.get("fallback_leaf_ids")
+    if not isinstance(fallback_leaf_ids, list):
+        errors.append(f"{path}.fallback_policy.fallback_leaf_ids must be a list")
+    elif not set(fallback_leaf_ids).issubset(leaf_ids):
+        errors.append(f"{path}.fallback_policy.fallback_leaf_ids references unknown leaves")
+    elif fallback.get("fallback_mode") == "use_unconditional_fallback_leaf":
+        if not fallback_leaf_ids:
+            errors.append(f"{path}.fallback_policy fallback leaf mode requires fallback_leaf_ids")
+        for leaf_id in fallback_leaf_ids:
+            leaf = leaves_by_id.get(leaf_id)
+            if leaf and leaf.get("leaf_condition_scope") in CONDITION_SCOPES_REQUIRING_ANCHOR_CONTRACT:
+                errors.append(f"{path}.fallback_policy fallback leaves must be unconditional or shared context")
+    if not _reason_codes_are_compact(fallback.get("fallback_reason_codes")):
+        errors.append(f"{path}.fallback_policy.fallback_reason_codes must be compact reason codes")
+
+
+def _validate_anchor_dependency_contract(
+    contract: Any,
+    path: str,
+    leaf_ids: set[str],
+    leaves_by_id: dict[str, dict[str, Any]],
+    errors: list[str],
+) -> None:
+    if not isinstance(contract, dict):
+        errors.append(f"{path} must be an object")
+        return
+    for field in REQUIRED_ANCHOR_CONTRACT_FIELDS:
+        if field not in contract:
+            errors.append(f"{path} missing {field}")
+    if contract.get("schema_version") != ANCHOR_DEPENDENCY_CONTRACT_SCHEMA_VERSION:
+        errors.append(f"{path}.schema_version must be {ANCHOR_DEPENDENCY_CONTRACT_SCHEMA_VERSION}")
+    if not _is_non_empty_string(contract.get("anchor_dependency_contract_id")):
+        errors.append(f"{path}.anchor_dependency_contract_id is required")
+    if not _is_non_empty_string(contract.get("edge_id")):
+        errors.append(f"{path}.edge_id is required")
+    edge_status = contract.get("edge_status")
+    if not _is_non_empty_string(edge_status):
+        errors.append(f"{path}.edge_status is required")
+    if not _is_non_empty_string(contract.get("conditional_branch_group_id")):
+        errors.append(f"{path}.conditional_branch_group_id is required")
+    anchor_mode = contract.get("anchor_mode")
+    if anchor_mode not in ALLOWED_ANCHOR_MODES:
+        errors.append(f"{path}.anchor_mode is invalid")
+    condition_scoped = contract.get("condition_scoped_leaf_ids")
+    if not isinstance(condition_scoped, list):
+        errors.append(f"{path}.condition_scoped_leaf_ids must be a list")
+        condition_scoped = []
+    elif not set(condition_scoped).issubset(leaf_ids):
+        errors.append(f"{path}.condition_scoped_leaf_ids references unknown leaves")
+    else:
+        for leaf_id in condition_scoped:
+            leaf = leaves_by_id.get(leaf_id)
+            if leaf and leaf.get("leaf_condition_scope") not in CONDITION_SCOPES_REQUIRING_ANCHOR_CONTRACT:
+                errors.append(f"{path}.condition_scoped_leaf_ids must reference condition-scoped leaves")
+
+    required_before = contract.get("required_before_leaf_ids")
+    if required_before is not None:
+        if not isinstance(required_before, list):
+            errors.append(f"{path}.required_before_leaf_ids must be a list")
+        elif not set(required_before).issubset(leaf_ids):
+            errors.append(f"{path}.required_before_leaf_ids references unknown leaves")
+
+    if anchor_mode in ANCHOR_MODES_SATISFYING_CONDITION_SCOPE:
+        if edge_status not in STRICT_PRECEDENCE_ANCHOR_EDGE_STATUSES:
+            errors.append(f"{path}.anchor_mode cannot use weak or non-strict AMRG edge status {edge_status}")
+        if not condition_scoped:
+            errors.append(f"{path}.condition_scoped_leaf_ids required for {anchor_mode}")
+
+    _validate_anchor_fallback_policy(contract.get("fallback_policy"), path, leaf_ids, leaves_by_id, errors)
+    for int_field in ("max_anchor_repair_attempts", "max_anchor_repair_wall_clock_seconds"):
+        if not _non_negative_int(contract.get(int_field)):
+            errors.append(f"{path}.{int_field} must be a non-negative integer")
+    if anchor_mode == "anchor_required":
+        if not _positive_int(contract.get("max_anchor_repair_attempts")):
+            errors.append(f"{path}.max_anchor_repair_attempts must be positive for anchor_required")
+        if not _positive_int(contract.get("max_anchor_repair_wall_clock_seconds")):
+            errors.append(f"{path}.max_anchor_repair_wall_clock_seconds must be positive for anchor_required")
+    if contract.get("repair_exhaustion_policy") not in ALLOWED_REPAIR_EXHAUSTION_POLICIES:
+        errors.append(f"{path}.repair_exhaustion_policy is invalid")
+    related_ref = contract.get("related_market_ref")
+    if related_ref is not None and not _is_non_empty_string(related_ref):
+        errors.append(f"{path}.related_market_ref must be string or null")
+
+
+def validate_anchor_dependency_contract(
+    contract: dict[str, Any],
+    *,
+    leaves: Any = None,
+) -> QDTValidationResult:
+    leaves_by_id = _leaves_by_id(leaves)
+    errors: list[str] = []
+    _validate_anchor_dependency_contract(contract, "anchor_dependency_contract", set(leaves_by_id), leaves_by_id, errors)
+    return QDTValidationResult(not errors, tuple(errors))
+
+
+def _validate_amrg_contracts(value: Any, leaves_by_id: dict[str, dict[str, Any]], errors: list[str]) -> None:
     if not isinstance(value, list):
         errors.append("amrg_anchor_dependency_contracts must be a list")
         return
+    leaf_ids = set(leaves_by_id)
+    seen_contract_ids: set[str] = set()
     for idx, contract in enumerate(value):
         path = f"amrg_anchor_dependency_contracts[{idx}]"
-        if not isinstance(contract, dict):
-            errors.append(f"{path} must be an object")
-            continue
-        for field in ("contract_id", "related_market_ref", "anchor_role", "required_before_leaf_ids"):
-            if field not in contract:
-                errors.append(f"{path} missing {field}")
-        if not _is_non_empty_string(contract.get("contract_id")):
-            errors.append(f"{path}.contract_id is required")
-        if not isinstance(contract.get("required_before_leaf_ids"), list):
-            errors.append(f"{path}.required_before_leaf_ids must be a list")
-        elif not set(contract["required_before_leaf_ids"]).issubset(leaf_ids):
-            errors.append(f"{path}.required_before_leaf_ids references unknown leaves")
-        condition_scoped = contract.get("condition_scoped_leaf_ids")
-        if condition_scoped is not None:
-            if not isinstance(condition_scoped, list):
-                errors.append(f"{path}.condition_scoped_leaf_ids must be a list")
-            elif not set(condition_scoped).issubset(leaf_ids):
-                errors.append(f"{path}.condition_scoped_leaf_ids references unknown leaves")
+        before = len(errors)
+        _validate_anchor_dependency_contract(contract, path, leaf_ids, leaves_by_id, errors)
+        if isinstance(contract, dict):
+            contract_id = contract.get("anchor_dependency_contract_id")
+            if _is_non_empty_string(contract_id):
+                if contract_id in seen_contract_ids:
+                    errors.append(f"{path}.anchor_dependency_contract_id is duplicated")
+                seen_contract_ids.add(str(contract_id))
+            if len(errors) == before and contract.get("anchor_mode") == "anchor_required":
+                fallback = contract.get("fallback_policy", {})
+                if not fallback or not contract.get("repair_exhaustion_policy"):
+                    errors.append(f"{path} anchor_required requires fallback and repair policy")
 
 
 def _validate_condition_scope_contracts(
@@ -826,6 +1194,8 @@ def _validate_condition_scope_contracts(
     contracted_leaf_ids: set[str] = set()
     for contract in contracts:
         if not isinstance(contract, dict):
+            continue
+        if contract.get("anchor_mode") not in ANCHOR_MODES_SATISFYING_CONDITION_SCOPE:
             continue
         for field in ("condition_scoped_leaf_ids", "required_before_leaf_ids"):
             values = contract.get(field)
@@ -985,7 +1355,7 @@ def validate_question_decomposition(
         errors,
     )
     _validate_related_context_usage(artifact.get("related_market_context_usage"), errors)
-    _validate_amrg_contracts(artifact.get("amrg_anchor_dependency_contracts"), set(leaves_by_id), errors)
+    _validate_amrg_contracts(artifact.get("amrg_anchor_dependency_contracts"), leaves_by_id, errors)
     _validate_condition_scope_contracts(leaves_by_id, artifact.get("amrg_anchor_dependency_contracts"), errors)
     _validate_model_context(artifact.get("model_execution_context"), errors)
     _validate_candidate_selection_audit(
@@ -994,8 +1364,6 @@ def validate_question_decomposition(
         require_selected=require_selected,
     )
     _validate_validation_summary(artifact.get("validation_summary"), errors, require_selected=require_selected)
-    if artifact.get("amrg_anchor_dependency_contracts"):
-        warnings.append("amrg_anchor_dependency_contracts_schema_only_pending_qdt_004")
     return QDTValidationResult(not errors, tuple(errors), tuple(warnings))
 
 
@@ -1100,6 +1468,133 @@ def select_qdt_candidate(candidates: list[dict[str, Any]]) -> dict[str, Any]:
     }
     require_valid_question_decomposition(selected)
     return selected
+
+
+def _relationship_edges_from_context(related_market_context: Any) -> list[dict[str, Any]]:
+    if not isinstance(related_market_context, dict):
+        return []
+    edges = related_market_context.get("relationship_edges")
+    if not isinstance(edges, list):
+        return []
+    return [edge for edge in edges if isinstance(edge, dict) and _is_non_empty_string(edge.get("edge_id"))]
+
+
+def _edge_ref_value(ref: Any) -> str | None:
+    if _is_non_empty_string(ref):
+        return str(ref)
+    if isinstance(ref, dict):
+        for field in ("edge_id", "ref_id", "id"):
+            if _is_non_empty_string(ref.get(field)):
+                return str(ref[field])
+    return None
+
+
+def _select_repair_edge(qdt_branch: dict[str, Any], edges: list[dict[str, Any]]) -> dict[str, Any] | None:
+    edges_by_id = {str(edge["edge_id"]): edge for edge in edges}
+    preferred_refs = qdt_branch.get("amrg_usage_refs")
+    if isinstance(preferred_refs, list):
+        for ref in preferred_refs:
+            edge_id = _edge_ref_value(ref)
+            if edge_id in edges_by_id and _edge_status(edges_by_id[edge_id]) in STRICT_PRECEDENCE_ANCHOR_EDGE_STATUSES:
+                return edges_by_id[edge_id]
+    for edge in edges:
+        if _edge_status(edge) in STRICT_PRECEDENCE_ANCHOR_EDGE_STATUSES:
+            return edge
+    return None
+
+
+def _covered_condition_scoped_leaf_ids(contracts: Any) -> set[str]:
+    covered: set[str] = set()
+    if not isinstance(contracts, list):
+        return covered
+    for contract in contracts:
+        if not isinstance(contract, dict):
+            continue
+        if contract.get("anchor_mode") not in ANCHOR_MODES_SATISFYING_CONDITION_SCOPE:
+            continue
+        values = contract.get("condition_scoped_leaf_ids")
+        if isinstance(values, list):
+            covered.update(item for item in values if isinstance(item, str))
+    return covered
+
+
+def repair_anchor_dependency_contracts(
+    artifact: dict[str, Any],
+    *,
+    related_market_context: dict[str, Any] | None = None,
+    repair_policy: AnchorRepairPolicy | dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if not isinstance(artifact, dict):
+        raise QDTError("qdt must be an object")
+    repaired = copy.deepcopy(artifact)
+    leaves = repaired.get("required_leaf_questions") or []
+    contracts = repaired.get("amrg_anchor_dependency_contracts")
+    if not isinstance(contracts, list):
+        contracts = []
+    contracts = copy.deepcopy(contracts)
+    edges = _relationship_edges_from_context(related_market_context)
+    covered = _covered_condition_scoped_leaf_ids(contracts)
+    repaired_contract_ids: list[str] = []
+    unrepaired_leaf_ids: list[str] = []
+    edge_ids_used: list[str] = []
+    related_ref = repaired.get("related_market_context_usage", {}).get("related_context_artifact_ref")
+
+    for branch in repaired.get("branches") or []:
+        if not isinstance(branch, dict):
+            continue
+        condition_scoped_leaf_ids = find_condition_scoped_leaves(branch, leaves)
+        missing = [leaf_id for leaf_id in condition_scoped_leaf_ids if leaf_id not in covered]
+        if not missing:
+            continue
+        edge = _select_repair_edge(branch, edges)
+        if edge is None:
+            unrepaired_leaf_ids.extend(missing)
+            continue
+        contract = build_anchor_dependency_contract(
+            edge,
+            branch,
+            leaves=leaves,
+            related_market_ref=related_ref,
+            repair_policy=repair_policy,
+        )
+        contracts.append(contract)
+        repaired_contract_ids.append(contract["anchor_dependency_contract_id"])
+        edge_ids_used.append(contract["edge_id"])
+        covered.update(contract["condition_scoped_leaf_ids"])
+
+    repaired["amrg_anchor_dependency_contracts"] = contracts
+    if isinstance(repaired.get("related_market_context_usage"), dict):
+        usage = copy.deepcopy(repaired["related_market_context_usage"])
+        existing_refs = [str(ref) for ref in usage.get("amrg_usage_refs", []) if _is_non_empty_string(ref)]
+        usage["amrg_usage_refs"] = sorted(set(existing_refs + edge_ids_used))
+        if unrepaired_leaf_ids:
+            usage["anchor_dependency_status"] = "repair_exhausted"
+        elif contracts:
+            usage["anchor_dependency_status"] = "declared"
+        repaired["related_market_context_usage"] = usage
+    if repaired_contract_ids and isinstance(repaired.get("validation_summary"), dict):
+        summary = copy.deepcopy(repaired["validation_summary"])
+        reason_codes = list(summary.get("reason_codes") or [])
+        for code in ("amrg_anchor_dependency_contract_present", "anchor_dependency_repair_bounded"):
+            if code not in reason_codes:
+                reason_codes.append(code)
+        summary["reason_codes"] = reason_codes
+        repaired["validation_summary"] = summary
+
+    require_selected = repaired.get("candidate_selection_audit", {}).get("selection_status") == "selected"
+    validation = validate_question_decomposition(repaired, require_selected=require_selected)
+    return {
+        "artifact": repaired,
+        "repair_summary": {
+            "repair_helper_version": ANCHOR_DEPENDENCY_REPAIR_HELPER_VERSION,
+            "repaired_contract_ids": repaired_contract_ids,
+            "edge_ids_used": sorted(set(edge_ids_used)),
+            "unrepaired_condition_scoped_leaf_ids": sorted(set(unrepaired_leaf_ids)),
+            "repair_exhausted": bool(unrepaired_leaf_ids),
+            "post_repair_valid": validation.valid,
+            "post_repair_errors": list(validation.errors),
+        },
+    }
 
 
 def load_question_decomposition(path: Path | str) -> dict[str, Any]:
