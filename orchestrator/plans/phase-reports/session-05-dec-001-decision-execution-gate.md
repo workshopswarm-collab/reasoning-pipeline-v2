@@ -1,0 +1,21 @@
+# Session 05 DEC-001: Decision Execution Gate
+
+- Session: 05
+- Phase: DEC-001
+- Owner: Session 5
+- Feature IDs: `DEC-001`
+- Migration Groups: none
+- Status: local implementation complete; push held for coordinator review
+- Acceptance Evidence: Implemented deterministic post-SCAE decision/actionability gate in `/Users/agent2/.openclaw/orchestrator/scripts/predquant/decision_gate.py` with CLI entrypoint `/Users/agent2/.openclaw/orchestrator/scripts/bin/run_decision_gate.py`. The artifact consumes SCAE `production_forecast_prob` and `canonical_probability` only through an SCAE-owned context, verifies canonical equals production, accepts optional SYN-001 qualitative annotation as non-authoritative context only, and emits preserve-or-downgrade forecast validity, execution authority, and actionability statuses. The gate rejects decision-authored replacement probabilities, probability ranges, fair values, intervals, SCAE deltas, forecast-validity or execution upgrades, persistence writes, market prediction writes, scoreable forecast outputs, and calibration-debt clearance. It keeps forecast/probability, persistence, market-prediction, scoring, and calibration-debt-clearance authority flags false. No `PERSIST-*`, `MIG-008`, scoring, calibration, forecast persistence, market prediction, or shared inventory/map updates are implemented in this slice.
+- Checks Run:
+  - `python3 orchestrator/plans/check_dependency_gates.py` -> `inventory valid`
+  - `python3 orchestrator/plans/check_dependency_gates.py --feature-id DEC-001 --mode runtime_integration --report-only` -> `OK DEC-001 mode=runtime_integration`
+  - `python3 -m unittest discover -s orchestrator/plans/tests` -> 13 tests, OK
+  - `python3 -m unittest discover -s orchestrator/scripts/tests` -> 132 tests, OK
+  - `python3 -m unittest orchestrator/scripts/tests/test_decision_gate.py` -> 7 tests, OK
+  - `git diff --check` -> OK
+  - `git diff --cached --check` -> OK
+- Shared Inventory Updates Requested: Mark `DEC-001` `ready_for_integration` after coordinator review, with acceptance evidence covering SCAE-only probability consumption, downgrade-only forecast validity/execution/actionability behavior, non-authoritative SYN-001 context, and rejection of replacement probability, persistence, market prediction, scoring, and calibration-debt authority. After reconciliation, `PERSIST-001` should become dependency-ready; `PERSIST-002` and `MIG-008` remain blocked by later persistence rows.
+- Shared Map/Matrix Updates Requested: No direct edits. The existing script-placement map already lists `/Users/agent2/.openclaw/orchestrator/scripts/bin/run_decision_gate.py` for `DEC-001`/`PERSIST-001`.
+- Blockers: No implementation blocker. Push is held for the coordinator window.
+- Commit SHA: Pending final detached-HEAD commit.
