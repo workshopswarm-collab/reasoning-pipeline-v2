@@ -118,7 +118,7 @@ These migration groups are the data backbone for replay, scoring, calibration, a
 | Feature ID | Stage | Component | Blocking | Owner | Dependencies | Output | Status |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | QDT-001 | v2_live_cutover | Decomposer | cutover_blocker | Session 3 | CASE-002, CTX-001, POL-003, AMRG-002 | Artifact-path handoff contract including ADS case contract manifest | ready_for_integration |
-| QDT-002 | v2_live_cutover | Decomposer | cutover_blocker | Session 3 | QDT-001, FND-003 | `question-decomposition.json` schema | not_started |
+| QDT-002 | v2_live_cutover | Decomposer | cutover_blocker | Session 3 | QDT-001, FND-003 | `question-decomposition.json` schema | ready_for_integration |
 | QDT-003 | v2_live_cutover | Decomposer validation | cutover_blocker | Session 3 | QDT-002 | Deterministic QDT structural validator | not_started |
 | QDT-004 | v2_live_cutover | Decomposer AMRG | integration_blocker | Session 3 | QDT-002, AMRG-003 | AMRG anchor dependency contract | not_started |
 | QDT-005 | v2_live_cutover | Research sufficiency | cutover_blocker | Session 3 | QDT-002, QDT-003, POL-003 | Per-leaf high-certainty research sufficiency requirements in canonical QDT template | not_started |
