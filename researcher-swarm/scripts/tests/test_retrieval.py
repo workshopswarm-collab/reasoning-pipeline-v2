@@ -37,6 +37,8 @@ from researcher_swarm.retrieval import (  # noqa: E402
     build_retrieval_packet_manifest,
     build_retrieval_query_contexts,
     build_source_metadata_resolution_placeholder,
+    normalize_retrieval_provenance,
+    validate_temporal_eligibility,
     dump_retrieval_packet,
     validate_retrieval_packet,
 )
@@ -132,8 +134,11 @@ class RetrievalPacketContractTest(unittest.TestCase):
         result = validate_retrieval_packet(packet)
         self.assertTrue(result.valid, result.errors)
         self.assertEqual(packet["schema_feature_gates"]["RET-001"], "implemented")
-        for feature_id in ["RET-002", "RET-003", "RET-004", "RET-008", "RET-009", "RET-010", "RET-011"]:
+        self.assertEqual(packet["schema_feature_gates"]["RET-002"], "implemented")
+        self.assertEqual(packet["schema_feature_gates"]["RET-004"], "implemented")
+        for feature_id in ["RET-003", "RET-008", "RET-009", "RET-010", "RET-011"]:
             self.assertEqual(packet["schema_feature_gates"][feature_id], "pending")
+        self.assertEqual(packet["temporal_isolation_schema_gate"]["status"], "strict_validator_implemented")
         self.assertEqual(packet["research_sufficiency_summary"]["classification_dispatch_status"], "blocked_until_certified")
         self.assertEqual(packet["browser_search_provider_diagnostics"][0]["provider_id"], "openclaw_web_fetch_browser")
 
@@ -176,6 +181,10 @@ class RetrievalPacketContractTest(unittest.TestCase):
             final_url=browser_attempt["final_url"],
             canonical_url=browser_attempt["canonical_url"],
             temporal_gate_status="pass",
+            source_published_at="2026-06-24T11:30:00+00:00",
+            captured_at="2026-06-24T12:01:00+00:00",
+            artifact_generated_at="2026-06-24T12:01:00+00:00",
+            retrieval_capture_for_dispatch=True,
             admission_reason_codes=["manual_fixture_selected"],
         )
         chunk = build_evidence_chunk(
@@ -242,9 +251,356 @@ class RetrievalPacketContractTest(unittest.TestCase):
         result = validate_retrieval_packet(packet)
 
         self.assertTrue(result.valid, result.errors)
+        self.assertEqual(packet["retrieval_evidence_provenance_slices"][0]["temporal_gate_status"], "pass")
         self.assertTrue(claim_family["claim_family_id"].startswith("claim-family-"))
         self.assertEqual(claim_family["counts_toward_claim_family_breadth"], True)
         self.assertEqual(source_metadata["temporal_safety_status"], "unknown_not_counted")
+
+    def test_temporal_validator_rejects_post_cutoff_source_time(self) -> None:
+        result = validate_temporal_eligibility(
+            {
+                "case_id": "case-1",
+                "dispatch_id": "dispatch-1",
+                "retrieval_transport": "browser",
+                "source_published_at": "2026-06-24T12:00:01+00:00",
+            },
+            {
+                "case_id": "case-1",
+                "dispatch_id": "dispatch-1",
+                "forecast_timestamp": "2026-06-24T12:00:00+00:00",
+                "source_cutoff_timestamp": "2026-06-24T12:00:00+00:00",
+            },
+        )
+
+        self.assertEqual(result["temporal_gate_status"], "fail")
+        self.assertIn("source_after_cutoff", result["rejection_reason_codes"])
+
+    def test_live_browser_capture_after_forecast_can_pass_with_pre_cutoff_source_time(self) -> None:
+        result = validate_temporal_eligibility(
+            {
+                "case_id": "case-1",
+                "dispatch_id": "dispatch-1",
+                "retrieval_transport": "browser",
+                "retrieval_capture_for_dispatch": True,
+                "captured_at": "2026-06-24T12:05:00+00:00",
+                "artifact_generated_at": "2026-06-24T12:05:00+00:00",
+                "source_published_at": "2026-06-24T11:55:00+00:00",
+            },
+            {
+                "case_id": "case-1",
+                "dispatch_id": "dispatch-1",
+                "forecast_timestamp": "2026-06-24T12:00:00+00:00",
+                "source_cutoff_timestamp": "2026-06-24T12:00:00+00:00",
+                "live_retrieval_allowlist": ["browser"],
+            },
+        )
+
+        self.assertEqual(result["temporal_gate_status"], "pass")
+        self.assertEqual(result["live_retrieval_allowlist_status"], "allowed")
+
+    def test_same_case_post_dispatch_artifact_without_live_capture_is_rejected(self) -> None:
+        result = validate_temporal_eligibility(
+            {
+                "case_id": "case-1",
+                "dispatch_id": "dispatch-1",
+                "retrieval_transport": "manual_fixture",
+                "artifact_generated_at": "2026-06-24T12:01:00+00:00",
+                "source_published_at": "2026-06-24T11:00:00+00:00",
+            },
+            {
+                "case_id": "case-1",
+                "dispatch_id": "dispatch-1",
+                "forecast_timestamp": "2026-06-24T12:00:00+00:00",
+                "source_cutoff_timestamp": "2026-06-24T12:00:00+00:00",
+            },
+        )
+
+        self.assertEqual(result["temporal_gate_status"], "fail")
+        self.assertIn("same_case_post_dispatch_artifact", result["rejection_reason_codes"])
+
+    def test_unknown_source_time_is_unknown_not_counted_and_mtime_is_warning_only(self) -> None:
+        result = validate_temporal_eligibility(
+            {
+                "retrieval_transport": "db",
+                "filesystem_mtime": "2026-06-24T12:10:00+00:00",
+            },
+            {
+                "forecast_timestamp": "2026-06-24T12:00:00+00:00",
+                "source_cutoff_timestamp": "2026-06-24T12:00:00+00:00",
+            },
+        )
+
+        self.assertEqual(result["temporal_gate_status"], "unknown_not_counted")
+        self.assertIn("source_time_unknown", result["reason_codes"])
+        self.assertIn("mtime_after_forecast_timestamp", result["warning_reason_codes"])
+
+    def test_pre_dispatch_whitelist_allows_required_input(self) -> None:
+        result = validate_temporal_eligibility(
+            {
+                "retrieval_transport": "db",
+                "requires_pre_dispatch_whitelist": True,
+                "pre_dispatch_input_ref": "artifact:evidence-packet-1",
+                "artifact_generated_at": "2026-06-24T11:00:00+00:00",
+                "source_published_at": "2026-06-24T10:00:00+00:00",
+            },
+            {
+                "forecast_timestamp": "2026-06-24T12:00:00+00:00",
+                "source_cutoff_timestamp": "2026-06-24T12:00:00+00:00",
+                "pre_dispatch_input_whitelist_refs": ["artifact:evidence-packet-1"],
+            },
+        )
+
+        self.assertEqual(result["temporal_gate_status"], "pass")
+        self.assertEqual(result["pre_dispatch_whitelist_status"], "whitelisted")
+
+    def test_packet_validation_rejects_selected_evidence_claiming_pass_when_source_time_unknown(self) -> None:
+        context = build_retrieval_query_contexts(self.qdt, evidence_packet=self.evidence_packet)[0]
+        evidence = build_retrieval_evidence_item(
+            case_id="case-1",
+            dispatch_id="dispatch-1",
+            leaf_id=context["leaf_id"],
+            parent_branch_id=context["parent_branch_id"],
+            retrieval_transport="browser",
+            transport_attempt_ref="browser-attempt:1",
+            temporal_gate_status="pass",
+        )
+        packet = build_retrieval_packet(self.qdt, evidence_packet=self.evidence_packet)
+        packet["leaf_retrieval_results"][0]["selected_evidence"].append(evidence)
+
+        result = validate_retrieval_packet(packet)
+
+        self.assertFalse(result.valid)
+        self.assertIn("declares pass but validator returned unknown_not_counted", "; ".join(result.errors))
+
+    def test_native_unsupported_source_class_is_unknown_not_counted(self) -> None:
+        provenance = normalize_retrieval_provenance(
+            {
+                "retrieval_transport": "native_gpt_research",
+                "transport_attempt_ref": "native:1",
+                "model_proposed_source_class": "rumor_blog",
+                "source_published_at": "2026-06-24T11:00:00+00:00",
+            },
+            dispatch_context={
+                "forecast_timestamp": "2026-06-24T12:00:00+00:00",
+                "source_cutoff_timestamp": "2026-06-24T12:00:00+00:00",
+            },
+        )
+
+        self.assertEqual(provenance["source_class"], "unknown")
+        self.assertIn("unsupported_model_proposed_source_class", provenance["unknown_reason_codes"])
+        self.assertFalse(provenance["counts_toward_breadth"])
+
+    def test_classifier_accepted_source_class_records_slice_ref_and_reason_codes(self) -> None:
+        provenance = normalize_retrieval_provenance(
+            {
+                "retrieval_transport": "browser",
+                "transport_attempt_ref": "browser:1",
+                "canonical_url": "https://news.example.com/story",
+                "source_published_at": "2026-06-24T11:00:00+00:00",
+            },
+            dispatch_context={
+                "forecast_timestamp": "2026-06-24T12:00:00+00:00",
+                "source_cutoff_timestamp": "2026-06-24T12:00:00+00:00",
+            },
+            classifier_slice={
+                "classifier_slice_id": "classifier:1",
+                "proposed_source_class": "independent_secondary",
+                "validator_acceptance_status": "accepted",
+                "acceptance_reason_codes": ["domain_matches_reporter_registry"],
+            },
+        )
+
+        self.assertEqual(provenance["source_class"], "independent_secondary")
+        self.assertEqual(provenance["source_metadata_classifier_ref"], "classifier:1")
+        self.assertEqual(provenance["classifier_acceptance_status"], "accepted")
+        self.assertIn("domain_matches_reporter_registry", provenance["classifier_acceptance_reason_codes"])
+
+    def test_classifier_protected_primary_without_deterministic_proof_does_not_count(self) -> None:
+        provenance = normalize_retrieval_provenance(
+            {
+                "retrieval_transport": "browser",
+                "transport_attempt_ref": "browser:2",
+                "canonical_url": "https://news.example.com/story",
+                "source_published_at": "2026-06-24T11:00:00+00:00",
+            },
+            dispatch_context={
+                "forecast_timestamp": "2026-06-24T12:00:00+00:00",
+                "source_cutoff_timestamp": "2026-06-24T12:00:00+00:00",
+            },
+            classifier_slice={
+                "classifier_slice_id": "classifier:protected",
+                "proposed_source_class": "official_or_primary",
+                "protected_primary_proposed": True,
+                "validator_acceptance_status": "accepted",
+            },
+        )
+
+        self.assertEqual(provenance["source_class"], "unknown")
+        self.assertEqual(provenance["classifier_acceptance_status"], "classifier_unsupported")
+        self.assertFalse(provenance["counts_toward_breadth"])
+
+    def test_browser_final_and_canonical_url_drive_source_identity(self) -> None:
+        provenance = normalize_retrieval_provenance(
+            {
+                "retrieval_transport": "browser",
+                "transport_attempt_ref": "browser:3",
+                "requested_url": "https://search.example/?q=market",
+                "final_url": "https://publisher.example.com/redirect?id=1",
+                "canonical_url": "https://publisher.example.com/story",
+                "source_published_at": "2026-06-24T11:00:00+00:00",
+            },
+            dispatch_context={
+                "forecast_timestamp": "2026-06-24T12:00:00+00:00",
+                "source_cutoff_timestamp": "2026-06-24T12:00:00+00:00",
+            },
+        )
+
+        self.assertEqual(provenance["canonical_url"], "https://publisher.example.com/story")
+        self.assertNotIn("search.example", provenance["canonical_source_id"])
+
+    def test_source_family_syndication_mirrors_and_canonical_dedupe_are_deterministic(self) -> None:
+        dispatch = {
+            "forecast_timestamp": "2026-06-24T12:00:00+00:00",
+            "source_cutoff_timestamp": "2026-06-24T12:00:00+00:00",
+        }
+        wire_a = normalize_retrieval_provenance(
+            {
+                "retrieval_transport": "browser",
+                "transport_attempt_ref": "browser:wire-a",
+                "canonical_url": "https://publisher-a.example/wire-copy",
+                "syndication_key": "wire:story-123",
+                "source_published_at": "2026-06-24T11:00:00+00:00",
+            },
+            dispatch_context=dispatch,
+        )
+        wire_b = normalize_retrieval_provenance(
+            {
+                "retrieval_transport": "browser",
+                "transport_attempt_ref": "browser:wire-b",
+                "canonical_url": "https://publisher-b.example/wire-copy",
+                "syndication_key": "wire:story-123",
+                "source_published_at": "2026-06-24T11:00:00+00:00",
+            },
+            dispatch_context=dispatch,
+        )
+        api_a = normalize_retrieval_provenance(
+            {
+                "retrieval_transport": "structured_feed",
+                "transport_attempt_ref": "api:a",
+                "canonical_url": "https://api1.example.com/events/123",
+                "mirrored_api_family_key": "event-api:123",
+                "source_published_at": "2026-06-24T11:00:00+00:00",
+            },
+            dispatch_context=dispatch,
+        )
+        api_b = normalize_retrieval_provenance(
+            {
+                "retrieval_transport": "structured_feed",
+                "transport_attempt_ref": "api:b",
+                "canonical_url": "https://api2.example.com/events/123",
+                "mirrored_api_family_key": "event-api:123",
+                "source_published_at": "2026-06-24T11:00:00+00:00",
+            },
+            dispatch_context=dispatch,
+        )
+        direct = normalize_retrieval_provenance(
+            {
+                "retrieval_transport": "browser",
+                "transport_attempt_ref": "browser:direct",
+                "requested_url": "https://publisher.example.com/story?utm_source=search",
+                "canonical_url": "https://publisher.example.com/story",
+                "source_published_at": "2026-06-24T11:00:00+00:00",
+            },
+            dispatch_context=dispatch,
+        )
+        search = normalize_retrieval_provenance(
+            {
+                "retrieval_transport": "browser",
+                "transport_attempt_ref": "browser:search",
+                "requested_url": "https://search.example/?q=story",
+                "final_url": "https://publisher.example.com/story?utm_campaign=x",
+                "canonical_url": "https://publisher.example.com/story",
+                "source_published_at": "2026-06-24T11:00:00+00:00",
+            },
+            dispatch_context=dispatch,
+        )
+        content_a = normalize_retrieval_provenance(
+            {
+                "retrieval_transport": "browser",
+                "transport_attempt_ref": "browser:content-a",
+                "canonical_url": "https://mirror-a.example/story",
+                "content_sha256": "sha256:" + "a" * 64,
+                "source_published_at": "2026-06-24T11:00:00+00:00",
+            },
+            dispatch_context=dispatch,
+        )
+        content_b = normalize_retrieval_provenance(
+            {
+                "retrieval_transport": "browser",
+                "transport_attempt_ref": "browser:content-b",
+                "canonical_url": "https://mirror-b.example/story",
+                "content_sha256": "sha256:" + "a" * 64,
+                "source_published_at": "2026-06-24T11:00:00+00:00",
+            },
+            dispatch_context=dispatch,
+        )
+
+        self.assertEqual(wire_a["source_family_id"], wire_b["source_family_id"])
+        self.assertEqual(wire_a["source_family_status"], "syndicated_copy")
+        self.assertEqual(api_a["source_family_id"], api_b["source_family_id"])
+        self.assertEqual(api_a["source_family_status"], "mirrored_api_endpoint")
+        self.assertEqual(direct["source_family_id"], search["source_family_id"])
+        self.assertEqual(content_a["source_family_id"], content_b["source_family_id"])
+        self.assertEqual(content_a["source_family_status"], "content_hash_dedupe")
+
+    def test_claim_family_identity_and_contradiction_family_are_deterministic(self) -> None:
+        base_tuple = {
+            "subject": "Example event",
+            "predicate": "happened",
+            "object_or_value": "yes",
+            "event_time": "2026-06-24",
+            "entity_or_jurisdiction": "example",
+            "condition_scope": "unconditional",
+            "polarity": "affirmed",
+        }
+        same_a = build_atomic_claim_candidate(
+            evidence_ref="evidence:a",
+            leaf_id="leaf:a",
+            chunk_refs=["chunk:a"],
+            proposed_tuple=base_tuple,
+            validation_status="accepted_for_normalization",
+        )
+        same_b = build_atomic_claim_candidate(
+            evidence_ref="evidence:b",
+            leaf_id="leaf:b",
+            chunk_refs=["chunk:b"],
+            proposed_tuple=base_tuple,
+            validation_status="accepted_for_normalization",
+        )
+        different = build_atomic_claim_candidate(
+            evidence_ref="evidence:c",
+            leaf_id="leaf:c",
+            chunk_refs=["chunk:c"],
+            proposed_tuple={**base_tuple, "object_or_value": "no"},
+            validation_status="accepted_for_normalization",
+        )
+        negated = build_atomic_claim_candidate(
+            evidence_ref="evidence:d",
+            leaf_id="leaf:d",
+            chunk_refs=["chunk:d"],
+            proposed_tuple={**base_tuple, "polarity": "negated"},
+            validation_status="accepted_for_normalization",
+        )
+
+        family_a = build_claim_family_resolution([same_a])
+        family_b = build_claim_family_resolution([same_b])
+        family_c = build_claim_family_resolution([different])
+        family_d = build_claim_family_resolution([negated])
+
+        self.assertEqual(family_a["claim_family_id"], family_b["claim_family_id"])
+        self.assertNotEqual(family_a["claim_family_id"], family_c["claim_family_id"])
+        self.assertNotEqual(family_a["claim_family_id"], family_d["claim_family_id"])
+        self.assertEqual(family_a["contradiction_family_id"], family_d["contradiction_family_id"])
 
     def test_forbidden_probability_field_is_rejected(self) -> None:
         packet = build_retrieval_packet(self.qdt, evidence_packet=self.evidence_packet)

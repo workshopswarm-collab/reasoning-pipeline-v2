@@ -9,8 +9,10 @@ import os
 import re
 import sys
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 
 def _add_orchestrator_scripts_to_path() -> None:
@@ -47,9 +49,13 @@ BROWSER_PROVIDER_DIAGNOSTIC_SCHEMA_VERSION = "browser-search-provider-diagnostic
 SOURCE_METADATA_RESOLUTION_SCHEMA_VERSION = "source-metadata-resolution/v1"
 ATOMIC_CLAIM_CANDIDATE_SCHEMA_VERSION = "atomic-claim-candidate/v1"
 CLAIM_FAMILY_RESOLUTION_SCHEMA_VERSION = "claim-family-resolution/v1"
+RETRIEVAL_TEMPORAL_ELIGIBILITY_SCHEMA_VERSION = "retrieval-temporal-eligibility/v1"
+RETRIEVAL_EVIDENCE_PROVENANCE_SCHEMA_VERSION = "retrieval-evidence-provenance/v1"
 RETRIEVAL_BREADTH_PROFILE_SCHEMA_VERSION = "retrieval-breadth-profile/v1"
-RETRIEVAL_VALIDATOR_VERSION = "ads-ret-001-retrieval-schema/v1"
+RETRIEVAL_VALIDATOR_VERSION = "ads-ret-002-004-retrieval-schema/v1"
 RETRIEVAL_QUERY_PLANNER_VERSION = "ads-ret-001-query-planner/v1"
+RETRIEVAL_TEMPORAL_VALIDATOR_VERSION = "ads-ret-002-temporal-isolation/v1"
+RETRIEVAL_PROVENANCE_NORMALIZER_VERSION = "ads-ret-004-provenance-normalizer/v1"
 OPENCLAW_BROWSER_PROVIDER_ID = "openclaw_web_fetch_browser"
 
 ALLOWED_RETRIEVAL_TRANSPORTS = {
@@ -102,6 +108,40 @@ ALLOWED_CLAIM_VALIDATION_STATUSES = {
     "rejected_temporal",
     "rejected_forbidden_output",
     "unknown_not_counted",
+}
+ALLOWED_CLASSIFIER_ACCEPTANCE_STATUSES = {
+    "not_used",
+    "accepted",
+    "rejected",
+    "classifier_unsupported",
+    "unsupported_source_class",
+}
+ALLOWED_SOURCE_FAMILY_STATUSES = {
+    "resolved",
+    "same_source_family",
+    "syndicated_copy",
+    "mirrored_api_endpoint",
+    "content_hash_dedupe",
+    "unknown_not_counted",
+}
+DEFAULT_LIVE_RETRIEVAL_TRANSPORT_ALLOWLIST = {
+    "browser",
+    "native_gpt_research",
+    "structured_feed",
+}
+PROTECTED_SOURCE_CLASSES = {
+    "official_or_primary",
+    "market_rules_or_resolution_source",
+    "market_price_or_orderbook",
+}
+DETERMINISTIC_SOURCE_CLASS_METHODS = {
+    "manual_fixture",
+    "official_url_hint",
+    "market_rules_resolution_url",
+    "source_registry",
+    "structured_feed_registry",
+    "db_registry",
+    "deterministic_url_registry",
 }
 FORBIDDEN_RETRIEVAL_KEY_FRAGMENTS = (
     "probability",
@@ -162,6 +202,103 @@ def _reason_codes_are_compact(value: Any) -> bool:
 
 def _normalized_space(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip()
+
+
+def _parse_timestamp(value: Any) -> datetime | None:
+    if not _is_non_empty_string(value):
+        return None
+    text = str(value).strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _timestamp_at_or_after(value: Any, boundary: Any) -> bool:
+    parsed = _parse_timestamp(value)
+    parsed_boundary = _parse_timestamp(boundary)
+    if parsed is None or parsed_boundary is None:
+        return False
+    return parsed >= parsed_boundary
+
+
+def _iso_or_none(value: Any) -> str | None:
+    parsed = _parse_timestamp(value)
+    if parsed is None:
+        return None
+    return parsed.isoformat().replace("+00:00", "Z")
+
+
+def _first_non_empty(*values: Any) -> str:
+    for value in values:
+        if _is_non_empty_string(value):
+            return str(value).strip()
+    return ""
+
+
+def canonicalize_source_url(*urls: Any) -> str:
+    raw = _first_non_empty(*urls)
+    if not raw:
+        return ""
+    parsed = urlsplit(raw)
+    scheme = (parsed.scheme or "https").lower()
+    netloc = parsed.netloc.lower()
+    path = re.sub(r"/{2,}", "/", parsed.path or "/")
+    if path != "/":
+        path = path.rstrip("/")
+    query_pairs = [
+        (key, value)
+        for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+        if not key.lower().startswith(("utm_", "fbclid", "gclid"))
+    ]
+    query = urlencode(sorted(query_pairs), doseq=True)
+    return urlunsplit((scheme, netloc, path, query, ""))
+
+
+def _registrable_domain(url: str) -> str:
+    if not url:
+        return ""
+    host = urlsplit(url).netloc.lower().split("@")[-1].split(":")[0]
+    if host.startswith("www."):
+        host = host[4:]
+    labels = [label for label in host.split(".") if label]
+    if len(labels) <= 2:
+        return host
+    return ".".join(labels[-2:])
+
+
+def _hash_suffix(value: Any, length: int = 24) -> str:
+    return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()[:length]
+
+
+def _content_sha256(candidate: dict[str, Any], canonical_url: str = "") -> str:
+    existing = candidate.get("content_sha256")
+    if _is_non_empty_string(existing):
+        return str(existing)
+    for field in ("content", "extracted_text", "rendered_text", "snippet"):
+        if _is_non_empty_string(candidate.get(field)):
+            return _prefixed_sha256(candidate[field])
+    return _prefixed_sha256(
+        {
+            "canonical_url": canonical_url,
+            "transport_attempt_ref": candidate.get("transport_attempt_ref"),
+            "retrieval_transport": candidate.get("retrieval_transport"),
+        }
+    )
+
+
+def _claim_contradiction_family_id(normalized: dict[str, Any]) -> str | None:
+    polarity = normalized.get("polarity")
+    if polarity not in {"affirmed", "negated"}:
+        return None
+    polarityless = dict(normalized)
+    polarityless["polarity"] = "affirmed_or_negated"
+    return "contradiction-family-" + _hash_suffix(polarityless)
 
 
 def _bounded_query_text(value: str) -> str:
@@ -506,9 +643,9 @@ def build_leaf_retrieval_query_context(
         "source_cutoff_timestamp": source_cutoff_timestamp,
         "planner_version": RETRIEVAL_QUERY_PLANNER_VERSION,
         "feature_gate_status": {
-            "RET-002": "temporal_validator_pending",
+            "RET-002": "temporal_validator_available",
             "RET-003": "quality_scoring_pending",
-            "RET-004": "provenance_resolution_pending",
+            "RET-004": "provenance_resolution_available",
             "RET-008": "sufficiency_certificate_pending",
             "RET-009": "breadth_certification_pending",
             "RET-010": "native_transport_pending",
@@ -663,6 +800,177 @@ def build_native_research_attempt(
     }
 
 
+def _dispatch_temporal_context(dispatch_context: dict[str, Any] | None) -> dict[str, Any]:
+    context = dispatch_context or {}
+    allowlist = context.get("live_retrieval_allowlist") or context.get("allowed_live_retrieval_transports")
+    if not isinstance(allowlist, list) or not allowlist:
+        allowlist = sorted(DEFAULT_LIVE_RETRIEVAL_TRANSPORT_ALLOWLIST)
+    whitelist = context.get("pre_dispatch_input_whitelist_refs") or context.get("input_manifest_ids") or []
+    if not isinstance(whitelist, list):
+        whitelist = []
+    return {
+        "case_id": context.get("case_id"),
+        "dispatch_id": context.get("dispatch_id"),
+        "forecast_timestamp": context.get("forecast_timestamp"),
+        "source_cutoff_timestamp": context.get("source_cutoff_timestamp") or context.get("forecast_timestamp"),
+        "live_retrieval_allowlist": set(str(item) for item in allowlist if _is_non_empty_string(item)),
+        "pre_dispatch_input_whitelist_refs": set(str(item) for item in whitelist if _is_non_empty_string(item)),
+    }
+
+
+def _candidate_ref_is_pre_dispatch_whitelisted(candidate: dict[str, Any], context: dict[str, Any]) -> bool:
+    refs = context["pre_dispatch_input_whitelist_refs"]
+    if not refs:
+        return False
+    for field in (
+        "pre_dispatch_input_ref",
+        "input_manifest_id",
+        "manifest_ref",
+        "artifact_ref",
+        "source_artifact_ref",
+        "content_artifact_ref",
+    ):
+        value = candidate.get(field)
+        if _is_non_empty_string(value) and str(value) in refs:
+            return True
+    return False
+
+
+def _source_time_allowed_by_market_contract(candidate: dict[str, Any]) -> bool:
+    if candidate.get("market_contract_source_time_allowed") is True:
+        return True
+    if candidate.get("source_time_allowlist_status") == "allowed_by_market_contract":
+        return True
+    return "market_contract_cutoff_allowlist" in (candidate.get("temporal_policy_tags") or [])
+
+
+def validate_temporal_eligibility(
+    candidate: dict[str, Any],
+    dispatch_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Evaluate RET-002 temporal safety without treating filesystem mtime as authority."""
+
+    if not isinstance(candidate, dict):
+        raise RetrievalPacketError("candidate must be an object")
+    context = _dispatch_temporal_context(dispatch_context)
+    forecast = context["forecast_timestamp"]
+    cutoff = context["source_cutoff_timestamp"]
+    hard_rejections: list[str] = []
+    warnings: list[str] = []
+    reason_codes: list[str] = []
+
+    if _parse_timestamp(forecast) is None:
+        hard_rejections.append("forecast_timestamp_invalid")
+    if _parse_timestamp(cutoff) is None:
+        hard_rejections.append("source_cutoff_timestamp_invalid")
+
+    retrieval_transport = str(candidate.get("retrieval_transport") or candidate.get("transport") or "")
+    live_capture_requested = candidate.get("retrieval_capture_for_dispatch") is True
+    live_transport_allowed = retrieval_transport in context["live_retrieval_allowlist"]
+    post_dispatch_fields = [
+        field
+        for field in ("artifact_authored_at", "artifact_generated_at", "captured_at")
+        if _timestamp_at_or_after(candidate.get(field), forecast)
+    ]
+    same_case = (
+        (not context.get("case_id") or candidate.get("case_id") == context.get("case_id"))
+        and (not context.get("dispatch_id") or candidate.get("dispatch_id") == context.get("dispatch_id"))
+    )
+    if post_dispatch_fields and not (live_capture_requested and live_transport_allowed):
+        if same_case:
+            hard_rejections.append("same_case_post_dispatch_artifact")
+        else:
+            hard_rejections.append("post_dispatch_artifact_not_from_live_retrieval")
+    elif post_dispatch_fields:
+        reason_codes.append("post_dispatch_live_capture_allowed")
+
+    source_time_fields = (
+        "source_published_at",
+        "source_updated_at",
+        "source_observed_at",
+        "source_authored_at",
+        "authored_at",
+        "db_row_created_at",
+        "published_at",
+    )
+    source_times = {field: candidate.get(field) for field in source_time_fields if _parse_timestamp(candidate.get(field))}
+    after_cutoff_fields = [
+        field for field, value in source_times.items() if _timestamp_at_or_after(value, cutoff)
+    ]
+    if after_cutoff_fields:
+        if _source_time_allowed_by_market_contract(candidate):
+            reason_codes.append("source_after_cutoff_allowed_by_market_contract")
+        else:
+            hard_rejections.append("source_after_cutoff")
+    if not source_times:
+        reason_codes.append("source_time_unknown")
+
+    if _timestamp_at_or_after(candidate.get("filesystem_mtime"), forecast):
+        warnings.append("mtime_after_forecast_timestamp")
+
+    whitelist_required = (
+        candidate.get("requires_pre_dispatch_whitelist") is True
+        or candidate.get("pre_dispatch_input_whitelist_required") is True
+    )
+    if whitelist_required:
+        if _candidate_ref_is_pre_dispatch_whitelisted(candidate, context):
+            reason_codes.append("pre_dispatch_input_whitelisted")
+        else:
+            hard_rejections.append("pre_dispatch_input_not_whitelisted")
+
+    if hard_rejections:
+        status = "fail"
+        counts_toward_temporal_freshness = False
+    elif not source_times:
+        status = "unknown_not_counted"
+        counts_toward_temporal_freshness = False
+    else:
+        status = "pass"
+        counts_toward_temporal_freshness = True
+
+    validation_id = _sha_id(
+        "temporal-validation",
+        {
+            "candidate": candidate.get("evidence_ref") or candidate.get("candidate_id") or candidate.get("transport_attempt_ref"),
+            "forecast_timestamp": forecast,
+            "source_cutoff_timestamp": cutoff,
+            "status": status,
+            "rejections": hard_rejections,
+            "reason_codes": reason_codes,
+        },
+    )
+    return {
+        "artifact_type": "retrieval_temporal_eligibility",
+        "schema_version": RETRIEVAL_TEMPORAL_ELIGIBILITY_SCHEMA_VERSION,
+        "temporal_validation_id": validation_id,
+        "evidence_ref": candidate.get("evidence_ref"),
+        "candidate_id": candidate.get("candidate_id"),
+        "transport_attempt_ref": candidate.get("transport_attempt_ref"),
+        "retrieval_transport": retrieval_transport,
+        "forecast_timestamp": forecast,
+        "source_cutoff_timestamp": cutoff,
+        "temporal_gate_status": status,
+        "counts_toward_temporal_freshness": counts_toward_temporal_freshness,
+        "rejection_reason_codes": hard_rejections,
+        "reason_codes": reason_codes,
+        "warning_reason_codes": warnings,
+        "live_retrieval_allowlist_status": (
+            "allowed" if live_capture_requested and live_transport_allowed else
+            "not_allowed" if live_capture_requested else
+            "not_requested"
+        ),
+        "pre_dispatch_whitelist_status": (
+            "whitelisted" if _candidate_ref_is_pre_dispatch_whitelisted(candidate, context) else
+            "required_missing" if whitelist_required else
+            "not_required"
+        ),
+        "source_time_fields_present": sorted(source_times),
+        "post_dispatch_timestamp_fields": sorted(post_dispatch_fields),
+        "filesystem_mtime_warning_only": bool(warnings),
+        "validator_version": RETRIEVAL_TEMPORAL_VALIDATOR_VERSION,
+    }
+
+
 def build_retrieval_candidate_record(
     *,
     leaf_id: str,
@@ -714,18 +1022,187 @@ def build_retrieval_candidate_record(
     }
 
 
-def build_source_metadata_resolution_placeholder(
+def _matches_any_url(candidate_url: str, urls: list[Any]) -> bool:
+    if not candidate_url:
+        return False
+    canonical = canonicalize_source_url(candidate_url)
+    return any(canonical and canonical == canonicalize_source_url(url) for url in urls if _is_non_empty_string(url))
+
+
+def _deterministic_source_class_proof(
+    candidate: dict[str, Any],
+    source_class: str,
+    *,
+    market_rules: dict[str, Any] | None = None,
+) -> tuple[bool, str]:
+    method = str(candidate.get("source_class_resolution_method") or "")
+    if candidate.get("deterministic_source_class_proof") is True or method in DETERMINISTIC_SOURCE_CLASS_METHODS:
+        return True, method or "deterministic_candidate_field"
+    canonical_url = canonicalize_source_url(candidate.get("canonical_url"), candidate.get("final_url"), candidate.get("requested_url"))
+    rules = market_rules or {}
+    official_hints = list(candidate.get("official_source_hints") or [])
+    if isinstance(rules.get("official_source_hints"), list):
+        official_hints.extend(rules["official_source_hints"])
+    if source_class == "market_rules_or_resolution_source" and _matches_any_url(
+        canonical_url,
+        [rules.get("resolution_url"), candidate.get("market_resolution_url")],
+    ):
+        return True, "market_rules_resolution_url"
+    if source_class == "official_or_primary" and _matches_any_url(canonical_url, official_hints):
+        return True, "official_url_hint"
+    return False, "no_deterministic_proof"
+
+
+def _classifier_slice_ref(classifier_slice: dict[str, Any] | None) -> str | None:
+    if not classifier_slice:
+        return None
+    for field in ("classifier_slice_id", "classifier_slice_ref", "slice_id"):
+        if _is_non_empty_string(classifier_slice.get(field)):
+            return str(classifier_slice[field])
+    return _sha_id("source-classifier", classifier_slice)
+
+
+def _resolve_classifier_source_class(
+    candidate: dict[str, Any],
+    classifier_slice: dict[str, Any] | None,
+    *,
+    market_rules: dict[str, Any] | None = None,
+) -> tuple[str, str, list[str]]:
+    if not classifier_slice:
+        return "not_used", "unknown", []
+    proposed = str(
+        classifier_slice.get("proposed_source_class")
+        or classifier_slice.get("source_class")
+        or candidate.get("model_proposed_source_class")
+        or "unknown"
+    )
+    if proposed not in ALLOWED_SOURCE_CLASSES:
+        return "unsupported_source_class", "unknown", ["unsupported_classifier_source_class"]
+    protected_primary = bool(classifier_slice.get("protected_primary_proposed")) or proposed in PROTECTED_SOURCE_CLASSES
+    has_proof, proof_method = _deterministic_source_class_proof(candidate, proposed, market_rules=market_rules)
+    if protected_primary and not has_proof:
+        return "classifier_unsupported", "unknown", ["classifier_unsupported_for_protected_primary"]
+    accepted = classifier_slice.get("deterministic_acceptance_status") == "accepted" or classifier_slice.get("validator_acceptance_status") == "accepted"
+    if accepted or has_proof:
+        reason_codes = list(classifier_slice.get("acceptance_reason_codes") or [])
+        if proof_method != "no_deterministic_proof":
+            reason_codes.append(proof_method)
+        return "accepted", proposed, sorted(set(reason_codes or ["classifier_validated"]))
+    return "rejected", "unknown", ["classifier_not_accepted_by_validator"]
+
+
+def _resolve_source_class(
+    candidate: dict[str, Any],
+    classifier_slice: dict[str, Any] | None,
+    *,
+    market_rules: dict[str, Any] | None = None,
+) -> tuple[str, str, str, list[str]]:
+    explicit = str(candidate.get("source_class") or "unknown")
+    if explicit in ALLOWED_SOURCE_CLASSES and explicit != "unknown":
+        has_proof, proof_method = _deterministic_source_class_proof(candidate, explicit, market_rules=market_rules)
+        if explicit not in PROTECTED_SOURCE_CLASSES or has_proof:
+            return explicit, proof_method if has_proof else "candidate_field", "not_used", []
+    proposed_native = candidate.get("model_proposed_source_class")
+    if _is_non_empty_string(proposed_native) and str(proposed_native) not in ALLOWED_SOURCE_CLASSES:
+        return "unknown", "unknown", "unsupported_source_class", ["unsupported_model_proposed_source_class"]
+    classifier_status, classifier_class, classifier_reasons = _resolve_classifier_source_class(
+        candidate,
+        classifier_slice,
+        market_rules=market_rules,
+    )
+    if classifier_status == "accepted" and classifier_class != "unknown":
+        return classifier_class, "classifier_assist_validated", classifier_status, classifier_reasons
+    return "unknown", "unknown", classifier_status, classifier_reasons or ["source_class_unknown"]
+
+
+def _resolve_source_family(
+    candidate: dict[str, Any],
+    *,
+    canonical_url: str,
+    content_sha256: str,
+) -> tuple[str, str, str]:
+    explicit = candidate.get("source_family_id")
+    if _is_non_empty_string(explicit) and explicit != "source-family-unknown":
+        return str(explicit), "candidate_field", "resolved"
+    if _is_non_empty_string(candidate.get("syndication_key")):
+        return "source-family-" + _hash_suffix({"syndication": candidate["syndication_key"]}), "syndication_key", "syndicated_copy"
+    if _is_non_empty_string(candidate.get("mirrored_api_family_key")):
+        return "source-family-" + _hash_suffix({"api_mirror": candidate["mirrored_api_family_key"]}), "mirrored_api_family_key", "mirrored_api_endpoint"
+    explicit_content_hash = _is_non_empty_string(candidate.get("content_sha256")) or any(
+        _is_non_empty_string(candidate.get(field)) for field in ("content", "extracted_text", "rendered_text", "snippet")
+    )
+    if explicit_content_hash and content_sha256:
+        return "source-family-" + _hash_suffix({"content": content_sha256}), "content_sha256", "content_hash_dedupe"
+    if canonical_url:
+        return "source-family-" + _hash_suffix({"canonical_url": canonical_url}), "canonical_url", "resolved"
+    domain = _registrable_domain(canonical_url)
+    if domain:
+        return "source-family-" + _hash_suffix({"domain": domain}), "registrable_domain", "resolved"
+    return "source-family-unknown", "unknown", "unknown_not_counted"
+
+
+def _resolve_independence_status(
+    *,
+    source_family_id: str,
+    claim_family_ids: list[str],
+    source_family_status: str,
+    seen_source_family_ids: set[str] | None = None,
+    seen_claim_family_ids: set[str] | None = None,
+) -> str:
+    if source_family_id == "source-family-unknown" or not claim_family_ids:
+        return "unknown_not_counted"
+    if source_family_status == "syndicated_copy":
+        return "syndicated_copy"
+    if seen_claim_family_ids and any(claim_id in seen_claim_family_ids for claim_id in claim_family_ids):
+        return "same_claim_family"
+    if seen_source_family_ids and source_family_id in seen_source_family_ids:
+        return "same_source_family"
+    return "independent"
+
+
+def build_source_metadata_resolution(
     *,
     evidence_ref: str,
     transport_attempt_ref: str,
+    requested_url: str = "",
+    final_url: str = "",
     canonical_url: str = "",
     source_class: str = "unknown",
+    canonical_source_id: str = "source-unknown",
+    source_family_id: str = "source-family-unknown",
+    source_family_resolution_method: str = "unknown",
+    source_family_status: str = "unknown_not_counted",
+    claim_family_resolution_refs: list[str] | None = None,
+    claim_family_ids: list[str] | None = None,
+    temporal_safety_status: str = "unknown_not_counted",
+    published_at: str | None = None,
+    published_at_method: str = "unknown",
+    classifier_slice_ref: str | None = None,
+    classifier_acceptance_status: str = "not_used",
+    classifier_acceptance_reason_codes: list[str] | None = None,
+    source_class_resolution_method: str = "unknown",
+    metadata_confidence: str = "unknown",
+    counts_toward_breadth: bool = False,
+    unknown_reason_codes: list[str] | None = None,
+    content_sha256: str | None = None,
 ) -> dict[str, Any]:
     if source_class not in ALLOWED_SOURCE_CLASSES:
         raise RetrievalPacketError(f"unknown source class: {source_class}")
+    if temporal_safety_status not in ALLOWED_TEMPORAL_GATE_STATUSES:
+        raise RetrievalPacketError(f"unknown temporal safety status: {temporal_safety_status}")
+    if classifier_acceptance_status not in ALLOWED_CLASSIFIER_ACCEPTANCE_STATUSES:
+        raise RetrievalPacketError(f"unknown classifier acceptance status: {classifier_acceptance_status}")
+    if source_family_status not in ALLOWED_SOURCE_FAMILY_STATUSES:
+        raise RetrievalPacketError(f"unknown source family status: {source_family_status}")
     resolution_id = _sha_id(
         "source-metadata",
-        {"evidence_ref": evidence_ref, "transport_attempt_ref": transport_attempt_ref, "canonical_url": canonical_url},
+        {
+            "evidence_ref": evidence_ref,
+            "transport_attempt_ref": transport_attempt_ref,
+            "canonical_url": canonical_url,
+            "source_class": source_class,
+            "source_family_id": source_family_id,
+        },
     )
     return {
         "artifact_type": "source_metadata_resolution",
@@ -733,26 +1210,49 @@ def build_source_metadata_resolution_placeholder(
         "resolution_id": resolution_id,
         "evidence_ref": evidence_ref,
         "transport_attempt_ref": transport_attempt_ref,
+        "requested_url": requested_url,
+        "final_url": final_url,
         "canonical_url": canonical_url,
-        "registrable_domain": "",
+        "registrable_domain": _registrable_domain(canonical_url),
+        "canonical_source_id": canonical_source_id,
+        "content_sha256": content_sha256,
         "source_class": source_class,
-        "source_class_resolution_method": "unknown",
-        "source_family_id": "source-family-unknown",
-        "source_family_resolution_method": "unknown",
-        "claim_family_resolution_refs": [],
-        "claim_family_ids": [],
+        "source_class_resolution_method": source_class_resolution_method,
+        "source_family_id": source_family_id,
+        "source_family_resolution_method": source_family_resolution_method,
+        "source_family_status": source_family_status,
+        "claim_family_resolution_refs": list(claim_family_resolution_refs or []),
+        "claim_family_ids": list(claim_family_ids or []),
         "claim_family_resolution_method": "unknown",
-        "temporal_safety_status": "unknown_not_counted",
-        "published_at": None,
-        "published_at_method": "unknown",
-        "classifier_slice_ref": None,
-        "classifier_acceptance_status": "not_used",
-        "classifier_acceptance_reason_codes": [],
-        "metadata_confidence": "unknown",
-        "counts_toward_breadth": False,
-        "unknown_reason_codes": ["ret_004_resolver_pending"],
-        "feature_gate_status": "deterministic_resolution_pending_RET_004_RET_010_RET_011",
+        "temporal_safety_status": temporal_safety_status,
+        "published_at": published_at,
+        "published_at_method": published_at_method,
+        "classifier_slice_ref": classifier_slice_ref,
+        "classifier_acceptance_status": classifier_acceptance_status,
+        "classifier_acceptance_reason_codes": list(classifier_acceptance_reason_codes or []),
+        "metadata_confidence": metadata_confidence,
+        "counts_toward_breadth": bool(counts_toward_breadth),
+        "unknown_reason_codes": list(unknown_reason_codes or []),
+        "feature_gate_status": "ret_004_deterministic_resolution",
+        "normalizer_version": RETRIEVAL_PROVENANCE_NORMALIZER_VERSION,
     }
+
+
+def build_source_metadata_resolution_placeholder(
+    *,
+    evidence_ref: str,
+    transport_attempt_ref: str,
+    canonical_url: str = "",
+    source_class: str = "unknown",
+) -> dict[str, Any]:
+    return build_source_metadata_resolution(
+        evidence_ref=evidence_ref,
+        transport_attempt_ref=transport_attempt_ref,
+        canonical_url=canonical_url,
+        source_class=source_class,
+        unknown_reason_codes=["ret_004_resolver_pending"],
+        source_family_status="unknown_not_counted",
+    )
 
 
 def build_retrieval_evidence_item(
@@ -775,8 +1275,15 @@ def build_retrieval_evidence_item(
     temporal_gate_status: str = "unknown_not_counted",
     source_published_at: str | None = None,
     source_updated_at: str | None = None,
+    source_observed_at: str | None = None,
+    source_authored_at: str | None = None,
+    db_row_created_at: str | None = None,
     captured_at: str | None = None,
     artifact_generated_at: str | None = None,
+    artifact_authored_at: str | None = None,
+    filesystem_mtime: str | None = None,
+    retrieval_capture_for_dispatch: bool = False,
+    pre_dispatch_input_ref: str | None = None,
     content_sha256: str | None = None,
     chunk_refs: list[str] | None = None,
     retrieval_score: float = 0.0,
@@ -827,8 +1334,15 @@ def build_retrieval_evidence_item(
         "temporal_gate_status": temporal_gate_status,
         "source_published_at": source_published_at,
         "source_updated_at": source_updated_at,
+        "source_observed_at": source_observed_at,
+        "source_authored_at": source_authored_at,
+        "db_row_created_at": db_row_created_at,
         "captured_at": captured_at,
         "artifact_generated_at": artifact_generated_at,
+        "artifact_authored_at": artifact_authored_at,
+        "filesystem_mtime": filesystem_mtime,
+        "retrieval_capture_for_dispatch": bool(retrieval_capture_for_dispatch),
+        "pre_dispatch_input_ref": pre_dispatch_input_ref,
         "content_sha256": content_sha256 or _prefixed_sha256(
             {"canonical_url": canonical_url, "transport_attempt_ref": transport_attempt_ref}
         ),
@@ -976,6 +1490,7 @@ def build_claim_family_resolution(
         normalized = normalize_claim_tuple(accepted[0].get("proposed_tuple", {}))
         normalized_sha = _prefixed_sha256(normalized)
         claim_family_id = "claim-family-" + normalized_sha.removeprefix("sha256:")[:24]
+        contradiction_family_id = _claim_contradiction_family_id(normalized)
         equivalence_status = "new_family"
         counts = True
     else:
@@ -990,6 +1505,7 @@ def build_claim_family_resolution(
         }
         normalized_sha = _prefixed_sha256(normalized)
         claim_family_id = "claim-family-unknown"
+        contradiction_family_id = None
         equivalence_status = "unknown_not_counted"
         counts = False
     return {
@@ -1005,9 +1521,189 @@ def build_claim_family_resolution(
         "normalized_tuple_sha256": normalized_sha,
         "resolution_method": resolution_method,
         "equivalence_status": equivalence_status,
-        "contradiction_family_id": None,
+        "contradiction_family_id": contradiction_family_id,
         "counts_toward_claim_family_breadth": counts,
         "reason_codes": [] if counts else ["no_accepted_atomic_claim_candidate"],
+    }
+
+
+def resolve_claim_families(
+    claim_candidates: list[dict[str, Any]],
+    *,
+    resolution_method: str = "candidate_validated_then_deterministic_tuple_hash",
+) -> list[dict[str, Any]]:
+    groups: dict[str, list[dict[str, Any]]] = {}
+    unknown: list[dict[str, Any]] = []
+    for candidate in claim_candidates:
+        if candidate.get("validation_status") != "accepted_for_normalization":
+            unknown.append(candidate)
+            continue
+        normalized = normalize_claim_tuple(candidate.get("proposed_tuple", {}))
+        groups.setdefault(_prefixed_sha256(normalized), []).append(candidate)
+    resolutions = [
+        build_claim_family_resolution(candidates, resolution_method=resolution_method)
+        for _, candidates in sorted(groups.items())
+    ]
+    if unknown:
+        resolutions.append(build_claim_family_resolution(unknown, resolution_method=resolution_method))
+    return resolutions
+
+
+def normalize_retrieval_provenance(
+    candidate: dict[str, Any],
+    *,
+    dispatch_context: dict[str, Any] | None = None,
+    classifier_slice: dict[str, Any] | None = None,
+    claim_candidates: list[dict[str, Any]] | None = None,
+    claim_family_resolutions: list[dict[str, Any]] | None = None,
+    market_rules: dict[str, Any] | None = None,
+    seen_source_family_ids: set[str] | None = None,
+    seen_claim_family_ids: set[str] | None = None,
+) -> dict[str, Any]:
+    if not isinstance(candidate, dict):
+        raise RetrievalPacketError("candidate must be an object")
+    retrieval_transport = str(candidate.get("retrieval_transport") or candidate.get("transport") or "")
+    if retrieval_transport not in ALLOWED_RETRIEVAL_TRANSPORTS:
+        raise RetrievalPacketError(f"unknown retrieval transport: {retrieval_transport}")
+
+    requested_url = str(candidate.get("requested_url") or "")
+    final_url = str(candidate.get("final_url") or "")
+    canonical_url = canonicalize_source_url(candidate.get("canonical_url"), final_url, requested_url)
+    content_hash = _content_sha256(candidate, canonical_url)
+    source_class, source_class_method, classifier_status, classifier_reason_codes = _resolve_source_class(
+        {**candidate, "canonical_url": canonical_url},
+        classifier_slice,
+        market_rules=market_rules,
+    )
+    source_family_id, source_family_method, source_family_status = _resolve_source_family(
+        candidate,
+        canonical_url=canonical_url,
+        content_sha256=content_hash,
+    )
+    canonical_source_id = "source-" + _hash_suffix(
+        {
+            "source_family_id": source_family_id,
+            "canonical_url": canonical_url,
+            "registrable_domain": _registrable_domain(canonical_url),
+        }
+    )
+    temporal_validation = validate_temporal_eligibility(
+        {**candidate, "retrieval_transport": retrieval_transport, "canonical_url": canonical_url},
+        dispatch_context=dispatch_context,
+    )
+    resolutions = list(claim_family_resolutions or resolve_claim_families(claim_candidates or []))
+    claim_family_ids = [
+        resolution["claim_family_id"]
+        for resolution in resolutions
+        if resolution.get("counts_toward_claim_family_breadth") and resolution.get("claim_family_id") != "claim-family-unknown"
+    ]
+    independence_status = _resolve_independence_status(
+        source_family_id=source_family_id,
+        claim_family_ids=claim_family_ids,
+        source_family_status=source_family_status,
+        seen_source_family_ids=seen_source_family_ids,
+        seen_claim_family_ids=seen_claim_family_ids,
+    )
+    counts_toward_breadth = (
+        source_class != "unknown"
+        and source_family_id != "source-family-unknown"
+        and temporal_validation["temporal_gate_status"] == "pass"
+        and independence_status not in {"unknown_not_counted"}
+    )
+    unknown_reason_codes = []
+    if source_class == "unknown":
+        unknown_reason_codes.extend(classifier_reason_codes or ["source_class_unknown"])
+    if source_family_id == "source-family-unknown":
+        unknown_reason_codes.append("source_family_unknown")
+    if not claim_family_ids:
+        unknown_reason_codes.append("claim_family_unknown_not_counted")
+    if temporal_validation["temporal_gate_status"] != "pass":
+        unknown_reason_codes.append(f"temporal_{temporal_validation['temporal_gate_status']}")
+
+    classifier_ref = _classifier_slice_ref(classifier_slice)
+    published_at = _iso_or_none(
+        candidate.get("source_published_at")
+        or candidate.get("published_at")
+        or (classifier_slice or {}).get("visible_published_at")
+    )
+    metadata_resolution = build_source_metadata_resolution(
+        evidence_ref=str(candidate.get("evidence_ref") or ""),
+        transport_attempt_ref=str(candidate.get("transport_attempt_ref") or ""),
+        requested_url=requested_url,
+        final_url=final_url,
+        canonical_url=canonical_url,
+        canonical_source_id=canonical_source_id,
+        source_class=source_class,
+        source_class_resolution_method=source_class_method,
+        source_family_id=source_family_id,
+        source_family_resolution_method=source_family_method,
+        source_family_status=source_family_status,
+        claim_family_resolution_refs=[resolution["claim_family_resolution_id"] for resolution in resolutions],
+        claim_family_ids=claim_family_ids,
+        temporal_safety_status=temporal_validation["temporal_gate_status"],
+        published_at=published_at,
+        published_at_method=str(candidate.get("published_at_extraction_method") or "unknown"),
+        classifier_slice_ref=classifier_ref,
+        classifier_acceptance_status=classifier_status,
+        classifier_acceptance_reason_codes=classifier_reason_codes,
+        metadata_confidence="medium" if counts_toward_breadth else "unknown",
+        counts_toward_breadth=counts_toward_breadth,
+        unknown_reason_codes=sorted(set(unknown_reason_codes)),
+        content_sha256=content_hash,
+    )
+    provenance_seed = {
+        "evidence_ref": candidate.get("evidence_ref"),
+        "candidate_id": candidate.get("candidate_id"),
+        "transport_attempt_ref": candidate.get("transport_attempt_ref"),
+        "canonical_url": canonical_url,
+        "content_sha256": content_hash,
+        "claim_family_ids": claim_family_ids,
+    }
+    return {
+        "artifact_type": "retrieval_evidence_provenance",
+        "schema_version": RETRIEVAL_EVIDENCE_PROVENANCE_SCHEMA_VERSION,
+        "provenance_id": _sha_id("retrieval-provenance", provenance_seed),
+        "evidence_ref": candidate.get("evidence_ref"),
+        "candidate_id": candidate.get("candidate_id"),
+        "retrieval_transport": retrieval_transport,
+        "transport_attempt_ref": candidate.get("transport_attempt_ref"),
+        "browser_attempt_ref": candidate.get("browser_attempt_ref") or (
+            candidate.get("transport_attempt_ref") if retrieval_transport == "browser" else None
+        ),
+        "native_research_attempt_ref": candidate.get("native_research_attempt_ref") or (
+            candidate.get("transport_attempt_ref") if retrieval_transport == "native_gpt_research" else None
+        ),
+        "source_metadata_resolution_ref": metadata_resolution["resolution_id"],
+        "source_metadata_resolution": metadata_resolution,
+        "source_metadata_classifier_ref": classifier_ref,
+        "atomic_claim_candidate_refs": [candidate.get("claim_candidate_id") for candidate in claim_candidates or []],
+        "claim_family_resolution_refs": [resolution["claim_family_resolution_id"] for resolution in resolutions],
+        "claim_family_ids": claim_family_ids,
+        "classifier_acceptance_status": classifier_status,
+        "classifier_acceptance_reason_codes": classifier_reason_codes,
+        "metadata_confidence": metadata_resolution["metadata_confidence"],
+        "unknown_reason_codes": metadata_resolution["unknown_reason_codes"],
+        "requested_url": requested_url,
+        "final_url": final_url,
+        "canonical_url": canonical_url,
+        "url_identity_basis": "canonical_url" if canonical_url else "content_sha256",
+        "captured_at": candidate.get("captured_at"),
+        "artifact_generated_at": candidate.get("artifact_generated_at"),
+        "source_published_at": candidate.get("source_published_at") or candidate.get("published_at"),
+        "source_updated_at": candidate.get("source_updated_at"),
+        "source_observed_at": candidate.get("source_observed_at"),
+        "published_at_extraction_method": candidate.get("published_at_extraction_method") or "unknown",
+        "canonical_source_id": canonical_source_id,
+        "source_class": source_class,
+        "source_family_id": source_family_id,
+        "source_family_status": source_family_status,
+        "independence_status": independence_status,
+        "content_sha256": content_hash,
+        "temporal_gate_status": temporal_validation["temporal_gate_status"],
+        "temporal_validation_ref": temporal_validation["temporal_validation_id"],
+        "temporal_validation": temporal_validation,
+        "counts_toward_breadth": counts_toward_breadth,
+        "normalizer_version": RETRIEVAL_PROVENANCE_NORMALIZER_VERSION,
     }
 
 
@@ -1066,9 +1762,9 @@ def build_leaf_retrieval_result(
         ],
         "result_status": "schema_only_pending_retrieval_execution" if not selected else "schema_only_with_supplied_evidence",
         "feature_gate_status": {
-            "RET-002": "temporal_validation_not_run",
+            "RET-002": "temporal_validation_enforced_for_selected_evidence",
             "RET-003": "quality_scoring_not_run",
-            "RET-004": "provenance_resolution_not_run",
+            "RET-004": "provenance_resolution_normalized_for_selected_evidence",
             "RET-008": "sufficiency_certificate_not_run",
         },
     }
@@ -1085,6 +1781,8 @@ def build_retrieval_packet(
     omitted_candidates: list[dict[str, Any]] | None = None,
     forecast_timestamp: str | None = None,
     source_cutoff_timestamp: str | None = None,
+    pre_dispatch_input_whitelist_refs: list[str] | None = None,
+    live_retrieval_allowlist: list[str] | None = None,
 ) -> dict[str, Any]:
     _ensure_no_forbidden_keys(qdt, "qdt")
     forecast, cutoff = _timestamps_from_inputs(qdt, evidence_packet, forecast_timestamp, source_cutoff_timestamp)
@@ -1105,7 +1803,32 @@ def build_retrieval_packet(
         profile["negative_checks"]["query_variants_by_check"] = context["negative_check_query_variants"]
         breadth_profiles.append(profile)
 
+    dispatch_context = {
+        "case_id": qdt.get("case_id"),
+        "dispatch_id": qdt.get("dispatch_id"),
+        "forecast_timestamp": forecast,
+        "source_cutoff_timestamp": cutoff,
+        "pre_dispatch_input_whitelist_refs": list(pre_dispatch_input_whitelist_refs or []),
+        "live_retrieval_allowlist": list(live_retrieval_allowlist or sorted(DEFAULT_LIVE_RETRIEVAL_TRANSPORT_ALLOWLIST)),
+    }
     selected = copy.deepcopy(selected_evidence or [])
+    provenance_slices = []
+    source_metadata_resolutions = []
+    for item in selected:
+        provenance = normalize_retrieval_provenance(
+            item,
+            dispatch_context=dispatch_context,
+            market_rules=(evidence_packet or {}).get("market_rules") if isinstance(evidence_packet, dict) else None,
+        )
+        provenance_slices.append(provenance)
+        source_metadata_resolutions.append(provenance["source_metadata_resolution"])
+        item["source_metadata_resolution_ref"] = provenance["source_metadata_resolution_ref"]
+        item["canonical_source_id"] = provenance["canonical_source_id"]
+        item["source_family_id"] = provenance["source_family_id"]
+        item["source_class"] = provenance["source_class"]
+        item["independence_status"] = provenance["independence_status"]
+        item["temporal_gate_status"] = provenance["temporal_gate_status"]
+        item["content_sha256"] = provenance["content_sha256"]
     omitted = copy.deepcopy(omitted_candidates or [])
     packet = {
         "artifact_type": RETRIEVAL_PACKET_ARTIFACT_TYPE,
@@ -1116,10 +1839,13 @@ def build_retrieval_packet(
         "question_decomposition_artifact_id": question_decomposition_artifact_id or qdt.get("artifact_id") or "artifact:question-decomposition-unregistered",
         "forecast_timestamp": forecast,
         "source_cutoff_timestamp": cutoff,
+        "pre_dispatch_input_whitelist_refs": list(pre_dispatch_input_whitelist_refs or []),
+        "live_retrieval_allowlist": list(live_retrieval_allowlist or sorted(DEFAULT_LIVE_RETRIEVAL_TRANSPORT_ALLOWLIST)),
         "temporal_isolation_status": "pass",
         "temporal_isolation_schema_gate": {
             "feature_id": "RET-002",
-            "status": "strict_validator_not_implemented_in_RET_001",
+            "status": "strict_validator_implemented",
+            "validator_version": RETRIEVAL_TEMPORAL_VALIDATOR_VERSION,
         },
         "leaf_query_contexts": contexts,
         "leaf_retrieval_results": [
@@ -1155,17 +1881,18 @@ def build_retrieval_packet(
         ],
         "native_research_attempts": [],
         "browser_retrieval_attempts": [],
-        "source_metadata_resolutions": [],
+        "source_metadata_resolutions": source_metadata_resolutions,
         "atomic_claim_candidates": [],
         "claim_family_resolutions": [],
+        "retrieval_evidence_provenance_slices": provenance_slices,
         "evidence_chunks": [],
         "evidence_spans": [],
         "policy_context_ref": policy_context_ref or "artifact:effective-profile-context-unregistered",
         "schema_feature_gates": {
             "RET-001": "implemented",
-            "RET-002": "pending",
+            "RET-002": "implemented",
             "RET-003": "pending",
-            "RET-004": "pending",
+            "RET-004": "implemented",
             "RET-005": "pending",
             "RET-006": "pending",
             "RET-007": "pending",
@@ -1177,7 +1904,7 @@ def build_retrieval_packet(
         "validation_summary": {
             "status": "schema_constructed",
             "validator_version": RETRIEVAL_VALIDATOR_VERSION,
-            "reason_codes": ["ret_001_schema_and_query_planning_only"],
+            "reason_codes": ["ret_001_schema", "ret_002_temporal_validator", "ret_004_provenance_normalizer"],
         },
     }
     result = validate_retrieval_packet(packet)
@@ -1326,6 +2053,94 @@ def validate_candidate_record(item: Any, path: str, errors: list[str]) -> None:
         errors.append(f"{path}.omission_reason_codes must be compact reason codes")
 
 
+def validate_source_metadata_resolution(item: Any, path: str, errors: list[str]) -> None:
+    if not isinstance(item, dict):
+        errors.append(f"{path} must be an object")
+        return
+    for field in (
+        "artifact_type",
+        "schema_version",
+        "resolution_id",
+        "evidence_ref",
+        "transport_attempt_ref",
+        "canonical_url",
+        "canonical_source_id",
+        "source_class",
+        "source_family_id",
+        "source_family_status",
+        "temporal_safety_status",
+        "classifier_acceptance_status",
+        "counts_toward_breadth",
+        "unknown_reason_codes",
+    ):
+        if field not in item:
+            errors.append(f"{path} missing {field}")
+    if item.get("artifact_type") != "source_metadata_resolution":
+        errors.append(f"{path}.artifact_type must be source_metadata_resolution")
+    if item.get("schema_version") != SOURCE_METADATA_RESOLUTION_SCHEMA_VERSION:
+        errors.append(f"{path}.schema_version must be {SOURCE_METADATA_RESOLUTION_SCHEMA_VERSION}")
+    if item.get("source_class") not in ALLOWED_SOURCE_CLASSES:
+        errors.append(f"{path}.source_class is invalid")
+    if item.get("source_family_status") not in ALLOWED_SOURCE_FAMILY_STATUSES:
+        errors.append(f"{path}.source_family_status is invalid")
+    if item.get("temporal_safety_status") not in ALLOWED_TEMPORAL_GATE_STATUSES:
+        errors.append(f"{path}.temporal_safety_status is invalid")
+    if item.get("classifier_acceptance_status") not in ALLOWED_CLASSIFIER_ACCEPTANCE_STATUSES:
+        errors.append(f"{path}.classifier_acceptance_status is invalid")
+    if not isinstance(item.get("counts_toward_breadth"), bool):
+        errors.append(f"{path}.counts_toward_breadth must be boolean")
+    if not _reason_codes_are_compact(item.get("unknown_reason_codes")):
+        errors.append(f"{path}.unknown_reason_codes must be compact reason codes")
+
+
+def validate_evidence_provenance_slice(item: Any, path: str, errors: list[str]) -> None:
+    if not isinstance(item, dict):
+        errors.append(f"{path} must be an object")
+        return
+    for field in (
+        "artifact_type",
+        "schema_version",
+        "provenance_id",
+        "retrieval_transport",
+        "source_metadata_resolution_ref",
+        "requested_url",
+        "final_url",
+        "canonical_url",
+        "canonical_source_id",
+        "source_class",
+        "source_family_id",
+        "independence_status",
+        "content_sha256",
+        "temporal_gate_status",
+        "temporal_validation",
+        "counts_toward_breadth",
+    ):
+        if field not in item:
+            errors.append(f"{path} missing {field}")
+    if item.get("artifact_type") != "retrieval_evidence_provenance":
+        errors.append(f"{path}.artifact_type must be retrieval_evidence_provenance")
+    if item.get("schema_version") != RETRIEVAL_EVIDENCE_PROVENANCE_SCHEMA_VERSION:
+        errors.append(f"{path}.schema_version must be {RETRIEVAL_EVIDENCE_PROVENANCE_SCHEMA_VERSION}")
+    if item.get("retrieval_transport") not in ALLOWED_RETRIEVAL_TRANSPORTS:
+        errors.append(f"{path}.retrieval_transport is invalid")
+    if item.get("source_class") not in ALLOWED_SOURCE_CLASSES:
+        errors.append(f"{path}.source_class is invalid")
+    if item.get("independence_status") not in ALLOWED_INDEPENDENCE_STATUSES:
+        errors.append(f"{path}.independence_status is invalid")
+    if item.get("temporal_gate_status") not in ALLOWED_TEMPORAL_GATE_STATUSES:
+        errors.append(f"{path}.temporal_gate_status is invalid")
+    if not isinstance(item.get("counts_toward_breadth"), bool):
+        errors.append(f"{path}.counts_toward_breadth must be boolean")
+    temporal = item.get("temporal_validation")
+    if isinstance(temporal, dict):
+        if temporal.get("schema_version") != RETRIEVAL_TEMPORAL_ELIGIBILITY_SCHEMA_VERSION:
+            errors.append(f"{path}.temporal_validation.schema_version is invalid")
+        if temporal.get("temporal_gate_status") != item.get("temporal_gate_status"):
+            errors.append(f"{path}.temporal_validation.temporal_gate_status must match temporal_gate_status")
+    else:
+        errors.append(f"{path}.temporal_validation must be an object")
+
+
 def validate_retrieval_packet(packet: dict[str, Any]) -> RetrievalValidationResult:
     errors: list[str] = []
     warnings: list[str] = []
@@ -1340,6 +2155,8 @@ def validate_retrieval_packet(packet: dict[str, Any]) -> RetrievalValidationResu
         "question_decomposition_artifact_id",
         "forecast_timestamp",
         "source_cutoff_timestamp",
+        "pre_dispatch_input_whitelist_refs",
+        "live_retrieval_allowlist",
         "temporal_isolation_status",
         "leaf_query_contexts",
         "leaf_retrieval_results",
@@ -1354,6 +2171,8 @@ def validate_retrieval_packet(packet: dict[str, Any]) -> RetrievalValidationResu
         "leaf_research_sufficiency_certificates",
         "protected_primary_access_failures",
         "missingness_candidates",
+        "source_metadata_resolutions",
+        "retrieval_evidence_provenance_slices",
         "policy_context_ref",
     )
     for field in required:
@@ -1368,6 +2187,18 @@ def validate_retrieval_packet(packet: dict[str, Any]) -> RetrievalValidationResu
             errors.append(f"{field} is required")
     if packet.get("temporal_isolation_status") not in {"pass", "fail"}:
         errors.append("temporal_isolation_status must be pass or fail")
+    if not isinstance(packet.get("pre_dispatch_input_whitelist_refs"), list):
+        errors.append("pre_dispatch_input_whitelist_refs must be a list")
+    if not isinstance(packet.get("live_retrieval_allowlist"), list):
+        errors.append("live_retrieval_allowlist must be a list")
+    dispatch_context = {
+        "case_id": packet.get("case_id"),
+        "dispatch_id": packet.get("dispatch_id"),
+        "forecast_timestamp": packet.get("forecast_timestamp"),
+        "source_cutoff_timestamp": packet.get("source_cutoff_timestamp"),
+        "pre_dispatch_input_whitelist_refs": packet.get("pre_dispatch_input_whitelist_refs", []),
+        "live_retrieval_allowlist": packet.get("live_retrieval_allowlist", []),
+    }
     contexts = packet.get("leaf_query_contexts")
     if not isinstance(contexts, list) or not contexts:
         errors.append("leaf_query_contexts must be a non-empty list")
@@ -1399,6 +2230,24 @@ def validate_retrieval_packet(packet: dict[str, Any]) -> RetrievalValidationResu
                     f"leaf_retrieval_results[{idx}].selected_evidence[{evidence_idx}]",
                     errors,
                 )
+                if isinstance(evidence, dict):
+                    temporal = validate_temporal_eligibility(evidence, dispatch_context)
+                    for warning in temporal["warning_reason_codes"]:
+                        warnings.append(
+                            f"leaf_retrieval_results[{idx}].selected_evidence[{evidence_idx}]: {warning}"
+                        )
+                    declared = evidence.get("temporal_gate_status")
+                    computed = temporal["temporal_gate_status"]
+                    if declared == "pass" and computed != "pass":
+                        errors.append(
+                            f"leaf_retrieval_results[{idx}].selected_evidence[{evidence_idx}].temporal_gate_status "
+                            f"declares pass but validator returned {computed}"
+                        )
+                    if computed == "fail":
+                        errors.append(
+                            f"leaf_retrieval_results[{idx}].selected_evidence[{evidence_idx}] failed temporal isolation: "
+                            + ",".join(temporal["rejection_reason_codes"])
+                        )
         omitted = result.get("omitted_candidates")
         if not isinstance(omitted, list):
             errors.append(f"leaf_retrieval_results[{idx}].omitted_candidates must be a list")
@@ -1421,6 +2270,8 @@ def validate_retrieval_packet(packet: dict[str, Any]) -> RetrievalValidationResu
         "leaf_research_sufficiency_certificates",
         "protected_primary_access_failures",
         "missingness_candidates",
+        "source_metadata_resolutions",
+        "retrieval_evidence_provenance_slices",
     ):
         if not isinstance(packet.get(field), list):
             errors.append(f"{field} must be a list")
@@ -1428,8 +2279,16 @@ def validate_retrieval_packet(packet: dict[str, Any]) -> RetrievalValidationResu
         errors.append("research_sufficiency_summary must be an object")
     for idx, candidate in enumerate(packet.get("omitted_candidates", []) if isinstance(packet.get("omitted_candidates"), list) else []):
         validate_candidate_record(candidate, f"omitted_candidates[{idx}]", errors)
+    for idx, item in enumerate(packet.get("source_metadata_resolutions", []) if isinstance(packet.get("source_metadata_resolutions"), list) else []):
+        validate_source_metadata_resolution(item, f"source_metadata_resolutions[{idx}]", errors)
+    for idx, item in enumerate(packet.get("retrieval_evidence_provenance_slices", []) if isinstance(packet.get("retrieval_evidence_provenance_slices"), list) else []):
+        validate_evidence_provenance_slice(item, f"retrieval_evidence_provenance_slices[{idx}]", errors)
     if packet.get("schema_feature_gates", {}).get("RET-001") != "implemented":
         warnings.append("schema_feature_gates.RET-001 is not marked implemented")
+    if packet.get("schema_feature_gates", {}).get("RET-002") != "implemented":
+        warnings.append("schema_feature_gates.RET-002 is not marked implemented")
+    if packet.get("schema_feature_gates", {}).get("RET-004") != "implemented":
+        warnings.append("schema_feature_gates.RET-004 is not marked implemented")
     return RetrievalValidationResult(not errors, tuple(errors), tuple(warnings))
 
 

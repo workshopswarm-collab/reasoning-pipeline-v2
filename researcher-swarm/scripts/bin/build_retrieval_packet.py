@@ -34,6 +34,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--policy-context-ref", help="Effective tuning/profile context artifact ref")
     parser.add_argument("--forecast-timestamp", help="Forecast timestamp override")
     parser.add_argument("--source-cutoff-timestamp", help="Source cutoff timestamp override")
+    parser.add_argument(
+        "--pre-dispatch-input-ref",
+        action="append",
+        default=[],
+        help="Artifact/input ref allowed as pre-dispatch retrieval input; repeatable",
+    )
+    parser.add_argument(
+        "--live-retrieval-transport",
+        action="append",
+        default=[],
+        help="Transport allowed to create live dispatch captures; repeatable",
+    )
     return parser.parse_args()
 
 
@@ -51,6 +63,8 @@ def main() -> int:
             policy_context_ref=args.policy_context_ref,
             forecast_timestamp=args.forecast_timestamp,
             source_cutoff_timestamp=args.source_cutoff_timestamp,
+            pre_dispatch_input_whitelist_refs=args.pre_dispatch_input_ref,
+            live_retrieval_allowlist=args.live_retrieval_transport or None,
         )
         result = validate_retrieval_packet(packet)
         if not result.valid:
