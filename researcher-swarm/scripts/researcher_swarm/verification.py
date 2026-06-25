@@ -1,4 +1,4 @@
-"""VER-001/VER-002 deterministic researcher verification slices."""
+"""Deterministic researcher verification and sufficiency reconciliation slices."""
 
 from __future__ import annotations
 
@@ -13,14 +13,18 @@ from typing import Any
 DIRECTION_VERIFICATION_SLICE_SCHEMA_VERSION = "evidence-direction-verification-slice/v1"
 QUALITY_VERIFICATION_SLICE_SCHEMA_VERSION = "evidence-quality-verification-slice/v1"
 SCAE_READINESS_RECONCILIATION_SCHEMA_VERSION = "scae-readiness-reconciliation/v1"
+RESEARCH_SUFFICIENCY_RECONCILIATION_SCHEMA_VERSION = "research-sufficiency-reconciliation/v1"
+RESEARCH_SUFFICIENCY_RECONCILIATION_BUNDLE_SCHEMA_VERSION = "research-sufficiency-reconciliation-bundle/v1"
 VERIFICATION_BUNDLE_SCHEMA_VERSION = "researcher-verification-bundle/v1"
 DIRECTION_VERIFIER_VERSION = "ads-ver-001-direction-verifier/v1"
 QUALITY_VERIFIER_VERSION = "ads-ver-002-quality-verifier/v1"
 SCAE_READINESS_VALIDATOR_VERSION = "ads-ver-003-scae-readiness-validator/v1"
+RESEARCH_SUFFICIENCY_RECONCILER_VERSION = "ads-ver-004-research-sufficiency-reconciler/v1"
 
 DIRECTION_VERIFICATION_SURFACE = "evidence_direction_verification_slices"
 QUALITY_VERIFICATION_SURFACE = "evidence_quality_verification_slices"
 SCAE_READINESS_SURFACE = "scae_readiness_reconciliation"
+RESEARCH_SUFFICIENCY_RECONCILIATION_SURFACE = "research_sufficiency_reconciliation_slices"
 
 ALLOWED_IMPACT_DIRECTIONS = {"supports_yes", "supports_no", "neutral"}
 VERIFIED_DIRECTIONS = {"supports_yes", "supports_no", "neutral", "ambiguous", "excluded"}
@@ -56,7 +60,55 @@ MEDIUM_AUTHORITY_SOURCE_CLASSES = {"primary_reporting", "independent_secondary"}
 LOW_AUTHORITY_SOURCE_CLASSES = {"social_or_user_generated"}
 NON_CRITICAL_WEIGHTS = {"low", "medium", "normal"}
 HIGH_CERTAINTY_SUFFICIENCY_STATUSES = {"scae_ready_high_certainty"}
-ESCALATION_COMPLETE_STATUSES = {"complete", "completed", "not_required", "not_applicable"}
+ESCALATION_COMPLETE_STATUSES = {"complete", "completed", "required_complete", "not_required", "not_applicable"}
+VALID_RESEARCH_RECONCILIATION_STATUSES = {
+    "scae_ready_high_certainty",
+    "structurally_unanswerable",
+    "watch_only_non_live_blocker",
+    "blocked_insufficient_research",
+    "excluded",
+}
+SCAE_CONSUMABLE_RESEARCH_RECONCILIATION_STATUSES = {
+    "scae_ready_high_certainty",
+    "structurally_unanswerable",
+}
+HIGH_CERTAINTY_CERTIFICATE_STATUSES = {"certified_high_certainty"}
+STRUCTURAL_UNANSWERABLE_CERTIFICATE_STATUSES = {
+    "structurally_unanswerable",
+    "expansion_exhausted_structurally_unanswerable",
+}
+WATCH_ONLY_CERTIFICATE_STATUSES = {"watch_only", "watch_only_non_live_blocker", "non_live_blocker"}
+EXCLUDED_CERTIFICATE_STATUSES = {"excluded", "not_scae_bound"}
+FORBIDDEN_RESEARCH_AUTHORITY_FIELD_NAMES = {
+    "own_probability",
+    "leaf_probability",
+    "researcher_reassembled_probability",
+    "researcher_macro_probability",
+    "macro_probability",
+    "final_macro_probability",
+    "forecast_probability",
+    "production_probability",
+    "probability_estimate",
+    "probability_yes",
+    "probability_no",
+    "probability_interval",
+    "replacement_probability",
+    "replacement_forecast",
+    "replacement_decision",
+    "fair_value",
+    "fair_value_low",
+    "fair_value_mid",
+    "fair_value_high",
+    "interval",
+    "odds",
+    "log_odds",
+    "scae_delta",
+    "scae_probability_delta",
+    "decision_recommendation",
+    "decision_output",
+    "trade_recommendation",
+}
+ALLOWED_RESEARCH_AUTHORITY_GUARD_FIELDS = {"probability_fields_forbidden"}
 
 
 class VerificationError(ValueError):
@@ -81,6 +133,18 @@ class ScaeReadinessResult:
     readiness_digest: str
     ready_for_scae: bool
     blockers: list[dict[str, Any]]
+
+
+@dataclass(frozen=True)
+class ResearchSufficiencyReconciliationResult:
+    reconciliation_bundle: dict[str, Any]
+    research_sufficiency_reconciliation_slices: list[dict[str, Any]]
+    reconciliation_digest: str
+    scae_ready_leaf_ids: list[str]
+    structurally_unanswerable_leaf_ids: list[str]
+    watch_only_leaf_ids: list[str]
+    blocked_leaf_ids: list[str]
+    excluded_leaf_ids: list[str]
 
 
 def _canonical_json(value: Any) -> str:
@@ -1040,6 +1104,32 @@ def _index_sufficiency_records(value: Any) -> dict[str, dict[str, Any]]:
     return indexed
 
 
+def _normalized_field_name(value: Any) -> str:
+    normalized = "".join(ch.lower() if ch.isalnum() else "_" for ch in str(value))
+    while "__" in normalized:
+        normalized = normalized.replace("__", "_")
+    return normalized.strip("_")
+
+
+def _forbidden_research_authority_paths(value: Any, path: str = "input") -> list[str]:
+    paths: list[str] = []
+    if isinstance(value, dict):
+        for key, child in value.items():
+            normalized = _normalized_field_name(key)
+            child_path = f"{path}.{key}"
+            if normalized not in ALLOWED_RESEARCH_AUTHORITY_GUARD_FIELDS and (
+                normalized in FORBIDDEN_RESEARCH_AUTHORITY_FIELD_NAMES
+                or normalized.endswith("_interval")
+                or normalized.endswith("_odds")
+            ):
+                paths.append(child_path)
+            paths.extend(_forbidden_research_authority_paths(child, child_path))
+    elif isinstance(value, list):
+        for idx, child in enumerate(value):
+            paths.extend(_forbidden_research_authority_paths(child, f"{path}[{idx}]"))
+    return paths
+
+
 def _escalation_records_from(value: Any) -> list[dict[str, Any]]:
     if value is None:
         return []
@@ -1155,6 +1245,694 @@ def _structural_unanswerable_leaf_ids(classification_matrix: dict[str, Any]) -> 
         if any(row.get("certificate_status") == "structurally_unanswerable" for row in rows):
             leaf_ids.add(leaf_id)
     return leaf_ids
+
+
+def _leaf_is_critical_or_source_of_truth(leaf: dict[str, Any] | None) -> bool:
+    if not isinstance(leaf, dict):
+        return False
+    requirements = leaf.get("research_sufficiency_requirements")
+    if not isinstance(requirements, dict):
+        requirements = {}
+    values = {
+        str(leaf.get("criticality") or "").lower(),
+        str(leaf.get("source_role") or "").lower(),
+        str(leaf.get("required_source_role") or "").lower(),
+        str(leaf.get("purpose") or "").lower(),
+        str(_leaf_static_weight(leaf)).lower(),
+    }
+    return (
+        leaf.get("is_critical") is True
+        or leaf.get("is_source_of_truth") is True
+        or leaf.get("source_of_truth") is True
+        or requirements.get("protected_primary_required") is True
+        or "critical" in values
+        or "source_of_truth" in values
+        or "critical_source_of_truth" in values
+    )
+
+
+def _qdt_required_leaf_ids(qdt: dict[str, Any] | None, retrieval_packet: dict[str, Any] | None) -> list[str]:
+    qdt_leaves = _lookup_qdt_leaves(qdt)
+    if qdt_leaves:
+        return sorted(qdt_leaves)
+    if isinstance(retrieval_packet, dict):
+        leaf_ids = {
+            str(row["leaf_id"])
+            for row in retrieval_packet.get("leaf_research_sufficiency_certificates", [])
+            if isinstance(row, dict) and _is_non_empty_string(row.get("leaf_id"))
+        }
+        leaf_ids.update(
+            str(row["leaf_id"])
+            for row in retrieval_packet.get("leaf_retrieval_results", [])
+            if isinstance(row, dict) and _is_non_empty_string(row.get("leaf_id"))
+        )
+        return sorted(leaf_ids)
+    return []
+
+
+def _dicts_by_field(items: Any, field: str) -> dict[str, dict[str, Any]]:
+    if not isinstance(items, list):
+        return {}
+    return {
+        str(item[field]): item
+        for item in items
+        if isinstance(item, dict) and _is_non_empty_string(item.get(field))
+    }
+
+
+def _certificates_by_leaf(retrieval_packet: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
+    if not isinstance(retrieval_packet, dict):
+        return {}
+    return _dicts_by_field(retrieval_packet.get("leaf_research_sufficiency_certificates"), "leaf_id")
+
+
+def _breadth_coverage_by_ref(retrieval_packet: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
+    if not isinstance(retrieval_packet, dict):
+        return {}
+    return _dicts_by_field(retrieval_packet.get("retrieval_breadth_coverage_slices"), "coverage_id")
+
+
+def _coverage_records_by_leaf(coverage_proof_bundle: dict[str, Any] | None) -> dict[str, list[dict[str, Any]]]:
+    by_leaf: dict[str, list[dict[str, Any]]] = {}
+    if not isinstance(coverage_proof_bundle, dict):
+        return by_leaf
+    for record in coverage_proof_bundle.get("coverage_proofs", []):
+        if isinstance(record, dict) and _is_non_empty_string(record.get("leaf_id")):
+            by_leaf.setdefault(str(record["leaf_id"]), []).append(record)
+    for records in by_leaf.values():
+        records.sort(key=lambda item: (str(item.get("assignment_id") or ""), _canonical_json(item)))
+    return by_leaf
+
+
+def _classification_rows_by_leaf(classification_matrix: dict[str, Any] | None) -> dict[str, list[dict[str, Any]]]:
+    by_leaf: dict[str, list[dict[str, Any]]] = {}
+    if not isinstance(classification_matrix, dict):
+        return by_leaf
+    for row in _classification_slices_from(classification_matrix):
+        if _is_non_empty_string(row.get("leaf_id")):
+            by_leaf.setdefault(str(row["leaf_id"]), []).append(row)
+    return by_leaf
+
+
+def _escalation_records_by_leaf(value: Any) -> dict[str, list[dict[str, Any]]]:
+    by_leaf: dict[str, list[dict[str, Any]]] = {}
+    for record in _escalation_records_from(value):
+        if _is_non_empty_string(record.get("leaf_id")):
+            by_leaf.setdefault(str(record["leaf_id"]), []).append(record)
+    return by_leaf
+
+
+def _leaf_requirement_ref(leaf: dict[str, Any] | None, certificate: dict[str, Any] | None) -> str | None:
+    if isinstance(certificate, dict) and _is_non_empty_string(certificate.get("requirement_ref")):
+        return str(certificate["requirement_ref"])
+    if not isinstance(leaf, dict):
+        return None
+    requirements = leaf.get("research_sufficiency_requirements")
+    if isinstance(requirements, dict) and _is_non_empty_string(requirements.get("requirement_id")):
+        return str(requirements["requirement_id"])
+    for field in ("requirement_id", "sufficiency_requirement_ref"):
+        if _is_non_empty_string(leaf.get(field)):
+            return str(leaf[field])
+    return None
+
+
+def _leaf_required_values(leaf: dict[str, Any] | None, coverage_records: list[dict[str, Any]]) -> list[str]:
+    values: list[str] = []
+    if isinstance(leaf, dict):
+        requirements = leaf.get("research_sufficiency_requirements")
+        if isinstance(requirements, dict):
+            values.extend(_string_list(requirements.get("required_value_fields")))
+        values.extend(_string_list(leaf.get("required_value_field_ids")))
+    for record in coverage_records:
+        values.extend(_string_list(record.get("required_value_fields")))
+    return sorted(set(values))
+
+
+def _leaf_required_negative_checks(leaf: dict[str, Any] | None, coverage_records: list[dict[str, Any]]) -> list[str]:
+    values: list[str] = []
+    if isinstance(leaf, dict):
+        requirements = leaf.get("research_sufficiency_requirements")
+        if isinstance(requirements, dict):
+            values.extend(_string_list(requirements.get("required_negative_checks")))
+        values.extend(_string_list(leaf.get("required_negative_check_ids")))
+    for record in coverage_records:
+        values.extend(_string_list(record.get("required_negative_checks")))
+    return sorted(set(values))
+
+
+def _coverage_summary_ok(coverage_proof_bundle: dict[str, Any] | None) -> tuple[bool, list[str]]:
+    if not isinstance(coverage_proof_bundle, dict):
+        return False, ["classification_coverage_proof_bundle_missing"]
+    reason_codes: list[str] = []
+    if coverage_proof_bundle.get("feature_id") != "CLS-005":
+        reason_codes.append("classification_coverage_proof_bundle_not_cls005")
+    summary = coverage_proof_bundle.get("coverage_summary")
+    if not isinstance(summary, dict):
+        reason_codes.append("classification_coverage_summary_missing")
+    else:
+        for field in (
+            "all_assigned_evidence_reviewed",
+            "all_certificate_evidence_reviewed",
+            "all_required_outputs_addressed",
+            "all_context_isolation_audits_launch_allowed",
+        ):
+            if summary.get(field) is not True:
+                reason_codes.append(f"classification_coverage_summary_{field}_false")
+    return not reason_codes, reason_codes
+
+
+def _completed_escalation_with_delivery(record: dict[str, Any]) -> bool:
+    if not _escalation_complete(record):
+        return False
+    expected = int(record.get("additional_assignment_count") or record.get("required_assignment_count") or 0)
+    if expected <= 0:
+        return True
+    refs = _string_list(record.get("escalation_assignment_refs"))
+    descriptors = record.get("escalation_assignment_descriptors")
+    active_statuses = {"completed", "delivered", "already_active"}
+    if isinstance(descriptors, list) and descriptors:
+        delivered = [
+            item
+            for item in descriptors
+            if isinstance(item, dict) and str(item.get("delivery_status")) in active_statuses
+        ]
+        return len(delivered) >= expected
+    delivered = int(record.get("delivered_assignment_count") or 0)
+    active = int(record.get("active_assignment_count") or 0)
+    completed = int(record.get("completed_assignment_count") or 0)
+    return len(refs) >= expected and (delivered + active + completed) >= expected
+
+
+def _required_escalation_blockers(
+    *,
+    leaf_id: str,
+    leaf: dict[str, Any] | None,
+    certificate_status: str | None,
+    coverage_records: list[dict[str, Any]],
+    escalation_records: list[dict[str, Any]],
+) -> list[str]:
+    reason_codes: list[str] = []
+    required_records = [record for record in escalation_records if _escalation_required(record)]
+    for record in required_records:
+        if not _completed_escalation_with_delivery(record):
+            reason_codes.append("researcher_escalation_incomplete")
+
+    needs_confirmation = certificate_status in STRUCTURAL_UNANSWERABLE_CERTIFICATE_STATUSES
+    if needs_confirmation:
+        matching = [
+            record
+            for record in required_records
+            if "structural_unanswerability_claimed" in _string_list(record.get("trigger_codes"))
+        ]
+        if not matching:
+            reason_codes.append("structural_unanswerability_confirmation_missing")
+        elif not any(_completed_escalation_with_delivery(record) for record in matching):
+            reason_codes.append("structural_unanswerability_confirmation_incomplete")
+
+    if _leaf_is_critical_or_source_of_truth(leaf):
+        matching = [
+            record
+            for record in required_records
+            if "critical_source_of_truth_leaf" in _string_list(record.get("trigger_codes"))
+        ]
+        if matching and not any(_completed_escalation_with_delivery(record) for record in matching):
+            reason_codes.append("critical_source_of_truth_confirmation_incomplete")
+
+    expected_extra = sum(
+        max(0, int(record.get("additional_assignment_count") or record.get("required_assignment_count") or 0))
+        for record in required_records
+        if _completed_escalation_with_delivery(record)
+    )
+    if expected_extra > 0:
+        non_primary_records = [
+            record
+            for record in coverage_records
+            if str(record.get("assignment_role") or "") in {"escalation", "confirmation"}
+        ]
+        if len(non_primary_records) < expected_extra:
+            reason_codes.append("required_escalation_coverage_proof_missing")
+
+    return sorted(set(reason_codes))
+
+
+def _coverage_record_blockers(
+    *,
+    leaf_id: str,
+    leaf: dict[str, Any] | None,
+    certificate: dict[str, Any],
+    breadth_coverage: dict[str, Any] | None,
+    coverage_records: list[dict[str, Any]],
+    classification_rows: list[dict[str, Any]],
+    structural: bool,
+) -> list[str]:
+    reason_codes: list[str] = []
+    if not coverage_records:
+        return ["researcher_coverage_proof_missing"]
+    certificate_ref = str(certificate.get("certificate_id") or "")
+    breadth_ref = str(certificate.get("breadth_coverage_ref") or "")
+    coverage_evidence_refs = set(_string_list(certificate.get("evidence_refs")))
+    classified_refs = {
+        str(row["evidence_ref"])
+        for row in classification_rows
+        if _is_non_empty_string(row.get("evidence_ref"))
+    }
+    required_value_fields = set(_leaf_required_values(leaf, coverage_records))
+    required_negative_checks = set(_leaf_required_negative_checks(leaf, coverage_records))
+    requirement_ref = _leaf_requirement_ref(leaf, certificate)
+
+    primary_complete = False
+    extracted_fields: set[str] = set()
+    completed_negative_checks: set[str] = set()
+    reviewed_requirements: set[str] = set()
+    answered_requirements: set[str] = set()
+    unanswered_requirements: set[str] = set()
+    reviewed_evidence_refs: set[str] = set()
+    certificate_evidence_reviewed: set[str] = set()
+    for record in coverage_records:
+        if record.get("coverage_status") != "complete":
+            reason_codes.append("researcher_coverage_proof_incomplete")
+        if record.get("certificate_status") != certificate.get("status"):
+            reason_codes.append("coverage_certificate_status_mismatch")
+        if record.get("research_sufficiency_certificate_ref") != certificate_ref:
+            reason_codes.append("coverage_certificate_ref_mismatch")
+        if breadth_ref and record.get("retrieval_breadth_coverage_ref") != breadth_ref:
+            reason_codes.append("coverage_breadth_ref_mismatch")
+        if str(record.get("assignment_role") or "primary") == "primary":
+            primary_complete = True
+        reviewed_evidence_refs.update(_string_list(record.get("reviewed_evidence_refs")))
+        certificate_evidence_reviewed.update(_string_list(record.get("certificate_evidence_refs")))
+        reviewed_requirements.update(_string_list(record.get("requirements_reviewed")))
+        answered_requirements.update(_string_list(record.get("requirements_answered")))
+        unanswered_requirements.update(_string_list(record.get("requirements_unanswered")))
+        extracted_fields.update(_string_list(record.get("required_value_fields_extracted")))
+        completed_negative_checks.update(_string_list(record.get("required_negative_checks_completed")))
+
+    if not primary_complete:
+        reason_codes.append("primary_researcher_coverage_proof_missing")
+    if coverage_evidence_refs and not coverage_evidence_refs <= reviewed_evidence_refs:
+        reason_codes.append("certificate_evidence_not_reviewed")
+    if coverage_evidence_refs and not coverage_evidence_refs <= certificate_evidence_reviewed:
+        reason_codes.append("certificate_evidence_not_joined_to_proof")
+    if not structural and classified_refs and not classified_refs <= reviewed_evidence_refs:
+        reason_codes.append("classified_evidence_not_reviewed")
+    if requirement_ref:
+        if requirement_ref not in reviewed_requirements:
+            reason_codes.append("certificate_requirement_not_reviewed")
+        if structural:
+            if requirement_ref not in unanswered_requirements:
+                reason_codes.append("structural_requirement_not_marked_unanswered")
+        elif requirement_ref not in answered_requirements:
+            reason_codes.append("certificate_requirement_not_answered")
+    if not structural:
+        if not set(required_value_fields) <= extracted_fields:
+            reason_codes.append("required_value_field_not_extracted")
+        if not set(required_negative_checks) <= completed_negative_checks:
+            reason_codes.append("required_negative_check_not_completed")
+    if isinstance(breadth_coverage, dict) and not structural and breadth_coverage.get("breadth_certified") is not True:
+        reason_codes.append("retrieval_breadth_not_certified")
+    return sorted(set(reason_codes))
+
+
+def _certificate_blockers(
+    *,
+    certificate: dict[str, Any] | None,
+    breadth_coverage: dict[str, Any] | None,
+    structural: bool,
+) -> list[str]:
+    if not isinstance(certificate, dict):
+        return ["research_sufficiency_certificate_missing"]
+    reason_codes: list[str] = []
+    status = str(certificate.get("status") or "")
+    if certificate.get("classification_dispatch_allowed") is not True:
+        reason_codes.append("classification_dispatch_not_allowed")
+    if not structural:
+        if status not in HIGH_CERTAINTY_CERTIFICATE_STATUSES:
+            reason_codes.append("certificate_not_high_certainty")
+        if certificate.get("breadth_certified") is not True:
+            reason_codes.append("certificate_breadth_not_certified")
+        if not _string_list(certificate.get("evidence_refs")):
+            reason_codes.append("certificate_evidence_refs_missing")
+    if structural and not _is_non_empty_string(certificate.get("structural_unanswerability_proof_ref")):
+        reason_codes.append("structural_unanswerability_proof_ref_missing")
+    if _string_list(certificate.get("unsatisfied_requirement_codes")) and not structural:
+        reason_codes.append("certificate_unsatisfied_requirements")
+    if _string_list(certificate.get("blocking_reason_codes")) and not structural:
+        reason_codes.append("certificate_blocking_reasons_present")
+    if str(certificate.get("macro_fallback_sufficiency_status") or "not_requested") not in {
+        "not_requested",
+        "not_applicable",
+        "not_applicable_structural_unanswerability",
+    }:
+        reason_codes.append("macro_fallback_cannot_satisfy_research_sufficiency")
+    if not isinstance(breadth_coverage, dict):
+        reason_codes.append("retrieval_breadth_coverage_missing")
+    elif not structural and breadth_coverage.get("breadth_certified") is not True:
+        reason_codes.append("retrieval_breadth_not_certified")
+    return sorted(set(reason_codes))
+
+
+def _matrix_blockers(
+    *,
+    classification_rows: list[dict[str, Any]],
+    structural: bool,
+) -> list[str]:
+    if structural:
+        return []
+    if not classification_rows:
+        return ["classification_matrix_leaf_rows_missing"]
+    scae_bound_rows = [
+        row
+        for row in classification_rows
+        if row.get("included_for_scae", row.get("ledger_ready", True)) is not False
+    ]
+    if not scae_bound_rows:
+        return ["classification_matrix_leaf_has_no_scae_bound_rows"]
+    return []
+
+
+def _research_reconciliation_slice(
+    *,
+    qdt: dict[str, Any] | None,
+    classification_matrix: dict[str, Any] | None,
+    coverage_proof_bundle: dict[str, Any] | None,
+    leaf_id: str,
+    leaf: dict[str, Any] | None,
+    certificate: dict[str, Any] | None,
+    breadth_coverage: dict[str, Any] | None,
+    coverage_records: list[dict[str, Any]],
+    classification_rows: list[dict[str, Any]],
+    escalation_records: list[dict[str, Any]],
+    coverage_summary_ok: bool,
+    coverage_summary_reason_codes: list[str],
+) -> dict[str, Any]:
+    certificate_status = str((certificate or {}).get("status") or "")
+    structural = certificate_status in STRUCTURAL_UNANSWERABLE_CERTIFICATE_STATUSES
+    watch_only = certificate_status in WATCH_ONLY_CERTIFICATE_STATUSES or (certificate or {}).get("watch_only") is True
+    excluded = certificate_status in EXCLUDED_CERTIFICATE_STATUSES or (certificate or {}).get("included_for_scae") is False
+
+    reason_codes: list[str] = []
+    blockers: list[str] = []
+    if not coverage_summary_ok:
+        blockers.extend(coverage_summary_reason_codes)
+
+    blockers.extend(_certificate_blockers(certificate=certificate, breadth_coverage=breadth_coverage, structural=structural))
+    if isinstance(certificate, dict):
+        blockers.extend(
+            _coverage_record_blockers(
+                leaf_id=leaf_id,
+                leaf=leaf,
+                certificate=certificate,
+                breadth_coverage=breadth_coverage,
+                coverage_records=coverage_records,
+                classification_rows=classification_rows,
+                structural=structural,
+            )
+        )
+    blockers.extend(_matrix_blockers(classification_rows=classification_rows, structural=structural))
+    blockers.extend(
+        _required_escalation_blockers(
+            leaf_id=leaf_id,
+            leaf=leaf,
+            certificate_status=certificate_status,
+            coverage_records=coverage_records,
+            escalation_records=escalation_records,
+        )
+    )
+
+    if structural:
+        if blockers:
+            reconciled_status = "blocked_insufficient_research"
+            scae_ready = False
+        else:
+            reconciled_status = "structurally_unanswerable"
+            scae_ready = True
+            reason_codes.append("structural_unanswerability_verified_with_required_confirmation")
+    elif excluded:
+        reconciled_status = "excluded"
+        scae_ready = False
+        reason_codes.append("leaf_excluded_from_scae_bound_research")
+    elif watch_only:
+        reconciled_status = "watch_only_non_live_blocker"
+        scae_ready = False
+        reason_codes.append("watch_only_non_live_blocker_recorded")
+    elif blockers:
+        reconciled_status = "blocked_insufficient_research"
+        scae_ready = False
+    else:
+        reconciled_status = "scae_ready_high_certainty"
+        scae_ready = True
+        reason_codes.append("high_certainty_research_sufficiency_verified")
+
+    missing_requirement_codes = sorted(
+        set(
+            blockers
+            + _string_list((certificate or {}).get("unsatisfied_requirement_codes"))
+            + _string_list((certificate or {}).get("blocking_reason_codes"))
+            + _string_list((breadth_coverage or {}).get("unsatisfied_breadth_dimensions"))
+        )
+    )
+    seed = {
+        "leaf_id": leaf_id,
+        "certificate_ref": (certificate or {}).get("certificate_id"),
+        "coverage_proof_refs": [record.get("coverage_proof_ref") or record.get("proof_id") for record in coverage_records],
+        "reconciled_status": reconciled_status,
+        "missing_requirement_codes": missing_requirement_codes,
+    }
+    row = {
+        "artifact_type": "research_sufficiency_reconciliation_slice",
+        "schema_version": RESEARCH_SUFFICIENCY_RECONCILIATION_SCHEMA_VERSION,
+        "surface_name": RESEARCH_SUFFICIENCY_RECONCILIATION_SURFACE,
+        "feature_id": "VER-004",
+        "reconciler_version": RESEARCH_SUFFICIENCY_RECONCILER_VERSION,
+        "research_sufficiency_reconciliation_id": _sha_id("research-sufficiency-reconcile", seed),
+        "research_sufficiency_reconciliation_ref": None,
+        "case_id": (classification_matrix or {}).get("case_id") or (certificate or {}).get("case_id"),
+        "dispatch_id": (classification_matrix or {}).get("dispatch_id") or (certificate or {}).get("dispatch_id"),
+        "leaf_id": leaf_id,
+        "parent_branch_id": (leaf or {}).get("parent_branch_id"),
+        "condition_scope": (leaf or {}).get("leaf_condition_scope") or (leaf or {}).get("condition_scope"),
+        "certificate_ref": (certificate or {}).get("certificate_id"),
+        "research_sufficiency_certificate_ref": (certificate or {}).get("certificate_id"),
+        "certificate_status": certificate_status or None,
+        "retrieval_breadth_coverage_ref": (certificate or {}).get("breadth_coverage_ref"),
+        "retrieval_breadth_certified": (breadth_coverage or {}).get("breadth_certified"),
+        "coverage_proof_refs": sorted(
+            str(record.get("coverage_proof_ref") or record.get("proof_id"))
+            for record in coverage_records
+            if _is_non_empty_string(record.get("coverage_proof_ref") or record.get("proof_id"))
+        ),
+        "primary_coverage_proof_present": any(
+            str(record.get("assignment_role") or "primary") == "primary" for record in coverage_records
+        ),
+        "escalation_coverage_proof_refs": sorted(
+            str(record.get("coverage_proof_ref") or record.get("proof_id"))
+            for record in coverage_records
+            if str(record.get("assignment_role") or "") in {"escalation", "confirmation"}
+            and _is_non_empty_string(record.get("coverage_proof_ref") or record.get("proof_id"))
+        ),
+        "classification_slice_refs": sorted(
+            str(row.get("slice_id") or row.get("classification_id"))
+            for row in classification_rows
+            if _is_non_empty_string(row.get("slice_id") or row.get("classification_id"))
+        ),
+        "required_escalation_decision_refs": sorted(
+            str(record.get("decision_ref") or record.get("decision_id"))
+            for record in escalation_records
+            if _escalation_required(record) and _is_non_empty_string(record.get("decision_ref") or record.get("decision_id"))
+        ),
+        "completed_escalation_decision_refs": sorted(
+            str(record.get("decision_ref") or record.get("decision_id"))
+            for record in escalation_records
+            if _escalation_required(record)
+            and _completed_escalation_with_delivery(record)
+            and _is_non_empty_string(record.get("decision_ref") or record.get("decision_id"))
+        ),
+        "required_value_fields": _leaf_required_values(leaf, coverage_records),
+        "required_negative_checks": _leaf_required_negative_checks(leaf, coverage_records),
+        "reconciled_status": reconciled_status,
+        "research_sufficiency_reconciliation_status": reconciled_status,
+        "missing_requirement_codes": missing_requirement_codes,
+        "blocking_reason_codes": sorted(set(blockers)),
+        "reason_codes": sorted(set(reason_codes or ["research_sufficiency_reconciliation_checks_applied"])),
+        "scae_ready": scae_ready,
+        "scae_consumable_under_policy": reconciled_status in SCAE_CONSUMABLE_RESEARCH_RECONCILIATION_STATUSES,
+        "watch_only_non_live": reconciled_status == "watch_only_non_live_blocker",
+        "source_refs": {
+            "qdt_leaf_ref": (leaf or {}).get("leaf_id"),
+            "classification_matrix_id": (classification_matrix or {}).get("matrix_id"),
+            "classification_matrix_digest": (classification_matrix or {}).get("matrix_digest"),
+            "coverage_proof_bundle_digest": (coverage_proof_bundle or {}).get("bundle_digest")
+            if isinstance(coverage_proof_bundle, dict)
+            else None,
+        },
+        "authority_boundary": {
+            "numeric_estimate_authority": False,
+            "pricing_authority": False,
+            "range_estimate_authority": False,
+            "market_action_authority": False,
+            "downstream_ledger_authority": False,
+            "forecast_authority": False,
+        },
+    }
+    row["research_sufficiency_reconciliation_ref"] = (
+        "research-sufficiency-reconciliation:" + row["research_sufficiency_reconciliation_id"]
+    )
+    row["reconciliation_slice_digest"] = _prefixed_sha256(row)
+    return row
+
+
+def build_research_sufficiency_reconciliation(
+    *,
+    qdt: dict[str, Any] | None,
+    retrieval_packet: dict[str, Any],
+    coverage_proof_bundle: dict[str, Any],
+    classification_matrix: dict[str, Any] | None = None,
+    escalation_decisions: dict[str, Any] | list[dict[str, Any]] | None = None,
+) -> ResearchSufficiencyReconciliationResult:
+    """Build VER-004 high-certainty research sufficiency reconciliation.
+
+    This joins RET-008 certificates, retrieval breadth coverage, CLS-005
+    coverage proofs, materialized classification rows, and CLS-007 escalation
+    decisions. It never promotes thin retrieval into a clean SCAE-ready input.
+    """
+
+    if not isinstance(retrieval_packet, dict):
+        raise VerificationError("retrieval_packet must be an object")
+    if not isinstance(coverage_proof_bundle, dict):
+        raise VerificationError("coverage_proof_bundle must be an object")
+    if classification_matrix is not None and not isinstance(classification_matrix, dict):
+        raise VerificationError("classification_matrix must be an object")
+
+    forbidden_paths = (
+        _forbidden_research_authority_paths(classification_matrix, "classification_matrix")
+        + _forbidden_research_authority_paths(coverage_proof_bundle, "coverage_proof_bundle")
+        + _forbidden_research_authority_paths(escalation_decisions, "escalation_decisions")
+    )
+    if forbidden_paths:
+        raise VerificationError("forbidden researcher authority fields: " + ", ".join(sorted(forbidden_paths)))
+
+    qdt_leaves = _lookup_qdt_leaves(qdt)
+    leaf_ids = _qdt_required_leaf_ids(qdt, retrieval_packet)
+    certificates = _certificates_by_leaf(retrieval_packet)
+    breadth_by_ref = _breadth_coverage_by_ref(retrieval_packet)
+    coverage_by_leaf = _coverage_records_by_leaf(coverage_proof_bundle)
+    classification_by_leaf = _classification_rows_by_leaf(classification_matrix)
+    escalation_by_leaf = _escalation_records_by_leaf(escalation_decisions)
+    coverage_ok, coverage_summary_reasons = _coverage_summary_ok(coverage_proof_bundle)
+
+    slices: list[dict[str, Any]] = []
+    for leaf_id in leaf_ids:
+        certificate = certificates.get(leaf_id)
+        breadth_coverage = None
+        if isinstance(certificate, dict) and _is_non_empty_string(certificate.get("breadth_coverage_ref")):
+            breadth_coverage = breadth_by_ref.get(str(certificate["breadth_coverage_ref"]))
+        slices.append(
+            _research_reconciliation_slice(
+                qdt=qdt,
+                classification_matrix=classification_matrix,
+                coverage_proof_bundle=coverage_proof_bundle,
+                leaf_id=leaf_id,
+                leaf=qdt_leaves.get(leaf_id),
+                certificate=certificate,
+                breadth_coverage=breadth_coverage,
+                coverage_records=coverage_by_leaf.get(leaf_id, []),
+                classification_rows=classification_by_leaf.get(leaf_id, []),
+                escalation_records=escalation_by_leaf.get(leaf_id, []),
+                coverage_summary_ok=coverage_ok,
+                coverage_summary_reason_codes=coverage_summary_reasons,
+            )
+        )
+
+    slices.sort(key=lambda item: (str(item["leaf_id"]), str(item["research_sufficiency_reconciliation_id"])))
+    scae_ready_leaf_ids = sorted(
+        row["leaf_id"] for row in slices if row["reconciled_status"] == "scae_ready_high_certainty"
+    )
+    structurally_unanswerable_leaf_ids = sorted(
+        row["leaf_id"] for row in slices if row["reconciled_status"] == "structurally_unanswerable"
+    )
+    watch_only_leaf_ids = sorted(
+        row["leaf_id"] for row in slices if row["reconciled_status"] == "watch_only_non_live_blocker"
+    )
+    blocked_leaf_ids = sorted(
+        row["leaf_id"] for row in slices if row["reconciled_status"] == "blocked_insufficient_research"
+    )
+    excluded_leaf_ids = sorted(row["leaf_id"] for row in slices if row["reconciled_status"] == "excluded")
+    bundle_status = "scae_consumable" if slices and not blocked_leaf_ids else "blocked"
+    if watch_only_leaf_ids and not blocked_leaf_ids:
+        bundle_status = "watch_only_non_live"
+    if excluded_leaf_ids and not (scae_ready_leaf_ids or structurally_unanswerable_leaf_ids or blocked_leaf_ids):
+        bundle_status = "excluded"
+
+    source_matrix_digest = (classification_matrix or {}).get("matrix_digest") if isinstance(classification_matrix, dict) else None
+    source_coverage_digest = coverage_proof_bundle.get("bundle_digest")
+    source_retrieval_digest = retrieval_packet.get("retrieval_packet_digest") or retrieval_packet.get("packet_digest")
+    seed = {
+        "case_id": (classification_matrix or retrieval_packet).get("case_id"),
+        "dispatch_id": (classification_matrix or retrieval_packet).get("dispatch_id"),
+        "source_matrix_digest": source_matrix_digest,
+        "source_coverage_digest": source_coverage_digest,
+        "source_retrieval_digest": source_retrieval_digest,
+        "slice_digests": [row["reconciliation_slice_digest"] for row in slices],
+    }
+    bundle = {
+        "artifact_type": "research_sufficiency_reconciliation_bundle",
+        "schema_version": RESEARCH_SUFFICIENCY_RECONCILIATION_BUNDLE_SCHEMA_VERSION,
+        "feature_id": "VER-004",
+        "surface_name": RESEARCH_SUFFICIENCY_RECONCILIATION_SURFACE,
+        "reconciler_version": RESEARCH_SUFFICIENCY_RECONCILER_VERSION,
+        "reconciliation_bundle_id": _sha_id("research-sufficiency-reconciliation-bundle", seed),
+        "case_id": (classification_matrix or retrieval_packet).get("case_id"),
+        "dispatch_id": (classification_matrix or retrieval_packet).get("dispatch_id"),
+        "source_retrieval_packet_digest": source_retrieval_digest,
+        "source_classification_matrix_id": (classification_matrix or {}).get("matrix_id")
+        if isinstance(classification_matrix, dict)
+        else None,
+        "source_classification_matrix_digest": source_matrix_digest,
+        "source_coverage_proof_bundle_digest": source_coverage_digest,
+        "research_sufficiency_reconciliation_slices": slices,
+        "leaf_summary": {
+            "total_leaf_count": len(slices),
+            "scae_ready_high_certainty_leaf_ids": scae_ready_leaf_ids,
+            "structurally_unanswerable_leaf_ids": structurally_unanswerable_leaf_ids,
+            "watch_only_non_live_leaf_ids": watch_only_leaf_ids,
+            "blocked_leaf_ids": blocked_leaf_ids,
+            "excluded_leaf_ids": excluded_leaf_ids,
+        },
+        "bundle_status": bundle_status,
+        "ready_for_scae": bundle_status == "scae_consumable",
+        "scae_consumable_leaf_ids": sorted(scae_ready_leaf_ids + structurally_unanswerable_leaf_ids),
+        "blocker_codes": sorted(
+            {
+                code
+                for row in slices
+                for code in row.get("blocking_reason_codes", [])
+                if row["reconciled_status"] == "blocked_insufficient_research"
+            }
+        ),
+        "authority_boundary": {
+            "writes_scae_ledger_rows": False,
+            "numeric_estimate_authority": False,
+            "forecast_authority": False,
+            "decision_authority": False,
+            "persistence_authority": False,
+        },
+        "scope_boundaries": {
+            "implements": ["VER-004"],
+            "requires": ["RET-008", "CLS-005", "CLS-007", "VER-001", "VER-002", "VER-003"],
+            "not_implemented": ["MIG-006 persistence", "SCAE", "forecast", "replay", "scoring", "persistence"],
+        },
+    }
+    bundle["reconciliation_digest"] = _prefixed_sha256(bundle)
+    return ResearchSufficiencyReconciliationResult(
+        reconciliation_bundle=bundle,
+        research_sufficiency_reconciliation_slices=slices,
+        reconciliation_digest=bundle["reconciliation_digest"],
+        scae_ready_leaf_ids=scae_ready_leaf_ids,
+        structurally_unanswerable_leaf_ids=structurally_unanswerable_leaf_ids,
+        watch_only_leaf_ids=watch_only_leaf_ids,
+        blocked_leaf_ids=blocked_leaf_ids,
+        excluded_leaf_ids=excluded_leaf_ids,
+    )
 
 
 def _dedupe_blockers(blockers: list[dict[str, Any]]) -> list[dict[str, Any]]:
