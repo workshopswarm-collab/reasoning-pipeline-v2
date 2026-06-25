@@ -11,4 +11,4 @@
 - Shared Inventory Updates Requested: Mark `SCAE-007` `ready_for_integration` with acceptance evidence summarizing deterministic branch sub-ledgers, QDT branch validation, sign-partitioned covariance penalties, per-branch cap application, diagnostic-only mechanism-family context, and no ledger/probability/forecast authority. After reconciliation, `SCAE-010` should become newly dependency-ready; `SCAE-011` remains dependency-ready but intentionally held for separate dispatch.
 - Shared Map/Matrix Updates Requested: No direct shared map edits requested. `FIX-016`, `FIX-023`, and `BLK-008` now have SCAE-007 implementation evidence but should be reconciled by Session 1/coordinator with their owning fixture/static validation rows.
 - Blockers: No implementation blocker for `SCAE-007`. Downstream `SCAE-010` remains inventory-blocked until `SCAE-007` is reconciled to `ready_for_integration`; later SCAE, persistence, scoring, and calibration rows remain out of scope for this phase.
-- Commit SHA: Pending final detached-HEAD commit.
+- Commit SHA: `51b8eb671ff2d8a08c0fd544d0796af4600a5b6d`
