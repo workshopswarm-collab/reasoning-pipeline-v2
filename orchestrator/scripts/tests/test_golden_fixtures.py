@@ -162,7 +162,8 @@ class GoldenFixturesTest(unittest.TestCase):
         self.assertEqual(error_row[0], "blocked")
         blocking_feature_ids = json.loads(error_row[1])["blocking_feature_ids"]
         self.assertTrue(blocking_feature_ids)
-        self.assertIn("VER-004", blocking_feature_ids)
+        self.assertIn("SYN-001", blocking_feature_ids)
+        self.assertNotIn("VER-004", blocking_feature_ids)
 
 
 if __name__ == "__main__":
