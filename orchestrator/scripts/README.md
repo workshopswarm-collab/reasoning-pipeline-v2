@@ -59,6 +59,7 @@ Root files should stay minimal. New runnable scripts belong in `bin/`; new reusa
 | Path | Responsibility |
 | --- | --- |
 | `predquant/brier.py` | Probability validation, market probability extraction, and Brier scoring helpers. |
+| `predquant/calibration_debt.py` | CAL-001 non-authoritative calibration-debt clearance report and hard-gate validation over Brier/scorecard evidence. |
 | `predquant/polymarket_intake.py` | Polymarket Gamma API fetch/filter logic. |
 | `predquant/pipeline.py` | Load filtered markets into SQLite. |
 | `predquant/polymarket_resolution.py` | Source-backed Polymarket resolution sync. |
