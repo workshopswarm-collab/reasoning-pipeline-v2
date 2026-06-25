@@ -8,11 +8,22 @@ from typing import Any
 from predquant.ads_pipeline_runner import (
     DEFAULT_DISABLE_ACTIONS,
     RUNNER_MODES,
+    STOP_POLICIES,
     PipelineRunnerContractError,
     build_pipeline_control_state,
     read_pipeline_control_state,
+    utc_now_iso,
     write_pipeline_control_state,
 )
+
+
+PIPELINE_STOP_SIGNAL_SCHEMA_VERSION = "ads-pipeline-stop-signal/v1"
+STOP_SIGNAL_POLICIES = tuple(policy for policy in STOP_POLICIES if policy != "none")
+STOP_POLICY_DISABLE_ACTIONS = {
+    "stop_before_next_case": "no_new_leases",
+    "stop_after_current_case": "stop_after_current_case",
+    "safe_drain_now": "safe_drain_now",
+}
 
 
 def get_pipeline_control_state(conn: sqlite3.Connection, *, create_default: bool = True) -> dict[str, Any]:
@@ -50,6 +61,70 @@ def set_pipeline_enabled(
     return read_pipeline_control_state(conn)
 
 
+def build_pipeline_stop_signal(
+    *,
+    stop_policy: str,
+    reason: str,
+    requested_by: str = "manual",
+    requested_at: str | None = None,
+    pipeline_run_id: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build the structured AUTO-004 stop/drain request stored in control metadata."""
+
+    if stop_policy not in STOP_SIGNAL_POLICIES:
+        raise PipelineRunnerContractError("stop_policy must be a concrete stop signal policy")
+    if not isinstance(reason, str) or not reason:
+        raise PipelineRunnerContractError("reason is required")
+    if not isinstance(requested_by, str) or not requested_by:
+        raise PipelineRunnerContractError("requested_by is required")
+    signal = {
+        "schema_version": PIPELINE_STOP_SIGNAL_SCHEMA_VERSION,
+        "stop_policy": stop_policy,
+        "requested_at": requested_at or utc_now_iso(),
+        "requested_by": requested_by,
+        "reason": reason,
+        "pipeline_run_id": pipeline_run_id,
+        "metadata": metadata or {},
+    }
+    if pipeline_run_id is None:
+        del signal["pipeline_run_id"]
+    return signal
+
+
+def request_pipeline_stop(
+    conn: sqlite3.Connection,
+    *,
+    stop_policy: str,
+    reason: str,
+    requested_by: str = "manual",
+    pipeline_run_id: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Disable new work and record a structured stop/drain request for the runner."""
+
+    current = read_pipeline_control_state(conn)
+    control_metadata = dict(current["metadata"])
+    control_metadata["stop_signal"] = build_pipeline_stop_signal(
+        stop_policy=stop_policy,
+        reason=reason,
+        requested_by=requested_by,
+        pipeline_run_id=pipeline_run_id,
+        metadata=metadata,
+    )
+    record = build_pipeline_control_state(
+        pipeline_enabled=False,
+        desired_runner_mode=current["desired_runner_mode"],
+        updated_by=requested_by,
+        reason=reason,
+        default_disable_action=STOP_POLICY_DISABLE_ACTIONS[stop_policy],
+        acknowledged_by_run_id=current["acknowledged_by_run_id"],
+        metadata=control_metadata,
+    )
+    write_pipeline_control_state(conn, record)
+    return read_pipeline_control_state(conn)
+
+
 def acknowledge_pipeline_control_state(
     conn: sqlite3.Connection,
     *,
@@ -75,8 +150,12 @@ def acknowledge_pipeline_control_state(
 
 __all__ = [
     "DEFAULT_DISABLE_ACTIONS",
+    "PIPELINE_STOP_SIGNAL_SCHEMA_VERSION",
     "RUNNER_MODES",
+    "STOP_SIGNAL_POLICIES",
     "acknowledge_pipeline_control_state",
+    "build_pipeline_stop_signal",
     "get_pipeline_control_state",
+    "request_pipeline_stop",
     "set_pipeline_enabled",
 ]

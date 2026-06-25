@@ -16,13 +16,21 @@ from predquant.ads_pipeline_runner import (
     TERMINAL_REASON_DISABLED,
     TERMINAL_REASON_NO_ELIGIBLE_CASE,
     TERMINAL_REASON_NON_EXECUTING,
+    TERMINAL_REASON_RETRY_SCHEDULED,
+    TERMINAL_REASON_SAFE_DRAIN,
+    TERMINAL_REASON_STOP_AFTER_CURRENT,
+    TERMINAL_REASON_STOP_BEFORE_NEXT,
+    TERMINAL_REASON_STUCK_LEASE_RECOVERED,
+    NonRetryableStageError,
     PipelineRunnerContractError,
     PipelineRunnerPolicy,
+    RetryableStageError,
     build_pipeline_control_state,
     build_pipeline_run,
     ensure_pipeline_runner_schema,
     read_pipeline_control_state,
     read_pipeline_run,
+    recover_stuck_case_leases,
     run_ads_pipeline_loop,
     validate_pipeline_run,
     write_pipeline_control_state,
@@ -108,12 +116,14 @@ class AdsPipelineRunnerTest(unittest.TestCase):
             ),
         )
 
-    def auto003_policy(self):
-        return PipelineRunnerPolicy(
-            runner_mode="fixture",
-            allow_downstream_execution=True,
-            allow_forecast_persistence=True,
-        )
+    def auto003_policy(self, **overrides):
+        values = {
+            "runner_mode": "fixture",
+            "allow_downstream_execution": True,
+            "allow_forecast_persistence": True,
+        }
+        values.update(overrides)
+        return PipelineRunnerPolicy(**values)
 
     def case_selection_policy(self):
         return CaseSelectionPolicy(
@@ -122,12 +132,27 @@ class AdsPipelineRunnerTest(unittest.TestCase):
             metadata={"test_scope": "AUTO-003"},
         )
 
-    def stage_handlers(self, calls=None, *, duplicate_forecast=False, fail_stage=None, omit_forecast=False):
+    def stage_handlers(
+        self,
+        calls=None,
+        *,
+        duplicate_forecast=False,
+        fail_stage=None,
+        retry_stage=None,
+        non_retryable_stage=None,
+        disable_after_stage=None,
+        disable_action="safe_drain_now",
+        omit_forecast=False,
+    ):
         calls = calls if calls is not None else []
 
         def make_handler(stage):
             def handler(**kwargs):
                 calls.append(stage)
+                if stage == retry_stage:
+                    raise RetryableStageError(f"{stage} transient fixture failure", retry_after_seconds=7)
+                if stage == non_retryable_stage:
+                    raise NonRetryableStageError(f"{stage} non-retryable fixture failure")
                 if stage == fail_stage:
                     raise RuntimeError(f"{stage} fixture failure")
                 result = {
@@ -135,6 +160,17 @@ class AdsPipelineRunnerTest(unittest.TestCase):
                     "validation_result_refs": [f"validation:{stage}"],
                     "safe_metadata": {"stage": stage, "handler_scope": "AUTO-003"},
                 }
+                if stage == disable_after_stage:
+                    write_pipeline_control_state(
+                        self.conn,
+                        build_pipeline_control_state(
+                            pipeline_enabled=False,
+                            desired_runner_mode="fixture",
+                            updated_by="fixture",
+                            reason="unit test disables active AUTO-004 run",
+                            default_disable_action=disable_action,
+                        ),
+                    )
                 if stage == "decision" and not omit_forecast:
                     result["forecast_decision_record_id"] = "forecast-decision:auto003"
                 if duplicate_forecast and stage == "replay_record":
@@ -321,6 +357,145 @@ class AdsPipelineRunnerTest(unittest.TestCase):
         self.assertEqual(second.terminal_status, TERMINAL_REASON_NO_ELIGIBLE_CASE)
         self.assertEqual(second_calls, [])
         self.assertEqual(self.conn.execute(f"SELECT COUNT(*) FROM {CASE_LEASE_TABLE}").fetchone()[0], 1)
+
+    def test_auto004_stop_before_next_case_exits_without_acquiring_lease(self):
+        self.initialize_intake_case()
+        self.enable_fixture_pipeline()
+
+        result = run_ads_pipeline_loop(
+            self.conn,
+            self.auto003_policy(stop_policy="stop_before_next_case"),
+            downstream_stage_handlers=self.stage_handlers(),
+            case_selection_policy=self.case_selection_policy(),
+        )
+
+        self.assertEqual(result.terminal_status, TERMINAL_REASON_STOP_BEFORE_NEXT)
+        self.assertIsNone(result.case_lease_id)
+        self.assertEqual(self.conn.execute(f"SELECT COUNT(*) FROM {CASE_LEASE_TABLE}").fetchone()[0], 0)
+        run = read_pipeline_run(self.conn, result.pipeline_run_id)
+        self.assertEqual(run["status"], "stopped")
+        self.assertIsNone(run["active_case_lease_id"])
+
+    def test_auto004_stop_after_current_case_finishes_and_acknowledges(self):
+        self.initialize_intake_case()
+        self.enable_fixture_pipeline()
+        calls = []
+
+        result = run_ads_pipeline_loop(
+            self.conn,
+            self.auto003_policy(stop_policy="stop_after_current_case"),
+            downstream_stage_handlers=self.stage_handlers(calls),
+            case_selection_policy=self.case_selection_policy(),
+        )
+
+        self.assertEqual(result.terminal_status, TERMINAL_REASON_STOP_AFTER_CURRENT)
+        self.assertEqual(calls, list(ADS_PIPELINE_STAGE_ORDER[1:]))
+        lease = read_case_lease(self.conn, result.case_lease_id)
+        self.assertEqual(lease["lease_status"], "released")
+        self.assertEqual(lease["release_reason"], "auto004_stop_after_current_case")
+        run = read_pipeline_run(self.conn, result.pipeline_run_id)
+        self.assertEqual(run["status"], "stopped")
+        self.assertIsNone(run["active_case_lease_id"])
+        self.assertTrue(run["metadata"]["stop_after_current_requested"])
+
+    def test_auto004_retryable_stage_failure_writes_backoff_and_keeps_lease_recoverable(self):
+        self.initialize_intake_case()
+        self.enable_fixture_pipeline()
+
+        result = run_ads_pipeline_loop(
+            self.conn,
+            self.auto003_policy(retry_backoff_seconds=11),
+            downstream_stage_handlers=self.stage_handlers(retry_stage="retrieval"),
+            case_selection_policy=self.case_selection_policy(),
+        )
+
+        self.assertEqual(result.terminal_status, TERMINAL_REASON_RETRY_SCHEDULED)
+        lease = read_case_lease(self.conn, result.case_lease_id)
+        self.assertEqual(lease["lease_status"], "leased")
+        self.assertIsNone(lease["release_reason"])
+        run = read_pipeline_run(self.conn, result.pipeline_run_id)
+        self.assertEqual(run["status"], "draining")
+        self.assertEqual(run["active_case_lease_id"], result.case_lease_id)
+        self.assertEqual(run["metadata"]["retry_stage"], "retrieval")
+        self.assertIn("next_retry_at", run["metadata"])
+        retry_events = self.conn.execute(
+            f"SELECT COUNT(*) FROM {STAGE_EXECUTION_EVENT_TABLE} WHERE event_type = 'retry_scheduled'"
+        ).fetchone()[0]
+        retryable_errors = self.conn.execute(
+            f"SELECT COUNT(*) FROM {PIPELINE_ERROR_EVENT_TABLE} WHERE retryability = 'retryable'"
+        ).fetchone()[0]
+        self.assertEqual(retry_events, 1)
+        self.assertEqual(retryable_errors, 1)
+
+    def test_auto004_non_retryable_stage_failure_quarantines_with_soft_fail_reason(self):
+        self.initialize_intake_case()
+        self.enable_fixture_pipeline()
+
+        result = run_ads_pipeline_loop(
+            self.conn,
+            self.auto003_policy(),
+            downstream_stage_handlers=self.stage_handlers(non_retryable_stage="retrieval"),
+            case_selection_policy=self.case_selection_policy(),
+        )
+
+        self.assertEqual(result.terminal_status, TERMINAL_REASON_AUTO003_FAILED)
+        lease = read_case_lease(self.conn, result.case_lease_id)
+        self.assertEqual(lease["lease_status"], "quarantined")
+        self.assertEqual(lease["release_reason"], "auto004_non_retryable_stage_failed")
+        run = read_pipeline_run(self.conn, result.pipeline_run_id)
+        self.assertTrue(run["metadata"]["non_retryable_failure"])
+
+    def test_auto004_safe_drain_disable_releases_active_lease_and_acknowledges_control(self):
+        self.initialize_intake_case()
+        self.enable_fixture_pipeline()
+
+        result = run_ads_pipeline_loop(
+            self.conn,
+            self.auto003_policy(),
+            downstream_stage_handlers=self.stage_handlers(disable_after_stage="retrieval"),
+            case_selection_policy=self.case_selection_policy(),
+        )
+
+        self.assertEqual(result.terminal_status, TERMINAL_REASON_SAFE_DRAIN)
+        lease = read_case_lease(self.conn, result.case_lease_id)
+        self.assertEqual(lease["lease_status"], "expired")
+        self.assertEqual(lease["release_reason"], TERMINAL_REASON_SAFE_DRAIN)
+        run = read_pipeline_run(self.conn, result.pipeline_run_id)
+        self.assertEqual(run["status"], "stopped")
+        self.assertIsNone(run["active_case_lease_id"])
+        self.assertEqual(run["metadata"]["safe_drained_after_stage"], "retrieval")
+        control = read_pipeline_control_state(self.conn)
+        self.assertEqual(control["acknowledged_by_run_id"], result.pipeline_run_id)
+
+    def test_auto004_stuck_lease_recovery_expires_lease_and_clears_active_run(self):
+        self.initialize_intake_case()
+        self.enable_fixture_pipeline()
+        result = run_ads_pipeline_loop(
+            self.conn,
+            self.auto003_policy(),
+            downstream_stage_handlers=self.stage_handlers(retry_stage="retrieval"),
+            case_selection_policy=CaseSelectionPolicy(
+                forecast_timestamp="2026-06-24T18:00:00+00:00",
+                lease_duration_seconds=1,
+                metadata={"test_scope": "AUTO-004"},
+            ),
+        )
+        self.assertEqual(result.terminal_status, TERMINAL_REASON_RETRY_SCHEDULED)
+
+        recovered = recover_stuck_case_leases(
+            self.conn,
+            recovered_at="2100-01-01T00:00:00+00:00",
+        )
+
+        self.assertEqual([lease["case_lease_id"] for lease in recovered], [result.case_lease_id])
+        self.assertEqual(recovered[0]["cleared_pipeline_run_ids"], [result.pipeline_run_id])
+        lease = read_case_lease(self.conn, result.case_lease_id)
+        self.assertEqual(lease["lease_status"], "expired")
+        self.assertEqual(lease["release_reason"], TERMINAL_REASON_STUCK_LEASE_RECOVERED)
+        run = read_pipeline_run(self.conn, result.pipeline_run_id)
+        self.assertEqual(run["status"], "failed")
+        self.assertIsNone(run["active_case_lease_id"])
+        self.assertEqual(run["terminal_reason"], TERMINAL_REASON_STUCK_LEASE_RECOVERED)
 
     def test_auto003_quarantines_lease_and_logs_structured_failure(self):
         self.initialize_intake_case()

@@ -18,8 +18,10 @@ from predquant.ads_case_selector import (
     select_eligible_case,
 )
 from predquant.ads_pipeline_control import (
+    PIPELINE_STOP_SIGNAL_SCHEMA_VERSION,
     acknowledge_pipeline_control_state,
     get_pipeline_control_state,
+    request_pipeline_stop,
     set_pipeline_enabled,
 )
 from predquant.ads_pipeline_runner import (
@@ -178,6 +180,33 @@ class AdsPipelineControlTest(unittest.TestCase):
         self.assertEqual(acknowledged["acknowledged_by_run_id"], "ads-pipeline-run:ack")
         self.assertEqual(acknowledged["reason"], "unit test acknowledgement")
 
+    def test_stop_request_records_structured_signal_without_enabling_pipeline(self):
+        set_pipeline_enabled(
+            self.conn,
+            pipeline_enabled=True,
+            updated_by="fixture",
+            reason="unit test enables before stop request",
+            desired_runner_mode="fixture",
+        )
+
+        stopped = request_pipeline_stop(
+            self.conn,
+            stop_policy="stop_after_current_case",
+            requested_by="fixture",
+            reason="unit test requests stop after current",
+            pipeline_run_id="ads-pipeline-run:active",
+            metadata={"scope": "AUTO-004"},
+        )
+
+        self.assertFalse(stopped["pipeline_enabled"])
+        self.assertEqual(stopped["desired_runner_mode"], "fixture")
+        self.assertEqual(stopped["default_disable_action"], "stop_after_current_case")
+        signal = stopped["metadata"]["stop_signal"]
+        self.assertEqual(signal["schema_version"], PIPELINE_STOP_SIGNAL_SCHEMA_VERSION)
+        self.assertEqual(signal["stop_policy"], "stop_after_current_case")
+        self.assertEqual(signal["pipeline_run_id"], "ads-pipeline-run:active")
+        self.assertEqual(signal["metadata"], {"scope": "AUTO-004"})
+
     def test_set_and_get_cli_helpers_share_durable_state(self):
         set_cli = load_bin_module("set_ads_pipeline_enabled")
         get_cli = load_bin_module("get_ads_pipeline_control")
@@ -213,6 +242,38 @@ class AdsPipelineControlTest(unittest.TestCase):
         self.assertEqual(control["updated_by"], "fixture")
         self.assertEqual(control["reason"], "unit test CLI enable")
         self.assertEqual(control["metadata"], {"scope": "AUTO-006"})
+
+    def test_stop_cli_records_structured_stop_signal(self):
+        stop_cli = load_bin_module("stop_ads_pipeline_loop")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "ads-control.sqlite3")
+            with redirect_stdout(io.StringIO()):
+                result = stop_cli.main(
+                    [
+                        "safe_drain_now",
+                        "--db-path",
+                        db_path,
+                        "--requested-by",
+                        "fixture",
+                        "--reason",
+                        "unit test CLI stop",
+                        "--metadata-json",
+                        '{"scope":"AUTO-004"}',
+                    ]
+                )
+
+            conn = sqlite3.connect(db_path)
+            try:
+                control = get_pipeline_control_state(conn, create_default=False)
+            finally:
+                conn.close()
+
+        self.assertEqual(result, 0)
+        self.assertFalse(control["pipeline_enabled"])
+        self.assertEqual(control["default_disable_action"], "safe_drain_now")
+        self.assertEqual(control["metadata"]["stop_signal"]["stop_policy"], "safe_drain_now")
+        self.assertEqual(control["metadata"]["stop_signal"]["metadata"], {"scope": "AUTO-004"})
 
 
 if __name__ == "__main__":

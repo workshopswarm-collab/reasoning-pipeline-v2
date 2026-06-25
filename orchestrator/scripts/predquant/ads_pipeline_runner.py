@@ -7,7 +7,7 @@ import json
 import sqlite3
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -55,6 +55,11 @@ TERMINAL_REASON_NON_EXECUTING = "auto001_non_executing_runner_skeleton"
 TERMINAL_REASON_NO_ELIGIBLE_CASE = "no_eligible_case"
 TERMINAL_REASON_AUTO003_COMPLETE = "auto003_single_case_complete"
 TERMINAL_REASON_AUTO003_FAILED = "auto003_stage_failed"
+TERMINAL_REASON_STOP_BEFORE_NEXT = "stop_before_next_case"
+TERMINAL_REASON_STOP_AFTER_CURRENT = "stopped_after_current_case"
+TERMINAL_REASON_SAFE_DRAIN = "safe_drain_now"
+TERMINAL_REASON_RETRY_SCHEDULED = "auto004_retry_scheduled"
+TERMINAL_REASON_STUCK_LEASE_RECOVERED = "auto004_stuck_lease_recovered"
 
 ADS_PIPELINE_STAGE_ORDER = (
     "case_selection",
@@ -118,6 +123,25 @@ class PipelineRunnerContractError(ValueError):
     """Raised when the runner/control contract is unsafe or invalid."""
 
 
+class RetryableStageError(PipelineRunnerContractError):
+    """Raised when a stage should be retried after AUTO-004 backoff."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        retry_after_seconds: int | None = None,
+        retry_policy_ref: str = "auto004-transient-stage-retry/v1",
+    ):
+        super().__init__(message)
+        self.retry_after_seconds = retry_after_seconds
+        self.retry_policy_ref = retry_policy_ref
+
+
+class NonRetryableStageError(PipelineRunnerContractError):
+    """Raised when a stage failure should quarantine the leased case."""
+
+
 @dataclass(frozen=True)
 class IdlePolicy:
     on_no_eligible_case: str = "exit"
@@ -149,6 +173,7 @@ class PipelineRunnerPolicy:
     dependency_gate_mode: str = DEFAULT_DEPENDENCY_GATE_MODE
     allow_downstream_execution: bool = False
     allow_forecast_persistence: bool = False
+    retry_backoff_seconds: int = 60
 
 
 @dataclass(frozen=True)
@@ -215,6 +240,19 @@ class PipelineRunnerResult:
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _parse_iso_timestamp(timestamp: str) -> datetime:
+    parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def add_seconds(timestamp: str, seconds: int) -> str:
+    if not isinstance(seconds, int) or seconds < 0:
+        raise PipelineRunnerContractError("seconds must be a non-negative integer")
+    return (_parse_iso_timestamp(timestamp) + timedelta(seconds=seconds)).isoformat()
 
 
 def canonical_json(value: Any) -> str:
@@ -432,6 +470,8 @@ def validate_pipeline_runner_policy(policy: PipelineRunnerPolicy) -> None:
     require_choice("dependency_gate_mode", policy.dependency_gate_mode, DEPENDENCY_GATE_MODES)
     if policy.max_cases is not None and (not isinstance(policy.max_cases, int) or policy.max_cases < 0):
         raise PipelineRunnerContractError("max_cases must be a non-negative integer")
+    if not isinstance(policy.retry_backoff_seconds, int) or policy.retry_backoff_seconds < 0:
+        raise PipelineRunnerContractError("retry_backoff_seconds must be a non-negative integer")
     policy.idle_policy.to_record()
     if policy.allow_forecast_persistence and not policy.allow_downstream_execution:
         raise PipelineRunnerContractError("forecast persistence requires downstream stage execution")
@@ -729,6 +769,69 @@ def _active_inflight_work_exists(conn: sqlite3.Connection) -> bool:
     return row is not None
 
 
+def recover_stuck_case_leases(
+    conn: sqlite3.Connection,
+    *,
+    recovered_at: str | None = None,
+) -> list[dict[str, Any]]:
+    """Expire leased cases whose lease window elapsed and clear active runner refs."""
+
+    from predquant.ads_case_selector import read_case_lease, release_case_lease
+
+    ensure_pipeline_runner_schema(conn)
+    recovered_at = recovered_at or utc_now_iso()
+    recovered_dt = _parse_iso_timestamp(recovered_at)
+    rows = conn.execute(
+        """
+        SELECT case_lease_id, lease_expires_at
+        FROM ads_case_leases
+        WHERE lease_status = 'leased'
+        ORDER BY lease_expires_at, case_lease_id
+        """
+    ).fetchall()
+    recovered: list[dict[str, Any]] = []
+    for case_lease_id, lease_expires_at in rows:
+        if _parse_iso_timestamp(lease_expires_at) > recovered_dt:
+            continue
+        lease = release_case_lease(
+            conn,
+            case_lease_id=case_lease_id,
+            lease_status="expired",
+            release_reason=TERMINAL_REASON_STUCK_LEASE_RECOVERED,
+            released_at=recovered_at,
+        )
+        run_rows = conn.execute(
+            f"""
+            SELECT pipeline_run_id
+            FROM {PIPELINE_RUN_TABLE}
+            WHERE status IN ('starting', 'running', 'draining')
+              AND active_case_lease_id = ?
+            """,
+            (case_lease_id,),
+        ).fetchall()
+        cleared_runs: list[str] = []
+        for (pipeline_run_id,) in run_rows:
+            run = read_pipeline_run(conn, pipeline_run_id)
+            _update_pipeline_run(
+                conn,
+                run,
+                status="failed",
+                stopped_at=recovered_at,
+                terminal_reason=TERMINAL_REASON_STUCK_LEASE_RECOVERED,
+                active_case_lease_id=None,
+                metadata_updates={
+                    "feature_id": "AUTO-004",
+                    "recovered_case_lease_id": case_lease_id,
+                    "recovered_at": recovered_at,
+                },
+            )
+            cleared_runs.append(pipeline_run_id)
+        recovered.append({**read_case_lease(conn, case_lease_id), "cleared_pipeline_run_ids": cleared_runs})
+        if lease["case_lease_id"] != case_lease_id:
+            raise PipelineRunnerContractError("stuck lease recovery read back unexpected lease id")
+    return recovered
+
+
 def _update_pipeline_run(
     conn: sqlite3.Connection,
     record: dict[str, Any],
@@ -923,6 +1026,166 @@ def _record_stage_failed(
     return error_event_id
 
 
+def _record_stage_retry_scheduled(
+    conn: sqlite3.Connection,
+    context: StageContext,
+    *,
+    started_event_id: str,
+    exc: RetryableStageError,
+    policy: PipelineRunnerPolicy,
+) -> dict[str, Any]:
+    retry_after_seconds = (
+        policy.retry_backoff_seconds
+        if exc.retry_after_seconds is None
+        else exc.retry_after_seconds
+    )
+    if not isinstance(retry_after_seconds, int) or retry_after_seconds < 0:
+        raise PipelineRunnerContractError("retry_after_seconds must be a non-negative integer")
+    retry_event_id = _stage_event_id(context, "retry_scheduled")
+    error_event_id = stable_id("pipeline-error", context.pipeline_run_id, context.case_lease_id, context.stage, "retry")
+    replay_command = _stage_replay_command(context.stage, context)
+    next_retry_at = add_seconds(utc_now_iso(), retry_after_seconds)
+    safe_message = str(exc)[:512] or exc.__class__.__name__
+    metadata = {
+        "feature_id": "AUTO-004",
+        "retry_policy_ref": exc.retry_policy_ref,
+        "retry_after_seconds": retry_after_seconds,
+        "started_execution_event_id": started_event_id,
+    }
+    error = build_pipeline_error_event(
+        error_event_id=error_event_id,
+        execution_event_id=retry_event_id,
+        context=context,
+        failure_class="dependency_not_ready",
+        failure_grouping_key=f"{context.stage}:auto004_retry_scheduled:{exc.__class__.__name__}",
+        retryability="retryable",
+        safe_message=safe_message,
+        safe_metadata=metadata,
+        replay_command=replay_command,
+    )
+    event = build_stage_execution_event(
+        execution_event_id=retry_event_id,
+        context=context,
+        event_type="retry_scheduled",
+        event_status="warning",
+        completed_at=utc_now_iso(),
+        duration_ms=0,
+        attempt_number=1,
+        max_attempts=1,
+        runner_ref=f"ads-runner:{context.pipeline_run_id}",
+        agent_or_component_ref=STAGE_COMPONENT_REFS[context.stage],
+        script_path=RUNNER_SCRIPT_PATH,
+        command_sha256_value=RUNNER_COMMAND_SHA256,
+        error_event_id=error_event_id,
+        failure_class="dependency_not_ready",
+        safe_exception_class=exc.__class__.__name__,
+        safe_exception_message=safe_message,
+        no_log_reason="auto004_retry_scheduled_without_raw_log",
+        redaction_status="not_needed",
+        retry_policy_ref=exc.retry_policy_ref,
+        next_retry_at=next_retry_at,
+        replay_command=replay_command,
+        safe_metadata=metadata,
+    )
+    write_stage_execution_event(conn, event)
+    write_pipeline_error_event(conn, error)
+    status = build_stage_status_snapshot(
+        context=context,
+        status="blocked",
+        completed_at=event["completed_at"],
+        duration_ms=0,
+        latest_execution_event_ids=[started_event_id, retry_event_id],
+        error_event_ids=[error_event_id],
+        reason_codes=[TERMINAL_REASON_RETRY_SCHEDULED],
+        replay_command=replay_command,
+        metadata={**metadata, "next_retry_at": next_retry_at},
+    )
+    write_stage_status_snapshot(conn, status)
+    return {
+        "retry_event_id": retry_event_id,
+        "error_event_id": error_event_id,
+        "next_retry_at": next_retry_at,
+        "retry_policy_ref": exc.retry_policy_ref,
+        "retry_after_seconds": retry_after_seconds,
+    }
+
+
+def _control_stop_signal(control: dict[str, Any]) -> dict[str, Any] | None:
+    signal = dict(control.get("metadata", {}).get("stop_signal") or {})
+    policy = signal.get("stop_policy")
+    if policy in STOP_POLICIES and policy != "none":
+        return signal
+    if not control.get("pipeline_enabled"):
+        action = control.get("default_disable_action")
+        if action == "stop_after_current_case":
+            return {"stop_policy": "stop_after_current_case", "source": "default_disable_action"}
+        if action == "safe_drain_now":
+            return {"stop_policy": "safe_drain_now", "source": "default_disable_action"}
+        return {"stop_policy": "stop_before_next_case", "source": "default_disable_action"}
+    return None
+
+
+def _acknowledge_control_stop(
+    conn: sqlite3.Connection,
+    *,
+    pipeline_run_id: str,
+    reason: str,
+) -> None:
+    control = read_pipeline_control_state(conn)
+    metadata = dict(control.get("metadata") or {})
+    signal = dict(metadata.get("stop_signal") or {})
+    if control["pipeline_enabled"] and not signal:
+        return
+    if signal:
+        signal["acknowledged_by_run_id"] = pipeline_run_id
+        signal["acknowledged_at"] = utc_now_iso()
+        metadata["stop_signal"] = signal
+    record = build_pipeline_control_state(
+        pipeline_enabled=control["pipeline_enabled"],
+        desired_runner_mode=control["desired_runner_mode"],
+        updated_by="system",
+        reason=reason,
+        default_disable_action=control["default_disable_action"],
+        acknowledged_by_run_id=pipeline_run_id,
+        metadata=metadata,
+    )
+    write_pipeline_control_state(conn, record)
+
+
+def _stop_without_case_lease(
+    conn: sqlite3.Connection,
+    *,
+    policy: PipelineRunnerPolicy,
+    terminal_reason: str,
+    metadata: dict[str, Any] | None = None,
+) -> PipelineRunnerResult:
+    started_at = utc_now_iso()
+    run_record = build_pipeline_run(
+        policy=policy,
+        status="stopped",
+        started_at=started_at,
+        stopped_at=utc_now_iso(),
+        terminal_reason=terminal_reason,
+        metadata={"feature_id": "AUTO-004", **(metadata or {})},
+    )
+    write_pipeline_run(conn, run_record)
+    _acknowledge_control_stop(
+        conn,
+        pipeline_run_id=run_record["pipeline_run_id"],
+        reason=terminal_reason,
+    )
+    return PipelineRunnerResult(
+        started=True,
+        terminal_status=terminal_reason,
+        pipeline_run_id=run_record["pipeline_run_id"],
+        runner_mode=run_record["runner_mode"],
+        stage_order=ADS_PIPELINE_STAGE_ORDER,
+        downstream_execution_enabled=True,
+        forecast_persistence_enabled=True,
+        reason=terminal_reason,
+    )
+
+
 def _coerce_stage_result(stage: str, value: Any) -> dict[str, Any]:
     if value is None:
         value = StageHandlerResult()
@@ -973,8 +1236,25 @@ def _run_auto003_single_case(
 
     handlers = validate_auto003_policy(policy, downstream_stage_handlers)
     ensure_stage_logging_schema(conn)
+    recovered_leases = recover_stuck_case_leases(conn)
     control = read_pipeline_control_state(conn)
     if not control["pipeline_enabled"]:
+        signal = _control_stop_signal(control)
+        if signal and control.get("metadata", {}).get("stop_signal"):
+            stop_policy = signal["stop_policy"]
+            terminal_reason = (
+                TERMINAL_REASON_SAFE_DRAIN
+                if stop_policy == "safe_drain_now"
+                else TERMINAL_REASON_STOP_AFTER_CURRENT
+                if stop_policy == "stop_after_current_case"
+                else TERMINAL_REASON_STOP_BEFORE_NEXT
+            )
+            return _stop_without_case_lease(
+                conn,
+                policy=policy,
+                terminal_reason=terminal_reason,
+                metadata={"stop_signal": signal, "recovered_lease_count": len(recovered_leases)},
+            )
         return PipelineRunnerResult(
             started=False,
             terminal_status=TERMINAL_REASON_DISABLED,
@@ -989,6 +1269,20 @@ def _run_auto003_single_case(
         raise PipelineRunnerContractError("runner_mode must match pipeline control desired_runner_mode")
     if _active_inflight_work_exists(conn):
         raise PipelineRunnerContractError("AUTO-003 refuses to start while another case lease is in flight")
+    if policy.stop_policy == "stop_before_next_case":
+        return _stop_without_case_lease(
+            conn,
+            policy=policy,
+            terminal_reason=TERMINAL_REASON_STOP_BEFORE_NEXT,
+            metadata={"policy_stop": policy.stop_policy, "recovered_lease_count": len(recovered_leases)},
+        )
+    if policy.stop_policy == "safe_drain_now":
+        return _stop_without_case_lease(
+            conn,
+            policy=policy,
+            terminal_reason=TERMINAL_REASON_SAFE_DRAIN,
+            metadata={"policy_stop": policy.stop_policy, "recovered_lease_count": len(recovered_leases)},
+        )
 
     started_at = utc_now_iso()
     run_record = build_pipeline_run(
@@ -996,7 +1290,7 @@ def _run_auto003_single_case(
         status="running",
         started_at=started_at,
         terminal_reason="auto003_running",
-        metadata={"feature_id": "AUTO-003"},
+        metadata={"feature_id": "AUTO-003", "recovered_lease_count": len(recovered_leases)},
     )
     write_pipeline_run(conn, run_record)
 
@@ -1036,6 +1330,8 @@ def _run_auto003_single_case(
     stage_outputs: dict[str, dict[str, Any]] = {}
     forecast_decision_record_id: str | None = None
     completed_stage_count = 0
+    stop_after_current_requested = policy.stop_policy == "stop_after_current_case"
+    stop_after_current_reason = TERMINAL_REASON_STOP_AFTER_CURRENT
     try:
         context = _stage_context(lease, pipeline_run_id=run_record["pipeline_run_id"], stage="case_selection")
         started_event_id = _record_stage_started(conn, context)
@@ -1073,6 +1369,87 @@ def _run_auto003_single_case(
                 _record_stage_completed(conn, context, started_event_id=started_event_id, result=result)
                 stage_outputs[stage] = result
                 completed_stage_count += 1
+                latest_control = read_pipeline_control_state(conn)
+                signal = _control_stop_signal(latest_control)
+                if signal:
+                    requested_policy = signal["stop_policy"]
+                    if requested_policy == "safe_drain_now" or signal.get("source") == "default_disable_action":
+                        release_case_lease(
+                            conn,
+                            case_lease_id=lease["case_lease_id"],
+                            release_reason=TERMINAL_REASON_SAFE_DRAIN,
+                            lease_status="expired",
+                        )
+                        run_record = _update_pipeline_run(
+                            conn,
+                            run_record,
+                            status="stopped",
+                            stopped_at=utc_now_iso(),
+                            terminal_reason=TERMINAL_REASON_SAFE_DRAIN,
+                            active_case_lease_id=None,
+                            metadata_updates={
+                                "completed_stage_count": completed_stage_count,
+                                "stop_signal": signal,
+                                "safe_drained_after_stage": stage,
+                            },
+                        )
+                        _acknowledge_control_stop(
+                            conn,
+                            pipeline_run_id=run_record["pipeline_run_id"],
+                            reason=TERMINAL_REASON_SAFE_DRAIN,
+                        )
+                        return PipelineRunnerResult(
+                            started=True,
+                            terminal_status=TERMINAL_REASON_SAFE_DRAIN,
+                            pipeline_run_id=run_record["pipeline_run_id"],
+                            runner_mode=run_record["runner_mode"],
+                            stage_order=ADS_PIPELINE_STAGE_ORDER,
+                            downstream_execution_enabled=True,
+                            forecast_persistence_enabled=True,
+                            reason=TERMINAL_REASON_SAFE_DRAIN,
+                            case_lease_id=lease["case_lease_id"],
+                            completed_stage_count=completed_stage_count,
+                            forecast_decision_record_id=forecast_decision_record_id,
+                        )
+                    stop_after_current_requested = True
+                    stop_after_current_reason = (
+                        TERMINAL_REASON_STOP_BEFORE_NEXT
+                        if requested_policy == "stop_before_next_case"
+                        else TERMINAL_REASON_STOP_AFTER_CURRENT
+                    )
+            except RetryableStageError as exc:
+                retry = _record_stage_retry_scheduled(
+                    conn,
+                    context,
+                    started_event_id=started_event_id,
+                    exc=exc,
+                    policy=policy,
+                )
+                run_record = _update_pipeline_run(
+                    conn,
+                    run_record,
+                    status="draining",
+                    terminal_reason=TERMINAL_REASON_RETRY_SCHEDULED,
+                    metadata_updates={
+                        "completed_stage_count": completed_stage_count,
+                        "retry_stage": stage,
+                        "next_retry_at": retry["next_retry_at"],
+                        "retry_policy_ref": retry["retry_policy_ref"],
+                    },
+                )
+                return PipelineRunnerResult(
+                    started=True,
+                    terminal_status=TERMINAL_REASON_RETRY_SCHEDULED,
+                    pipeline_run_id=run_record["pipeline_run_id"],
+                    runner_mode=run_record["runner_mode"],
+                    stage_order=ADS_PIPELINE_STAGE_ORDER,
+                    downstream_execution_enabled=True,
+                    forecast_persistence_enabled=True,
+                    reason=TERMINAL_REASON_RETRY_SCHEDULED,
+                    case_lease_id=lease["case_lease_id"],
+                    completed_stage_count=completed_stage_count,
+                    forecast_decision_record_id=forecast_decision_record_id,
+                )
             except Exception as exc:
                 _record_stage_failed(conn, context, started_event_id=started_event_id, exc=exc)
                 raise
@@ -1087,29 +1464,73 @@ def _run_auto003_single_case(
         release_case_lease(
             conn,
             case_lease_id=lease["case_lease_id"],
-            release_reason="auto003_single_case_complete",
+            release_reason=(
+                "auto004_stop_after_current_case"
+                if stop_after_current_requested
+                else "auto003_single_case_complete"
+            ),
         )
+        terminal_reason = stop_after_current_reason if stop_after_current_requested else TERMINAL_REASON_AUTO003_COMPLETE
         run_record = _update_pipeline_run(
             conn,
             run_record,
             status="stopped",
             stopped_at=utc_now_iso(),
-            terminal_reason=TERMINAL_REASON_AUTO003_COMPLETE,
+            terminal_reason=terminal_reason,
             active_case_lease_id=None,
             metadata_updates={
                 "completed_stage_count": completed_stage_count,
                 "forecast_decision_record_id": forecast_decision_record_id,
+                "stop_after_current_requested": stop_after_current_requested,
             },
         )
+        if stop_after_current_requested:
+            _acknowledge_control_stop(
+                conn,
+                pipeline_run_id=run_record["pipeline_run_id"],
+                reason=terminal_reason,
+            )
         return PipelineRunnerResult(
             started=True,
-            terminal_status=TERMINAL_REASON_AUTO003_COMPLETE,
+            terminal_status=terminal_reason,
             pipeline_run_id=run_record["pipeline_run_id"],
             runner_mode=run_record["runner_mode"],
             stage_order=ADS_PIPELINE_STAGE_ORDER,
             downstream_execution_enabled=True,
             forecast_persistence_enabled=True,
-            reason=TERMINAL_REASON_AUTO003_COMPLETE,
+            reason=terminal_reason,
+            case_lease_id=lease["case_lease_id"],
+            completed_stage_count=completed_stage_count,
+            forecast_decision_record_id=forecast_decision_record_id,
+        )
+    except NonRetryableStageError:
+        release_case_lease(
+            conn,
+            case_lease_id=lease["case_lease_id"],
+            release_reason="auto004_non_retryable_stage_failed",
+            lease_status="quarantined",
+        )
+        _update_pipeline_run(
+            conn,
+            run_record,
+            status="failed",
+            stopped_at=utc_now_iso(),
+            terminal_reason=TERMINAL_REASON_AUTO003_FAILED,
+            active_case_lease_id=None,
+            metadata_updates={
+                "completed_stage_count": completed_stage_count,
+                "non_retryable_failure": True,
+            },
+        )
+        return PipelineRunnerResult(
+            started=True,
+            terminal_status=TERMINAL_REASON_AUTO003_FAILED,
+            pipeline_run_id=run_record["pipeline_run_id"],
+            runner_mode=run_record["runner_mode"],
+            stage_order=ADS_PIPELINE_STAGE_ORDER,
+            downstream_execution_enabled=True,
+            forecast_persistence_enabled=True,
+            reason=TERMINAL_REASON_AUTO003_FAILED,
             case_lease_id=lease["case_lease_id"],
             completed_stage_count=completed_stage_count,
             forecast_decision_record_id=forecast_decision_record_id,
