@@ -27,7 +27,7 @@ Status values: `not_started`, `fixture_defined`, `implemented`, `passing`, `waiv
 | FIX-033 | Wave B | 1,4,5 | Researcher skips certified evidence | Coverage proof/reconciliation rejects a sidecar that classifies a leaf without reviewing assigned evidence refs and required negative checks. | not_started |
 | FIX-035 | Wave B | 1,2,3 | AMRG vector source unavailable | Ollama route, BGE model, or vector index unavailable writes `amrg_vector_candidate_source_unavailable`; deterministic AMRG candidates or no-related-context waiver still proceed. | not_started |
 | FIX-037 | Wave B | 1,2,5 | Existing intake to ADS case contract | Real SQLite fixture rows from `markets` and `market_snapshots` produce `ads-case-contract/v1`, artifact manifest, evidence packet input refs, source row IDs, source payload hash, prediction-time market baseline, and stale/lookahead snapshot rejection. | not_started |
-| FIX-039 | Wave B | 1,3,4,5 | Runtime script placement static scan | Planned script paths resolve to the owning runtime workspace: QDT under Decomposer, retrieval/research/verification under Researcher Swarm, ledger under SCAE, and Orchestrator-only for intake/context/wakeup/handoff/post-SCAE routing. | not_started |
+| FIX-039 | Wave B | 1,3,4,5 | Runtime script placement static scan | Planned script paths resolve to the owning runtime workspace: QDT under Decomposer, retrieval/research/verification under Researcher Swarm, ledger under SCAE, and Orchestrator-only for intake/context/wakeup/handoff/post-SCAE routing. | implemented |
 | FIX-040 | Wave B | 1,2,5 | Continuous automation two-case loop | Runner leases a unique eligible case from existing intake rows, completes the vertical slice to scoreable SCAE forecast persistence, releases the lease, selects a second unique case, then honors stop-after-current without duplicate leases or duplicate prediction rows. | not_started |
 | FIX-041 | Wave B | 1 | Manual pipeline enable switch | `pipeline_enabled=false` blocks runner start and new lease acquisition; enabling permits the next lease; disabling during an active case writes the configured stop-after-current or safe-drain signal and acknowledgement. | not_started |
 | FIX-008 | Cutover | 2,5 | Stale/illiquid prior | Market prior reliability shrinks toward validated structural/base-rate anchor when present; no instant-snapshot-only shrink. | not_started |
@@ -59,7 +59,7 @@ Status values: `not_started`, `fixture_defined`, `implemented`, `passing`, `waiv
 
 ## Wave Requirements
 
-- Wave B requires `FIX-001` to `FIX-007` plus `FIX-031` to `FIX-033`, `FIX-035`, `FIX-037`, and `FIX-039` to `FIX-047`.
+- Wave B requires `FIX-001` to `FIX-007` plus `FIX-031` to `FIX-033`, `FIX-035`, `FIX-037`, and `FIX-039` to `FIX-048`.
 - Non-executing canary requires all `Cutover` fixtures that apply to the selected canary case class.
 - Calibration debt clearance requires `FIX-024` plus resolved replay scorecards.
 - Autonomous optimization maturity requires `Maturity` fixtures.

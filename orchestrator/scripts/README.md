@@ -53,6 +53,7 @@ Root files should stay minimal. New runnable scripts belong in `bin/`; new reusa
 | `bin/run_ads_pipeline_loop.py` | Run the AUTO-001 ADS pipeline runner contract skeleton. | Safe control-plane check; refuses start while disabled and never selects cases or persists forecasts. |
 | `bin/set_ads_pipeline_enabled.py` | Enable or disable the durable AUTO-006 ADS pipeline control switch. | Manual operator control for whether new runner starts and case leases are allowed. |
 | `bin/get_ads_pipeline_control.py` | Inspect the durable AUTO-006 ADS pipeline control row. | Manual diagnostics for enablement, desired runner mode, disable action, reason, metadata, and acknowledgement. |
+| `bin/check_ads_script_placement.py` | Check planned ADS v2 runtime paths against the script placement map. | Static FIX-039/BLK-032 evidence for missing paths, owner mismatches, duplicate declarations, and workspace-boundary drift. |
 
 ## Source Index
 
@@ -66,6 +67,7 @@ Root files should stay minimal. New runnable scripts belong in `bin/`; new reusa
 | `predquant/sqlite_store.py` | SQLite schema, market snapshot storage, prediction recording, settlement, and Brier persistence. |
 | `predquant/foundation_schema.py` | Foundation schema dependency used by `sqlite_store.py`. |
 | `predquant/golden_fixtures.py` | Golden fixture matrix parser, starter fixture specs, fail-closed validation harness, and fixture registry/result writers. |
+| `predquant/script_placement.py` | Static parser and validator for the ADS v2 runtime script placement map. |
 | `predquant/ads_pipeline_runner.py` | AUTO-001 pipeline control-state, run identity, stage-order, no-live-autostart, and non-executing runner skeleton helpers. |
 | `predquant/ads_case_selector.py` | AUTO-002 eligible-case selection plus disabled-gated case lease and idempotency helpers over intake rows. |
 | `predquant/ads_pipeline_control.py` | AUTO-006 durable manual pipeline enablement, inspection, and acknowledgement helpers. |
