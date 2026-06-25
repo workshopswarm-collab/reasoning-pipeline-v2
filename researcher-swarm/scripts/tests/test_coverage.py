@@ -29,7 +29,10 @@ from researcher_swarm.classification import (  # noqa: E402
     compute_classification_matrix_digest,
     compute_researcher_sidecar_digest,
 )
-from researcher_swarm.classification_matrix import materialize_classification_matrix  # noqa: E402
+from researcher_swarm.classification_matrix import (  # noqa: E402
+    ClassificationMatrixError,
+    materialize_classification_matrix,
+)
 from researcher_swarm.coverage import (  # noqa: E402
     RESEARCHER_EVIDENCE_REVIEW_COVERAGE_BUNDLE_SCHEMA_VERSION,
     ResearcherCoverageProofError,
@@ -360,6 +363,21 @@ class ResearcherEvidenceReviewCoverageProofTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ResearcherCoverageProofError, "assignment_requirement_not_reviewed"):
             self._bundle(packet, broken, broken_audits, sidecar, matrix)
+
+    def test_skipped_evidence_or_negative_checks_fail_closed(self) -> None:
+        packet, _assignments, _audits, sidecar, _matrix = self._inputs()
+        mutations = {
+            "missing reviewed refs": ("evidence_refs_reviewed", []),
+            "required negative checks not completed": ("required_negative_checks_completed", []),
+        }
+        for expected, (field, value) in mutations.items():
+            with self.subTest(expected=expected):
+                broken = copy.deepcopy(sidecar)
+                broken["coverage_proofs"][0][field] = value
+                self._refresh_sidecar_digests(broken)
+
+                with self.assertRaisesRegex(ClassificationMatrixError, expected):
+                    materialize_classification_matrix([broken], self.qdt, packet)
 
     def test_missing_or_blocked_isolation_audit_fails_closed(self) -> None:
         packet, assignments, audits, sidecar, matrix = self._inputs()

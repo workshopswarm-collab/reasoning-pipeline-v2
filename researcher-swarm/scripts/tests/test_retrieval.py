@@ -23,7 +23,10 @@ from ads_decomposer.handoff import (  # noqa: E402
 )
 from ads_decomposer.qdt import build_fixture_qdt_candidate, select_qdt_candidate  # noqa: E402
 from predquant.ads_handoff import validate_artifact_manifest  # noqa: E402
-from researcher_swarm.assignments import build_leaf_research_assignments  # noqa: E402
+from researcher_swarm.assignments import (  # noqa: E402
+    LeafResearchAssignmentError,
+    build_leaf_research_assignments,
+)
 from researcher_swarm.retrieval import (  # noqa: E402
     RetrievalPacketError,
     attach_native_research_transport_diagnostics,
@@ -947,6 +950,82 @@ class RetrievalPacketContractTest(unittest.TestCase):
         )
         self.assertEqual(finalized["retrieval_stage_status_records"], [])
         self.assertEqual(finalized["retrieval_stage_execution_events"], [])
+
+    def test_thin_leaf_expands_before_research_assignment(self) -> None:
+        qdt = copy.deepcopy(self.qdt)
+        qdt["required_leaf_questions"] = [qdt["required_leaf_questions"][0]]
+        leaf = qdt["required_leaf_questions"][0]
+        leaf["purpose"] = "source_of_truth"
+        leaf["research_sufficiency_requirements"].update(
+            {
+                "required_source_classes": ["official_or_primary", "independent_secondary"],
+                "min_independent_claim_families": 2,
+                "min_independent_source_families": 2,
+                "min_temporally_fresh_sources": 1,
+                "protected_primary_required": True,
+                "required_negative_checks": ["no_official_confirmation"],
+                "max_targeted_expansion_attempts": 2,
+            }
+        )
+        thin_packet = build_retrieval_packet(qdt, evidence_packet=self.evidence_packet)
+
+        blocked = finalize_retrieval_packet_for_dispatch(thin_packet)
+
+        self.assertEqual(
+            blocked["research_sufficiency_summary"]["classification_dispatch_status"],
+            "blocked_insufficient_research",
+        )
+        self.assertFalse(
+            blocked["leaf_research_sufficiency_certificates"][0]["classification_dispatch_allowed"]
+        )
+        self.assertIn(
+            blocked["leaf_research_sufficiency_certificates"][0]["status"],
+            {"blocked_insufficient_research", "blocked_stale"},
+        )
+        self.assertEqual(
+            [attempt["attempt_index"] for attempt in blocked["retrieval_expansion_attempts"]],
+            [1, 2],
+        )
+        with self.assertRaisesRegex(LeafResearchAssignmentError, "blocked_insufficient_research"):
+            build_leaf_research_assignments(qdt=qdt, retrieval_packet=blocked)
+
+        context = build_retrieval_query_contexts(qdt, evidence_packet=self.evidence_packet)[0]
+        official = self._evidence(
+            context,
+            attempt_ref="expanded-official",
+            canonical_url="https://example.com/official/expanded",
+            source_class="official_or_primary",
+            source_family_id="source-family-expanded-official",
+            claim_family_id="claim-family-expanded-official",
+        )
+        official["deterministic_source_class_proof"] = True
+        official["source_class_resolution_method"] = "manual_fixture"
+        secondary = self._evidence(
+            context,
+            attempt_ref="expanded-secondary",
+            canonical_url="https://independent.example/expanded",
+            source_class="independent_secondary",
+            source_family_id="source-family-expanded-secondary",
+            claim_family_id="claim-family-expanded-secondary",
+        )
+        expanded_packet = build_retrieval_packet(
+            qdt,
+            evidence_packet=self.evidence_packet,
+            selected_evidence=[official, secondary],
+        )
+
+        certified = finalize_retrieval_packet_for_dispatch(expanded_packet)
+        assignments = build_leaf_research_assignments(qdt=qdt, retrieval_packet=certified)
+
+        self.assertEqual(
+            certified["research_sufficiency_summary"]["classification_dispatch_status"],
+            "allowed",
+        )
+        self.assertEqual(
+            certified["leaf_research_sufficiency_certificates"][0]["status"],
+            "certified_high_certainty",
+        )
+        self.assertEqual(len(assignments), 1)
 
     def test_browser_only_cutover_uses_direct_urls_and_yields_assignments(self) -> None:
         contexts = build_retrieval_query_contexts(self.qdt, evidence_packet=self.evidence_packet)
