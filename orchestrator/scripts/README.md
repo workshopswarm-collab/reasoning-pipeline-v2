@@ -64,9 +64,10 @@ Root files should stay minimal. New runnable scripts belong in `bin/`; new reusa
 | `predquant/foundation_schema.py` | Foundation schema dependency used by `sqlite_store.py`. |
 | `predquant/golden_fixtures.py` | Golden fixture matrix parser, starter fixture specs, fail-closed validation harness, and fixture registry/result writers. |
 | `predquant/ads_pipeline_runner.py` | AUTO-001 pipeline control-state, run identity, stage-order, no-live-autostart, and non-executing runner skeleton helpers. |
+| `predquant/ads_case_selector.py` | AUTO-002 eligible-case selection plus disabled-gated case lease and idempotency helpers over intake rows. |
 | `migrations/001_foundation_persistence_and_artifacts.sql` | Ordered schema migration required by this bundle. |
 | `migrations/006_golden_fixture_harness.sql` | Typed golden fixture registry and result tables for ADS v2 fixture-first integration. |
-| `migrations/008_pipeline_runner_contract.sql` | Minimal AUTO-001 `ads_pipeline_runs` and `ads_pipeline_control_state` schema. |
+| `migrations/008_pipeline_runner_contract.sql` | AUTO-001 `ads_pipeline_runs`/`ads_pipeline_control_state` and AUTO-002 `ads_case_leases` schema. |
 | `tests/test_prediction_provenance.py` | Regression coverage for prediction provenance, idempotent recording, stale snapshots, and Brier scoring metadata. |
 
 ## Adding Future Scripts

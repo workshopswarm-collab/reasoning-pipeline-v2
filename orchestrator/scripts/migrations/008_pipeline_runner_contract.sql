@@ -44,3 +44,36 @@ CREATE INDEX IF NOT EXISTS idx_ads_pipeline_runs_status
 
 CREATE INDEX IF NOT EXISTS idx_ads_pipeline_runs_gate_mode
   ON ads_pipeline_runs(dependency_gate_mode, runner_mode);
+
+CREATE TABLE IF NOT EXISTS ads_case_leases (
+  case_lease_id TEXT PRIMARY KEY,
+  schema_version TEXT NOT NULL,
+  pipeline_run_id TEXT NOT NULL,
+  market_id INTEGER NOT NULL,
+  case_key TEXT NOT NULL,
+  case_id TEXT NOT NULL,
+  lease_status TEXT NOT NULL,
+  lease_owner TEXT NOT NULL,
+  lease_acquired_at TEXT NOT NULL,
+  lease_expires_at TEXT NOT NULL,
+  lease_released_at TEXT,
+  dispatch_id TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL UNIQUE,
+  selected_snapshot_id INTEGER NOT NULL,
+  selected_snapshot_observed_at TEXT NOT NULL,
+  selection_policy_ref TEXT NOT NULL,
+  release_reason TEXT,
+  metadata TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ads_case_leases_active_case
+  ON ads_case_leases(market_id, case_key)
+  WHERE lease_status = 'leased';
+
+CREATE INDEX IF NOT EXISTS idx_ads_case_leases_status
+  ON ads_case_leases(lease_status, lease_expires_at);
+
+CREATE INDEX IF NOT EXISTS idx_ads_case_leases_snapshot
+  ON ads_case_leases(market_id, selected_snapshot_id);

@@ -89,7 +89,7 @@ class DependencyGateTests(unittest.TestCase):
         inv = load_inventory()
         rows = rows_by_id(inv)
         failures = gates.can_start(rows["AUTO-003"], rows, set(inv["ready_statuses"]), inv["waivers"], "runtime_integration")
-        self.assertIn("AUTO-002 status=not_started", failures)
+        self.assertNotIn("AUTO-002 status=not_started", failures)
         self.assertIn("CLS-001 status=not_started", failures)
         self.assertIn("SCAE-012 status=not_started", failures)
         self.assertNotIn("CASE-002 status=not_started", failures)

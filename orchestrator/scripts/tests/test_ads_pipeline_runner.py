@@ -150,7 +150,7 @@ class AdsPipelineRunnerTest(unittest.TestCase):
         with self.assertRaisesRegex(PipelineRunnerContractError, "stage_order"):
             validate_pipeline_run(bad_order)
 
-    def test_migration_creates_only_auto001_control_and_run_tables(self):
+    def test_migration_creates_auto001_control_run_and_auto002_lease_tables(self):
         ensure_pipeline_runner_schema(self.conn)
         tables = {
             row[0]
@@ -159,7 +159,7 @@ class AdsPipelineRunnerTest(unittest.TestCase):
             ).fetchall()
         }
 
-        self.assertEqual(tables, {PIPELINE_CONTROL_STATE_TABLE, PIPELINE_RUN_TABLE})
+        self.assertEqual(tables, {PIPELINE_CONTROL_STATE_TABLE, PIPELINE_RUN_TABLE, "ads_case_leases"})
 
 
 if __name__ == "__main__":
