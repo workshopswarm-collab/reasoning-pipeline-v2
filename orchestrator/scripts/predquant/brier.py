@@ -1,4 +1,8 @@
+import math
 from typing import Optional
+
+
+LOG_LOSS_EPSILON = 1e-15
 
 
 def as_float(value):
@@ -18,6 +22,29 @@ def brier_score(probability, outcome) -> float:
     probability = validate_probability(probability, "probability")
     outcome = validate_probability(outcome, "outcome")
     return (probability - outcome) ** 2
+
+
+def brier_edge(prediction_brier, market_brier):
+    if prediction_brier is None or market_brier is None:
+        return None
+    return float(market_brier) - float(prediction_brier)
+
+
+def binary_log_loss(probability, outcome) -> float:
+    probability = validate_probability(probability, "probability")
+    outcome = validate_probability(outcome, "outcome")
+    clipped = min(max(probability, LOG_LOSS_EPSILON), 1.0 - LOG_LOSS_EPSILON)
+    return -(outcome * math.log(clipped) + (1.0 - outcome) * math.log(1.0 - clipped))
+
+
+def reliability_bucket(probability, bucket_count: int = 10) -> str:
+    probability = validate_probability(probability, "probability")
+    if bucket_count <= 0:
+        raise ValueError("bucket_count must be positive")
+    bucket_index = min(bucket_count - 1, int(probability * bucket_count))
+    lower = int(100 * bucket_index / bucket_count)
+    upper = int(100 * (bucket_index + 1) / bucket_count)
+    return f"p{lower:02d}_{upper:02d}" if upper < 100 else f"p{lower:02d}_100"
 
 
 def probability_or_none(value):

@@ -12,8 +12,11 @@ from typing import Optional
 
 from predquant.brier import (
     as_float,
+    binary_log_loss,
+    brier_edge,
     market_probability_from_snapshot,
     prediction_scores,
+    reliability_bucket,
     validate_probability,
 )
 from predquant.foundation_schema import ensure_foundation_schema
@@ -21,6 +24,9 @@ from predquant.foundation_schema import ensure_foundation_schema
 DEFAULT_DB_PATH = Path("data/predquant.sqlite3")
 DEFAULT_MAX_SNAPSHOT_AGE_SECONDS = 3600.0
 BRIER_SCORING_VERSION = "brier-v1"
+SCORE001_REPORT_SCHEMA_VERSION = "score-001-brier-score-report/v1"
+EVALUATOR_SCORECARD_SCHEMA_VERSION = "score-001-evaluator-scorecard/v1"
+CALIBRATION_DEBT_CLEARANCE_CLUSTER_ID = "calibration_debt_clearance"
 
 
 SCHEMA = """
@@ -1549,6 +1555,343 @@ def prediction_result(row: sqlite3.Row, idempotent: bool = False) -> dict:
     return result
 
 
+def _json_object_from_row(row: sqlite3.Row, column_name: str) -> dict:
+    value = row[column_name]
+    if not value:
+        return {}
+    try:
+        parsed = json.loads(value)
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _scorecard_id_for_prediction(row: sqlite3.Row, evaluation_cluster_id: str) -> str:
+    key = {
+        "prediction_id": int(row["id"]),
+        "evaluation_cluster_id": evaluation_cluster_id,
+        "scoring_version": row["scoring_version"],
+        "resolution_payload_hash": row["scoring_resolution_payload_hash"],
+    }
+    return "scorecard:" + payload_hash(key)
+
+
+def _scorecard_result(row: sqlite3.Row, idempotent: bool = False) -> dict:
+    metadata = _json_object_from_row(row, "metadata")
+    result = {
+        "schema_version": EVALUATOR_SCORECARD_SCHEMA_VERSION,
+        "feature_id": "SCORE-001",
+        "scorecard_id": row["scorecard_id"],
+        "prediction_id": metadata.get("prediction_id"),
+        "market_id": metadata.get("market_id"),
+        "market_snapshot_id": metadata.get("market_snapshot_id"),
+        "prediction_run_id": metadata.get("prediction_run_id"),
+        "forecast_artifact_id": metadata.get("forecast_artifact_id"),
+        "evaluation_cluster_id": row["evaluation_cluster_id"],
+        "prediction_brier": row["prediction_brier"],
+        "market_brier": row["market_brier"],
+        "brier_edge": metadata.get("brier_edge"),
+        "reliability_bucket": row["reliability_bucket"],
+        "diagnostic_status": row["diagnostic_status"],
+    }
+    if idempotent:
+        result["idempotent"] = True
+    return result
+
+
+def _scorecard_values_from_prediction(
+    row: sqlite3.Row,
+    *,
+    evaluation_cluster_id: str,
+    forecast_decision_id: Optional[str] = None,
+    reliability_bucket_override: Optional[str] = None,
+    diagnostic_status: str = "scoreable",
+    metadata: Optional[dict] = None,
+) -> dict:
+    if row["outcome"] is None or row["prediction_brier"] is None:
+        raise ValueError("prediction must be scored before writing an evaluator scorecard")
+    if row["market_brier"] is None or row["market_probability"] is None:
+        raise ValueError("prediction-time market baseline is required for SCORE-001 scorecards")
+    if row["market_snapshot_id"] is None:
+        raise ValueError("market_snapshot_id is required for SCORE-001 scorecards")
+    if not row["scoring_version"]:
+        raise ValueError("scoring_version is required for SCORE-001 scorecards")
+    if not row["scoring_resolution_payload_hash"]:
+        raise ValueError("resolution payload hash is required for SCORE-001 scorecards")
+
+    prediction_metadata = _json_object_from_row(row, "metadata")
+    resolved_forecast_decision_id = (
+        forecast_decision_id or prediction_metadata.get("forecast_decision_id")
+    )
+    edge = brier_edge(row["prediction_brier"], row["market_brier"])
+    scorecard_metadata = {
+        "schema_version": EVALUATOR_SCORECARD_SCHEMA_VERSION,
+        "feature_id": "SCORE-001",
+        "prediction_id": int(row["id"]),
+        "market_id": int(row["market_id"]),
+        "market_snapshot_id": int(row["market_snapshot_id"]),
+        "prediction_run_id": row["prediction_run_id"],
+        "forecast_artifact_id": row["forecast_artifact_id"],
+        "case_key": row["case_key"],
+        "case_id": row["case_id"],
+        "dispatch_id": row["dispatch_id"],
+        "prediction_source": row["prediction_source"],
+        "prediction_label": row["prediction_label"],
+        "predicted_probability": row["predicted_probability"],
+        "market_probability": row["market_probability"],
+        "market_probability_method": row["market_probability_method"],
+        "snapshot_age_seconds": row["snapshot_age_seconds"],
+        "source_payload_hash": row["source_payload_hash"],
+        "input_artifact_path": row["input_artifact_path"],
+        "input_artifact_sha256": row["input_artifact_sha256"],
+        "prediction_artifact_path": row["prediction_artifact_path"],
+        "prediction_artifact_sha256": row["prediction_artifact_sha256"],
+        "outcome": row["outcome"],
+        "prediction_brier": row["prediction_brier"],
+        "market_brier": row["market_brier"],
+        "brier_edge": edge,
+        "scoring_version": row["scoring_version"],
+        "scored_at": row["scored_at"],
+        "resolved_at": row["resolved_at"],
+        "resolution_source": row["scoring_resolution_source"],
+        "resolution_payload_hash": row["scoring_resolution_payload_hash"],
+        "allowed_uses": [
+            "calibration_debt_clearance_metric",
+            "replay_scorecard_reference",
+            "session6_evaluator_tuning_input",
+        ],
+        "forbidden_uses": [
+            "production_forecast_write",
+            "calibration_policy_promotion",
+            "scae_probability_rewrite",
+        ],
+        "live_forecast_authority": False,
+        "production_forecast_write_authority": False,
+        "calibration_policy_promotion_authority": False,
+        "scae_probability_rewrite_authority": False,
+    }
+    if metadata:
+        scorecard_metadata["scorecard_metadata"] = metadata
+
+    return {
+        "scorecard_id": _scorecard_id_for_prediction(row, evaluation_cluster_id),
+        "case_key": row["case_key"] or f"market:{row['market_id']}",
+        "dispatch_id": row["dispatch_id"] or f"prediction:{row['id']}",
+        "forecast_decision_id": resolved_forecast_decision_id,
+        "evaluation_cluster_id": evaluation_cluster_id,
+        "outcome": row["outcome"],
+        "prediction_brier": row["prediction_brier"],
+        "log_loss": binary_log_loss(row["predicted_probability"], row["outcome"]),
+        "market_brier": row["market_brier"],
+        "reliability_bucket": (
+            reliability_bucket_override
+            if reliability_bucket_override is not None
+            else reliability_bucket(row["predicted_probability"])
+        ),
+        "resolution_component": edge,
+        "diagnostic_status": diagnostic_status,
+        "metadata": to_json_text(scorecard_metadata),
+    }
+
+
+def _write_evaluator_scorecard_for_row(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+    *,
+    evaluation_cluster_id: str,
+    forecast_decision_id: Optional[str] = None,
+    reliability_bucket_override: Optional[str] = None,
+    diagnostic_status: str = "scoreable",
+    metadata: Optional[dict] = None,
+) -> dict:
+    values = _scorecard_values_from_prediction(
+        row,
+        evaluation_cluster_id=evaluation_cluster_id,
+        forecast_decision_id=forecast_decision_id,
+        reliability_bucket_override=reliability_bucket_override,
+        diagnostic_status=diagnostic_status,
+        metadata=metadata,
+    )
+    existing = conn.execute(
+        "SELECT * FROM evaluator_scorecards WHERE scorecard_id = ?",
+        (values["scorecard_id"],),
+    ).fetchone()
+    now = utc_now()
+    if existing:
+        conn.execute(
+            """
+            UPDATE evaluator_scorecards
+            SET case_key = ?,
+                dispatch_id = ?,
+                forecast_decision_id = ?,
+                evaluation_cluster_id = ?,
+                outcome = ?,
+                prediction_brier = ?,
+                log_loss = ?,
+                market_brier = ?,
+                reliability_bucket = ?,
+                resolution_component = ?,
+                diagnostic_status = ?,
+                metadata = ?
+            WHERE scorecard_id = ?
+            """,
+            (
+                values["case_key"],
+                values["dispatch_id"],
+                values["forecast_decision_id"],
+                values["evaluation_cluster_id"],
+                values["outcome"],
+                values["prediction_brier"],
+                values["log_loss"],
+                values["market_brier"],
+                values["reliability_bucket"],
+                values["resolution_component"],
+                values["diagnostic_status"],
+                values["metadata"],
+                values["scorecard_id"],
+            ),
+        )
+        scorecard_row = conn.execute(
+            "SELECT * FROM evaluator_scorecards WHERE scorecard_id = ?",
+            (values["scorecard_id"],),
+        ).fetchone()
+        return _scorecard_result(scorecard_row, idempotent=True)
+
+    conn.execute(
+        """
+        INSERT INTO evaluator_scorecards (
+          scorecard_id,
+          case_key,
+          dispatch_id,
+          forecast_decision_id,
+          evaluation_cluster_id,
+          outcome,
+          prediction_brier,
+          log_loss,
+          market_brier,
+          reliability_bucket,
+          resolution_component,
+          diagnostic_status,
+          created_at,
+          metadata
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            values["scorecard_id"],
+            values["case_key"],
+            values["dispatch_id"],
+            values["forecast_decision_id"],
+            values["evaluation_cluster_id"],
+            values["outcome"],
+            values["prediction_brier"],
+            values["log_loss"],
+            values["market_brier"],
+            values["reliability_bucket"],
+            values["resolution_component"],
+            values["diagnostic_status"],
+            now,
+            values["metadata"],
+        ),
+    )
+    scorecard_row = conn.execute(
+        "SELECT * FROM evaluator_scorecards WHERE scorecard_id = ?",
+        (values["scorecard_id"],),
+    ).fetchone()
+    return _scorecard_result(scorecard_row)
+
+
+def write_evaluator_scorecard(
+    db_path: Path,
+    prediction_id: int,
+    *,
+    evaluation_cluster_id: str = CALIBRATION_DEBT_CLEARANCE_CLUSTER_ID,
+    forecast_decision_id: Optional[str] = None,
+    reliability_bucket_override: Optional[str] = None,
+    diagnostic_status: str = "scoreable",
+    metadata: Optional[dict] = None,
+) -> dict:
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        with conn:
+            ensure_schema(conn)
+            prediction_row = conn.execute(
+                "SELECT * FROM market_predictions WHERE id = ?",
+                (int(prediction_id),),
+            ).fetchone()
+            if prediction_row is None:
+                raise ValueError("prediction not found")
+            return _write_evaluator_scorecard_for_row(
+                conn,
+                prediction_row,
+                evaluation_cluster_id=evaluation_cluster_id,
+                forecast_decision_id=forecast_decision_id,
+                reliability_bucket_override=reliability_bucket_override,
+                diagnostic_status=diagnostic_status,
+                metadata=metadata,
+            )
+    finally:
+        conn.close()
+
+
+def write_evaluator_scorecards(
+    db_path: Path,
+    *,
+    prediction_source: Optional[str] = None,
+    prediction_label: Optional[str] = None,
+    market_id: Optional[int] = None,
+    evaluation_cluster_id: str = CALIBRATION_DEBT_CLEARANCE_CLUSTER_ID,
+    metadata: Optional[dict] = None,
+) -> dict:
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        with conn:
+            ensure_schema(conn)
+            filter_sql, filter_params = _prediction_filter_clause(
+                prediction_source=prediction_source,
+                prediction_label=prediction_label,
+            )
+            market_sql = ""
+            if market_id is not None:
+                market_sql = " AND market_id = ?"
+                filter_params.append(int(market_id))
+            rows = conn.execute(
+                f"""
+                SELECT *
+                FROM market_predictions
+                WHERE outcome IS NOT NULL
+                  AND prediction_brier IS NOT NULL
+                  AND market_brier IS NOT NULL
+                  AND market_snapshot_id IS NOT NULL{filter_sql}{market_sql}
+                ORDER BY scored_at, id
+                """,
+                filter_params,
+            ).fetchall()
+            scorecards = [
+                _write_evaluator_scorecard_for_row(
+                    conn,
+                    row,
+                    evaluation_cluster_id=evaluation_cluster_id,
+                    metadata=metadata,
+                )
+                for row in rows
+            ]
+        return {
+            "schema_version": EVALUATOR_SCORECARD_SCHEMA_VERSION,
+            "feature_id": "SCORE-001",
+            "evaluation_cluster_id": evaluation_cluster_id,
+            "scored_predictions_considered": len(rows),
+            "written_scorecards": len(scorecards),
+            "scorecard_ids": [scorecard["scorecard_id"] for scorecard in scorecards],
+        }
+    finally:
+        conn.close()
+
+
 def existing_prediction_result_or_error(
     row: sqlite3.Row,
     *,
@@ -2150,6 +2493,63 @@ def settle_market_outcome(
         conn.close()
 
 
+def write_resolution_score(
+    db_path: Path,
+    outcome,
+    market_id: Optional[int] = None,
+    platform: str = "polymarket",
+    external_market_id: Optional[str] = None,
+    resolved_at: Optional[str] = None,
+    resolution_source: str = "manual",
+    resolution_payload: Optional[dict] = None,
+    resolution_payload_hash: Optional[str] = None,
+    resolution_method: Optional[str] = None,
+    resolution_checked_at: Optional[str] = None,
+    prediction_source: Optional[str] = None,
+    prediction_label: Optional[str] = None,
+    evaluation_cluster_id: str = CALIBRATION_DEBT_CLEARANCE_CLUSTER_ID,
+    write_scorecards: bool = True,
+) -> dict:
+    if write_scorecards and resolution_payload is None and not resolution_payload_hash:
+        raise ValueError("resolution payload hash is required for SCORE-001 scorecards")
+    settled = settle_market_outcome(
+        db_path=db_path,
+        market_id=market_id,
+        platform=platform,
+        external_market_id=external_market_id,
+        outcome=outcome,
+        resolved_at=resolved_at,
+        resolution_source=resolution_source,
+        resolution_payload=resolution_payload,
+        resolution_payload_hash=resolution_payload_hash,
+        resolution_method=resolution_method,
+        resolution_checked_at=resolution_checked_at,
+    )
+    scorecards = None
+    if write_scorecards:
+        scorecards = write_evaluator_scorecards(
+            db_path,
+            market_id=settled["market_id"],
+            prediction_source=prediction_source,
+            prediction_label=prediction_label,
+            evaluation_cluster_id=evaluation_cluster_id,
+            metadata={
+                "resolution_source": settled["resolution_source"],
+                "resolution_payload_hash": settled["resolution_payload_hash"],
+                "resolution_method": settled["resolution_method"],
+            },
+        )
+    return {
+        "schema_version": SCORE001_REPORT_SCHEMA_VERSION,
+        "feature_id": "SCORE-001",
+        "settled_market": settled,
+        "scorecards": scorecards,
+        "calibration_policy_promotion_authority": False,
+        "production_forecast_write_authority": False,
+        "scae_probability_rewrite_authority": False,
+    }
+
+
 def _prediction_filter_clause(
     prediction_source: Optional[str] = None,
     prediction_label: Optional[str] = None,
@@ -2171,6 +2571,7 @@ def brier_score_report(
     db_path: Path,
     prediction_source: Optional[str] = None,
     prediction_label: Optional[str] = None,
+    evaluation_cluster_id: Optional[str] = CALIBRATION_DEBT_CLEARANCE_CLUSTER_ID,
 ) -> dict:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path)
@@ -2187,6 +2588,21 @@ def brier_score_report(
               COUNT(*) AS predictions,
               COUNT(prediction_brier) AS scored_predictions,
               COUNT(market_brier) AS scored_market_baselines,
+              COALESCE(SUM(CASE
+                    WHEN prediction_brier IS NOT NULL AND market_brier IS NOT NULL THEN 1
+                    ELSE 0
+                  END), 0) AS scored_predictions_with_market_baseline,
+              COALESCE(SUM(CASE
+                    WHEN prediction_brier IS NOT NULL AND market_brier IS NULL THEN 1
+                    ELSE 0
+                  END), 0) AS scored_predictions_missing_market_baseline,
+              COALESCE(SUM(CASE
+                    WHEN prediction_brier IS NOT NULL
+                     AND market_brier IS NOT NULL
+                     AND market_snapshot_id IS NOT NULL
+                     AND scoring_resolution_payload_hash IS NOT NULL THEN 1
+                    ELSE 0
+                  END), 0) AS scoreable_resolution_records,
               AVG(prediction_brier) AS avg_prediction_brier,
               AVG(market_brier) AS avg_market_brier,
               AVG(CASE
@@ -2210,6 +2626,10 @@ def brier_score_report(
               COUNT(*) AS predictions,
               COUNT(prediction_brier) AS scored_predictions,
               COUNT(market_brier) AS scored_market_baselines,
+              COALESCE(SUM(CASE
+                    WHEN prediction_brier IS NOT NULL AND market_brier IS NOT NULL THEN 1
+                    ELSE 0
+                  END), 0) AS scored_predictions_with_market_baseline,
               AVG(prediction_brier) AS avg_prediction_brier,
               AVG(market_brier) AS avg_market_brier,
               AVG(CASE
@@ -2223,15 +2643,105 @@ def brier_score_report(
             """,
             filter_params,
         ).fetchall()
+        bucket_rows = conn.execute(
+            f"""
+            SELECT predicted_probability, prediction_brier, market_brier
+            FROM market_predictions
+            WHERE prediction_brier IS NOT NULL{filter_sql}
+            """,
+            filter_params,
+        ).fetchall()
+        bucket_summaries: dict[str, dict] = {}
+        for row in bucket_rows:
+            bucket = reliability_bucket(row["predicted_probability"])
+            summary = bucket_summaries.setdefault(
+                bucket,
+                {
+                    "reliability_bucket": bucket,
+                    "scored_predictions": 0,
+                    "scored_market_baselines": 0,
+                    "prediction_brier_sum": 0.0,
+                    "market_brier_sum": 0.0,
+                    "brier_edge_sum": 0.0,
+                    "brier_edge_count": 0,
+                },
+            )
+            summary["scored_predictions"] += 1
+            summary["prediction_brier_sum"] += float(row["prediction_brier"])
+            if row["market_brier"] is not None:
+                summary["scored_market_baselines"] += 1
+                summary["market_brier_sum"] += float(row["market_brier"])
+                summary["brier_edge_sum"] += brier_edge(
+                    row["prediction_brier"],
+                    row["market_brier"],
+                )
+                summary["brier_edge_count"] += 1
+        by_reliability_bucket = []
+        for bucket in sorted(bucket_summaries):
+            summary = bucket_summaries[bucket]
+            scored_predictions = summary["scored_predictions"]
+            scored_market_baselines = summary["scored_market_baselines"]
+            edge_count = summary["brier_edge_count"]
+            by_reliability_bucket.append(
+                {
+                    "reliability_bucket": bucket,
+                    "scored_predictions": scored_predictions,
+                    "scored_market_baselines": scored_market_baselines,
+                    "avg_prediction_brier": (
+                        summary["prediction_brier_sum"] / scored_predictions
+                        if scored_predictions
+                        else None
+                    ),
+                    "avg_market_brier": (
+                        summary["market_brier_sum"] / scored_market_baselines
+                        if scored_market_baselines
+                        else None
+                    ),
+                    "avg_brier_edge": (
+                        summary["brier_edge_sum"] / edge_count
+                        if edge_count
+                        else None
+                    ),
+                }
+            )
+        scorecard_sql = ""
+        scorecard_params: list[str] = []
+        if evaluation_cluster_id:
+            scorecard_sql = "WHERE evaluation_cluster_id = ?"
+            scorecard_params.append(evaluation_cluster_id)
+        scorecards = conn.execute(
+            f"""
+            SELECT
+              COUNT(*) AS scorecards,
+              COUNT(DISTINCT case_key || '|' || dispatch_id) AS scored_cases,
+              AVG(prediction_brier) AS avg_prediction_brier,
+              AVG(market_brier) AS avg_market_brier,
+              AVG(CASE
+                    WHEN market_brier IS NULL OR prediction_brier IS NULL THEN NULL
+                    ELSE market_brier - prediction_brier
+                  END) AS avg_brier_edge,
+              MIN(created_at) AS first_scorecard_at,
+              MAX(created_at) AS latest_scorecard_at
+            FROM evaluator_scorecards
+            {scorecard_sql}
+            """,
+            scorecard_params,
+        ).fetchone()
         return {
+            "schema_version": SCORE001_REPORT_SCHEMA_VERSION,
+            "feature_id": "SCORE-001",
             "db_path": str(db_path),
             "prediction_source": prediction_source,
             "prediction_label": prediction_label,
+            "evaluation_cluster_id": evaluation_cluster_id,
             "overall": dict(overall),
             "by_source": [dict(row) for row in by_source],
+            "by_reliability_bucket": by_reliability_bucket,
+            "scorecards": dict(scorecards),
             "notes": {
                 "brier_direction": "lower_is_better",
                 "avg_brier_edge": "avg_market_brier - avg_prediction_brier; positive means pipeline beat the market baseline",
+                "scorecard_authority": "SCORE-001 scorecards are diagnostic references only; they do not promote calibration policy, rewrite SCAE probability, or write live forecasts.",
             },
         }
     finally:

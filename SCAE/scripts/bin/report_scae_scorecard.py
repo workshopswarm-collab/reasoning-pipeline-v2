@@ -1,13 +1,20 @@
 #!/usr/bin/env python3
+"""Report SCORE-001 SCAE Brier and market-baseline scorecards."""
+
+from __future__ import annotations
+
 import argparse
 import json
 import os
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+REPO_ROOT = Path(__file__).resolve().parents[3]
+ORCHESTRATOR_SCRIPTS = REPO_ROOT / "orchestrator" / "scripts"
+if str(ORCHESTRATOR_SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(ORCHESTRATOR_SCRIPTS))
 
-from predquant.sqlite_store import (
+from predquant.sqlite_store import (  # noqa: E402
     CALIBRATION_DEBT_CLEARANCE_CLUSTER_ID,
     DEFAULT_DB_PATH,
     brier_score_report,
@@ -15,12 +22,25 @@ from predquant.sqlite_store import (
 )
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Report pipeline Brier scores against prediction-time market baselines"
+        description="Report SCAE SCORE-001 Brier scores against prediction-time market baselines."
     )
-    parser.add_argument("--source", help="Optional prediction_source filter")
-    parser.add_argument("--label", help="Optional prediction_label filter")
+    parser.add_argument(
+        "--db-path",
+        default=os.getenv("PREDQUANT_SQLITE_PATH", str(DEFAULT_DB_PATH)),
+        help="SQLite database path.",
+    )
+    parser.add_argument(
+        "--source",
+        default="ads_pipeline",
+        help="Prediction source to report; defaults to PERSIST-002 SCAE bridge rows.",
+    )
+    parser.add_argument(
+        "--label",
+        default="v2_scae",
+        help="Prediction label to report; defaults to PERSIST-002 SCAE bridge rows.",
+    )
     parser.add_argument(
         "--evaluation-cluster-id",
         default=CALIBRATION_DEBT_CLEARANCE_CLUSTER_ID,
@@ -29,19 +49,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--write-scorecards",
         action="store_true",
-        help="Write idempotent evaluator scorecards for scored predictions before reporting.",
+        help="Write idempotent evaluator scorecards for already-scored SCAE predictions.",
     )
-    parser.add_argument("--pretty", action="store_true", help="Pretty-print JSON output")
-    parser.add_argument(
-        "--db-path",
-        default=os.getenv("PREDQUANT_SQLITE_PATH", str(DEFAULT_DB_PATH)),
-        help="SQLite database path.",
-    )
-    return parser.parse_args()
+    parser.add_argument("--pretty", action="store_true", help="Pretty-print JSON output.")
+    return parser.parse_args(argv)
 
 
-def main() -> int:
-    args = parse_args()
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
     try:
         scorecards = None
         if args.write_scorecards:
@@ -62,6 +77,7 @@ def main() -> int:
     except Exception as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
+
     print(json.dumps(result, indent=2 if args.pretty else None, sort_keys=args.pretty))
     return 0
 

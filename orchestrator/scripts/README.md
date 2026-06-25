@@ -178,6 +178,27 @@ python3 bin/report_brier_scores.py --db-path data/predquant.sqlite3 --pretty
 
 `avg_brier_edge` is `avg_market_brier - avg_prediction_brier`; positive values mean the pipeline beat the prediction-time market baseline.
 
+For SCORE-001 calibration-debt-clearance reporting, write idempotent evaluator
+scorecards for already-scored predictions before reporting:
+
+```bash
+python3 bin/report_brier_scores.py \
+  --db-path data/predquant.sqlite3 \
+  --source ads_pipeline \
+  --label v2_scae \
+  --write-scorecards \
+  --pretty
+```
+
+SCAE-focused reporting defaults to the PERSIST-002 bridge rows:
+
+```bash
+python3 ../../SCAE/scripts/bin/report_scae_scorecard.py \
+  --db-path data/predquant.sqlite3 \
+  --write-scorecards \
+  --pretty
+```
+
 ## Boundary
 
 This bundle does not include the v2 decomposition, retrieval, classification, SCAE, calibration, UI, or agent runtime.
