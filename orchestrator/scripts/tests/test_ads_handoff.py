@@ -19,6 +19,7 @@ from predquant.ads_handoff import (
     write_artifact_manifest,
     write_validation_result,
 )
+from predquant.foundation_schema import ensure_foundation_schema
 
 
 class AdsHandoffTest(unittest.TestCase):
@@ -104,6 +105,101 @@ class AdsHandoffTest(unittest.TestCase):
                     (artifact_id,),
                 ).fetchone()[0]
                 self.assertEqual(result_count, 1)
+            finally:
+                conn.close()
+
+    def test_write_artifact_manifest_can_persist_validation_results(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            path = self.artifact_path(tempdir)
+            manifest = build_artifact_manifest(
+                context=self.context(),
+                artifact_type="retrieval-packet",
+                artifact_schema_version="retrieval-packet/v1",
+                path=path,
+                validation_status="not_validated",
+                validator_version="ads-handoff-test/v1",
+            )
+            validation = build_validation_result(
+                artifact_id=manifest["artifact_id"],
+                status="valid",
+                validator_version="ads-handoff-test/v1",
+                reason_codes=["schema_passed"],
+                validation_messages=["manifest and payload validated"],
+                metadata={"validator": "unit-test"},
+            )
+            conn = sqlite3.connect(":memory:")
+            try:
+                artifact_id = write_artifact_manifest(conn, manifest, validation_results=[validation])
+
+                manifest_row = conn.execute(
+                    "SELECT artifact_id, validation_status, validation_result_refs "
+                    "FROM case_artifact_manifest"
+                ).fetchone()
+                validation_row = conn.execute(
+                    "SELECT validation_result_id, artifact_id, status FROM artifact_validation_results"
+                ).fetchone()
+                self.assertEqual(manifest_row[0], artifact_id)
+                self.assertEqual(manifest_row[1], "valid")
+                self.assertEqual(json.loads(manifest_row[2]), [validation["validation_result_id"]])
+                self.assertEqual(validation_row, (validation["validation_result_id"], artifact_id, "valid"))
+            finally:
+                conn.close()
+
+    def test_validation_result_requires_existing_artifact_manifest(self):
+        result = build_validation_result(
+            artifact_id="artifact:missing",
+            status="valid",
+            validator_version="ads-handoff-test/v1",
+            reason_codes=["schema_passed"],
+            validation_messages=["manifest and payload validated"],
+        )
+        conn = sqlite3.connect(":memory:")
+        try:
+            with self.assertRaisesRegex(ArtifactManifestError, "unknown artifact_id"):
+                write_validation_result(conn, result)
+        finally:
+            conn.close()
+
+    def test_combined_manifest_write_rejects_reused_validation_result_id(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            first_path = self.artifact_path(tempdir)
+            second_path = Path(tempdir) / "second-retrieval-packet.json"
+            second_path.write_text('{"schema_version":"retrieval-packet/v1","items":[2]}\n', encoding="utf-8")
+            first_manifest = build_artifact_manifest(
+                context=self.context(),
+                artifact_type="retrieval-packet",
+                artifact_schema_version="retrieval-packet/v1",
+                path=first_path,
+            )
+            second_manifest = build_artifact_manifest(
+                context=self.context(),
+                artifact_type="retrieval-packet",
+                artifact_schema_version="retrieval-packet/v1",
+                path=second_path,
+            )
+            reused_id = "artifact-validation:shared"
+            first_validation = build_validation_result(
+                artifact_id=first_manifest["artifact_id"],
+                status="valid",
+                validator_version="ads-handoff-test/v1",
+                validation_result_id=reused_id,
+            )
+            second_validation = build_validation_result(
+                artifact_id=second_manifest["artifact_id"],
+                status="valid",
+                validator_version="ads-handoff-test/v1",
+                validation_result_id=reused_id,
+            )
+            conn = sqlite3.connect(":memory:")
+            try:
+                write_artifact_manifest(conn, first_manifest, validation_results=[first_validation])
+                with self.assertRaisesRegex(ArtifactManifestError, "already linked"):
+                    write_artifact_manifest(conn, second_manifest, validation_results=[second_validation])
+                second_count = conn.execute(
+                    "SELECT COUNT(*) FROM case_artifact_manifest WHERE artifact_id = ?",
+                    (second_manifest["artifact_id"],),
+                ).fetchone()[0]
+                self.assertEqual(second_count, 0)
             finally:
                 conn.close()
 
@@ -196,6 +292,35 @@ class AdsHandoffTest(unittest.TestCase):
         self.assertIn("validation_result_refs", manifest_columns)
         self.assertIn("validation_result_id", result_columns)
         self.assertIn("reason_codes", result_columns)
+
+    def test_foundation_migration_defines_mig001_named_surfaces(self):
+        conn = sqlite3.connect(":memory:")
+        try:
+            ensure_foundation_schema(conn)
+            tables = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                ).fetchall()
+            }
+            manifest_columns = {
+                row[1]
+                for row in conn.execute("PRAGMA table_info(case_artifact_manifest)").fetchall()
+            }
+            result_columns = {
+                row[1]
+                for row in conn.execute("PRAGMA table_info(artifact_validation_results)").fetchall()
+            }
+        finally:
+            conn.close()
+
+        self.assertIn("case_artifact_manifest", tables)
+        self.assertIn("artifact_validation_results", tables)
+        self.assertIn("artifact_id", manifest_columns)
+        self.assertIn("artifact_schema_version", manifest_columns)
+        self.assertIn("validation_result_refs", manifest_columns)
+        self.assertIn("artifact_id", result_columns)
+        self.assertIn("validation_result_id", result_columns)
 
 
 if __name__ == "__main__":

@@ -297,17 +297,21 @@ class AdsCaseContractTest(unittest.TestCase):
         self.assertIn("forecast_artifact_id", contract_columns)
         self.assertIn("artifact_id", contract_columns)
 
-    def test_legacy_sqlite_store_bootstrap_is_upgraded_before_materialization(self):
+    def test_sqlite_store_bootstrap_upgrades_artifact_manifest_surface(self):
         conn = sqlite3.connect(":memory:")
         conn.row_factory = sqlite3.Row
         try:
             ensure_sqlite_store_schema(conn)
-            legacy_columns = {
+            bootstrap_columns = {
                 row[1]
                 for row in conn.execute("PRAGMA table_info(case_artifact_manifest)").fetchall()
             }
-            self.assertIn("producer_stage", legacy_columns)
-            self.assertNotIn("stage", legacy_columns)
+            self.assertIn("producer_stage", bootstrap_columns)
+            self.assertIn("stage", bootstrap_columns)
+            self.assertIn("artifact_id", bootstrap_columns)
+            self.assertIn("artifact_schema_version", bootstrap_columns)
+            self.assertIn("validation_status", bootstrap_columns)
+            self.assertIn("validation_result_refs", bootstrap_columns)
 
             market_id = conn.execute(
                 """
@@ -351,13 +355,13 @@ class AdsCaseContractTest(unittest.TestCase):
                 artifact_dir=self.artifact_dir,
             )
 
-            upgraded_columns = {
+            materialized_columns = {
                 row[1]
                 for row in conn.execute("PRAGMA table_info(case_artifact_manifest)").fetchall()
             }
-            self.assertIn("stage", upgraded_columns)
-            self.assertIn("artifact_schema_version", upgraded_columns)
-            self.assertIn("validation_status", upgraded_columns)
+            self.assertIn("stage", materialized_columns)
+            self.assertIn("artifact_schema_version", materialized_columns)
+            self.assertIn("validation_status", materialized_columns)
             self.assertEqual(result["contract"]["intake_source"]["market_snapshot_id"], snapshot_id)
             manifest = conn.execute("SELECT * FROM case_artifact_manifest").fetchone()
             self.assertEqual(manifest["artifact_id"], result["artifact_id"])

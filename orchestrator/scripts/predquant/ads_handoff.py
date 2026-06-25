@@ -60,7 +60,11 @@ ARTIFACT_MANIFEST_COMPAT_COLUMNS = {
     "stage": "TEXT",
     "stage_attempt_id": "TEXT",
     "pipeline_run_id": "TEXT",
+    "market_id": "TEXT",
+    "feature_id": "TEXT",
     "producer": "TEXT",
+    "producer_stage": "TEXT",
+    "schema_id": "TEXT",
     "generated_at": "TEXT",
     "forecast_timestamp": "TEXT",
     "source_cutoff_timestamp": "TEXT",
@@ -69,6 +73,8 @@ ARTIFACT_MANIFEST_COMPAT_COLUMNS = {
     "validation_result_refs": "TEXT NOT NULL DEFAULT '[]'",
     "validator_version": "TEXT",
     "temporal_isolation_status": "TEXT",
+    "sha256": "TEXT",
+    "replay_command": "TEXT",
     "metadata": "TEXT NOT NULL DEFAULT '{}'",
     "updated_at": "TEXT",
 }
@@ -133,6 +139,7 @@ def ensure_artifact_manifest_schema(conn: sqlite3.Connection) -> None:
     indexes in place so component migrations can safely reference it.
     """
 
+    conn.execute("PRAGMA foreign_keys = ON")
     if not table_exists(conn, ARTIFACT_MANIFEST_TABLE):
         conn.executescript(ARTIFACT_MANIFEST_MIGRATION.read_text(encoding="utf-8"))
         return
@@ -436,40 +443,79 @@ def validate_validation_result(result: dict[str, Any]) -> None:
     ensure_safe_metadata(result["metadata"])
 
 
-def write_artifact_manifest(conn: sqlite3.Connection, manifest: dict[str, Any]) -> str:
-    validate_artifact_manifest(manifest)
+def write_artifact_manifest(
+    conn: sqlite3.Connection,
+    manifest: dict[str, Any],
+    validation_results: list[dict[str, Any]] | tuple[dict[str, Any], ...] | None = None,
+) -> str:
+    return write_artifact_manifest_with_validation(conn, manifest, validation_results)
+
+
+def write_artifact_manifest_with_validation(
+    conn: sqlite3.Connection,
+    manifest: dict[str, Any],
+    validation_results: list[dict[str, Any]] | tuple[dict[str, Any], ...] | None = None,
+) -> str:
+    manifest_to_write = dict(manifest)
+    validation_rows: list[dict[str, Any]] = []
+    if validation_results is not None:
+        if not isinstance(validation_results, (list, tuple)):
+            raise ArtifactManifestError("validation_results must be a list of validation result objects")
+        for result in validation_results:
+            validate_validation_result(result)
+            if result["artifact_id"] != manifest_to_write.get("artifact_id"):
+                raise ArtifactManifestError("validation result artifact_id must match artifact manifest")
+            validation_rows.append(dict(result))
+        manifest_to_write["validation_result_refs"] = [
+            result["validation_result_id"] for result in validation_rows
+        ]
+        if validation_rows:
+            manifest_to_write["validation_status"] = validation_rows[-1]["status"]
+            manifest_to_write["validator_version"] = validation_rows[-1]["validator_version"]
+
+    validate_artifact_manifest(manifest_to_write)
     ensure_artifact_manifest_schema(conn)
+    for result in validation_rows:
+        existing_result = conn.execute(
+            """
+            SELECT artifact_id FROM artifact_validation_results
+            WHERE validation_result_id = ?
+            """,
+            (result["validation_result_id"],),
+        ).fetchone()
+        if existing_result is not None and existing_result[0] != result["artifact_id"]:
+            raise ArtifactManifestError("validation_result_id is already linked to another artifact")
     available = table_columns(conn, ARTIFACT_MANIFEST_TABLE)
     values = {
-        "artifact_id": manifest["artifact_id"],
-        "schema_version": manifest["schema_version"],
-        "artifact_type": manifest["artifact_type"],
-        "artifact_schema_version": manifest["artifact_schema_version"],
-        "case_id": manifest["case_id"],
-        "case_key": manifest["case_key"],
-        "dispatch_id": manifest["dispatch_id"],
-        "stage": manifest["stage"],
-        "stage_attempt_id": manifest.get("stage_attempt_id"),
-        "pipeline_run_id": manifest.get("pipeline_run_id"),
-        "producer": manifest["producer"],
-        "artifact_path": manifest["path"],
-        "artifact_sha256": manifest["sha256"],
-        "generated_at": manifest["generated_at"],
-        "forecast_timestamp": manifest["forecast_timestamp"],
-        "source_cutoff_timestamp": manifest["source_cutoff_timestamp"],
-        "input_manifest_ids": canonical_json(manifest["input_manifest_ids"]),
-        "validation_status": manifest["validation_status"],
-        "validation_result_refs": canonical_json(manifest["validation_result_refs"]),
-        "validator_version": manifest.get("validator_version"),
-        "temporal_isolation_status": manifest["temporal_isolation_status"],
-        "metadata": canonical_json(manifest["metadata"]),
+        "artifact_id": manifest_to_write["artifact_id"],
+        "schema_version": manifest_to_write["schema_version"],
+        "artifact_type": manifest_to_write["artifact_type"],
+        "artifact_schema_version": manifest_to_write["artifact_schema_version"],
+        "case_id": manifest_to_write["case_id"],
+        "case_key": manifest_to_write["case_key"],
+        "dispatch_id": manifest_to_write["dispatch_id"],
+        "stage": manifest_to_write["stage"],
+        "stage_attempt_id": manifest_to_write.get("stage_attempt_id"),
+        "pipeline_run_id": manifest_to_write.get("pipeline_run_id"),
+        "producer": manifest_to_write["producer"],
+        "artifact_path": manifest_to_write["path"],
+        "artifact_sha256": manifest_to_write["sha256"],
+        "generated_at": manifest_to_write["generated_at"],
+        "forecast_timestamp": manifest_to_write["forecast_timestamp"],
+        "source_cutoff_timestamp": manifest_to_write["source_cutoff_timestamp"],
+        "input_manifest_ids": canonical_json(manifest_to_write["input_manifest_ids"]),
+        "validation_status": manifest_to_write["validation_status"],
+        "validation_result_refs": canonical_json(manifest_to_write["validation_result_refs"]),
+        "validator_version": manifest_to_write.get("validator_version"),
+        "temporal_isolation_status": manifest_to_write["temporal_isolation_status"],
+        "metadata": canonical_json(manifest_to_write["metadata"]),
     }
     legacy_values = {
-        "schema_id": manifest["artifact_schema_version"],
-        "producer_stage": manifest["stage"],
-        "sha256": manifest["sha256"],
-        "feature_id": manifest["stage"],
-        "market_id": manifest["metadata"].get("market_id"),
+        "schema_id": manifest_to_write["artifact_schema_version"],
+        "producer_stage": manifest_to_write["stage"],
+        "sha256": manifest_to_write["sha256"],
+        "feature_id": manifest_to_write["stage"],
+        "market_id": manifest_to_write["metadata"].get("market_id"),
         "replay_command": "",
     }
     values.update({key: value for key, value in legacy_values.items() if key in available})
@@ -502,11 +548,29 @@ def write_artifact_manifest(conn: sqlite3.Connection, manifest: dict[str, Any]) 
         """,
         tuple(values[column] for column in insert_columns),
     )
-    return manifest["artifact_id"]
+    for result in validation_rows:
+        write_validation_result(conn, result)
+    return manifest_to_write["artifact_id"]
 
 
 def write_validation_result(conn: sqlite3.Connection, result: dict[str, Any]) -> str:
     validate_validation_result(result)
+    ensure_artifact_manifest_schema(conn)
+    existing_manifest = conn.execute(
+        f"SELECT 1 FROM {ARTIFACT_MANIFEST_TABLE} WHERE artifact_id = ?",
+        (result["artifact_id"],),
+    ).fetchone()
+    if existing_manifest is None:
+        raise ArtifactManifestError("validation result references unknown artifact_id")
+    existing_result = conn.execute(
+        """
+        SELECT artifact_id FROM artifact_validation_results
+        WHERE validation_result_id = ?
+        """,
+        (result["validation_result_id"],),
+    ).fetchone()
+    if existing_result is not None and existing_result[0] != result["artifact_id"]:
+        raise ArtifactManifestError("validation_result_id is already linked to another artifact")
     conn.execute(
         """
         INSERT INTO artifact_validation_results (

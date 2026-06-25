@@ -15,3 +15,6 @@ def foundation_schema_sql() -> str:
 
 def ensure_foundation_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(foundation_schema_sql())
+    from predquant.ads_handoff import ensure_artifact_manifest_schema
+
+    ensure_artifact_manifest_schema(conn)
