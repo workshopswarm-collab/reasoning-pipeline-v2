@@ -15,6 +15,7 @@ from researcher_swarm.verification import (  # noqa: E402
     build_direction_verification_slices,
     build_quality_verification_slices,
     build_researcher_verification_bundle,
+    build_scae_readiness_reconciliation,
 )
 
 
@@ -33,6 +34,8 @@ class ResearcherVerificationTest(unittest.TestCase):
         classification_confidence: str = "high",
         quality: dict[str, str] | None = None,
         ledger_ready: bool = True,
+        source_family_id: str | None = None,
+        claim_family_id: str | None = None,
     ) -> dict[str, Any]:
         return {
             "slice_id": slice_id,
@@ -43,8 +46,8 @@ class ResearcherVerificationTest(unittest.TestCase):
             "condition_scope": "unconditional",
             "evidence_ref": f"evidence-{classification_id}",
             "source_class": source_class,
-            "source_family_id": f"source-family-{classification_id}",
-            "claim_family_id": f"claim-family-{classification_id}",
+            "source_family_id": source_family_id or f"source-family-{classification_id}",
+            "claim_family_id": claim_family_id or f"claim-family-{classification_id}",
             "impact_direction": impact_direction,
             "evidence_strength": evidence_strength,
             "classification_confidence": classification_confidence,
@@ -61,6 +64,8 @@ class ResearcherVerificationTest(unittest.TestCase):
                 "specificity": "specific",
             },
             "temporal_gate_status": temporal_gate_status,
+            "research_sufficiency_certificate_ref": f"research-sufficiency:{leaf_id}",
+            "coverage_proof_ref": f"coverage-proof:{leaf_id}",
             "ledger_ready": ledger_ready,
         }
 
@@ -77,12 +82,70 @@ class ResearcherVerificationTest(unittest.TestCase):
                     "slice_id": f"provenance-{item['slice_id']}",
                     "classification_slice_ref": item["slice_id"],
                     "source_class": item.get("source_class"),
+                    "leaf_id": item.get("leaf_id"),
+                    "condition_scope": item.get("condition_scope"),
+                    "evidence_ref": item.get("evidence_ref"),
                     "source_family_id": item.get("source_family_id"),
                     "claim_family_id": item.get("claim_family_id"),
                     "canonical_source_id": f"source-{item['classification_id']}",
+                    "research_sufficiency_certificate_ref": item.get("research_sufficiency_certificate_ref"),
+                    "coverage_proof_ref": item.get("coverage_proof_ref"),
+                    "provenance_refs": [
+                        item["evidence_ref"],
+                        item["coverage_proof_ref"],
+                        item["research_sufficiency_certificate_ref"],
+                    ],
                 }
                 for item in classifications
             ],
+        }
+
+    def _qdt(self, leaf_ids: list[str] | None = None, *, static_weight: str = "medium") -> dict[str, Any]:
+        return {
+            "required_leaf_questions": [
+                {
+                    "leaf_id": leaf_id,
+                    "bayesian_weighting": {"static_information_weight": static_weight},
+                }
+                for leaf_id in (leaf_ids or ["leaf-1"])
+            ]
+        }
+
+    def _coverage_bundle(self, matrix: dict[str, Any], leaf_ids: list[str] | None = None) -> dict[str, Any]:
+        return {
+            "feature_id": "CLS-005",
+            "bundle_digest": "sha256:" + "2" * 64,
+            "source_matrix": {
+                "matrix_id": matrix["matrix_id"],
+                "matrix_digest": matrix["matrix_digest"],
+            },
+            "coverage_proofs": [
+                {
+                    "leaf_id": leaf_id,
+                    "coverage_proof_ref": f"coverage-proof:{leaf_id}",
+                    "coverage_status": "complete",
+                }
+                for leaf_id in (leaf_ids or ["leaf-1"])
+            ],
+            "coverage_summary": {
+                "all_assigned_evidence_reviewed": True,
+                "all_certificate_evidence_reviewed": True,
+                "all_required_outputs_addressed": True,
+                "all_context_isolation_audits_launch_allowed": True,
+            },
+        }
+
+    def _sufficiency_reconciliation(self, leaf_ids: list[str] | None = None, *, status: str = "scae_ready_high_certainty") -> dict[str, Any]:
+        return {
+            "research_sufficiency_reconciliation_slices": [
+                {
+                    "leaf_id": leaf_id,
+                    "research_sufficiency_reconciliation_ref": f"research-sufficiency-reconcile:{leaf_id}",
+                    "research_sufficiency_reconciliation_status": status,
+                    "research_sufficiency_certificate_ref": f"research-sufficiency:{leaf_id}",
+                }
+                for leaf_id in (leaf_ids or ["leaf-1"])
+            ]
         }
 
     def _binary_constraints(self) -> dict[str, Any]:
@@ -292,6 +355,211 @@ class ResearcherVerificationTest(unittest.TestCase):
         self.assertFalse(bundle["scope_boundaries"]["writes_scae_ledger_rows"])
         self.assertEqual(len(bundle["direction_verification_slices"]), 1)
         self.assertEqual(len(bundle["quality_verification_slices"]), 1)
+
+    def test_scae_readiness_accepts_verified_high_certainty_inputs(self) -> None:
+        matrix = self._matrix([self._classification()])
+        direction = build_direction_verification_slices(
+            matrix,
+            market_reality_constraints=self._binary_constraints(),
+        )
+        quality = build_quality_verification_slices(matrix)
+
+        result = build_scae_readiness_reconciliation(
+            matrix,
+            direction,
+            quality,
+            qdt=self._qdt(),
+            coverage_proof_bundle=self._coverage_bundle(matrix),
+            sufficiency_reconciliation=self._sufficiency_reconciliation(),
+        )
+
+        self.assertTrue(result.ready_for_scae)
+        payload = result.readiness_reconciliation
+        self.assertEqual(payload["scope_boundaries"]["implements"], ["VER-003"])
+        self.assertIn("VER-004", payload["scope_boundaries"]["not_implemented"])
+        self.assertFalse(payload["authority_boundary"]["writes_scae_ledger_rows"])
+        self.assertEqual(payload["ready_classification_slice_refs"], [matrix["classification_slices"][0]["slice_id"]])
+
+    def test_scae_readiness_blocks_missing_direction_verification(self) -> None:
+        matrix = self._matrix([self._classification()])
+        quality = build_quality_verification_slices(matrix)
+
+        result = build_scae_readiness_reconciliation(
+            matrix,
+            [],
+            quality,
+            qdt=self._qdt(),
+            coverage_proof_bundle=self._coverage_bundle(matrix),
+            sufficiency_reconciliation=self._sufficiency_reconciliation(),
+        )
+
+        self.assertFalse(result.ready_for_scae)
+        self.assertIn("direction_verification_missing", result.readiness_reconciliation["blocker_codes"])
+
+    def test_scae_readiness_allows_deadlock_safe_noncritical_exclusion(self) -> None:
+        accepted = self._classification(
+            slice_id="classification-slice-accepted",
+            classification_id="classification-accepted",
+            impact_direction="supports_yes",
+            value="market_resolves_yes",
+        )
+        contradicted = self._classification(
+            slice_id="classification-slice-contradicted",
+            classification_id="classification-contradicted",
+            impact_direction="supports_yes",
+            value="market_resolves_no",
+        )
+        matrix = self._matrix([accepted, contradicted])
+        direction = build_direction_verification_slices(
+            matrix,
+            qdt=self._qdt(),
+            market_reality_constraints=self._binary_constraints(),
+        )
+        quality = build_quality_verification_slices(matrix)
+
+        result = build_scae_readiness_reconciliation(
+            matrix,
+            direction,
+            quality,
+            qdt=self._qdt(),
+            coverage_proof_bundle=self._coverage_bundle(matrix),
+            sufficiency_reconciliation=self._sufficiency_reconciliation(),
+        )
+
+        self.assertTrue(result.ready_for_scae)
+        rows_by_ref = {
+            row["classification_slice_ref"]: row
+            for row in result.readiness_reconciliation["readiness_rows"]
+        }
+        excluded = rows_by_ref[contradicted["slice_id"]]
+        self.assertEqual(excluded["readiness_status"], "excluded_deadlock_safe")
+        self.assertIn("deadlock_safe_exclusion_with_remaining_coverage", excluded["reason_codes"])
+
+    def test_scae_readiness_blocks_missing_sufficiency_reconciliation(self) -> None:
+        matrix = self._matrix([self._classification()])
+        direction = build_direction_verification_slices(
+            matrix,
+            market_reality_constraints=self._binary_constraints(),
+        )
+        quality = build_quality_verification_slices(matrix)
+
+        result = build_scae_readiness_reconciliation(
+            matrix,
+            direction,
+            quality,
+            qdt=self._qdt(),
+            coverage_proof_bundle=self._coverage_bundle(matrix),
+            sufficiency_reconciliation=None,
+        )
+
+        self.assertFalse(result.ready_for_scae)
+        self.assertIn("research_sufficiency_reconciliation_missing", result.readiness_reconciliation["blocker_codes"])
+
+    def test_scae_readiness_blocks_incomplete_required_escalation(self) -> None:
+        matrix = self._matrix([self._classification()])
+        direction = build_direction_verification_slices(
+            matrix,
+            market_reality_constraints=self._binary_constraints(),
+        )
+        quality = build_quality_verification_slices(matrix)
+
+        result = build_scae_readiness_reconciliation(
+            matrix,
+            direction,
+            quality,
+            qdt=self._qdt(),
+            coverage_proof_bundle=self._coverage_bundle(matrix),
+            sufficiency_reconciliation=self._sufficiency_reconciliation(),
+            escalation_decisions=[
+                {
+                    "leaf_id": "leaf-1",
+                    "escalation_required": True,
+                    "completion_status": "pending",
+                    "additional_assignment_count": 1,
+                    "delivered_assignment_count": 0,
+                    "active_assignment_count": 0,
+                }
+            ],
+        )
+
+        self.assertFalse(result.ready_for_scae)
+        self.assertIn("researcher_escalation_incomplete", result.readiness_reconciliation["blocker_codes"])
+
+    def test_scae_readiness_blocks_unnormalized_supplemental_rows(self) -> None:
+        row = self._classification()
+        row["evidence_source_type"] = "supplemental"
+        row["supplemental_evidence_ref"] = "supplemental:leaf-1"
+        matrix = self._matrix([row])
+        direction = build_direction_verification_slices(
+            matrix,
+            market_reality_constraints=self._binary_constraints(),
+        )
+        quality = build_quality_verification_slices(matrix)
+
+        result = build_scae_readiness_reconciliation(
+            matrix,
+            direction,
+            quality,
+            qdt=self._qdt(),
+            coverage_proof_bundle=self._coverage_bundle(matrix),
+            sufficiency_reconciliation=self._sufficiency_reconciliation(),
+        )
+
+        self.assertFalse(result.ready_for_scae)
+        self.assertIn("supplemental_normalization_missing", result.readiness_reconciliation["blocker_codes"])
+
+    def test_scae_readiness_blocks_duplicate_ledger_grain(self) -> None:
+        first = self._classification(
+            slice_id="classification-slice-1",
+            classification_id="classification-1",
+            source_family_id="source-family-shared",
+            claim_family_id="claim-family-shared",
+        )
+        second = self._classification(
+            slice_id="classification-slice-2",
+            classification_id="classification-2",
+            source_family_id="source-family-shared",
+            claim_family_id="claim-family-shared",
+        )
+        matrix = self._matrix([first, second])
+        direction = build_direction_verification_slices(
+            matrix,
+            market_reality_constraints=self._binary_constraints(),
+        )
+        quality = build_quality_verification_slices(matrix)
+
+        result = build_scae_readiness_reconciliation(
+            matrix,
+            direction,
+            quality,
+            qdt=self._qdt(),
+            coverage_proof_bundle=self._coverage_bundle(matrix),
+            sufficiency_reconciliation=self._sufficiency_reconciliation(),
+        )
+
+        self.assertFalse(result.ready_for_scae)
+        self.assertIn("duplicate_ledger_readiness_grain", result.readiness_reconciliation["blocker_codes"])
+
+    def test_scae_readiness_blocks_critical_structural_unanswerability(self) -> None:
+        matrix = self._matrix([])
+        matrix["coverage_proof_slices"] = [
+            {
+                "leaf_id": "leaf-1",
+                "certificate_status": "structurally_unanswerable",
+            }
+        ]
+
+        result = build_scae_readiness_reconciliation(
+            matrix,
+            [],
+            [],
+            qdt=self._qdt(static_weight="high"),
+            coverage_proof_bundle=self._coverage_bundle(matrix),
+            sufficiency_reconciliation=self._sufficiency_reconciliation(),
+        )
+
+        self.assertFalse(result.ready_for_scae)
+        self.assertIn("critical_unanswerable_leaf_policy_consequence", result.readiness_reconciliation["blocker_codes"])
 
 
 if __name__ == "__main__":

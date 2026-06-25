@@ -94,6 +94,7 @@ Root-level runtime entrypoints should be avoided except for compatibility shims 
 | `/Users/agent2/.openclaw/researcher-swarm/scripts/bin/validate_researcher_sidecars.py` | `CLS-002`, `CLS-003`, `CLS-005` | Validate no-probability sidecars and evidence coverage proofs. |
 | `/Users/agent2/.openclaw/researcher-swarm/scripts/bin/verify_evidence_directionality.py` | `VER-001` | Verify impact direction against side mapping and constraints. |
 | `/Users/agent2/.openclaw/researcher-swarm/scripts/bin/verify_evidence_quality.py` | `VER-002` | Verify evidence quality fields and multiplier inputs. |
+| `/Users/agent2/.openclaw/researcher-swarm/scripts/bin/validate_scae_readiness.py` | `VER-003` | Validate SCAE-readiness reconciliation inputs and emit `scae-readiness-reconciliation/v1` without writing SCAE ledger rows. |
 | `/Users/agent2/.openclaw/researcher-swarm/scripts/bin/reconcile_research_sufficiency.py` | `VER-003`, `VER-004` | Produce SCAE-ready, watch-only, or invalid sufficiency reconciliation. |
 | `/Users/agent2/.openclaw/researcher-swarm/scripts/researcher_swarm/retrieval.py` | `RET-001` to `RET-011` | Importable retrieval and expansion helpers. |
 | `/Users/agent2/.openclaw/researcher-swarm/scripts/researcher_swarm/retrieval_quality.py` | `RET-003`, `MIG-004` | Importable deterministic retrieval quality slice/report builder over `retrieval-packet/v1`; emits empty, thin, stale, unknown, protected-primary, and low-breadth diagnostics without forecast or evidence authority. |
@@ -114,7 +115,7 @@ Root-level runtime entrypoints should be avoided except for compatibility shims 
 | `/Users/agent2/.openclaw/researcher-swarm/scripts/researcher_swarm/classification_matrix.py` | `CLS-003` | Importable evidence classification matrix materializer for schema-valid sidecars, classification/provenance slices, support-only coverage proof slices, and deterministic matrix digests. |
 | `/Users/agent2/.openclaw/researcher-swarm/scripts/researcher_swarm/coverage.py` | `CLS-005` | Importable evidence-review coverage proof bundle builder joining CLS-002 sidecars, CLS-003 matrix rows, CLS-006 assignments, CLS-008 audits, and RET-008 certificates with fail-closed no-authority validation. |
 | `/Users/agent2/.openclaw/researcher-swarm/scripts/researcher_swarm/model_context.py` | `MODEL-003` | Importable metadata-only researcher leaf NLI model lane resolver and execution-context validator. |
-| `/Users/agent2/.openclaw/researcher-swarm/scripts/researcher_swarm/verification.py` | `VER-001` to `VER-004` | Importable verification and sufficiency reconciliation helpers. |
+| `/Users/agent2/.openclaw/researcher-swarm/scripts/researcher_swarm/verification.py` | `VER-001` to `VER-004` | Importable direction, quality, SCAE-readiness validation, and sufficiency reconciliation helpers. |
 | `/Users/agent2/.openclaw/researcher-swarm/scripts/researcher_swarm/subagents.py` | `CLS-001`, `MODEL-003` | Leaf researcher subagent coordination helpers. |
 
 ### SCAE Scripts

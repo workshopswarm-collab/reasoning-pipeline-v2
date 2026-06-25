@@ -26,8 +26,9 @@ leaf-research preparation, and downstream classification/verification helpers.
 - `researcher_swarm/assignments.py`: `CLS-006` compact `leaf-research-assignment/v1` builder/validator for RET-008 dispatchable QDT leaves, carrying refs, digests, context-isolation refs, model context, sidecar output contract, and budget caps without embedding QDT leaf blobs, evidence bodies, probabilities, fair values, intervals, or decision recommendations.
 - `researcher_swarm/isolation.py`: `CLS-008` compact prelaunch `researcher-context-isolation/v1` audit builder/validator for fresh context, visible-ref allowlists, forbidden-ref scans, peer-output exclusion, allowed shared schema/prompt refs, launch blocking, and deterministic audit digests without spawning subagents.
 - `researcher_swarm/escalation.py`: `CLS-007` deterministic `researcher-escalation-decision/v1` builder/validator for trigger-gated extra assignment descriptors and optional linked `leaf-research-assignment/v1` packets, enforcing five researchers per case, three assignments per leaf, independent confirmation for critical/source-of-truth and structural-unanswerability leaves, and no probability/SCAE/forecast/persistence authority.
-- `researcher_swarm/verification.py`: `VER-001` direction verification slices and `VER-002` evidence-quality verification slices over materialized CLS-003 rows, with no SCAE ledger writes, model calls, or production forecasts.
+- `researcher_swarm/verification.py`: `VER-001` direction verification slices, `VER-002` evidence-quality verification slices, and `VER-003` SCAE-readiness reconciliation over materialized CLS-003/CLS-005/verification inputs, with no SCAE ledger writes, model calls, persistence writes, or production forecasts.
 - `bin/build_retrieval_packet.py`: builds a schema-only `retrieval-packet/v1` from a validated QDT.
+- `bin/validate_scae_readiness.py`: validates JSON artifact inputs for VER-003 and emits `scae-readiness-reconciliation/v1`.
 
 ## Expected Future Entrypoints
 

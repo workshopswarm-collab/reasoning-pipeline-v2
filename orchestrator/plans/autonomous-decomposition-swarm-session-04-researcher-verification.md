@@ -43,6 +43,7 @@ Planned Session 4 paths:
 /Users/agent2/.openclaw/researcher-swarm/scripts/bin/validate_researcher_sidecars.py
 /Users/agent2/.openclaw/researcher-swarm/scripts/bin/verify_evidence_directionality.py
 /Users/agent2/.openclaw/researcher-swarm/scripts/bin/verify_evidence_quality.py
+/Users/agent2/.openclaw/researcher-swarm/scripts/bin/validate_scae_readiness.py
 /Users/agent2/.openclaw/researcher-swarm/scripts/bin/reconcile_research_sufficiency.py
 /Users/agent2/.openclaw/researcher-swarm/scripts/researcher_swarm/assignments.py
 /Users/agent2/.openclaw/researcher-swarm/scripts/researcher_swarm/isolation.py
@@ -1061,10 +1062,10 @@ Testing suite:
 
 Completion checklist:
 
-- [ ] SCAE-readiness validator written.
-- [ ] Completion reconciliation rules written.
-- [ ] Readiness output artifact/persistence mapped.
-- [ ] `VER-003` inventory row updated.
+- [x] SCAE-readiness validator written.
+- [x] Completion reconciliation rules written.
+- [x] Readiness output artifact/persistence mapped.
+- [x] `VER-003` inventory row updated.
 
 ## Phase 9: Research Sufficiency Reconciliation
 
