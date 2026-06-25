@@ -11,10 +11,12 @@ from predquant.amrg import (
     AMRG_VECTOR_CANDIDATE_SOURCE,
     AMRG_MODEL_ASSIST_OUTPUT_SCHEMA_VERSION,
     AMRG_REFRESH_LIFECYCLE_SCHEMA_VERSION,
+    AMRG_SHARED_CACHE_ELIGIBILITY_SCHEMA_VERSION,
     AMRG_VECTOR_NEIGHBOR_CANDIDATE_SCHEMA_VERSION,
     NO_RELATED_CONTEXT_WAIVER_SCHEMA_VERSION,
     RELATED_LIVE_MARKET_CONTEXT_SCHEMA_VERSION,
     WEAK_CONTEXT_ONLY,
+    apply_shared_cache_reuse_eligibility,
     build_amrg_model_assist_packet,
     build_related_live_market_context_or_waiver,
     build_unavailable_vector_source_diagnostic,
@@ -189,6 +191,30 @@ class AMRGContextTest(unittest.TestCase):
             active_market_index=markets,
             **kwargs,
         )
+
+    def consuming_dispatch(self, **overrides):
+        dispatch = {
+            "dispatch_id": "dispatch-fixture",
+            "leaf_condition_scope": "unconditional",
+            "contract_scope": "binary:fixture-labs-election",
+            "forecast_timestamp": "2026-06-24T18:00:00+00:00",
+        }
+        dispatch.update(overrides)
+        return dispatch
+
+    def shared_cache_entry(self, **overrides):
+        entry = {
+            "cache_entry_id": "shared-cache:retrieval:fixture",
+            "cache_entry_type": "retrieval_evidence",
+            "leaf_condition_scope": "unconditional",
+            "contract_scope": "binary:fixture-labs-election",
+            "temporal_provenance": {
+                "max_underlying_source_timestamp": "2026-06-24T17:55:00+00:00",
+            },
+            "source_ref": "retrieval-evidence:fixture",
+        }
+        entry.update(overrides)
+        return entry
 
     def test_empty_candidate_pool_produces_explicit_manifested_waiver(self):
         conn = sqlite3.connect(":memory:")
@@ -384,6 +410,85 @@ class AMRGContextTest(unittest.TestCase):
         self.assertEqual(edge["relationship_status"], "timing_mismatch_weak_context_only")
         self.assertEqual(edge["allowed_effects"], ["decomposition_context_hint"])
         self.assertNotIn("retrieval_query_hint", edge["allowed_effects"])
+
+    def test_shared_cache_temporal_scope_match_allows_conservative_reuse(self):
+        artifact = self.build_artifact([self.market(2)])
+        enriched = enrich_related_live_market_context(
+            artifact,
+            evidence_packet=self.evidence_packet(),
+            shared_cache_entries=[self.shared_cache_entry(cache_entry_type="leaf_classification")],
+            consuming_dispatch=self.consuming_dispatch(),
+        )
+
+        assessment = enriched["shared_cache_eligibility"][0]
+        self.assertEqual(assessment["schema_version"], AMRG_SHARED_CACHE_ELIGIBILITY_SCHEMA_VERSION)
+        self.assertEqual(assessment["eligibility_status"], "eligible_reuse")
+        self.assertEqual(assessment["allowed_use"], "shared_retrieval_classification_cache_reuse")
+        self.assertEqual(assessment["max_underlying_source_timestamp"], "2026-06-24T17:55:00+00:00")
+        self.assertIn("temporal_provenance_precedes_consuming_forecast", assessment["reason_codes"])
+        self.assertIn("probability_authority", assessment["forbidden_effects"])
+        self.assertIn("scae_delta", assessment["forbidden_effects"])
+        self.assertIn("qdt_repair", assessment["forbidden_effects"])
+        self.assertIn("production_forecast_write", assessment["forbidden_effects"])
+
+    def test_shared_cache_without_temporal_provenance_downgrades_to_source_hint_only(self):
+        artifact = self.build_artifact([self.market(2)])
+        entry = self.shared_cache_entry(cache_created_at="2026-06-24T17:00:00+00:00")
+        entry.pop("temporal_provenance")
+
+        enriched = apply_shared_cache_reuse_eligibility(
+            enrich_related_live_market_context(artifact, evidence_packet=self.evidence_packet()),
+            shared_cache_entries=[entry],
+            consuming_dispatch=self.consuming_dispatch(),
+        )
+
+        assessment = enriched["shared_cache_eligibility"][0]
+        self.assertEqual(assessment["eligibility_status"], "source_hint_only")
+        self.assertEqual(assessment["allowed_use"], "source_hint_only_requires_fresh_retrieval_or_classification")
+        self.assertIsNone(assessment["max_underlying_source_timestamp"])
+        self.assertIn("missing_max_underlying_source_timestamp", assessment["reason_codes"])
+
+    def test_shared_cache_scope_mismatch_is_rejected(self):
+        artifact = self.build_artifact([self.market(2)])
+        enriched = enrich_related_live_market_context(
+            artifact,
+            evidence_packet=self.evidence_packet(),
+            shared_cache_entries=[
+                self.shared_cache_entry(
+                    leaf_condition_scope="target_given_upstream",
+                    contract_scope="binary:other-contract",
+                )
+            ],
+            consuming_dispatch=self.consuming_dispatch(),
+        )
+
+        assessment = enriched["shared_cache_eligibility"][0]
+        self.assertEqual(assessment["eligibility_status"], "rejected")
+        self.assertEqual(assessment["allowed_use"], "not_reusable")
+        self.assertIn("leaf_condition_scope_mismatch", assessment["reason_codes"])
+        self.assertIn("contract_scope_mismatch", assessment["reason_codes"])
+
+    def test_shared_cache_write_path_does_not_persist_forecast_or_scae_rows(self):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        try:
+            result = write_related_market_context(
+                conn,
+                self.build_artifact([self.market(2)]),
+                evidence_packet=self.evidence_packet(),
+                shared_cache_entries=[self.shared_cache_entry()],
+                consuming_dispatch=self.consuming_dispatch(),
+            )
+
+            self.assertEqual(result["context"]["shared_cache_eligibility"][0]["eligibility_status"], "eligible_reuse")
+            table_names = [
+                row[0]
+                for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+            ]
+            self.assertFalse(any(name.startswith("scae_") for name in table_names))
+            self.assertFalse(any("forecast" in name or "prediction" in name for name in table_names))
+        finally:
+            conn.close()
 
     def test_model_assist_forbidden_probability_output_is_rejected(self):
         artifact = self.build_artifact([self.market(2)])

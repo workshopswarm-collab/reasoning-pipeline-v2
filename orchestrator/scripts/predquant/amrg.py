@@ -42,6 +42,7 @@ AMRG_MODEL_ASSIST_PACKET_SCHEMA_VERSION = "amrg-model-assist-packet/v1"
 AMRG_MODEL_ASSIST_OUTPUT_SCHEMA_VERSION = "amrg-model-assist-output/v1"
 AMRG_MODEL_ASSIST_PROVENANCE_SCHEMA_VERSION = "amrg-model-assist-provenance/v1"
 AMRG_REFRESH_LIFECYCLE_SCHEMA_VERSION = "amrg-refresh-lifecycle/v1"
+AMRG_SHARED_CACHE_ELIGIBILITY_SCHEMA_VERSION = "amrg-shared-cache-eligibility/v1"
 AMRG_VECTOR_MODEL_ID = "BAAI/bge-base-en-v1.5"
 AMRG_VECTOR_ROUTE_ID = "ollama/local"
 AMRG_VECTOR_PROVIDER = "ollama"
@@ -91,6 +92,8 @@ STRICT_PRECEDENCE_ANCHOR_STATUSES = {
 ANCHOR_VALIDATION_STATUSES = {"not_evaluated", "validated", "rejected"}
 QDT_ANCHOR_DEPENDENCY_CONTRACT_SCHEMA_VERSION = "amrg-anchor-dependency-contract/v1"
 QDT_ANCHOR_MODES_REQUIRING_CONDITION_SCOPE = {"anchor_optional", "anchor_required"}
+SHARED_CACHE_ELIGIBILITY_STATUSES = {"eligible_reuse", "source_hint_only", "rejected"}
+SHARED_CACHE_ENTRY_TYPE_TOKENS = {"retrieval", "classification", "classifier"}
 REFRESH_STATUSES = {
     "not_requested_phase7_placeholder",
     "refresh_required_later",
@@ -137,6 +140,16 @@ AMRG_FORBIDDEN_EFFECTS = [
     "fair_value_authority",
     "interval_authority",
 ]
+AMRG_SHARED_CACHE_FORBIDDEN_EFFECTS = sorted(
+    set(
+        AMRG_FORBIDDEN_EFFECTS
+        + [
+            "classification_authority",
+            "researcher_verdict_authority",
+            "production_forecast_write",
+        ]
+    )
+)
 AMRG_FORBIDDEN_ANCHOR_VALIDATED_EFFECTS = [
     effect for effect in AMRG_FORBIDDEN_EFFECTS if effect != "prior_anchor"
 ]
@@ -775,6 +788,305 @@ def normalize_timestamp_or_none(value: Any, field: str) -> str | None:
     if value is None or value == "":
         return None
     return parse_timestamp(str(value), field).isoformat()
+
+
+def normalized_scope_value(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text if text else None
+
+
+def first_nested_value(source: dict[str, Any], fields: tuple[str, ...], containers: tuple[str, ...]) -> Any:
+    for field in fields:
+        if field in source:
+            return source[field]
+    for container_name in containers:
+        container = source.get(container_name)
+        if not isinstance(container, dict):
+            continue
+        for field in fields:
+            if field in container:
+                return container[field]
+    return None
+
+
+def shared_cache_entry_id(entry: dict[str, Any]) -> str:
+    entry_id = first_nested_value(
+        entry,
+        ("cache_entry_id", "shared_cache_entry_id", "entry_id", "evidence_ref", "classification_id", "cache_key"),
+        ("metadata",),
+    )
+    return str(entry_id) if entry_id else stable_id("amrg-shared-cache-entry", prefixed_sha256(canonical_json(entry)))
+
+
+def shared_cache_entry_type(entry: dict[str, Any]) -> str:
+    entry_type = first_nested_value(
+        entry,
+        ("cache_entry_type", "entry_type", "artifact_type", "cache_type"),
+        ("metadata",),
+    )
+    return str(entry_type).strip().lower() if entry_type else "unknown"
+
+
+def shared_cache_entry_type_supported(entry_type: str) -> bool:
+    tokens = text_tokens(entry_type)
+    return bool(tokens & SHARED_CACHE_ENTRY_TYPE_TOKENS)
+
+
+def shared_cache_scope_value(entry: dict[str, Any], field: str) -> str | None:
+    return normalized_scope_value(
+        first_nested_value(
+            entry,
+            (field,),
+            ("scope", "dispatch_scope", "cache_scope", "metadata"),
+        )
+    )
+
+
+def shared_cache_source_timestamp_value(entry: dict[str, Any]) -> Any:
+    return first_nested_value(
+        entry,
+        (
+            "max_underlying_source_timestamp",
+            "max_source_timestamp",
+            "source_max_timestamp",
+            "latest_underlying_source_timestamp",
+        ),
+        ("temporal_provenance", "source_temporal_provenance", "provenance"),
+    )
+
+
+def max_temporal_source_timestamp(value: Any) -> str | None:
+    if value is None or value == "":
+        return None
+    values = value if isinstance(value, (list, tuple, set)) else [value]
+    parsed = [parse_timestamp(str(item), "max_underlying_source_timestamp") for item in values if item not in (None, "")]
+    if not parsed:
+        return None
+    return max(parsed).isoformat()
+
+
+def normalize_consuming_dispatch(
+    context: dict[str, Any] | None = None,
+    consuming_dispatch: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    context = context or {}
+    dispatch = dict(consuming_dispatch or {})
+    dispatch_id = dispatch.get("dispatch_id") or context.get("dispatch_id")
+    forecast_timestamp = dispatch.get("forecast_timestamp") or context.get("forecast_timestamp")
+    normalized = {
+        "dispatch_id": str(dispatch_id) if dispatch_id else None,
+        "leaf_condition_scope": normalized_scope_value(dispatch.get("leaf_condition_scope") or context.get("leaf_condition_scope")),
+        "contract_scope": normalized_scope_value(dispatch.get("contract_scope") or context.get("contract_scope")),
+        "forecast_timestamp": parse_timestamp(str(forecast_timestamp), "forecast_timestamp").isoformat()
+        if forecast_timestamp
+        else None,
+    }
+    return normalized
+
+
+def shared_cache_reuse_reason_codes(
+    *,
+    entry_leaf_scope: str | None,
+    entry_contract_scope: str | None,
+    entry_type: str,
+    max_source_timestamp: str | None,
+    consuming_dispatch: dict[str, Any],
+) -> tuple[str, list[str]]:
+    reasons: list[str] = []
+    if not shared_cache_entry_type_supported(entry_type):
+        reasons.append("unsupported_cache_entry_type")
+    if not consuming_dispatch.get("leaf_condition_scope"):
+        reasons.append("missing_consuming_leaf_condition_scope")
+    if not consuming_dispatch.get("contract_scope"):
+        reasons.append("missing_consuming_contract_scope")
+    if not consuming_dispatch.get("forecast_timestamp"):
+        reasons.append("missing_consuming_forecast_timestamp")
+    if not entry_leaf_scope:
+        reasons.append("missing_cache_leaf_condition_scope")
+    elif entry_leaf_scope != consuming_dispatch.get("leaf_condition_scope"):
+        reasons.append("leaf_condition_scope_mismatch")
+    if not entry_contract_scope:
+        reasons.append("missing_cache_contract_scope")
+    elif entry_contract_scope != consuming_dispatch.get("contract_scope"):
+        reasons.append("contract_scope_mismatch")
+
+    scope_rejected = any(
+        reason in reasons
+        for reason in (
+            "unsupported_cache_entry_type",
+            "missing_consuming_leaf_condition_scope",
+            "missing_consuming_contract_scope",
+            "missing_consuming_forecast_timestamp",
+            "missing_cache_leaf_condition_scope",
+            "leaf_condition_scope_mismatch",
+            "missing_cache_contract_scope",
+            "contract_scope_mismatch",
+        )
+    )
+    if scope_rejected:
+        return "rejected", sorted(set(reasons))
+
+    if not max_source_timestamp:
+        return "source_hint_only", ["missing_max_underlying_source_timestamp"]
+
+    source_at = parse_timestamp(max_source_timestamp, "max_underlying_source_timestamp")
+    forecast_at = parse_timestamp(consuming_dispatch["forecast_timestamp"], "forecast_timestamp")
+    if source_at >= forecast_at:
+        return "source_hint_only", ["max_underlying_source_not_before_consuming_forecast"]
+    return "eligible_reuse", ["temporal_provenance_precedes_consuming_forecast"]
+
+
+def validate_shared_cache_eligibility(assessment: dict[str, Any]) -> None:
+    required = [
+        "schema_version",
+        "eligibility_id",
+        "cache_entry_id",
+        "cache_entry_type",
+        "eligibility_status",
+        "allowed_use",
+        "reason_codes",
+        "leaf_condition_scope",
+        "contract_scope",
+        "max_underlying_source_timestamp",
+        "consuming_forecast_timestamp",
+        "forbidden_effects",
+        "authority",
+    ]
+    for field in required:
+        if field not in assessment:
+            raise AMRGError(f"shared cache eligibility {field} is required")
+    if assessment["schema_version"] != AMRG_SHARED_CACHE_ELIGIBILITY_SCHEMA_VERSION:
+        raise AMRGError(f"shared cache eligibility schema_version must be {AMRG_SHARED_CACHE_ELIGIBILITY_SCHEMA_VERSION}")
+    if assessment["eligibility_status"] not in SHARED_CACHE_ELIGIBILITY_STATUSES:
+        raise AMRGError("shared cache eligibility status is unknown")
+    if assessment["authority"] != "temporal_provenance_only_no_forecast_authority":
+        raise AMRGError("shared cache eligibility authority must be temporal-provenance only")
+    for effect in ("probability_authority", "scae_delta", "qdt_repair", "production_forecast_write"):
+        if effect not in assessment["forbidden_effects"]:
+            raise AMRGError(f"shared cache eligibility must forbid {effect}")
+    if assessment["eligibility_status"] == "eligible_reuse":
+        if assessment["allowed_use"] != "shared_retrieval_classification_cache_reuse":
+            raise AMRGError("eligible shared cache must use the conservative cache reuse mode")
+        source_at = parse_timestamp(assessment["max_underlying_source_timestamp"], "max_underlying_source_timestamp")
+        forecast_at = parse_timestamp(assessment["consuming_forecast_timestamp"], "consuming_forecast_timestamp")
+        if source_at >= forecast_at:
+            raise AMRGError("eligible shared cache source timestamp must be before forecast timestamp")
+    ensure_no_raw_amrg_fields(assessment, "shared_cache_eligibility")
+
+
+def evaluate_shared_cache_entry_eligibility(
+    entry: dict[str, Any],
+    consuming_dispatch: dict[str, Any],
+) -> dict[str, Any]:
+    if not isinstance(entry, dict):
+        raise AMRGError("shared cache entry must be an object")
+    ensure_no_raw_amrg_fields(entry, "shared_cache_entry")
+    normalized_dispatch = normalize_consuming_dispatch(consuming_dispatch=consuming_dispatch)
+    entry_id = shared_cache_entry_id(entry)
+    entry_type = shared_cache_entry_type(entry)
+    entry_leaf_scope = shared_cache_scope_value(entry, "leaf_condition_scope")
+    entry_contract_scope = shared_cache_scope_value(entry, "contract_scope")
+    invalid_timestamp = False
+    try:
+        max_source_timestamp = max_temporal_source_timestamp(shared_cache_source_timestamp_value(entry))
+    except Exception:
+        max_source_timestamp = None
+        invalid_timestamp = True
+    status, reason_codes = shared_cache_reuse_reason_codes(
+        entry_leaf_scope=entry_leaf_scope,
+        entry_contract_scope=entry_contract_scope,
+        entry_type=entry_type,
+        max_source_timestamp=max_source_timestamp,
+        consuming_dispatch=normalized_dispatch,
+    )
+    if invalid_timestamp and status != "rejected":
+        status = "source_hint_only"
+        reason_codes = ["invalid_max_underlying_source_timestamp"]
+
+    if status == "eligible_reuse":
+        allowed_use = "shared_retrieval_classification_cache_reuse"
+    elif status == "source_hint_only":
+        allowed_use = "source_hint_only_requires_fresh_retrieval_or_classification"
+    else:
+        allowed_use = "not_reusable"
+    assessment = {
+        "schema_version": AMRG_SHARED_CACHE_ELIGIBILITY_SCHEMA_VERSION,
+        "eligibility_id": stable_id(
+            "amrg-shared-cache-eligibility",
+            normalized_dispatch.get("dispatch_id"),
+            entry_id,
+            status,
+            sorted(set(reason_codes)),
+        ),
+        "cache_entry_id": entry_id,
+        "cache_entry_type": entry_type,
+        "consuming_dispatch_id": normalized_dispatch.get("dispatch_id"),
+        "eligibility_status": status,
+        "allowed_use": allowed_use,
+        "reason_codes": sorted(set(reason_codes)),
+        "leaf_condition_scope": {
+            "entry": entry_leaf_scope,
+            "consuming_dispatch": normalized_dispatch.get("leaf_condition_scope"),
+        },
+        "contract_scope": {
+            "entry": entry_contract_scope,
+            "consuming_dispatch": normalized_dispatch.get("contract_scope"),
+        },
+        "max_underlying_source_timestamp": max_source_timestamp,
+        "consuming_forecast_timestamp": normalized_dispatch.get("forecast_timestamp"),
+        "forbidden_effects": AMRG_SHARED_CACHE_FORBIDDEN_EFFECTS,
+        "authority": "temporal_provenance_only_no_forecast_authority",
+        "metadata": {
+            "temporal_provenance_required": True,
+            "scope_match_required": True,
+            "cache_payload_persisted_by_amrg": False,
+            "no_probability_authority": True,
+            "no_scae_delta_written": True,
+            "qdt_repair_authority": "forbidden",
+            "production_forecast_write_authority": "forbidden",
+        },
+    }
+    validate_shared_cache_eligibility(assessment)
+    return assessment
+
+
+def normalize_shared_cache_entries(shared_cache_entries: Any) -> list[dict[str, Any]]:
+    if shared_cache_entries is None:
+        return []
+    if isinstance(shared_cache_entries, dict):
+        for key in ("shared_cache_entries", "cache_entries", "entries"):
+            if key in shared_cache_entries:
+                return normalize_shared_cache_entries(shared_cache_entries[key])
+        return [shared_cache_entries]
+    if isinstance(shared_cache_entries, (list, tuple)):
+        entries = list(shared_cache_entries)
+    else:
+        raise AMRGError("shared_cache_entries must be an object or list")
+    if any(not isinstance(entry, dict) for entry in entries):
+        raise AMRGError("shared cache entries must be objects")
+    return entries
+
+
+def apply_shared_cache_reuse_eligibility(
+    context: dict[str, Any],
+    *,
+    shared_cache_entries: Any = None,
+    consuming_dispatch: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    validate_related_live_market_context(context)
+    entries = normalize_shared_cache_entries(shared_cache_entries)
+    if not entries:
+        return dict(context)
+    dispatch = normalize_consuming_dispatch(context, consuming_dispatch)
+    assessments = [
+        evaluate_shared_cache_entry_eligibility(entry, dispatch)
+        for entry in entries
+    ]
+    updated = {**context, "shared_cache_eligibility": assessments}
+    validate_related_live_market_context(updated)
+    return updated
 
 
 def market_identity_value(market: dict[str, Any]) -> Any:
@@ -1533,6 +1845,11 @@ def validate_common_amrg_artifact(artifact: dict[str, Any], *, schema_version: s
     )
     if artifact["candidate_set_id"] != expected_candidate_set_id:
         raise AMRGError("candidate_set_id mismatch")
+    shared_cache_eligibility = artifact.get("shared_cache_eligibility", [])
+    if not isinstance(shared_cache_eligibility, list):
+        raise AMRGError("shared_cache_eligibility must be a list")
+    for assessment in shared_cache_eligibility:
+        validate_shared_cache_eligibility(assessment)
     ensure_no_raw_amrg_fields(artifact)
 
 
@@ -2675,6 +2992,8 @@ def enrich_related_live_market_context(
     refresh_policy: dict[str, Any] | None = None,
     refresh_results: Any = None,
     active_market_index: list[dict[str, Any] | Any] | None = None,
+    shared_cache_entries: Any = None,
+    consuming_dispatch: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     validate_related_live_market_context(context)
     if context["artifact_type"] != "related_live_market_context":
@@ -2695,6 +3014,11 @@ def enrich_related_live_market_context(
         refresh_policy=refresh_policy,
         refresh_results=refresh_results,
         active_market_index=active_market_index,
+    )
+    enriched = apply_shared_cache_reuse_eligibility(
+        enriched,
+        shared_cache_entries=shared_cache_entries,
+        consuming_dispatch=consuming_dispatch,
     )
     validate_related_live_market_context(enriched)
     return enriched
@@ -3198,6 +3522,8 @@ def write_related_market_context(
     active_market_index: list[dict[str, Any] | Any] | None = None,
     qdt_anchor_contracts: Any = None,
     anchor_graph_edges: Any = None,
+    shared_cache_entries: Any = None,
+    consuming_dispatch: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     ensure_amrg_context_schema(conn)
     model_assist_status = model_assist_provenance["model_assist_status"] if model_assist_provenance else "not_requested"
@@ -3208,6 +3534,8 @@ def write_related_market_context(
         refresh_policy=refresh_policy,
         refresh_results=refresh_results,
         active_market_index=active_market_index,
+        shared_cache_entries=shared_cache_entries,
+        consuming_dispatch=consuming_dispatch,
     )
     if qdt_anchor_contracts is not None or any(
         edge.get("relationship_status") in STRICT_PRECEDENCE_ANCHOR_STATUSES
