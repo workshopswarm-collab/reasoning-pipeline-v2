@@ -1,9 +1,10 @@
-"""MIG-006 researcher/verification persistence helpers.
+"""MIG-004 and MIG-006 researcher-swarm persistence helpers.
 
-These helpers persist compact Session 4 records only. They store refs, digests,
-statuses, and bounded metadata, leaving evidence bodies, QDT leaf payloads,
-researcher transcripts, forecasts, probabilities, intervals, SCAE deltas, and
-decision recommendations outside the researcher-swarm persistence surface.
+These helpers persist compact retrieval, researcher, and verification records.
+They store refs, digests, statuses, and bounded metadata, leaving page bodies,
+browser transcripts, QDT leaf payloads, prompt text, researcher transcripts,
+forecasts, probabilities, intervals, SCAE deltas, and decision recommendations
+outside the researcher-swarm persistence surface.
 """
 
 from __future__ import annotations
@@ -20,14 +21,54 @@ from .classification import validate_researcher_nli_prompt_contract
 from .coverage import validate_researcher_evidence_review_coverage_proof_bundle
 from .escalation import validate_researcher_escalation_decision
 from .isolation import validate_researcher_context_isolation_audit
+from .retrieval import (
+    ATOMIC_CLAIM_CANDIDATE_SCHEMA_VERSION,
+    BROWSER_PROVIDER_DIAGNOSTIC_SCHEMA_VERSION,
+    BROWSER_RETRIEVAL_ATTEMPT_SCHEMA_VERSION,
+    CLAIM_FAMILY_RESOLUTION_SCHEMA_VERSION,
+    CONTRADICTION_SEARCH_ATTEMPT_SCHEMA_VERSION,
+    EXPECTED_SOURCE_MISSINGNESS_CANDIDATE_SCHEMA_VERSION,
+    NATIVE_RESEARCH_ATTEMPT_SCHEMA_VERSION,
+    NEGATIVE_CHECK_ATTEMPT_SCHEMA_VERSION,
+    PROTECTED_PRIMARY_ACCESS_FAILURE_SCHEMA_VERSION,
+    RESEARCH_SUFFICIENCY_CERTIFICATE_SCHEMA_VERSION,
+    RETRIEVAL_BREADTH_COVERAGE_SCHEMA_VERSION,
+    RETRIEVAL_BREADTH_PROFILE_SCHEMA_VERSION,
+    RETRIEVAL_EVIDENCE_CHUNK_SCHEMA_VERSION,
+    RETRIEVAL_EVIDENCE_PROVENANCE_SCHEMA_VERSION,
+    RETRIEVAL_EVIDENCE_SCHEMA_VERSION,
+    RETRIEVAL_EXPANSION_ATTEMPT_SCHEMA_VERSION,
+    RETRIEVAL_FALLBACK_STATE_SCHEMA_VERSION,
+    RETRIEVAL_METADATA_FILL_DIAGNOSTIC_SCHEMA_VERSION,
+    RETRIEVAL_PACKET_ARTIFACT_TYPE,
+    RETRIEVAL_PACKET_SCHEMA_VERSION,
+    SOURCE_METADATA_CLASSIFIER_SCHEMA_VERSION,
+    SOURCE_METADATA_RESOLUTION_SCHEMA_VERSION,
+    validate_contradiction_search_attempt,
+    validate_evidence_provenance_slice,
+    validate_negative_check_attempt,
+    validate_research_sufficiency_certificate,
+    validate_retrieval_breadth_coverage_slice,
+    validate_retrieval_evidence_item,
+    validate_retrieval_metadata_fill_diagnostic,
+    validate_retrieval_packet,
+    validate_source_metadata_classifier_slice,
+    validate_source_metadata_resolution,
+)
+from .retrieval_quality import validate_retrieval_quality_slice
 from .supplemental import validate_normalized_supplemental_evidence
 
 
+MIG_004_RETRIEVAL_PERSISTENCE_MIGRATION = (
+    Path(__file__).resolve().parents[1] / "migrations" / "004_retrieval_evidence_persistence.sql"
+)
 MIG_006_RESEARCHER_VERIFICATION_MIGRATION = (
     Path(__file__).resolve().parents[1] / "migrations" / "006_researcher_verification_persistence.sql"
 )
+RETRIEVAL_PERSISTENCE_VERSION = "ads-mig-004-retrieval-evidence-persistence/v1"
 RESEARCHER_PERSISTENCE_VERSION = "ads-mig-006-researcher-verification-persistence/v1"
 RESEARCHER_MODEL_LANE = "researcher_leaf_nli_classification"
+RETRIEVAL_PACKET_ARTIFACTS_TABLE = "retrieval_packet_artifacts"
 
 
 FORBIDDEN_PERSISTENCE_FIELD_NAMES = {
@@ -57,6 +98,17 @@ FORBIDDEN_PERSISTENCE_FIELD_NAMES = {
     "scae_delta",
     "scae_probability_delta",
     "scae_evidence_delta",
+    "synthesis_conclusion",
+    "synthesis_output",
+    "final_forecast",
+    "forecast_decision",
+    "scoreable_prediction",
+    "outcome_score",
+    "calibration_output",
+    "calibration_update",
+    "calibration_debt",
+    "live_llm_authority",
+    "llm_forecast_authority",
     "decision_recommendation",
     "decision_output",
     "trade_recommendation",
@@ -69,6 +121,10 @@ FORBIDDEN_PERSISTENCE_KEY_FRAGMENTS = (
     "log_odds",
     "scae_delta",
     "decision_recommendation",
+    "synthesis_conclusion",
+    "forecast_decision",
+    "scoreable_prediction",
+    "calibration_debt",
 )
 FORBIDDEN_RAW_PAYLOAD_FIELDS = {
     "full_leaf",
@@ -152,13 +208,21 @@ def _normalized_field_name(value: Any) -> str:
     return normalized.strip("_")
 
 
-def _collect_forbidden_persistence_paths(value: Any, path: str = "record") -> list[str]:
+def _collect_forbidden_persistence_paths(
+    value: Any,
+    path: str = "record",
+    *,
+    allowed_true_authority_fields: set[str] | None = None,
+) -> list[str]:
     errors: list[str] = []
+    allowed_true_authority_fields = allowed_true_authority_fields or set()
     if isinstance(value, dict):
         for key, child in value.items():
             normalized = _normalized_field_name(key)
             if normalized in ALLOWED_FALSE_AUTHORITY_FIELDS and child in {False, True}:
-                if normalized == "probability_fields_forbidden" and child is not True:
+                if normalized in allowed_true_authority_fields:
+                    pass
+                elif normalized == "probability_fields_forbidden" and child is not True:
                     errors.append(f"{path}.{key} must remain true")
                 elif normalized != "probability_fields_forbidden" and child is not False:
                     errors.append(f"{path}.{key} must remain false")
@@ -181,15 +245,36 @@ def _collect_forbidden_persistence_paths(value: Any, path: str = "record") -> li
                 "decision_authority",
             }:
                 errors.append(f"{path}.{key} is forbidden in MIG-006 persistence")
-            errors.extend(_collect_forbidden_persistence_paths(child, f"{path}.{key}"))
+            errors.extend(
+                _collect_forbidden_persistence_paths(
+                    child,
+                    f"{path}.{key}",
+                    allowed_true_authority_fields=allowed_true_authority_fields,
+                )
+            )
     elif isinstance(value, list):
         for idx, child in enumerate(value):
-            errors.extend(_collect_forbidden_persistence_paths(child, f"{path}[{idx}]"))
+            errors.extend(
+                _collect_forbidden_persistence_paths(
+                    child,
+                    f"{path}[{idx}]",
+                    allowed_true_authority_fields=allowed_true_authority_fields,
+                )
+            )
     return errors
 
 
-def _reject_forbidden_persistence_payload(value: Any, path: str = "record") -> None:
-    errors = _collect_forbidden_persistence_paths(value, path)
+def _reject_forbidden_persistence_payload(
+    value: Any,
+    path: str = "record",
+    *,
+    allowed_true_authority_fields: set[str] | None = None,
+) -> None:
+    errors = _collect_forbidden_persistence_paths(
+        value,
+        path,
+        allowed_true_authority_fields=allowed_true_authority_fields,
+    )
     if errors:
         raise ResearcherPersistenceError("; ".join(sorted(set(errors))))
 
@@ -200,6 +285,34 @@ def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
 
 def _has_column(conn: sqlite3.Connection, table: str, column: str) -> bool:
     return column in _table_columns(conn, table)
+
+
+def _ensure_columns(conn: sqlite3.Connection, table: str, columns: dict[str, str]) -> None:
+    existing = _table_columns(conn, table)
+    for column, definition in columns.items():
+        if column not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
+def ensure_retrieval_persistence_schema(conn: sqlite3.Connection) -> None:
+    """Create or upgrade Session 3 MIG-004 retrieval/evidence tables."""
+
+    conn.executescript(MIG_004_RETRIEVAL_PERSISTENCE_MIGRATION.read_text(encoding="utf-8"))
+    _ensure_columns(
+        conn,
+        "missingness_signal_slices",
+        {
+            "query_context_ref": "TEXT",
+            "expected_source_class": "TEXT",
+            "expected_source_ref": "TEXT NOT NULL DEFAULT '{}'",
+            "missingness_status": "TEXT",
+            "missingness_basis": "TEXT",
+            "evidence_refs_checked": "TEXT NOT NULL DEFAULT '[]'",
+            "attempt_refs_checked": "TEXT NOT NULL DEFAULT '[]'",
+            "distinct_absence_mechanism_proof_ref": "TEXT",
+            "candidate_tracking_only": "INTEGER NOT NULL DEFAULT 1",
+        },
+    )
 
 
 def _upsert(conn: sqlite3.Connection, table: str, row: dict[str, Any], conflict_columns: Iterable[str]) -> None:
@@ -263,6 +376,1102 @@ def _answer_value(record: dict[str, Any]) -> str | None:
         if _is_non_empty_string(extraction.get(field)):
             return str(extraction[field])
     return None
+
+
+def _stable_id(prefix: str, value: Any) -> str:
+    return f"{prefix}-" + hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()[:24]
+
+
+def _retrieval_packet_id(packet: dict[str, Any], *, artifact_ref: str | None = None) -> str:
+    for field in ("retrieval_packet_id", "packet_id", "artifact_id"):
+        if _is_non_empty_string(packet.get(field)):
+            return str(packet[field])
+    if _is_non_empty_string(artifact_ref):
+        return str(artifact_ref)
+    return _stable_id(
+        "retrieval-packet",
+        {
+            "case_id": packet.get("case_id"),
+            "dispatch_id": packet.get("dispatch_id"),
+            "question_decomposition_artifact_id": packet.get("question_decomposition_artifact_id"),
+            "source_cutoff_timestamp": packet.get("source_cutoff_timestamp"),
+        },
+    )
+
+
+def _packet_context(value: Any, *, packet_id: str | None = None) -> dict[str, str | None]:
+    if isinstance(value, dict) and value.get("artifact_type") == RETRIEVAL_PACKET_ARTIFACT_TYPE:
+        return {
+            "case_id": str(value.get("case_id") or ""),
+            "dispatch_id": str(value.get("dispatch_id") or ""),
+            "retrieval_packet_id": packet_id or _retrieval_packet_id(value),
+        }
+    return {"case_id": None, "dispatch_id": None, "retrieval_packet_id": packet_id}
+
+
+def _context_str(record: dict[str, Any], context: dict[str, str | None], field: str) -> str:
+    value = record.get(field) or context.get(field)
+    if _is_non_empty_string(value):
+        return str(value)
+    raise ResearcherPersistenceError(f"missing required field: {field}")
+
+
+def _context_optional(record: dict[str, Any], context: dict[str, str | None], field: str) -> str | None:
+    value = record.get(field) or context.get(field)
+    return str(value) if _is_non_empty_string(value) else None
+
+
+def _records_for_key(value: Any, key: str, *, artifact_type: str | None = None) -> list[dict[str, Any]]:
+    if isinstance(value, dict) and value.get("artifact_type") == RETRIEVAL_PACKET_ARTIFACT_TYPE:
+        raw = value.get(key, [])
+        if not isinstance(raw, list):
+            raise ResearcherPersistenceError(f"{key} must be a list")
+        return [item for item in raw if isinstance(item, dict)]
+    if artifact_type and isinstance(value, dict) and value.get("artifact_type") == artifact_type:
+        return [value]
+    return _records_from(value, key)
+
+
+def _selected_evidence_records(value: Any) -> list[dict[str, Any]]:
+    if isinstance(value, dict) and value.get("artifact_type") == RETRIEVAL_PACKET_ARTIFACT_TYPE:
+        selected: list[dict[str, Any]] = []
+        for result in value.get("leaf_retrieval_results", []):
+            if not isinstance(result, dict):
+                continue
+            records = result.get("selected_evidence", [])
+            if isinstance(records, list):
+                selected.extend(item for item in records if isinstance(item, dict))
+        return selected
+    return _records_for_key(value, "retrieval_evidence_items", artifact_type="retrieval_evidence")
+
+
+def _mixed_source_access_records(value: Any) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    if isinstance(value, dict) and value.get("artifact_type") == RETRIEVAL_PACKET_ARTIFACT_TYPE:
+        failures = _records_for_key(value, "protected_primary_access_failures")
+        missingness = _records_for_key(value, "missingness_candidates")
+        return failures, missingness
+    records = _records_from(value)
+    failures = [item for item in records if item.get("artifact_type") == "protected_primary_access_failure"]
+    missingness = [item for item in records if item.get("artifact_type") == "expected_source_missingness_candidate"]
+    if len(failures) + len(missingness) != len(records):
+        raise ResearcherPersistenceError("source access records must be access failures or missingness candidates")
+    return failures, missingness
+
+
+def _validate_retrieval_record(record: dict[str, Any], validator: Any, path: str) -> None:
+    errors: list[str] = []
+    validator(record, path, errors)
+    if errors:
+        raise ResearcherPersistenceError(f"{path} invalid: " + "; ".join(errors))
+
+
+def _validate_simple_artifact(
+    record: dict[str, Any],
+    *,
+    artifact_type: str,
+    schema_version: str,
+    id_field: str,
+    path: str,
+) -> None:
+    if record.get("artifact_type") != artifact_type:
+        raise ResearcherPersistenceError(f"{path}.artifact_type must be {artifact_type}")
+    if record.get("schema_version") != schema_version:
+        raise ResearcherPersistenceError(f"{path}.schema_version must be {schema_version}")
+    _required_str(record, id_field)
+
+
+def _retrieval_reject(record: Any, path: str, *, allow_sufficiency_authority: bool = False) -> None:
+    allowed = {"research_sufficiency_authority"} if allow_sufficiency_authority else None
+    _reject_forbidden_persistence_payload(
+        record,
+        path,
+        allowed_true_authority_fields=allowed,
+    )
+
+
+def write_retrieval_packet(
+    conn: sqlite3.Connection,
+    retrieval_packet: dict[str, Any],
+    *,
+    artifact_ref: str | None = None,
+    artifact_path: str | None = None,
+) -> str:
+    """Persist a compact retrieval-packet artifact row without storing the packet body."""
+
+    ensure_retrieval_persistence_schema(conn)
+    if not isinstance(retrieval_packet, dict):
+        raise ResearcherPersistenceError("retrieval_packet must be an object")
+    validation = validate_retrieval_packet(retrieval_packet)
+    if not validation.valid:
+        raise ResearcherPersistenceError("retrieval packet invalid: " + "; ".join(validation.errors))
+    _retrieval_reject(retrieval_packet, "retrieval_packet", allow_sufficiency_authority=True)
+    packet_id = _retrieval_packet_id(retrieval_packet, artifact_ref=artifact_ref)
+    leaf_results = [
+        result for result in retrieval_packet.get("leaf_retrieval_results", []) if isinstance(result, dict)
+    ]
+    evidence_count = sum(
+        len(result.get("selected_evidence", []))
+        for result in leaf_results
+        if isinstance(result.get("selected_evidence", []), list)
+    )
+    omitted_count = sum(
+        len(result.get("omitted_candidates", []))
+        for result in leaf_results
+        if isinstance(result.get("omitted_candidates", []), list)
+    )
+    summary = retrieval_packet.get("research_sufficiency_summary", {})
+    if not isinstance(summary, dict):
+        summary = {}
+    row = {
+        "retrieval_packet_id": packet_id,
+        "schema_version": retrieval_packet["schema_version"],
+        "case_id": _required_str(retrieval_packet, "case_id"),
+        "case_key": retrieval_packet.get("case_key"),
+        "dispatch_id": _required_str(retrieval_packet, "dispatch_id"),
+        "question_decomposition_artifact_id": retrieval_packet.get("question_decomposition_artifact_id"),
+        "forecast_timestamp": retrieval_packet.get("forecast_timestamp"),
+        "source_cutoff_timestamp": retrieval_packet.get("source_cutoff_timestamp"),
+        "temporal_isolation_status": retrieval_packet["temporal_isolation_status"],
+        "policy_context_ref": retrieval_packet.get("policy_context_ref"),
+        "artifact_ref": artifact_ref or retrieval_packet.get("artifact_ref"),
+        "artifact_path": artifact_path or retrieval_packet.get("artifact_path"),
+        "packet_sha256": retrieval_packet.get("packet_sha256") or _prefixed_sha256(retrieval_packet),
+        "leaf_count": len(leaf_results),
+        "evidence_count": evidence_count,
+        "omitted_candidate_count": omitted_count,
+        "quality_summary_ref": retrieval_packet.get("retrieval_quality_summary_ref"),
+        "research_sufficiency_status": summary.get("certificate_status"),
+        "classification_dispatch_status": summary.get("classification_dispatch_status"),
+        "leaf_certificate_refs": _json(summary.get("leaf_certificate_refs", [])),
+        "schema_feature_gates": _json(retrieval_packet.get("schema_feature_gates", {})),
+        "validation_summary": _json(retrieval_packet.get("validation_summary", {})),
+    }
+    _upsert(conn, RETRIEVAL_PACKET_ARTIFACTS_TABLE, row, ["retrieval_packet_id"])
+    return packet_id
+
+
+def write_retrieval_evidence_items(conn: sqlite3.Connection, evidence_items: Any) -> list[str]:
+    """Persist compact retrieval-evidence/v1 rows."""
+
+    ensure_retrieval_persistence_schema(conn)
+    context = _packet_context(evidence_items)
+    rows = _selected_evidence_records(evidence_items)
+    written: list[str] = []
+    for record in rows:
+        _validate_retrieval_record(record, validate_retrieval_evidence_item, "retrieval_evidence")
+        _retrieval_reject(record, "retrieval_evidence")
+        row = {
+            "evidence_ref": record["evidence_ref"],
+            "schema_version": record["schema_version"],
+            "case_id": _context_str(record, context, "case_id"),
+            "dispatch_id": _context_str(record, context, "dispatch_id"),
+            "retrieval_packet_id": _context_optional(record, context, "retrieval_packet_id"),
+            "leaf_id": record["leaf_id"],
+            "parent_branch_id": record.get("parent_branch_id"),
+            "retrieval_transport": record["retrieval_transport"],
+            "transport_attempt_ref": record["transport_attempt_ref"],
+            "requested_url": record.get("requested_url"),
+            "final_url": record.get("final_url"),
+            "canonical_url": record.get("canonical_url"),
+            "canonical_source_id": record.get("canonical_source_id"),
+            "source_metadata_resolution_ref": record.get("source_metadata_resolution_ref"),
+            "claim_family_resolution_refs": _json(record.get("claim_family_resolution_refs", [])),
+            "source_family_id": record.get("source_family_id"),
+            "source_class": record["source_class"],
+            "independence_status": record["independence_status"],
+            "temporal_gate_status": record["temporal_gate_status"],
+            "source_published_at": record.get("source_published_at"),
+            "source_updated_at": record.get("source_updated_at"),
+            "source_observed_at": record.get("source_observed_at"),
+            "source_authored_at": record.get("source_authored_at"),
+            "captured_at": record.get("captured_at"),
+            "artifact_generated_at": record.get("artifact_generated_at"),
+            "retrieval_capture_for_dispatch": _bool_int(record.get("retrieval_capture_for_dispatch")),
+            "pre_dispatch_input_ref": record.get("pre_dispatch_input_ref"),
+            "content_sha256": record["content_sha256"],
+            "chunk_refs": _json(record.get("chunk_refs", [])),
+            "retrieval_score": float(record.get("retrieval_score", 0.0)),
+            "admission_status": record["admission_status"],
+            "admission_reason_codes": _json(record.get("admission_reason_codes", [])),
+        }
+        _upsert(conn, "retrieval_evidence_items", row, ["evidence_ref"])
+        written.append(record["evidence_ref"])
+    return written
+
+
+def write_retrieval_evidence_chunk_slices(conn: sqlite3.Connection, chunk_slices: Any) -> list[str]:
+    """Persist bounded chunk/span refs without storing excerpt text."""
+
+    ensure_retrieval_persistence_schema(conn)
+    context = _packet_context(chunk_slices)
+    rows = _records_for_key(chunk_slices, "evidence_chunks", artifact_type="retrieval_evidence_chunk")
+    written: list[str] = []
+    for record in rows:
+        _validate_simple_artifact(
+            record,
+            artifact_type="retrieval_evidence_chunk",
+            schema_version=RETRIEVAL_EVIDENCE_CHUNK_SCHEMA_VERSION,
+            id_field="chunk_ref",
+            path="retrieval_evidence_chunk",
+        )
+        _retrieval_reject(record, "retrieval_evidence_chunk")
+        row = {
+            "chunk_ref": record["chunk_ref"],
+            "schema_version": record["schema_version"],
+            "case_id": _context_str(record, context, "case_id"),
+            "dispatch_id": _context_str(record, context, "dispatch_id"),
+            "retrieval_packet_id": _context_optional(record, context, "retrieval_packet_id"),
+            "evidence_ref": record["evidence_ref"],
+            "content_artifact_ref": record["content_artifact_ref"],
+            "chunk_index": int(record["chunk_index"]),
+            "char_start": int(record["char_start"]),
+            "char_end": int(record["char_end"]),
+            "text_sha256": record["text_sha256"],
+            "excerpt_char_count": int(record.get("excerpt_char_count", 0)),
+            "excerpt_policy": record["excerpt_policy"],
+            "contains_claim_candidate_ids": _json(record.get("contains_claim_candidate_ids", [])),
+        }
+        _upsert(conn, "retrieval_evidence_chunk_slices", row, ["chunk_ref"])
+        written.append(record["chunk_ref"])
+    return written
+
+
+def write_native_research_attempts(conn: sqlite3.Connection, attempts: Any) -> list[str]:
+    """Persist compact GPT-native research transport attempt records."""
+
+    ensure_retrieval_persistence_schema(conn)
+    context = _packet_context(attempts)
+    rows = _records_for_key(attempts, "native_research_attempts", artifact_type="native_research_attempt")
+    written: list[str] = []
+    for record in rows:
+        _validate_simple_artifact(
+            record,
+            artifact_type="native_research_attempt",
+            schema_version=NATIVE_RESEARCH_ATTEMPT_SCHEMA_VERSION,
+            id_field="attempt_id",
+            path="native_research_attempt",
+        )
+        _retrieval_reject(record, "native_research_attempt")
+        proposed_metadata = record.get("model_proposed_source_metadata", {})
+        row = {
+            "attempt_id": record["attempt_id"],
+            "schema_version": record["schema_version"],
+            "case_id": _context_str(record, context, "case_id"),
+            "dispatch_id": _context_str(record, context, "dispatch_id"),
+            "retrieval_packet_id": _context_optional(record, context, "retrieval_packet_id"),
+            "leaf_id": record["leaf_id"],
+            "query_variant_id": record.get("query_variant_id"),
+            "model_lane_id": record["model_lane_id"],
+            "resolved_model_id": record["resolved_model_id"],
+            "prompt_template_id": record["prompt_template_id"],
+            "query_manifest_sha256": record["query_manifest_sha256"],
+            "research_transport": record["research_transport"],
+            "candidate_citation_refs": _json(record.get("candidate_citation_refs", [])),
+            "candidate_claim_refs": _json(record.get("candidate_claim_refs", [])),
+            "contradiction_candidate_refs": _json(record.get("contradiction_candidate_refs", [])),
+            "negative_check_candidate_refs": _json(record.get("negative_check_candidate_refs", [])),
+            "model_proposed_source_metadata_sha256": _prefixed_sha256(proposed_metadata),
+            "candidate_output_schema_version": record.get("candidate_output_schema_version"),
+            "attempt_status": record["attempt_status"],
+            "native_transport_availability_status": record["native_transport_availability_status"],
+            "failure_reason_codes": _json(record.get("failure_reason_codes", [])),
+            "diagnostic_only_when_unavailable": _bool_int(record.get("diagnostic_only_when_unavailable")),
+            "non_blocking_when_alternative_transport_satisfies_requirements": _bool_int(
+                record.get("non_blocking_when_alternative_transport_satisfies_requirements")
+            ),
+            "resolver_required_for_accepted_metadata": record.get("resolver_required_for_accepted_metadata"),
+            "feature_gate_status": record.get("feature_gate_status"),
+        }
+        _upsert(conn, "native_research_attempts", row, ["attempt_id"])
+        written.append(record["attempt_id"])
+    return written
+
+
+def write_browser_retrieval_attempts(conn: sqlite3.Connection, attempts: Any) -> list[str]:
+    """Persist compact OpenClaw browser retrieval attempts."""
+
+    ensure_retrieval_persistence_schema(conn)
+    context = _packet_context(attempts)
+    rows = _records_for_key(attempts, "browser_retrieval_attempts", artifact_type="browser_retrieval_attempt")
+    written: list[str] = []
+    for record in rows:
+        _validate_simple_artifact(
+            record,
+            artifact_type="browser_retrieval_attempt",
+            schema_version=BROWSER_RETRIEVAL_ATTEMPT_SCHEMA_VERSION,
+            id_field="attempt_id",
+            path="browser_retrieval_attempt",
+        )
+        _retrieval_reject(record, "browser_retrieval_attempt")
+        row = {
+            "attempt_id": record["attempt_id"],
+            "schema_version": record["schema_version"],
+            "case_id": _context_str(record, context, "case_id"),
+            "dispatch_id": _context_str(record, context, "dispatch_id"),
+            "retrieval_packet_id": _context_optional(record, context, "retrieval_packet_id"),
+            "leaf_id": record["leaf_id"],
+            "query_variant_id": record.get("query_variant_id"),
+            "query_text_sha256": record.get("query_text_sha256"),
+            "browser_session_ref": record.get("browser_session_ref"),
+            "browser_provider_id": record["browser_provider_id"],
+            "openclaw_transport_ref": record.get("openclaw_transport_ref"),
+            "provider_capabilities": _json(record.get("provider_capabilities", [])),
+            "provider_availability_status": record.get("provider_availability_status"),
+            "news_feed_api_enabled": _bool_int(record.get("news_feed_api_enabled")),
+            "navigation_mode": record["navigation_mode"],
+            "direct_url_source_ref": record.get("direct_url_source_ref"),
+            "search_engine_or_navigation_source": record.get("search_engine_or_navigation_source"),
+            "result_rank": int(record.get("result_rank", 0)),
+            "requested_url": record.get("requested_url"),
+            "final_url": record.get("final_url"),
+            "canonical_url": record.get("canonical_url"),
+            "normalized_domain": record.get("normalized_domain"),
+            "page_title_sha256": record.get("page_title_sha256"),
+            "captured_at": record.get("captured_at"),
+            "published_at": record.get("published_at"),
+            "published_at_extraction_method": record.get("published_at_extraction_method"),
+            "rendered_text_sha256": record.get("rendered_text_sha256"),
+            "extracted_text_sha256": record.get("extracted_text_sha256"),
+            "screenshot_artifact_ref": record.get("screenshot_artifact_ref"),
+            "content_artifact_ref": record.get("content_artifact_ref"),
+            "extraction_status": record["extraction_status"],
+            "feature_gate_status": record.get("feature_gate_status"),
+        }
+        _upsert(conn, "browser_retrieval_attempts", row, ["attempt_id"])
+        written.append(record["attempt_id"])
+    return written
+
+
+def write_browser_search_provider_diagnostics(conn: sqlite3.Connection, diagnostics: Any) -> list[str]:
+    """Persist browser/search provider availability diagnostics."""
+
+    ensure_retrieval_persistence_schema(conn)
+    context = _packet_context(diagnostics)
+    rows = _records_for_key(
+        diagnostics,
+        "browser_search_provider_diagnostics",
+        artifact_type="browser_search_provider_diagnostic",
+    )
+    written: list[str] = []
+    for record in rows:
+        _validate_simple_artifact(
+            record,
+            artifact_type="browser_search_provider_diagnostic",
+            schema_version=BROWSER_PROVIDER_DIAGNOSTIC_SCHEMA_VERSION,
+            id_field="provider_id",
+            path="browser_search_provider_diagnostic",
+        )
+        _retrieval_reject(record, "browser_search_provider_diagnostic")
+        diagnostic_id = record.get("provider_diagnostic_id") or _stable_id(
+            "browser-provider-diagnostic",
+            {
+                "provider_id": record.get("provider_id"),
+                "case_id": context.get("case_id"),
+                "dispatch_id": context.get("dispatch_id"),
+                "checked_at": record.get("checked_at"),
+                "availability_status": record.get("availability_status"),
+            },
+        )
+        row = {
+            "provider_diagnostic_id": diagnostic_id,
+            "schema_version": record["schema_version"],
+            "case_id": _context_str(record, context, "case_id"),
+            "dispatch_id": _context_str(record, context, "dispatch_id"),
+            "retrieval_packet_id": _context_optional(record, context, "retrieval_packet_id"),
+            "provider_id": record["provider_id"],
+            "provider_refs": _json(record.get("provider_refs", [])),
+            "capabilities": _json(record.get("capabilities", [])),
+            "availability_status": record["availability_status"],
+            "news_feed_api_enabled": _bool_int(record.get("news_feed_api_enabled")),
+            "direct_url_priority": record.get("direct_url_priority"),
+            "unavailable_reason": record.get("unavailable_reason"),
+            "checked_at": record.get("checked_at"),
+            "feature_gate_status": record.get("feature_gate_status"),
+            "diagnostic_sha256": _prefixed_sha256(record),
+        }
+        _upsert(conn, "browser_search_provider_diagnostics", row, ["provider_diagnostic_id"])
+        written.append(diagnostic_id)
+    return written
+
+
+def write_source_metadata_classifier_slices(conn: sqlite3.Connection, classifier_slices: Any) -> list[str]:
+    """Persist compact RET-011 classifier assist slices without model output bodies."""
+
+    ensure_retrieval_persistence_schema(conn)
+    context = _packet_context(classifier_slices)
+    rows = _records_for_key(
+        classifier_slices,
+        "source_metadata_classifier_slices",
+        artifact_type="source_metadata_classifier_slice",
+    )
+    written: list[str] = []
+    for record in rows:
+        _validate_retrieval_record(record, validate_source_metadata_classifier_slice, "source_metadata_classifier_slice")
+        _retrieval_reject(record, "source_metadata_classifier_slice")
+        row = {
+            "classifier_slice_id": record["classifier_slice_id"],
+            "schema_version": record["schema_version"],
+            "case_id": _context_str(record, context, "case_id"),
+            "dispatch_id": _context_str(record, context, "dispatch_id"),
+            "retrieval_packet_id": _context_optional(record, context, "retrieval_packet_id"),
+            "candidate_id": record.get("candidate_id"),
+            "leaf_id": record.get("leaf_id"),
+            "model_lane_id": record["model_lane_id"],
+            "resolved_model_id": record["resolved_model_id"],
+            "provider_model_key": record["provider_model_key"],
+            "model_policy_ref": record.get("model_policy_ref"),
+            "prompt_template_id": record["prompt_template_id"],
+            "prompt_template_sha256": record["prompt_template_sha256"],
+            "input_candidate_sha256": record["input_candidate_sha256"],
+            "classifier_output_schema_version": record["classifier_output_schema_version"],
+            "proposed_source_class": record.get("proposed_source_class"),
+            "source_class_confidence": record.get("source_class_confidence"),
+            "proposed_source_family_hint_sha256": _prefixed_sha256(record.get("proposed_source_family_hint")),
+            "source_family_confidence": record.get("source_family_confidence"),
+            "syndication_hint": record.get("syndication_hint"),
+            "atomic_claim_candidate_count": len(record.get("atomic_claim_candidates", [])),
+            "visible_date_candidate_count": len(record.get("visible_date_candidates", [])),
+            "reason_codes": _json(record.get("reason_codes", [])),
+            "classifier_version": record.get("classifier_version"),
+        }
+        _upsert(conn, "source_metadata_classifier_slices", row, ["classifier_slice_id"])
+        written.append(record["classifier_slice_id"])
+    return written
+
+
+def write_source_metadata_resolution_slices(conn: sqlite3.Connection, resolution_slices: Any) -> list[str]:
+    """Persist deterministic source metadata resolver slices."""
+
+    ensure_retrieval_persistence_schema(conn)
+    context = _packet_context(resolution_slices)
+    rows = _records_for_key(
+        resolution_slices,
+        "source_metadata_resolutions",
+        artifact_type="source_metadata_resolution",
+    )
+    written: list[str] = []
+    for record in rows:
+        _validate_retrieval_record(record, validate_source_metadata_resolution, "source_metadata_resolution")
+        _retrieval_reject(record, "source_metadata_resolution")
+        row = {
+            "resolution_id": record["resolution_id"],
+            "schema_version": record["schema_version"],
+            "case_id": _context_str(record, context, "case_id"),
+            "dispatch_id": _context_str(record, context, "dispatch_id"),
+            "retrieval_packet_id": _context_optional(record, context, "retrieval_packet_id"),
+            "evidence_ref": record["evidence_ref"],
+            "transport_attempt_ref": record["transport_attempt_ref"],
+            "requested_url": record.get("requested_url"),
+            "final_url": record.get("final_url"),
+            "canonical_url": record.get("canonical_url"),
+            "registrable_domain": record.get("registrable_domain"),
+            "canonical_source_id": record.get("canonical_source_id"),
+            "content_sha256": record.get("content_sha256"),
+            "source_class": record["source_class"],
+            "source_class_resolution_method": record.get("source_class_resolution_method"),
+            "source_family_id": record.get("source_family_id"),
+            "source_family_resolution_method": record.get("source_family_resolution_method"),
+            "source_family_status": record.get("source_family_status"),
+            "claim_family_resolution_refs": _json(record.get("claim_family_resolution_refs", [])),
+            "claim_family_ids": _json(record.get("claim_family_ids", [])),
+            "claim_family_resolution_method": record.get("claim_family_resolution_method"),
+            "temporal_safety_status": record["temporal_safety_status"],
+            "published_at": record.get("published_at"),
+            "published_at_method": record.get("published_at_method"),
+            "classifier_slice_ref": record.get("classifier_slice_ref"),
+            "classifier_acceptance_status": record.get("classifier_acceptance_status"),
+            "classifier_acceptance_reason_codes": _json(record.get("classifier_acceptance_reason_codes", [])),
+            "metadata_confidence": record.get("metadata_confidence"),
+            "counts_toward_breadth": _bool_int(record.get("counts_toward_breadth")),
+            "unknown_reason_codes": _json(record.get("unknown_reason_codes", [])),
+            "accepted_metadata_authority": record["accepted_metadata_authority"],
+            "deterministic_resolver_accepted_fields": _json(record.get("deterministic_resolver_accepted_fields", [])),
+            "model_proposed_metadata_counted": _bool_int(record.get("model_proposed_metadata_counted")),
+            "normalizer_version": record.get("normalizer_version"),
+            "ret_010_resolver_version": record.get("ret_010_resolver_version"),
+        }
+        _upsert(conn, "source_metadata_resolution_slices", row, ["resolution_id"])
+        written.append(record["resolution_id"])
+    return written
+
+
+def write_atomic_claim_candidate_slices(conn: sqlite3.Connection, candidates: Any) -> list[str]:
+    """Persist atomic claim candidates as refs/hashes without tuple bodies."""
+
+    ensure_retrieval_persistence_schema(conn)
+    context = _packet_context(candidates)
+    rows = _records_for_key(candidates, "atomic_claim_candidates", artifact_type="atomic_claim_candidate")
+    written: list[str] = []
+    for record in rows:
+        _validate_simple_artifact(
+            record,
+            artifact_type="atomic_claim_candidate",
+            schema_version=ATOMIC_CLAIM_CANDIDATE_SCHEMA_VERSION,
+            id_field="claim_candidate_id",
+            path="atomic_claim_candidate",
+        )
+        _retrieval_reject(record, "atomic_claim_candidate")
+        row = {
+            "claim_candidate_id": record["claim_candidate_id"],
+            "schema_version": record["schema_version"],
+            "case_id": _context_str(record, context, "case_id"),
+            "dispatch_id": _context_str(record, context, "dispatch_id"),
+            "retrieval_packet_id": _context_optional(record, context, "retrieval_packet_id"),
+            "evidence_ref": record["evidence_ref"],
+            "leaf_id": record["leaf_id"],
+            "chunk_refs": _json(record.get("chunk_refs", [])),
+            "extraction_method": record["extraction_method"],
+            "model_lane_id": record.get("model_lane_id"),
+            "prompt_template_id": record.get("prompt_template_id"),
+            "proposed_tuple_sha256": _prefixed_sha256(record.get("proposed_tuple", {})),
+            "supporting_span_refs": _json(record.get("supporting_span_refs", [])),
+            "candidate_confidence": record.get("candidate_confidence"),
+            "validation_status": record["validation_status"],
+            "validator_reason_codes": _json(record.get("validator_reason_codes", [])),
+        }
+        _upsert(conn, "atomic_claim_candidate_slices", row, ["claim_candidate_id"])
+        written.append(record["claim_candidate_id"])
+    return written
+
+
+def write_claim_family_resolution_slices(conn: sqlite3.Connection, resolutions: Any) -> list[str]:
+    """Persist claim-family resolution refs and tuple hashes."""
+
+    ensure_retrieval_persistence_schema(conn)
+    context = _packet_context(resolutions)
+    rows = _records_for_key(resolutions, "claim_family_resolutions", artifact_type="claim_family_resolution")
+    written: list[str] = []
+    for record in rows:
+        _validate_simple_artifact(
+            record,
+            artifact_type="claim_family_resolution",
+            schema_version=CLAIM_FAMILY_RESOLUTION_SCHEMA_VERSION,
+            id_field="claim_family_resolution_id",
+            path="claim_family_resolution",
+        )
+        _retrieval_reject(record, "claim_family_resolution")
+        row = {
+            "claim_family_resolution_id": record["claim_family_resolution_id"],
+            "schema_version": record["schema_version"],
+            "case_id": _context_str(record, context, "case_id"),
+            "dispatch_id": _context_str(record, context, "dispatch_id"),
+            "retrieval_packet_id": _context_optional(record, context, "retrieval_packet_id"),
+            "claim_family_id": record["claim_family_id"],
+            "claim_candidate_refs": _json(record.get("claim_candidate_refs", [])),
+            "normalized_tuple_sha256": record.get("normalized_tuple_sha256") or _prefixed_sha256(
+                record.get("normalized_tuple", {})
+            ),
+            "resolution_method": record["resolution_method"],
+            "equivalence_status": record["equivalence_status"],
+            "contradiction_family_id": record.get("contradiction_family_id"),
+            "counts_toward_claim_family_breadth": _bool_int(record.get("counts_toward_claim_family_breadth")),
+            "reason_codes": _json(record.get("reason_codes", [])),
+        }
+        _upsert(conn, "claim_family_resolution_slices", row, ["claim_family_resolution_id"])
+        written.append(record["claim_family_resolution_id"])
+    return written
+
+
+def write_metadata_fill_diagnostics(conn: sqlite3.Connection, diagnostics: Any) -> list[str]:
+    """Persist retrieval metadata fill-rate diagnostics."""
+
+    ensure_retrieval_persistence_schema(conn)
+    context = _packet_context(diagnostics)
+    rows = _records_for_key(
+        diagnostics,
+        "retrieval_metadata_fill_diagnostics",
+        artifact_type="retrieval_metadata_fill_diagnostic",
+    )
+    written: list[str] = []
+    for record in rows:
+        _validate_retrieval_record(record, validate_retrieval_metadata_fill_diagnostic, "retrieval_metadata_fill_diagnostic")
+        _retrieval_reject(record, "retrieval_metadata_fill_diagnostic")
+        row = {
+            "diagnostic_id": record["diagnostic_id"],
+            "schema_version": record["schema_version"],
+            "case_id": _context_str(record, context, "case_id"),
+            "dispatch_id": _context_str(record, context, "dispatch_id"),
+            "retrieval_packet_id": _context_optional(record, context, "retrieval_packet_id"),
+            "leaf_id": record["leaf_id"],
+            "retrieval_transport": record["retrieval_transport"],
+            "raw_candidate_count": int(record.get("raw_candidate_count", 0)),
+            "admitted_ref_count": int(record.get("admitted_ref_count", 0)),
+            "field_fill_counts": _json(record.get("field_fill_counts", {})),
+            "unknown_counts": _json(record.get("unknown_counts", {})),
+            "fill_rates": _json(record.get("fill_rates", {})),
+            "diagnostic_authority": record["diagnostic_authority"],
+            "evaluator_version": record.get("evaluator_version"),
+        }
+        _upsert(conn, "retrieval_metadata_fill_diagnostics", row, ["diagnostic_id"])
+        written.append(record["diagnostic_id"])
+    return written
+
+
+def write_retrieval_quality_slices(conn: sqlite3.Connection, quality_slices: Any) -> list[str]:
+    """Persist RET-003 retrieval quality slices."""
+
+    ensure_retrieval_persistence_schema(conn)
+    context = _packet_context(quality_slices)
+    rows = _records_for_key(quality_slices, "retrieval_quality_slices", artifact_type="retrieval_quality_slice")
+    written: list[str] = []
+    for record in rows:
+        validation = validate_retrieval_quality_slice(record)
+        if not validation.valid:
+            raise ResearcherPersistenceError("retrieval quality slice invalid: " + "; ".join(validation.errors))
+        _retrieval_reject(record, "retrieval_quality_slice")
+        row = {
+            "slice_id": record["slice_id"],
+            "schema_version": record["schema_version"],
+            "case_id": _context_str(record, context, "case_id"),
+            "dispatch_id": _context_str(record, context, "dispatch_id"),
+            "retrieval_packet_id": _context_optional(record, context, "retrieval_packet_id"),
+            "leaf_id": record["leaf_id"],
+            "query_context_ref": record.get("query_context_ref"),
+            "selected_evidence_refs": _json(record.get("selected_evidence_refs", [])),
+            "quality_score": float(record["quality_score"]),
+            "quality_status": record["quality_status"],
+            "penalty_points": float(record["penalty_points"]),
+            "diagnostic_codes": _json(record.get("diagnostic_codes", [])),
+            "low_breadth_reason_codes": _json(record.get("low_breadth_reason_codes", [])),
+            "dimensions": _json(record.get("dimensions", {})),
+            "scorer_version": record.get("scorer_version"),
+        }
+        _upsert(conn, "retrieval_quality_slices", row, ["slice_id"])
+        written.append(record["slice_id"])
+    return written
+
+
+def write_evidence_provenance_slices(conn: sqlite3.Connection, provenance_slices: Any) -> list[str]:
+    """Persist retrieval provenance refs without nested resolver or temporal payload bodies."""
+
+    ensure_retrieval_persistence_schema(conn)
+    context = _packet_context(provenance_slices)
+    rows = _records_for_key(
+        provenance_slices,
+        "retrieval_evidence_provenance_slices",
+        artifact_type="retrieval_evidence_provenance",
+    )
+    written: list[str] = []
+    for record in rows:
+        _validate_retrieval_record(record, validate_evidence_provenance_slice, "retrieval_evidence_provenance")
+        _retrieval_reject(record, "retrieval_evidence_provenance")
+        row = {
+            "provenance_id": record["provenance_id"],
+            "schema_version": record["schema_version"],
+            "case_id": _context_str(record, context, "case_id"),
+            "dispatch_id": _context_str(record, context, "dispatch_id"),
+            "retrieval_packet_id": _context_optional(record, context, "retrieval_packet_id"),
+            "evidence_ref": record["evidence_ref"],
+            "candidate_id": record.get("candidate_id"),
+            "retrieval_transport": record["retrieval_transport"],
+            "transport_attempt_ref": record.get("transport_attempt_ref"),
+            "browser_attempt_ref": record.get("browser_attempt_ref"),
+            "native_research_attempt_ref": record.get("native_research_attempt_ref"),
+            "source_metadata_resolution_ref": record["source_metadata_resolution_ref"],
+            "source_metadata_classifier_ref": record.get("source_metadata_classifier_ref"),
+            "atomic_claim_candidate_refs": _json(record.get("atomic_claim_candidate_refs", [])),
+            "claim_family_resolution_refs": _json(record.get("claim_family_resolution_refs", [])),
+            "claim_family_ids": _json(record.get("claim_family_ids", [])),
+            "classifier_acceptance_status": record.get("classifier_acceptance_status"),
+            "classifier_acceptance_reason_codes": _json(record.get("classifier_acceptance_reason_codes", [])),
+            "metadata_confidence": record.get("metadata_confidence"),
+            "unknown_reason_codes": _json(record.get("unknown_reason_codes", [])),
+            "requested_url": record.get("requested_url"),
+            "final_url": record.get("final_url"),
+            "canonical_url": record.get("canonical_url"),
+            "url_identity_basis": record.get("url_identity_basis"),
+            "captured_at": record.get("captured_at"),
+            "artifact_generated_at": record.get("artifact_generated_at"),
+            "source_published_at": record.get("source_published_at"),
+            "source_updated_at": record.get("source_updated_at"),
+            "source_observed_at": record.get("source_observed_at"),
+            "published_at_extraction_method": record.get("published_at_extraction_method"),
+            "canonical_source_id": record.get("canonical_source_id"),
+            "source_class": record["source_class"],
+            "source_family_id": record.get("source_family_id"),
+            "source_family_status": record.get("source_family_status"),
+            "independence_status": record.get("independence_status"),
+            "content_sha256": record.get("content_sha256"),
+            "temporal_gate_status": record.get("temporal_gate_status"),
+            "temporal_validation_ref": record.get("temporal_validation_ref"),
+            "temporal_validation_sha256": _prefixed_sha256(record.get("temporal_validation", {})),
+            "counts_toward_breadth": _bool_int(record.get("counts_toward_breadth")),
+            "normalizer_version": record.get("normalizer_version"),
+        }
+        _upsert(conn, "retrieval_evidence_provenance_slices", row, ["provenance_id"])
+        written.append(record["provenance_id"])
+    return written
+
+
+def write_retrieval_breadth_profile(conn: sqlite3.Connection, profiles: Any) -> list[str]:
+    """Persist compact RET-009 breadth profiles."""
+
+    ensure_retrieval_persistence_schema(conn)
+    context = _packet_context(profiles)
+    rows = _records_for_key(profiles, "retrieval_breadth_profiles", artifact_type="retrieval_breadth_profile")
+    written: list[str] = []
+    for record in rows:
+        _validate_simple_artifact(
+            record,
+            artifact_type="retrieval_breadth_profile",
+            schema_version=RETRIEVAL_BREADTH_PROFILE_SCHEMA_VERSION,
+            id_field="profile_id",
+            path="retrieval_breadth_profile",
+        )
+        _retrieval_reject(record, "retrieval_breadth_profile")
+        row = {
+            "profile_id": record["profile_id"],
+            "schema_version": record["schema_version"],
+            "case_id": _context_str(record, context, "case_id"),
+            "dispatch_id": _context_str(record, context, "dispatch_id"),
+            "retrieval_packet_id": _context_optional(record, context, "retrieval_packet_id"),
+            "leaf_id": record["leaf_id"],
+            "source_class_requirements": _json(record.get("source_class_requirements", {})),
+            "claim_family_requirements": _json(record.get("claim_family_requirements", {})),
+            "source_family_requirements": _json(record.get("source_family_requirements", {})),
+            "freshness_requirement": _json(record.get("freshness_requirement", {})),
+            "contradiction_search": _json(record.get("contradiction_search", {})),
+            "negative_checks": _json(record.get("negative_checks", {})),
+            "retrieval_volume_tier": _json(record.get("retrieval_volume_tier", {})),
+            "feature_gate_status": _json(record.get("feature_gate_status", {})),
+        }
+        _upsert(conn, "retrieval_breadth_profiles", row, ["profile_id"])
+        written.append(record["profile_id"])
+    return written
+
+
+def write_retrieval_breadth_coverage_slices(conn: sqlite3.Connection, coverage_slices: Any) -> list[str]:
+    """Persist RET-009 breadth coverage slices."""
+
+    ensure_retrieval_persistence_schema(conn)
+    context = _packet_context(coverage_slices)
+    rows = _records_for_key(
+        coverage_slices,
+        "retrieval_breadth_coverage_slices",
+        artifact_type="retrieval_breadth_coverage",
+    )
+    written: list[str] = []
+    for record in rows:
+        _validate_retrieval_record(record, validate_retrieval_breadth_coverage_slice, "retrieval_breadth_coverage")
+        _retrieval_reject(record, "retrieval_breadth_coverage")
+        row = {
+            "coverage_id": record["coverage_id"],
+            "schema_version": record["schema_version"],
+            "case_id": _context_str(record, context, "case_id"),
+            "dispatch_id": _context_str(record, context, "dispatch_id"),
+            "retrieval_packet_id": _context_optional(record, context, "retrieval_packet_id"),
+            "leaf_id": record["leaf_id"],
+            "breadth_profile_ref": record["breadth_profile_ref"],
+            "source_class_coverage": _json(record.get("source_class_coverage", {})),
+            "claim_family_count": int(record.get("claim_family_count", 0)),
+            "source_family_count": int(record.get("source_family_count", 0)),
+            "fresh_source_count": int(record.get("fresh_source_count", 0)),
+            "contradiction_attempt_refs": _json(record.get("contradiction_attempt_refs", [])),
+            "negative_check_attempt_refs": _json(record.get("negative_check_attempt_refs", [])),
+            "protected_primary_status": record["protected_primary_status"],
+            "protected_primary_resolution_basis": record.get("protected_primary_resolution_basis"),
+            "structural_unanswerability_proof_ref": record.get("structural_unanswerability_proof_ref"),
+            "raw_candidate_count": int(record.get("raw_candidate_count", 0)),
+            "admitted_ref_count": int(record.get("admitted_ref_count", 0)),
+            "independent_claim_family_ids": _json(record.get("independent_claim_family_ids", [])),
+            "independent_source_family_ids": _json(record.get("independent_source_family_ids", [])),
+            "metadata_fill_diagnostic_refs": _json(record.get("metadata_fill_diagnostic_refs", [])),
+            "unknown_field_counts": _json(record.get("unknown_field_counts", {})),
+            "blocking_unknown_fields": _json(record.get("blocking_unknown_fields", [])),
+            "expansion_required": _bool_int(record.get("expansion_required")),
+            "expansion_requirement_codes": _json(record.get("expansion_requirement_codes", [])),
+            "unsatisfied_breadth_dimensions": _json(record.get("unsatisfied_breadth_dimensions", [])),
+            "breadth_certified": _bool_int(record.get("breadth_certified")),
+            "evaluator_version": record.get("evaluator_version"),
+        }
+        _upsert(conn, "retrieval_breadth_coverage_slices", row, ["coverage_id"])
+        written.append(record["coverage_id"])
+    return written
+
+
+def write_contradiction_search_attempts(conn: sqlite3.Connection, attempts: Any) -> list[str]:
+    """Persist contradiction-search attempt refs/statuses."""
+
+    ensure_retrieval_persistence_schema(conn)
+    context = _packet_context(attempts)
+    rows = _records_for_key(attempts, "contradiction_search_attempts", artifact_type="contradiction_search_attempt")
+    written: list[str] = []
+    for record in rows:
+        _validate_retrieval_record(record, validate_contradiction_search_attempt, "contradiction_search_attempt")
+        _retrieval_reject(record, "contradiction_search_attempt")
+        row = {
+            "attempt_id": record["attempt_id"],
+            "schema_version": record["schema_version"],
+            "case_id": _context_str(record, context, "case_id"),
+            "dispatch_id": _context_str(record, context, "dispatch_id"),
+            "retrieval_packet_id": _context_optional(record, context, "retrieval_packet_id"),
+            "leaf_id": record["leaf_id"],
+            "query_context_ref": record.get("query_context_ref"),
+            "query_variant_id": record.get("query_variant_id"),
+            "query_text_sha256": record.get("query_text_sha256"),
+            "source_refs_checked": _json(record.get("source_refs_checked", [])),
+            "contradiction_found": _bool_int(record.get("contradiction_found")),
+            "outcome_status": record["outcome_status"],
+            "attempt_authority": record["attempt_authority"],
+            "evaluator_version": record.get("evaluator_version"),
+        }
+        _upsert(conn, "contradiction_search_attempts", row, ["attempt_id"])
+        written.append(record["attempt_id"])
+    return written
+
+
+def write_negative_check_attempts(conn: sqlite3.Connection, attempts: Any) -> list[str]:
+    """Persist negative-check attempt refs/statuses."""
+
+    ensure_retrieval_persistence_schema(conn)
+    context = _packet_context(attempts)
+    rows = _records_for_key(attempts, "negative_check_attempts", artifact_type="negative_check_attempt")
+    written: list[str] = []
+    for record in rows:
+        _validate_retrieval_record(record, validate_negative_check_attempt, "negative_check_attempt")
+        _retrieval_reject(record, "negative_check_attempt")
+        row = {
+            "attempt_id": record["attempt_id"],
+            "schema_version": record["schema_version"],
+            "case_id": _context_str(record, context, "case_id"),
+            "dispatch_id": _context_str(record, context, "dispatch_id"),
+            "retrieval_packet_id": _context_optional(record, context, "retrieval_packet_id"),
+            "leaf_id": record["leaf_id"],
+            "query_context_ref": record.get("query_context_ref"),
+            "negative_check": record["negative_check"],
+            "query_text_sha256": record["query_text_sha256"],
+            "source_refs_checked": _json(record.get("source_refs_checked", [])),
+            "outcome_status": record["outcome_status"],
+            "no_confirmation_found": _bool_int(record.get("no_confirmation_found")),
+            "attempt_authority": record["attempt_authority"],
+            "evaluator_version": record.get("evaluator_version"),
+        }
+        _upsert(conn, "negative_check_attempts", row, ["attempt_id"])
+        written.append(record["attempt_id"])
+    return written
+
+
+def write_source_access_and_missingness_slices(conn: sqlite3.Connection, records: Any) -> dict[str, list[str]]:
+    """Persist RET-005 protected-source access failures and missingness candidates."""
+
+    ensure_retrieval_persistence_schema(conn)
+    context = _packet_context(records)
+    failures, missingness = _mixed_source_access_records(records)
+    failure_ids: list[str] = []
+    missingness_ids: list[str] = []
+    for record in failures:
+        _validate_simple_artifact(
+            record,
+            artifact_type="protected_primary_access_failure",
+            schema_version=PROTECTED_PRIMARY_ACCESS_FAILURE_SCHEMA_VERSION,
+            id_field="failure_id",
+            path="protected_primary_access_failure",
+        )
+        _retrieval_reject(record, "protected_primary_access_failure")
+        row = {
+            "failure_id": record["failure_id"],
+            "schema_version": record["schema_version"],
+            "case_id": _context_str(record, context, "case_id"),
+            "dispatch_id": _context_str(record, context, "dispatch_id"),
+            "retrieval_packet_id": _context_optional(record, context, "retrieval_packet_id"),
+            "leaf_id": record["leaf_id"],
+            "query_context_ref": record.get("query_context_ref"),
+            "required_source_classes": _json(record.get("required_source_classes", [])),
+            "expected_source_refs": _json(record.get("expected_source_refs", [])),
+            "observed_attempt_refs": _json(record.get("observed_attempt_refs", [])),
+            "admitted_evidence_refs": _json(record.get("admitted_evidence_refs", [])),
+            "access_status": record["access_status"],
+            "reason_codes": _json(record.get("reason_codes", [])),
+            "candidate_tracking_only": _bool_int(record.get("candidate_tracking_only")),
+            "tracker_version": record.get("tracker_version"),
+        }
+        _upsert(conn, "source_access_failure_slices", row, ["failure_id"])
+        failure_ids.append(record["failure_id"])
+    for record in missingness:
+        _validate_simple_artifact(
+            record,
+            artifact_type="expected_source_missingness_candidate",
+            schema_version=EXPECTED_SOURCE_MISSINGNESS_CANDIDATE_SCHEMA_VERSION,
+            id_field="candidate_id",
+            path="expected_source_missingness_candidate",
+        )
+        _retrieval_reject(record, "expected_source_missingness_candidate")
+        slice_id = record["candidate_id"]
+        payload = {
+            "expected_source_class": record.get("expected_source_class"),
+            "missingness_status": record.get("missingness_status"),
+            "missingness_basis": record.get("missingness_basis"),
+            "candidate_tracking_only": bool(record.get("candidate_tracking_only")),
+        }
+        row = {
+            "slice_id": slice_id,
+            "schema_version": record["schema_version"],
+            "artifact_type": record["artifact_type"],
+            "case_id": _context_str(record, context, "case_id"),
+            "dispatch_id": _context_str(record, context, "dispatch_id"),
+            "leaf_id": record.get("leaf_id"),
+            "parent_branch_id": record.get("parent_branch_id"),
+            "condition_scope": record.get("condition_scope"),
+            "feature_id": "RET-005",
+            "surface_name": "missingness_signal_slices",
+            "source_ref": None,
+            "source_family_id": None,
+            "claim_family_id": None,
+            "mechanism_family_id": None,
+            "dependency_group_id": None,
+            "signed_log_odds_delta": None,
+            "accepted_for_ledger_input": 0,
+            "diagnostic_only": 1,
+            "can_increase_evidence_strength": 0,
+            "live_forecast_authority": 0,
+            "writes_scae_ledger": 0,
+            "writes_production_forecast": 0,
+            "reason_codes": _json(record.get("reason_codes", [])),
+            "source_refs": _json(record.get("expected_source_ref", [])),
+            "payload_json": _json(payload),
+            "payload_sha256": _prefixed_sha256(payload),
+            "query_context_ref": record.get("query_context_ref"),
+            "expected_source_class": record.get("expected_source_class"),
+            "expected_source_ref": _json(record.get("expected_source_ref", {})),
+            "missingness_status": record.get("missingness_status"),
+            "missingness_basis": record.get("missingness_basis"),
+            "evidence_refs_checked": _json(record.get("evidence_refs_checked", [])),
+            "attempt_refs_checked": _json(record.get("attempt_refs_checked", [])),
+            "distinct_absence_mechanism_proof_ref": record.get("distinct_absence_mechanism_proof_ref"),
+            "candidate_tracking_only": _bool_int(record.get("candidate_tracking_only")),
+        }
+        _upsert(conn, "missingness_signal_slices", row, ["slice_id"])
+        missingness_ids.append(slice_id)
+    return {"source_access_failure_ids": failure_ids, "missingness_signal_ids": missingness_ids}
+
+
+def write_retrieval_fallback_state(conn: sqlite3.Connection, fallback_states: Any) -> list[str]:
+    """Persist RET-006 fallback state records."""
+
+    ensure_retrieval_persistence_schema(conn)
+    context = _packet_context(fallback_states)
+    rows = _records_for_key(fallback_states, "retrieval_fallback_states", artifact_type="retrieval_fallback_state")
+    written: list[str] = []
+    for record in rows:
+        _validate_simple_artifact(
+            record,
+            artifact_type="retrieval_fallback_state",
+            schema_version=RETRIEVAL_FALLBACK_STATE_SCHEMA_VERSION,
+            id_field="fallback_state_id",
+            path="retrieval_fallback_state",
+        )
+        _retrieval_reject(record, "retrieval_fallback_state")
+        row = {
+            "fallback_state_id": record["fallback_state_id"],
+            "schema_version": record["schema_version"],
+            "case_id": _context_str(record, context, "case_id"),
+            "dispatch_id": _context_str(record, context, "dispatch_id"),
+            "retrieval_packet_id": _context_optional(record, context, "retrieval_packet_id"),
+            "leaf_id": record["leaf_id"],
+            "query_context_ref": record.get("query_context_ref"),
+            "targeted_expansion_attempt_refs": _json(record.get("targeted_expansion_attempt_refs", [])),
+            "targeted_expansion_required_before_macro_fallback": _bool_int(
+                record.get("targeted_expansion_required_before_macro_fallback")
+            ),
+            "macro_fallback_requested": _bool_int(record.get("macro_fallback_requested")),
+            "macro_fallback_used": _bool_int(record.get("macro_fallback_used")),
+            "macro_fallback_policy": record["macro_fallback_policy"],
+            "macro_fallback_sufficiency_status": record["macro_fallback_sufficiency_status"],
+            "classification_dispatch_allowed_from_macro_fallback": _bool_int(
+                record.get("classification_dispatch_allowed_from_macro_fallback")
+            ),
+            "reason_codes": _json(record.get("reason_codes", [])),
+            "planner_version": record.get("planner_version"),
+        }
+        _upsert(conn, "retrieval_fallback_state_records", row, ["fallback_state_id"])
+        written.append(record["fallback_state_id"])
+    return written
+
+
+def write_retrieval_expansion_attempts(conn: sqlite3.Connection, attempts: Any) -> list[str]:
+    """Persist RET-006 targeted retrieval expansion attempts."""
+
+    ensure_retrieval_persistence_schema(conn)
+    context = _packet_context(attempts)
+    rows = _records_for_key(attempts, "retrieval_expansion_attempts", artifact_type="retrieval_expansion_attempt")
+    written: list[str] = []
+    for record in rows:
+        _validate_simple_artifact(
+            record,
+            artifact_type="retrieval_expansion_attempt",
+            schema_version=RETRIEVAL_EXPANSION_ATTEMPT_SCHEMA_VERSION,
+            id_field="attempt_id",
+            path="retrieval_expansion_attempt",
+        )
+        _retrieval_reject(record, "retrieval_expansion_attempt")
+        row = {
+            "attempt_id": record["attempt_id"],
+            "schema_version": record["schema_version"],
+            "case_id": _context_str(record, context, "case_id"),
+            "dispatch_id": _context_str(record, context, "dispatch_id"),
+            "retrieval_packet_id": _context_optional(record, context, "retrieval_packet_id"),
+            "leaf_id": record["leaf_id"],
+            "query_context_ref": record.get("query_context_ref"),
+            "attempt_index": int(record["attempt_index"]),
+            "max_attempts": int(record["max_attempts"]),
+            "expansion_strategy": record["expansion_strategy"],
+            "attempt_status": record["attempt_status"],
+            "unsatisfied_requirement_codes": _json(record.get("unsatisfied_requirement_codes", [])),
+            "query_variant_refs": _json(record.get("query_variant_refs", [])),
+            "expansion_query_text_sha256": record["expansion_query_text_sha256"],
+            "candidate_refs": _json(record.get("candidate_refs", [])),
+            "admitted_evidence_refs": _json(record.get("admitted_evidence_refs", [])),
+            "bounded_by_requirement_max": _bool_int(record.get("bounded_by_requirement_max")),
+            "macro_fallback_phase": _bool_int(record.get("macro_fallback_phase")),
+            "planner_version": record.get("planner_version"),
+        }
+        _upsert(conn, "retrieval_expansion_attempt_slices", row, ["attempt_id"])
+        written.append(record["attempt_id"])
+    return written
+
+
+def write_research_sufficiency_certificate(conn: sqlite3.Connection, certificates: Any) -> list[str]:
+    """Persist compact RET-008 research sufficiency certificates."""
+
+    ensure_retrieval_persistence_schema(conn)
+    context = _packet_context(certificates)
+    rows = _records_for_key(
+        certificates,
+        "leaf_research_sufficiency_certificates",
+        artifact_type="research_sufficiency_certificate",
+    )
+    written: list[str] = []
+    for record in rows:
+        _validate_retrieval_record(record, validate_research_sufficiency_certificate, "research_sufficiency_certificate")
+        _retrieval_reject(record, "research_sufficiency_certificate", allow_sufficiency_authority=True)
+        row = {
+            "certificate_id": record["certificate_id"],
+            "schema_version": record["schema_version"],
+            "case_id": _context_str(record, context, "case_id"),
+            "dispatch_id": _context_str(record, context, "dispatch_id"),
+            "retrieval_packet_id": _context_optional(record, context, "retrieval_packet_id"),
+            "leaf_id": record["leaf_id"],
+            "query_context_ref": record.get("query_context_ref"),
+            "requirement_ref": record.get("requirement_ref"),
+            "sufficiency_profile_id": record["sufficiency_profile_id"],
+            "status": record["status"],
+            "classification_dispatch_allowed": _bool_int(record.get("classification_dispatch_allowed")),
+            "evidence_refs": _json(record.get("evidence_refs", [])),
+            "breadth_coverage_ref": record.get("breadth_coverage_ref"),
+            "breadth_certified": _bool_int(record.get("breadth_certified")),
+            "expansion_attempt_refs": _json(record.get("expansion_attempt_refs", [])),
+            "fallback_state_ref": record.get("fallback_state_ref"),
+            "structural_unanswerability_proof_ref": record.get("structural_unanswerability_proof_ref"),
+            "temporal_validation_status": record["temporal_validation_status"],
+            "freshness_status": record["freshness_status"],
+            "macro_fallback_sufficiency_status": record["macro_fallback_sufficiency_status"],
+            "unsatisfied_requirement_codes": _json(record.get("unsatisfied_requirement_codes", [])),
+            "blocking_reason_codes": _json(record.get("blocking_reason_codes", [])),
+            "certifier_version": record.get("certifier_version"),
+        }
+        _upsert(conn, "research_sufficiency_certificates", row, ["certificate_id"])
+        written.append(record["certificate_id"])
+    return written
 
 
 def write_researcher_prompt_artifact(
@@ -1041,15 +2250,28 @@ def write_research_sufficiency_reconciliation(conn: sqlite3.Connection, reconcil
 
 
 __all__ = [
+    "MIG_004_RETRIEVAL_PERSISTENCE_MIGRATION",
     "MIG_006_RESEARCHER_VERIFICATION_MIGRATION",
+    "RETRIEVAL_PERSISTENCE_VERSION",
     "RESEARCHER_PERSISTENCE_VERSION",
     "ResearcherPersistenceError",
+    "ensure_retrieval_persistence_schema",
     "ensure_researcher_verification_persistence_schema",
+    "write_atomic_claim_candidate_slices",
+    "write_browser_retrieval_attempts",
+    "write_browser_search_provider_diagnostics",
     "write_classification_provenance_slices",
+    "write_claim_family_resolution_slices",
+    "write_contradiction_search_attempts",
     "write_direction_verification_slices",
+    "write_evidence_provenance_slices",
     "write_evidence_quality_verification_slices",
     "write_leaf_research_assignments",
+    "write_metadata_fill_diagnostics",
+    "write_native_research_attempts",
+    "write_negative_check_attempts",
     "write_normalized_supplemental_evidence",
+    "write_research_sufficiency_certificate",
     "write_research_sufficiency_reconciliation",
     "write_researcher_classification_slices",
     "write_researcher_classifications",
@@ -1057,6 +2279,17 @@ __all__ = [
     "write_researcher_coverage_proofs",
     "write_researcher_escalation_decisions",
     "write_researcher_prompt_artifact",
+    "write_retrieval_breadth_coverage_slices",
+    "write_retrieval_breadth_profile",
+    "write_retrieval_evidence_chunk_slices",
+    "write_retrieval_evidence_items",
+    "write_retrieval_expansion_attempts",
+    "write_retrieval_fallback_state",
+    "write_retrieval_packet",
+    "write_retrieval_quality_slices",
     "write_scae_readiness_reconciliation",
+    "write_source_access_and_missingness_slices",
+    "write_source_metadata_classifier_slices",
+    "write_source_metadata_resolution_slices",
     "write_verification_slices",
 ]

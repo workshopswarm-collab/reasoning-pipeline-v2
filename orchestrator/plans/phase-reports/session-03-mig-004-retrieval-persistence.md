@@ -1,0 +1,22 @@
+# Session 03 MIG-004: Retrieval Persistence
+
+- Session: Session 03, Decomposer and Retrieval Packet
+- Phase: MIG-004 retrieval/evidence persistence
+- Owner: ADS Session 03
+- Feature IDs: `RET-001`, `RET-002`, `RET-003`, `RET-004`, `RET-005`, `RET-006`, `RET-007`, `RET-010`, `RET-011`, `RET-009`, `RET-008`
+- Migration Groups: `MIG-004`
+- Status: Implementation complete; ready for coordinator reconciliation. Not pushed.
+- Acceptance Evidence: Added researcher-swarm-owned MIG-004 migration and compact persistence helpers for retrieval packet artifact refs, admitted evidence rows, bounded chunk refs, native GPT research attempts, OpenClaw browser retrieval/provider diagnostics, classifier-assist slices, deterministic source metadata resolutions, atomic claim candidate hashes, claim-family resolutions, metadata fill diagnostics, retrieval quality slices, retrieval provenance, breadth profiles and coverage, contradiction and negative-check attempts, protected-primary access failures, retrieval candidate missingness signals, fallback states, targeted expansion attempts, and research sufficiency certificates. Writers validate existing RET artifact contracts where validators exist, upsert on stable IDs, store refs/hashes/status/counts/provenance only, avoid full page bodies, browser transcripts, prompt payloads, and research content, and reject probability, fair-value, interval, SCAE delta, synthesis, decision, forecast, calibration, scoreable prediction, and live-LLM authority fields.
+- Checks Run:
+  - `python3 orchestrator/plans/check_dependency_gates.py` -> `inventory valid`
+  - `python3 orchestrator/plans/check_dependency_gates.py --feature-id MIG-004 --mode runtime_integration --report-only` -> unsupported for migration row: `unknown feature: MIG-004`
+  - `python3 orchestrator/plans/check_dependency_gates.py --all --mode runtime_integration --report-only` -> expected report-only blockers remain on `AUTO-003`, `AUTO-004`, `AUTO-005`, `PERSIST-001`, `PERSIST-002`, `SCORE-001`, and `CAL-*`; Session 3 RET feature rows report `OK`
+  - `python3 -m unittest discover -s orchestrator/plans/tests` -> `Ran 13 tests ... OK`
+  - `python3 -m unittest discover -s orchestrator/scripts/tests` -> `Ran 119 tests ... OK`
+  - `python3 -m unittest discover -s decomposer/scripts/tests` -> `Ran 43 tests ... OK`
+  - `python3 -m unittest discover -s researcher-swarm/scripts/tests` -> `Ran 132 tests ... OK`
+  - `python3 researcher-swarm/scripts/tests/test_persistence.py` -> `Ran 6 tests ... OK`
+- Shared Inventory Updates Requested: Mark `MIG-004` `ready_for_integration` with this acceptance evidence after coordinator review. No direct inventory/YAML edits were made in this implementation commit.
+- Shared Map/Matrix Updates Requested: Reconcile schema-name rows for `retrieval_evidence_items`, `retrieval_evidence_chunk_slices`, `native_research_attempts`, `browser_retrieval_attempts`, `browser_search_provider_diagnostics`, `source_metadata_classifier_slices`, `source_metadata_resolution_slices`, `atomic_claim_candidate_slices`, `claim_family_resolution_slices`, `retrieval_metadata_fill_diagnostics`, `retrieval_quality_slices`, `retrieval_evidence_provenance_slices`, `retrieval_breadth_profiles`, `retrieval_breadth_coverage_slices`, `contradiction_search_attempts`, `negative_check_attempts`, `source_access_failure_slices`, `retrieval_fallback_state_records`, `retrieval_expansion_attempt_slices`, and `research_sufficiency_certificates` from `needs_new_migration` to `canonical`; update `missingness_signal_slices` notes to include retrieval-candidate rows alongside SCAE-local posterior-consequence rows. Add script-placement coverage for `/Users/agent2/.openclaw/researcher-swarm/scripts/migrations/004_retrieval_evidence_persistence.sql` and extend `/Users/agent2/.openclaw/researcher-swarm/scripts/researcher_swarm/persistence.py` ownership to include `MIG-004`.
+- Blockers: No MIG-004 implementation blockers. Full Session 3 persistence gate needs Session 1/coordinator inventory, schema-name, script-placement, blocker, and fixture reconciliation after review. Downstream runtime report-only blockers still remain on `PERSIST-*`, `SCORE-001`, and `CAL-*` rows unrelated to this local slice.
+- Commit SHA: Held implementation commit `c53621e6e192e725ad5865929d1cae20dffc0c92`; final rebased/pushed commit SHA is reported by the worker after push.
