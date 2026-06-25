@@ -50,6 +50,7 @@ Root-level runtime entrypoints should be avoided except for compatibility shims 
 | `/Users/agent2/.openclaw/orchestrator/scripts/predquant/ads_pipeline_control.py` | `AUTO-006`, `MIG-013` | Importable durable control-state helpers for `pipeline_enabled`, operator reason, and acknowledgement. |
 | `/Users/agent2/.openclaw/orchestrator/scripts/predquant/ads_pipeline_runner.py` | `AUTO-001`, `AUTO-003`, `AUTO-004`, `AUTO-006`, `MIG-013` | Importable runner contract helpers. AUTO-001 covers run identity, durable control-state gate, stage-order contract, no-live-autostart, and non-executing start refusal. |
 | `/Users/agent2/.openclaw/orchestrator/scripts/migrations/008_pipeline_runner_contract.sql` | `AUTO-001`, `MIG-013` | Minimal `ads_pipeline_runs` and `ads_pipeline_control_state` schema for the AUTO-001 non-executing runner contract. |
+| `/Users/agent2/.openclaw/orchestrator/scripts/migrations/013_pipeline_automation_records.sql` | `MIG-013`, `AUTO-003`, `AUTO-004`, `AUTO-005` | Durable pipeline loop iteration and stop-signal schema for repeated automation runs, empty-queue waits, retries, stop/drain requests, and terminal outcomes. |
 | `/Users/agent2/.openclaw/orchestrator/scripts/predquant/ads_case_selector.py` | `AUTO-002`, `CASE-001`, `MIG-013` | Eligible-case selection, lease acquisition, idempotency, and stuck-lease recovery helpers. |
 | `/Users/agent2/.openclaw/orchestrator/scripts/predquant/ads_stage_logging.py` | `FND-002`, `FND-006`, `MIG-002`, `AUTO-003`, `AUTO-004` | Importable stage wrapper logging helpers for `v2_stage_execution_events`, safe log artifact refs, retry/error links, stage status updates, and replay commands. |
 | `/Users/agent2/.openclaw/orchestrator/scripts/bin/wake_decomposer.py` | `QDT-001`, `MODEL-002` | Orchestrator-owned wakeup/handoff to ADS Decomposer. |
@@ -131,6 +132,7 @@ Root-level runtime entrypoints should be avoided except for compatibility shims 
 | `/Users/agent2/.openclaw/SCAE/scripts/bin/build_scae_evidence_delta_candidates.py` | `SCAE-003`, `SCAE-004` | Build candidate-only signed log-odds update slices from verified classification, direction, and quality rows, with correlated-quality guard and per-update cap metadata. |
 | `/Users/agent2/.openclaw/SCAE/scripts/bin/validate_scae_ledger.py` | `SCAE-001`, `SCAE-011`, `SCAE-012` | Validate ledger schema, probability taxonomy, interval, and authority boundaries. |
 | `/Users/agent2/.openclaw/SCAE/scripts/bin/persist_scae_forecast.py` | `PERSIST-001`, `PERSIST-002`, `MIG-008` | Persist SCAE production probability and scoreable market prediction bridge. |
+| `/Users/agent2/.openclaw/SCAE/scripts/migrations/008_forecast_decision_records.sql` | `MIG-008`, `PERSIST-001`, `PERSIST-002` | Durable forecast decision record schema for SCAE-owned production probability, forecast validity/actionability, DEC/SYN refs, and blocked invalid-forecast status. |
 | `/Users/agent2/.openclaw/SCAE/scripts/bin/report_scae_scorecard.py` | `SCORE-001`, `MIG-010` | Summarize SCAE Brier and market-baseline scorecards. |
 | `/Users/agent2/.openclaw/SCAE/scripts/scae/ledger.py` | `SCAE-001` to `SCAE-013` | Ledger construction and probability field contract. |
 | `/Users/agent2/.openclaw/SCAE/scripts/scae/policy.py` | `SCAE-001`, `SCAE-004`, `SCAE-012` | SCAE policy resolution, caps, and debt controls. |
@@ -140,7 +142,7 @@ Root-level runtime entrypoints should be avoided except for compatibility shims 
 | `/Users/agent2/.openclaw/SCAE/scripts/scae/family.py` | `SCAE-009` | Family-aware binary child displacement and consistency diagnostics with sibling prices as context only. |
 | `/Users/agent2/.openclaw/SCAE/scripts/scae/netting.py` | `SCAE-005`, `SCAE-006`, `SCAE-007` | SCAE-005 intra-leaf representative cluster netting; later cross-leaf dependence and branch netting remain future work. |
 | `/Users/agent2/.openclaw/SCAE/scripts/scae/intervals.py` | `SCAE-011` | Deterministic logit uncertainty interval builder. |
-| `/Users/agent2/.openclaw/SCAE/scripts/scae/persistence.py` | `MIG-007`, `SCAE-001` to `SCAE-013` | Deterministic SCAE-local ledger, probability-audit, log-odds, sufficiency-input, and diagnostic slice persistence helpers without forecast bridge, scoring, or calibration-promotion authority. |
+| `/Users/agent2/.openclaw/SCAE/scripts/scae/persistence.py` | `MIG-007`, `MIG-008`, `SCAE-001` to `SCAE-013`, `PERSIST-001`, `PERSIST-002` | Deterministic SCAE-local ledger, probability-audit, log-odds, sufficiency-input, diagnostic, forecast-decision, and market-prediction bridge persistence helpers without scoring or calibration-promotion authority. |
 | `/Users/agent2/.openclaw/SCAE/scripts/migrations/007_scae_ledger_probability_audit.sql` | `MIG-007` | Named SCAE-local SQLite migration for ledger outputs, log-odds update slices, cross-leaf dependence, branch, conditional, calibration diagnostic, mechanism-family, research sufficiency input, missingness, and reconciliation slices. |
 
 ## Enforcement Rules
