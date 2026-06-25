@@ -13,9 +13,12 @@ from scae.ledger import (  # noqa: E402
     CONTEXT_READY,
     CONTEXT_WATCH_ONLY,
     RESEARCH_SUFFICIENCY_GUARD_AUTHORITY,
+    SCAE_CALIBRATION_DEBT_CONTEXT_SCHEMA_VERSION,
     SCAE_RESEARCH_SUFFICIENCY_CONTEXT_SCHEMA_VERSION,
+    SCAE_FINAL_PROBABILITY_AUTHORITY,
     ScaeLedgerError,
     apply_research_sufficiency_guard,
+    finalize_scae_probability_fields,
     build_research_sufficiency_context,
 )
 from scae.policy import default_scae_policy  # noqa: E402
@@ -238,6 +241,116 @@ class ScaeLedgerResearchSufficiencyTest(unittest.TestCase):
                 sufficiency_reconciliations=[self.reconciliation()],
                 policy=self.policy,
             )
+
+    def test_debt_active_tail_caps_probability_and_aliases_production(self):
+        guarded = apply_research_sufficiency_guard(
+            self.ledger(),
+            qdt=self.qdt(),
+            sufficiency_reconciliations=[self.reconciliation()],
+            policy=self.policy,
+        )
+        guarded["raw_ledger_probability"] = 0.995
+        guarded["post_ledger_probability"] = 0.995
+
+        finalized = finalize_scae_probability_fields(guarded, policy=self.policy)
+
+        self.assertEqual(finalized["debt_adjusted_probability"], 0.98)
+        self.assertEqual(finalized["production_forecast_prob"], 0.98)
+        self.assertEqual(finalized["canonical_probability"], 0.98)
+        self.assertEqual(finalized["final_probability_authority"], SCAE_FINAL_PROBABILITY_AUTHORITY)
+        self.assertEqual(finalized["execution_authority_status"], "low_size_only")
+        self.assertFalse(finalized["writes_production_forecast"])
+        self.assertFalse(finalized["writes_persistence"])
+        context = finalized["calibration_debt_context"]
+        self.assertEqual(context["schema_version"], SCAE_CALIBRATION_DEBT_CONTEXT_SCHEMA_VERSION)
+        self.assertTrue(context["active"])
+        self.assertTrue(context["tail_cap_applied"])
+        self.assertEqual(context["tail_cap_reason"], "tail_probability_ceiling_applied")
+        self.assertTrue(context["minimum_interval_width_applied"])
+        self.assertEqual(finalized["interval"]["minimum_interval_width_logit"], 0.5)
+        self.assertEqual(finalized["interval"]["total_half_width_logit"], 0.25)
+
+    def test_debt_cleared_uses_post_ledger_probability_and_normal_execution(self):
+        policy = copy.deepcopy(self.policy)
+        policy["calibration_debt"]["active"] = False
+        guarded = apply_research_sufficiency_guard(
+            self.ledger(),
+            qdt=self.qdt(),
+            sufficiency_reconciliations=[self.reconciliation()],
+            policy=policy,
+        )
+        guarded["raw_ledger_probability"] = 0.58
+        guarded["post_ledger_probability"] = 0.61
+
+        finalized = finalize_scae_probability_fields(guarded, policy=policy)
+
+        self.assertEqual(finalized["debt_adjusted_probability"], 0.61)
+        self.assertEqual(finalized["production_forecast_prob"], 0.61)
+        self.assertEqual(finalized["canonical_probability"], 0.61)
+        self.assertEqual(finalized["execution_authority_status"], "normal_execution_allowed")
+        self.assertFalse(finalized["calibration_debt_context"]["active"])
+        self.assertFalse(finalized["calibration_debt_context"]["calibration_debt_controls_applied"])
+        self.assertFalse(finalized["interval"]["calibration_debt_minimum_width_applied"])
+
+    def test_invalid_sufficiency_state_does_not_emit_production_probability_fields(self):
+        guarded = apply_research_sufficiency_guard(
+            self.ledger(),
+            qdt=self.qdt(),
+            sufficiency_reconciliations=[],
+            policy=self.policy,
+        )
+
+        finalized = finalize_scae_probability_fields(guarded, policy=self.policy)
+
+        self.assertEqual(finalized["final_probability_fields_status"], "blocked_invalid_for_forecast")
+        self.assertEqual(finalized["execution_authority_status"], "forbidden")
+        self.assertFalse(finalized["production_forecast_authority"])
+        serialized = json.dumps(finalized, sort_keys=True)
+        for forbidden_field in [
+            "debt_adjusted_probability",
+            "production_forecast_prob",
+            "canonical_probability",
+        ]:
+            self.assertNotIn(forbidden_field, serialized)
+
+    def test_watch_only_structural_unanswerability_caps_execution_authority(self):
+        policy = copy.deepcopy(self.policy)
+        policy["research_sufficiency"] = {"allow_watch_only_structural_unanswerability": True}
+        structural = self.reconciliation(
+            status="structurally_unanswerable",
+            breadth_certified=False,
+            required_escalation_refs=["researcher-escalation-decision:1"],
+            completed_escalation_refs=["researcher-escalation-decision:1"],
+            reason_codes=["structural_unanswerability_verified_with_required_confirmation"],
+        )
+        guarded = apply_research_sufficiency_guard(
+            self.ledger(),
+            qdt=self.qdt(),
+            sufficiency_reconciliations=[structural],
+            policy=policy,
+        )
+
+        finalized = finalize_scae_probability_fields(guarded, policy=policy)
+
+        self.assertEqual(finalized["forecast_validity_status"], "valid_for_forecast_watch_only")
+        self.assertEqual(finalized["execution_authority_status"], "watch_only")
+        self.assertTrue(finalized["production_forecast_authority"])
+        self.assertIn("production_forecast_prob", finalized)
+
+    def test_finalization_requires_sufficiency_guard_and_rejects_existing_final_fields(self):
+        with self.assertRaisesRegex(ScaeLedgerError, "requires SCAE-013"):
+            finalize_scae_probability_fields(self.ledger(), policy=self.policy)
+
+        guarded = apply_research_sufficiency_guard(
+            self.ledger(),
+            qdt=self.qdt(),
+            sufficiency_reconciliations=[self.reconciliation()],
+            policy=self.policy,
+        )
+        finalized = finalize_scae_probability_fields(guarded, policy=self.policy)
+
+        with self.assertRaisesRegex(ScaeLedgerError, "already-final probability"):
+            finalize_scae_probability_fields(finalized, policy=self.policy)
 
 
 if __name__ == "__main__":

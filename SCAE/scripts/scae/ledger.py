@@ -1,9 +1,8 @@
-"""SCAE ledger guard helpers for research sufficiency intake.
+"""SCAE ledger guard helpers for research sufficiency and final fields.
 
-This module currently implements the SCAE-013 research sufficiency /
-forecast-validity guard. It annotates SCAE-011 pre-debt ledger output with
-VER-004 reconciliation context, but does not apply calibration-debt controls,
-persist forecasts, or emit production/canonical probability fields.
+This module implements SCAE-013 research sufficiency / forecast-validity guards
+and SCAE-012 calibration-debt finalization. It never persists forecasts,
+decisions, scores, or tuning promotions.
 """
 
 from __future__ import annotations
@@ -13,12 +12,22 @@ import hashlib
 import json
 from typing import Any
 
-from scae.policy import default_scae_policy
+from scae.policy import (
+    EXECUTION_AUTHORITY_RANK,
+    MAX_EXECUTION_BY_VALIDITY,
+    default_scae_policy,
+    resolve_probability_taxonomy,
+    validate_probability,
+)
+from scae.prior import sigmoid
 
 
 SCAE_RESEARCH_SUFFICIENCY_CONTEXT_SCHEMA_VERSION = "scae-research-sufficiency-context/v1"
+SCAE_CALIBRATION_DEBT_CONTEXT_SCHEMA_VERSION = "scae-calibration-debt-context/v1"
 SCAE_013_RESEARCH_SUFFICIENCY_GUARD_VERSION = "ads-scae-013-research-sufficiency-guard/v1"
+SCAE_012_CALIBRATION_DEBT_VERSION = "ads-scae-012-calibration-debt-controls/v1"
 RESEARCH_SUFFICIENCY_GUARD_AUTHORITY = "research_sufficiency_validity_guard_no_production_forecast_authority"
+SCAE_FINAL_PROBABILITY_AUTHORITY = "scae_final_probability_fields_no_persistence_authority"
 SCAE_RECONCILIATION_SURFACE = "research_sufficiency_reconciliation_slices"
 HIGH_CERTAINTY_STATUS = "scae_ready_high_certainty"
 STRUCTURALLY_UNANSWERABLE_STATUS = "structurally_unanswerable"
@@ -34,6 +43,8 @@ FINAL_PROBABILITY_FIELDS = {
     "production_forecast_prob",
     "canonical_probability",
 }
+FINAL_BLOCKED_STATUS = "blocked_invalid_for_forecast"
+FINAL_READY_STATUS = "final_probability_fields_ready"
 
 
 class ScaeLedgerError(ValueError):
@@ -418,3 +429,271 @@ def apply_research_sufficiency_guard(
     annotated["research_sufficiency_guarded_ledger_id"] = _sha_id("scae-sufficiency-guarded-ledger", annotated)
     annotated["research_sufficiency_guarded_ledger_digest"] = _prefixed_sha256(annotated)
     return annotated
+
+
+def _calibration_debt_policy(policy: dict[str, Any]) -> dict[str, Any]:
+    debt_policy = policy.get("calibration_debt")
+    if not isinstance(debt_policy, dict):
+        raise ScaeLedgerError("policy.calibration_debt is required")
+    active = debt_policy.get("active")
+    if not isinstance(active, bool):
+        raise ScaeLedgerError("policy.calibration_debt.active must be boolean")
+    floor = validate_probability(debt_policy.get("tail_probability_floor"), "tail_probability_floor")
+    ceiling = validate_probability(debt_policy.get("tail_probability_ceiling"), "tail_probability_ceiling")
+    if floor >= ceiling:
+        raise ScaeLedgerError("calibration debt tail floor must be below tail ceiling")
+    minimum_width = _numeric_non_negative(
+        debt_policy.get("minimum_interval_width_logit"),
+        "minimum_interval_width_logit",
+    )
+    return {
+        "active": active,
+        "tail_probability_floor": floor,
+        "tail_probability_ceiling": ceiling,
+        "minimum_interval_width_logit": minimum_width,
+        "default_execution_authority_when_active": debt_policy.get(
+            "default_execution_authority_when_active",
+            "low_size_only",
+        ),
+    }
+
+
+def _numeric_non_negative(value: Any, field_name: str) -> float:
+    if isinstance(value, bool) or value is None:
+        raise ScaeLedgerError(f"{field_name} must be a non-negative number")
+    if isinstance(value, (int, float)):
+        number = float(value)
+    else:
+        try:
+            number = float(str(value))
+        except (TypeError, ValueError) as exc:
+            raise ScaeLedgerError(f"{field_name} must be a non-negative number") from exc
+    if number < 0.0:
+        raise ScaeLedgerError(f"{field_name} must be a non-negative number")
+    return number
+
+
+def _numeric(value: Any, field_name: str) -> float:
+    if isinstance(value, bool) or value is None:
+        raise ScaeLedgerError(f"{field_name} must be numeric")
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        return float(str(value))
+    except (TypeError, ValueError) as exc:
+        raise ScaeLedgerError(f"{field_name} must be numeric") from exc
+
+
+def _tail_capped_probability(probability: float, debt_policy: dict[str, Any]) -> tuple[float, bool, str | None]:
+    floor = float(debt_policy["tail_probability_floor"])
+    ceiling = float(debt_policy["tail_probability_ceiling"])
+    if probability < floor:
+        return round(floor, 9), True, "tail_probability_floor_applied"
+    if probability > ceiling:
+        return round(ceiling, 9), True, "tail_probability_ceiling_applied"
+    return round(probability, 9), False, None
+
+
+def _max_execution_for_validity(validity: str) -> str:
+    if validity not in MAX_EXECUTION_BY_VALIDITY:
+        raise ScaeLedgerError(f"unknown forecast_validity_status {validity}")
+    return MAX_EXECUTION_BY_VALIDITY[validity]
+
+
+def _execution_authority_for_final_ledger(validity: str, debt_policy: dict[str, Any]) -> str:
+    max_execution = _max_execution_for_validity(validity)
+    if validity == VALIDITY_INVALID:
+        return "forbidden"
+    if debt_policy["active"]:
+        requested = str(debt_policy["default_execution_authority_when_active"])
+    else:
+        requested = max_execution
+    if requested not in EXECUTION_AUTHORITY_RANK:
+        raise ScaeLedgerError(f"unknown debt-mode execution authority {requested}")
+    if EXECUTION_AUTHORITY_RANK[requested] > EXECUTION_AUTHORITY_RANK[max_execution]:
+        return max_execution
+    return requested
+
+
+def _debt_adjusted_interval(interval: dict[str, Any], debt_policy: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    if not isinstance(interval, dict):
+        raise ScaeLedgerError("SCAE-012 requires SCAE-011 interval context")
+    adjusted = copy.deepcopy(interval)
+    current_half_width = _numeric_non_negative(
+        adjusted.get("total_half_width_logit", 0.0),
+        "interval.total_half_width_logit",
+    )
+    minimum_width = float(debt_policy["minimum_interval_width_logit"])
+    minimum_half_width = round(minimum_width / 2.0, 9)
+    target_half_width = current_half_width
+    minimum_applied = False
+    if debt_policy["active"] and current_half_width < minimum_half_width:
+        target_half_width = minimum_half_width
+        minimum_applied = True
+
+    center_log_odds = adjusted.get("center_log_odds")
+    if center_log_odds is None:
+        raise ScaeLedgerError("SCAE-012 requires interval.center_log_odds")
+    center = _numeric(center_log_odds, "interval.center_log_odds")
+    lower_log_odds = round(center - target_half_width, 9)
+    upper_log_odds = round(center + target_half_width, 9)
+    adjusted.update(
+        {
+            "pre_debt_total_half_width_logit": round(current_half_width, 9),
+            "total_half_width_logit": round(target_half_width, 9),
+            "minimum_interval_width_logit": minimum_width,
+            "minimum_half_width_logit": minimum_half_width,
+            "calibration_debt_minimum_width_applied": minimum_applied,
+            "lower_log_odds": lower_log_odds,
+            "upper_log_odds": upper_log_odds,
+            "lower_probability": round(sigmoid(lower_log_odds), 9),
+            "upper_probability": round(sigmoid(upper_log_odds), 9),
+        }
+    )
+    return adjusted, minimum_applied
+
+
+def _finalization_blocked_ledger(
+    ledger: dict[str, Any],
+    *,
+    active_policy: dict[str, Any],
+    debt_policy: dict[str, Any],
+) -> dict[str, Any]:
+    blocked = copy.deepcopy(ledger)
+    context = {
+        "artifact_type": "scae_calibration_debt_context",
+        "schema_version": SCAE_CALIBRATION_DEBT_CONTEXT_SCHEMA_VERSION,
+        "feature_id": "SCAE-012",
+        "calibration_debt_version": SCAE_012_CALIBRATION_DEBT_VERSION,
+        "policy_snapshot_id": active_policy.get("policy_id"),
+        "active": debt_policy["active"],
+        "final_probability_fields_status": FINAL_BLOCKED_STATUS,
+        "forecast_validity_status": blocked.get("forecast_validity_status"),
+        "blocked_reason_codes": ["forecast_validity_invalid_for_forecast"],
+        "calibration_debt_controls_applied": False,
+        "production_forecast_authority": False,
+        "writes_production_forecast": False,
+        "writes_persistence": False,
+    }
+    context["calibration_debt_context_id"] = _sha_id("scae-calibration-debt-context", context)
+    context["calibration_debt_context_digest"] = _prefixed_sha256(context)
+    blocked["calibration_debt_context"] = context
+    blocked["final_probability_fields_status"] = FINAL_BLOCKED_STATUS
+    blocked["production_forecast_authority"] = False
+    blocked["execution_authority_status"] = "forbidden"
+    blocked["writes_production_forecast"] = False
+    blocked["writes_persistence"] = False
+    blocked["calibration_debt_controls_applied"] = False
+    blocked["final_probability_ledger_id"] = _sha_id("scae-final-probability-ledger", blocked)
+    blocked["final_probability_ledger_digest"] = _prefixed_sha256(blocked)
+    return blocked
+
+
+def apply_calibration_debt_controls_after_sufficiency(
+    ledger: dict[str, Any],
+    policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Apply SCAE-012 final probability fields after the SCAE-013 guard."""
+
+    if not isinstance(ledger, dict):
+        raise ScaeLedgerError("ledger must be an object")
+    if "research_sufficiency_context" not in ledger or "forecast_validity_status" not in ledger:
+        raise ScaeLedgerError("SCAE-012 requires SCAE-013 research sufficiency guard output")
+    if "raw_ledger_probability" not in ledger or "post_ledger_probability" not in ledger:
+        raise ScaeLedgerError("SCAE-012 requires SCAE-011 raw/post ledger probabilities")
+    forbidden_present = sorted(FINAL_PROBABILITY_FIELDS & set(ledger))
+    if forbidden_present:
+        raise ScaeLedgerError(
+            "SCAE-012 cannot accept already-final probability fields: " + ", ".join(forbidden_present)
+        )
+
+    active_policy = copy.deepcopy(policy or default_scae_policy())
+    debt_policy = _calibration_debt_policy(active_policy)
+    validity = str(ledger.get("forecast_validity_status"))
+    if validity == VALIDITY_INVALID:
+        return _finalization_blocked_ledger(
+            ledger,
+            active_policy=active_policy,
+            debt_policy=debt_policy,
+        )
+    if validity not in {VALIDITY_READY, VALIDITY_WATCH_ONLY}:
+        raise ScaeLedgerError(f"unknown forecast_validity_status {validity}")
+
+    raw_probability = validate_probability(ledger["raw_ledger_probability"], "raw_ledger_probability")
+    post_probability = validate_probability(ledger["post_ledger_probability"], "post_ledger_probability")
+    if debt_policy["active"]:
+        debt_probability, tail_cap_applied, tail_cap_reason = _tail_capped_probability(post_probability, debt_policy)
+    else:
+        debt_probability = round(post_probability, 9)
+        tail_cap_applied = False
+        tail_cap_reason = None
+
+    taxonomy = resolve_probability_taxonomy(
+        raw_ledger_probability=raw_probability,
+        post_ledger_probability=post_probability,
+        debt_adjusted_probability=debt_probability,
+        calibration_debt_active=debt_policy["active"],
+    )
+    adjusted_interval, minimum_width_applied = _debt_adjusted_interval(
+        ledger.get("interval"),
+        debt_policy,
+    )
+    execution_authority = _execution_authority_for_final_ledger(validity, debt_policy)
+    context = {
+        "artifact_type": "scae_calibration_debt_context",
+        "schema_version": SCAE_CALIBRATION_DEBT_CONTEXT_SCHEMA_VERSION,
+        "feature_id": "SCAE-012",
+        "calibration_debt_version": SCAE_012_CALIBRATION_DEBT_VERSION,
+        "policy_snapshot_id": active_policy.get("policy_id"),
+        "active": debt_policy["active"],
+        "tail_probability_floor": debt_policy["tail_probability_floor"],
+        "tail_probability_ceiling": debt_policy["tail_probability_ceiling"],
+        "tail_cap_applied": tail_cap_applied,
+        "tail_cap_reason": tail_cap_reason,
+        "minimum_interval_width_logit": debt_policy["minimum_interval_width_logit"],
+        "minimum_interval_width_applied": minimum_width_applied,
+        "pre_debt_post_ledger_probability": round(post_probability, 9),
+        "debt_adjusted_probability": taxonomy["debt_adjusted_probability"],
+        "production_source_rule": "debt_adjusted_when_calibration_debt_active_else_post_ledger",
+        "forecast_validity_status": validity,
+        "execution_authority_status": execution_authority,
+        "calibration_debt_controls_applied": debt_policy["active"],
+        "final_probability_fields_status": FINAL_READY_STATUS,
+        "production_forecast_authority": True,
+        "writes_production_forecast": False,
+        "writes_persistence": False,
+        "cleared_by_first_100_trace_completeness": False,
+    }
+    context["calibration_debt_context_id"] = _sha_id("scae-calibration-debt-context", context)
+    context["calibration_debt_context_digest"] = _prefixed_sha256(context)
+
+    finalized = copy.deepcopy(ledger)
+    finalized.update(taxonomy)
+    finalized["interval"] = adjusted_interval
+    finalized["calibration_debt_context"] = context
+    finalized["final_probability_fields_status"] = FINAL_READY_STATUS
+    finalized["final_probability_authority"] = SCAE_FINAL_PROBABILITY_AUTHORITY
+    finalized["production_forecast_authority"] = True
+    finalized["execution_authority_status"] = execution_authority
+    finalized["calibration_debt_controls_applied"] = debt_policy["active"]
+    finalized["writes_production_forecast"] = False
+    finalized["writes_persistence"] = False
+    scopes = [
+        scope
+        for scope in finalized.get("not_implemented_scope", [])
+        if not str(scope).startswith("SCAE-012_")
+    ]
+    finalized["not_implemented_scope"] = scopes
+    finalized["final_probability_ledger_id"] = _sha_id("scae-final-probability-ledger", finalized)
+    finalized["final_probability_ledger_digest"] = _prefixed_sha256(finalized)
+    return finalized
+
+
+def finalize_scae_probability_fields(
+    ledger: dict[str, Any],
+    *,
+    policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Compatibility alias for SCAE-012 callers."""
+
+    return apply_calibration_debt_controls_after_sufficiency(ledger, policy=policy)
