@@ -23,6 +23,7 @@ from ads_decomposer.handoff import (  # noqa: E402
 )
 from ads_decomposer.qdt import build_fixture_qdt_candidate, select_qdt_candidate  # noqa: E402
 from predquant.ads_handoff import validate_artifact_manifest  # noqa: E402
+from researcher_swarm.assignments import build_leaf_research_assignments  # noqa: E402
 from researcher_swarm.retrieval import (  # noqa: E402
     RetrievalPacketError,
     attach_native_research_transport_diagnostics,
@@ -946,6 +947,136 @@ class RetrievalPacketContractTest(unittest.TestCase):
         )
         self.assertEqual(finalized["retrieval_stage_status_records"], [])
         self.assertEqual(finalized["retrieval_stage_execution_events"], [])
+
+    def test_browser_only_cutover_uses_direct_urls_and_yields_assignments(self) -> None:
+        contexts = build_retrieval_query_contexts(self.qdt, evidence_packet=self.evidence_packet)
+        selected = []
+        browser_attempts = []
+        chunks = []
+        spans = []
+        attempt_refs_by_leaf = {}
+
+        for index, context in enumerate(contexts):
+            direct_candidates = context["direct_url_candidates"]
+            direct = next(
+                item for item in direct_candidates if "official_source_hints" in item["source_ref"]
+            )
+            self.assertEqual(direct["direct_url_priority"], "official_or_resolution_urls_first")
+            variant = context["query_variants"][0]
+            direct_attempt = build_browser_retrieval_attempt(
+                context,
+                variant,
+                navigation_mode="direct_url",
+                requested_url=direct["url"],
+                final_url=direct["url"],
+                canonical_url=direct["url"],
+                extraction_status="accepted",
+                result_rank=1,
+            )
+            search_attempt = build_browser_retrieval_attempt(
+                context,
+                variant,
+                navigation_mode="web_search",
+                requested_url=f"https://search.example/?q={context['leaf_id']}",
+                final_url=f"https://independent.example/{context['leaf_id']}",
+                canonical_url=f"https://independent.example/{context['leaf_id']}",
+                extraction_status="accepted",
+                result_rank=2,
+            )
+            browser_attempts.extend([direct_attempt, search_attempt])
+            attempt_refs_by_leaf[context["leaf_id"]] = [
+                direct_attempt["attempt_id"],
+                search_attempt["attempt_id"],
+            ]
+
+            official = self._evidence(
+                context,
+                attempt_ref=direct_attempt["attempt_id"],
+                canonical_url=direct["url"],
+                source_class="official_or_primary",
+                source_family_id=f"source-family-{context['leaf_id']}-official",
+                claim_family_id=f"claim-family-{context['leaf_id']}-official",
+            )
+            official["deterministic_source_class_proof"] = True
+            official["source_class_resolution_method"] = "manual_fixture"
+            secondary = self._evidence(
+                context,
+                attempt_ref=search_attempt["attempt_id"],
+                canonical_url=f"https://independent.example/{context['leaf_id']}",
+                source_class="independent_secondary",
+                source_family_id=f"source-family-{context['leaf_id']}-secondary",
+                claim_family_id=f"claim-family-{context['leaf_id']}-secondary",
+            )
+            for offset, evidence in enumerate([official, secondary]):
+                chunk = build_evidence_chunk(
+                    evidence_ref=evidence["evidence_ref"],
+                    content_artifact_ref=f"artifact:browser-capture/{index}-{offset}",
+                    chunk_index=0,
+                    char_start=0,
+                    char_end=32,
+                    text=f"Bounded browser evidence for {context['leaf_id']} {offset}",
+                )
+                span = build_evidence_span(
+                    chunk_ref=chunk["chunk_ref"],
+                    char_start=0,
+                    char_end=16,
+                    text="Bounded browser",
+                )
+                evidence["chunk_refs"] = [chunk["chunk_ref"]]
+                chunks.append(chunk)
+                spans.append(span)
+            selected.extend([official, secondary])
+
+        packet = build_retrieval_packet(
+            self.qdt,
+            evidence_packet=self.evidence_packet,
+            selected_evidence=selected,
+            question_decomposition_artifact_id="artifact:qdt-1",
+            policy_context_ref="artifact:profile-1",
+            live_retrieval_allowlist=["browser"],
+        )
+        packet["browser_retrieval_attempts"] = browser_attempts
+        packet["evidence_chunks"] = chunks
+        packet["evidence_spans"] = spans
+        for result in packet["leaf_retrieval_results"]:
+            result["browser_retrieval_attempt_refs"] = attempt_refs_by_leaf[result["leaf_id"]]
+
+        finalized = finalize_retrieval_packet_for_dispatch(packet)
+        assignments = build_leaf_research_assignments(qdt=self.qdt, retrieval_packet=finalized)
+
+        diagnostic = finalized["browser_search_provider_diagnostics"][0]
+        self.assertEqual(diagnostic["provider_id"], "openclaw_web_fetch_browser")
+        self.assertFalse(diagnostic["news_feed_api_enabled"])
+        self.assertEqual(diagnostic["direct_url_priority"], "official_or_resolution_urls_first")
+        self.assertIn("direct_url", diagnostic["capabilities"])
+        self.assertIn("web_search", diagnostic["capabilities"])
+        self.assertTrue(
+            all(attempt["news_feed_api_enabled"] is False for attempt in finalized["browser_retrieval_attempts"])
+        )
+        self.assertEqual(
+            [attempt["navigation_mode"] for attempt in finalized["browser_retrieval_attempts"][:2]],
+            ["direct_url", "web_search"],
+        )
+        self.assertTrue(
+            all(item["retrieval_transport"] == "browser" for item in finalized["retrieval_evidence_provenance_slices"])
+        )
+        transports = [
+            item["retrieval_transport"]
+            for item in finalized["retrieval_evidence_provenance_slices"]
+        ]
+        self.assertNotIn("structured_feed", transports)
+        self.assertTrue(all(result["evidence_chunk_refs"] for result in finalized["leaf_retrieval_results"]))
+        self.assertTrue(
+            all(
+                resolution["accepted_metadata_authority"] == "deterministic_source_metadata_resolver"
+                and resolution["counts_toward_breadth"]
+                for resolution in finalized["source_metadata_resolutions"]
+            )
+        )
+        self.assertTrue(finalized["leaf_research_sufficiency_certificates"])
+        self.assertEqual(finalized["research_sufficiency_summary"]["classification_dispatch_status"], "allowed")
+        self.assertEqual(len(assignments), len(self.qdt["required_leaf_questions"]))
+        self.assertTrue(all(assignment["assigned_evidence_refs"] for assignment in assignments))
 
     def test_ret_008_missing_certificate_rejects_allowed_dispatch_status(self) -> None:
         packet = self._certifiable_packet()
