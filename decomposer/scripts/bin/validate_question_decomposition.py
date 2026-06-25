@@ -25,10 +25,20 @@ def main() -> int:
         action="store_true",
         help="Validate a candidate before final selection audit fields are written.",
     )
+    parser.add_argument(
+        "--evidence-packet",
+        type=Path,
+        help="Optional evidence packet JSON for digest and required-purpose structural checks.",
+    )
     args = parser.parse_args()
 
     artifact = load_question_decomposition(args.path)
-    result = validate_question_decomposition(artifact, require_selected=not args.candidate)
+    evidence_packet = load_question_decomposition(args.evidence_packet) if args.evidence_packet else None
+    result = validate_question_decomposition(
+        artifact,
+        require_selected=not args.candidate,
+        evidence_packet=evidence_packet,
+    )
     print(canonical_json(result.to_dict()))
     return 0 if result.valid else 1
 

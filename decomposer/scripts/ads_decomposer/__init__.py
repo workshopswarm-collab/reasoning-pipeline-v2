@@ -17,6 +17,7 @@ from .qdt import (
     build_qdt_candidate,
     build_research_sufficiency_requirements,
     select_qdt_candidate,
+    validate_qdt_structure,
     validate_question_decomposition,
 )
 
@@ -35,5 +36,6 @@ __all__ = [
     "resolve_decomposer_model_lane",
     "select_qdt_candidate",
     "validate_decomposer_handoff",
+    "validate_qdt_structure",
     "validate_question_decomposition",
 ]

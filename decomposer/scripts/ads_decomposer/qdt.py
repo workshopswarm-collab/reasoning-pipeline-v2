@@ -1,4 +1,4 @@
-"""QDT schema and deterministic candidate-selection helpers."""
+"""QDT schema, deterministic selection, and no-LLM structural validation helpers."""
 
 from __future__ import annotations
 
@@ -69,6 +69,13 @@ ALLOWED_SOURCE_CLASSES = {
     "public_record",
 }
 ALLOWED_TARGET_ANSWERABILITY = {"high_confidence_or_structurally_unanswerable"}
+ALLOWED_ANSWERABILITY_STATUSES = {"answerable", "unanswerable_policy_candidate"}
+ALLOWED_UNANSWERABLE_POLICY_CONSEQUENCES = {
+    "requires_unanswerability_proof_before_dispatch",
+    "block_classification_until_sufficiency_certificate",
+}
+CONDITION_SCOPES_REQUIRING_ANCHOR_CONTRACT = {"target_given_upstream", "target_given_not_upstream"}
+APPROVED_WAIVER_STATUS = "approved"
 ALLOWED_RELATED_CONTEXT_USAGE_STATUS = {
     "related_context_used",
     "no_related_context_waiver",
@@ -186,6 +193,54 @@ def _non_negative_int(value: Any) -> bool:
 
 def _positive_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _has_approved_waiver(summary: Any, field: str) -> bool:
+    if not isinstance(summary, dict):
+        return False
+    waiver = summary.get(field)
+    return isinstance(waiver, dict) and waiver.get("waiver_status") == APPROVED_WAIVER_STATUS
+
+
+def _extract_string_list(value: Any) -> list[str] | None:
+    if isinstance(value, list) and all(_is_non_empty_string(item) for item in value):
+        return list(value)
+    return None
+
+
+def _required_purposes_from_evidence_packet(evidence_packet: dict[str, Any] | None) -> list[str] | None:
+    if not isinstance(evidence_packet, dict):
+        return None
+    candidates = [
+        evidence_packet.get("required_evidence_purposes"),
+        evidence_packet.get("required_research_purposes"),
+    ]
+    for container_key in ("decomposition_requirements", "market_reality_constraints"):
+        container = evidence_packet.get(container_key)
+        if isinstance(container, dict):
+            candidates.extend(
+                [
+                    container.get("required_evidence_purposes"),
+                    container.get("required_research_purposes"),
+                    container.get("required_purposes"),
+                ]
+            )
+    for candidate in candidates:
+        purposes = _extract_string_list(candidate)
+        if purposes is not None:
+            return sorted(set(purposes))
+    return None
+
+
+def _market_reality_constraints_digest_from_evidence_packet(evidence_packet: dict[str, Any] | None) -> str | None:
+    if not isinstance(evidence_packet, dict):
+        return None
+    digest = evidence_packet.get("market_reality_constraints_digest")
+    if _is_non_empty_string(digest):
+        return str(digest)
+    if "market_reality_constraints" in evidence_packet:
+        return _prefixed_sha256(evidence_packet.get("market_reality_constraints") or {})
+    return None
 
 
 def _reject_forbidden_qdt_keys(value: Any, errors: list[str], path: str = "qdt") -> None:
@@ -375,7 +430,7 @@ def build_fixture_qdt_candidate(
             "leaf_condition_scope": "unconditional",
             "required_evidence_fields": ["official_status", "resolution_criteria"],
             "market_component_terms": ["resolution", "official source"],
-            "structural_validation": {"depth": 2, "schema_only_status": "pending_qdt_003"},
+            "structural_validation": {"depth": 2, "answerability_status": "answerable"},
         },
         {
             "leaf_id": "leaf-direct-evidence",
@@ -390,7 +445,7 @@ def build_fixture_qdt_candidate(
             "leaf_condition_scope": "unconditional",
             "required_evidence_fields": ["event_status", "event_timestamp"],
             "market_component_terms": ["event", "cutoff"],
-            "structural_validation": {"depth": 2, "schema_only_status": "pending_qdt_003"},
+            "structural_validation": {"depth": 2, "answerability_status": "answerable"},
         },
     ]
     branches = [
@@ -402,7 +457,7 @@ def build_fixture_qdt_candidate(
             "required_evidence_purposes": ["direct_evidence", "source_of_truth"],
             "leaf_ids": ["leaf-source-of-truth", "leaf-direct-evidence"],
             "amrg_usage_refs": [],
-            "structural_validation": {"depth": 1, "schema_only_status": "pending_qdt_003"},
+            "structural_validation": {"depth": 1},
         }
     ]
     if include_resolution_leaf:
@@ -420,7 +475,7 @@ def build_fixture_qdt_candidate(
                 "leaf_condition_scope": "shared_context",
                 "required_evidence_fields": ["resolution_deadline", "rules_text"],
                 "market_component_terms": ["rules", "deadline"],
-                "structural_validation": {"depth": 2, "schema_only_status": "pending_qdt_003"},
+                "structural_validation": {"depth": 2, "answerability_status": "answerable"},
             }
         )
         branches.append(
@@ -432,7 +487,7 @@ def build_fixture_qdt_candidate(
                 "required_evidence_purposes": ["resolution_mechanics"],
                 "leaf_ids": ["leaf-resolution-mechanics"],
                 "amrg_usage_refs": [],
-                "structural_validation": {"depth": 1, "schema_only_status": "pending_qdt_003"},
+                "structural_validation": {"depth": 1},
             }
         )
     leaf_budget = build_leaf_budget_decision(
@@ -496,7 +551,7 @@ def _validate_leaf_budget(decision: Any, leaf_count: int, errors: list[str]) -> 
         errors.append("leaf_budget_decision.budget_audit.selected_leaf_count must equal leaf count")
 
 
-def _validate_branches(branches: Any, errors: list[str]) -> dict[str, dict[str, Any]]:
+def _validate_branches(branches: Any, errors: list[str], *, depth_waived: bool) -> dict[str, dict[str, Any]]:
     if not isinstance(branches, list) or not branches:
         errors.append("branches must be a non-empty list")
         return {}
@@ -525,8 +580,8 @@ def _validate_branches(branches: Any, errors: list[str]) -> dict[str, dict[str, 
         if branch_id in indexed:
             errors.append(f"{path}.branch_id is duplicated")
         indexed[branch_id] = branch
-        if "branches" in branch or "child_branches" in branch or "children" in branch:
-            errors.append(f"{path} must not contain nested branches")
+        if any(key in branch for key in ("branches", "child_branches", "children")) and not depth_waived:
+            errors.append(f"{path} invalid_depth: nested branches require approved depth waiver")
         if not _is_non_empty_string(branch.get("branch_question")):
             errors.append(f"{path}.branch_question is required")
         if not _is_non_empty_string(branch.get("branch_role")):
@@ -544,8 +599,11 @@ def _validate_branches(branches: Any, errors: list[str]) -> dict[str, dict[str, 
             errors.append(f"{path}.leaf_ids must contain leaf-* IDs")
         if not isinstance(branch.get("amrg_usage_refs"), list):
             errors.append(f"{path}.amrg_usage_refs must be a list")
-        if not isinstance(branch.get("structural_validation"), dict):
+        structural = branch.get("structural_validation")
+        if not isinstance(structural, dict):
             errors.append(f"{path}.structural_validation must be an object")
+        elif structural.get("depth") != 1 and not depth_waived:
+            errors.append(f"{path}.structural_validation.depth invalid_depth: branch depth must equal 1")
     return indexed
 
 
@@ -600,6 +658,34 @@ def _validate_sufficiency(requirements: Any, leaf: dict[str, Any], path: str, er
         requirements.get("protected_primary_required") or requirements.get("unanswerability_proof_required")
     ):
         errors.append(f"{path} critical/source-of-truth leaves require protected primary or unanswerability proof")
+    if critical_or_source and requirements.get("allow_macro_fallback_for_leaf") is True:
+        errors.append(f"{path} critical/source-of-truth leaves cannot allow macro fallback as sufficient research")
+
+
+def _validate_leaf_structural_validation(
+    structural: Any,
+    requirements: Any,
+    path: str,
+    errors: list[str],
+    *,
+    depth_waived: bool,
+) -> None:
+    if not isinstance(structural, dict):
+        errors.append(f"{path}.structural_validation must be an object")
+        return
+    if structural.get("depth") != 2 and not depth_waived:
+        errors.append(f"{path}.structural_validation.depth invalid_depth: leaf depth must equal 2")
+    answerability = structural.get("answerability_status")
+    if answerability not in ALLOWED_ANSWERABILITY_STATUSES:
+        errors.append(f"{path}.structural_validation.answerability_status is required")
+        return
+    if answerability != "unanswerable_policy_candidate":
+        return
+    consequence = structural.get("unanswerable_policy_consequence")
+    if consequence not in ALLOWED_UNANSWERABLE_POLICY_CONSEQUENCES:
+        errors.append(f"{path}.structural_validation.unanswerable_policy_consequence is required")
+    if not isinstance(requirements, dict) or requirements.get("unanswerability_proof_required") is not True:
+        errors.append(f"{path}.structural_validation unanswerable policy candidates require proof before dispatch")
 
 
 def _validate_leaves(
@@ -607,6 +693,8 @@ def _validate_leaves(
     branches_by_id: dict[str, dict[str, Any]],
     top_level_purposes: Any,
     errors: list[str],
+    *,
+    depth_waived: bool,
 ) -> dict[str, dict[str, Any]]:
     if not isinstance(leaves, list) or not leaves:
         errors.append("required_leaf_questions must be a non-empty list")
@@ -653,8 +741,15 @@ def _validate_leaves(
             errors.append(f"{path}.required_evidence_fields must be a string list")
         if not _string_list(leaf.get("market_component_terms")):
             errors.append(f"{path}.market_component_terms must be a string list")
-        if not isinstance(leaf.get("structural_validation"), dict):
-            errors.append(f"{path}.structural_validation must be an object")
+        if any(key in leaf for key in ("branches", "child_branches", "children", "required_leaf_questions")) and not depth_waived:
+            errors.append(f"{path} invalid_depth: leaves must not contain child decomposition nodes")
+        _validate_leaf_structural_validation(
+            leaf.get("structural_validation"),
+            leaf.get("research_sufficiency_requirements"),
+            path,
+            errors,
+            depth_waived=depth_waived,
+        )
         _validate_sufficiency(leaf.get("research_sufficiency_requirements"), leaf, path, errors)
 
     for branch_id, branch in branches_by_id.items():
@@ -713,6 +808,62 @@ def _validate_amrg_contracts(value: Any, leaf_ids: set[str], errors: list[str]) 
             errors.append(f"{path}.required_before_leaf_ids must be a list")
         elif not set(contract["required_before_leaf_ids"]).issubset(leaf_ids):
             errors.append(f"{path}.required_before_leaf_ids references unknown leaves")
+        condition_scoped = contract.get("condition_scoped_leaf_ids")
+        if condition_scoped is not None:
+            if not isinstance(condition_scoped, list):
+                errors.append(f"{path}.condition_scoped_leaf_ids must be a list")
+            elif not set(condition_scoped).issubset(leaf_ids):
+                errors.append(f"{path}.condition_scoped_leaf_ids references unknown leaves")
+
+
+def _validate_condition_scope_contracts(
+    leaves_by_id: dict[str, dict[str, Any]],
+    contracts: Any,
+    errors: list[str],
+) -> None:
+    if not isinstance(contracts, list):
+        return
+    contracted_leaf_ids: set[str] = set()
+    for contract in contracts:
+        if not isinstance(contract, dict):
+            continue
+        for field in ("condition_scoped_leaf_ids", "required_before_leaf_ids"):
+            values = contract.get(field)
+            if isinstance(values, list):
+                contracted_leaf_ids.update(item for item in values if isinstance(item, str))
+    for leaf_id, leaf in leaves_by_id.items():
+        scope = leaf.get("leaf_condition_scope")
+        if scope in CONDITION_SCOPES_REQUIRING_ANCHOR_CONTRACT and leaf_id not in contracted_leaf_ids:
+            errors.append(
+                f"required_leaf_questions[{leaf_id}].leaf_condition_scope requires valid anchor contract"
+            )
+
+
+def _validate_required_purpose_coverage(
+    artifact: dict[str, Any],
+    leaves_by_id: dict[str, dict[str, Any]],
+    evidence_packet: dict[str, Any] | None,
+    errors: list[str],
+) -> None:
+    required = _required_purposes_from_evidence_packet(evidence_packet)
+    if required is None:
+        return
+    observed = sorted({leaf.get("purpose") for leaf in leaves_by_id.values() if leaf.get("purpose")})
+    missing = sorted(set(required) - set(observed))
+    if missing and not _has_approved_waiver(artifact.get("validation_summary"), "purpose_coverage_waiver"):
+        errors.append("required_purpose_coverage_missing: " + ", ".join(missing))
+
+
+def _validate_market_reality_digest(
+    artifact: dict[str, Any],
+    evidence_packet: dict[str, Any] | None,
+    errors: list[str],
+) -> None:
+    expected = _market_reality_constraints_digest_from_evidence_packet(evidence_packet)
+    if expected is None:
+        return
+    if artifact.get("market_reality_constraints_digest") != expected:
+        errors.append("market_reality_constraints_digest does not match evidence packet")
 
 
 def _validate_model_context(value: Any, errors: list[str]) -> None:
@@ -795,6 +946,7 @@ def validate_question_decomposition(
     artifact: dict[str, Any],
     *,
     require_selected: bool = True,
+    evidence_packet: dict[str, Any] | None = None,
 ) -> QDTValidationResult:
     errors: list[str] = []
     warnings: list[str] = []
@@ -816,13 +968,17 @@ def validate_question_decomposition(
     digest = artifact.get("market_reality_constraints_digest")
     if not _is_non_empty_string(digest) or not str(digest).startswith("sha256:"):
         errors.append("market_reality_constraints_digest must be sha256-prefixed")
-    branches_by_id = _validate_branches(artifact.get("branches"), errors)
+    _validate_market_reality_digest(artifact, evidence_packet, errors)
+    depth_waived = _has_approved_waiver(artifact.get("validation_summary"), "depth_waiver")
+    branches_by_id = _validate_branches(artifact.get("branches"), errors, depth_waived=depth_waived)
     leaves_by_id = _validate_leaves(
         artifact.get("required_leaf_questions"),
         branches_by_id,
         artifact.get("required_evidence_purposes"),
         errors,
+        depth_waived=depth_waived,
     )
+    _validate_required_purpose_coverage(artifact, leaves_by_id, evidence_packet, errors)
     _validate_leaf_budget(
         artifact.get("leaf_budget_decision"),
         len(artifact.get("required_leaf_questions") or []),
@@ -830,6 +986,7 @@ def validate_question_decomposition(
     )
     _validate_related_context_usage(artifact.get("related_market_context_usage"), errors)
     _validate_amrg_contracts(artifact.get("amrg_anchor_dependency_contracts"), set(leaves_by_id), errors)
+    _validate_condition_scope_contracts(leaves_by_id, artifact.get("amrg_anchor_dependency_contracts"), errors)
     _validate_model_context(artifact.get("model_execution_context"), errors)
     _validate_candidate_selection_audit(
         artifact.get("candidate_selection_audit"),
@@ -842,8 +999,30 @@ def validate_question_decomposition(
     return QDTValidationResult(not errors, tuple(errors), tuple(warnings))
 
 
-def require_valid_question_decomposition(artifact: dict[str, Any], *, require_selected: bool = True) -> None:
-    result = validate_question_decomposition(artifact, require_selected=require_selected)
+def validate_qdt_structure(
+    artifact: dict[str, Any],
+    evidence_packet: dict[str, Any] | None = None,
+    *,
+    require_selected: bool = True,
+) -> QDTValidationResult:
+    return validate_question_decomposition(
+        artifact,
+        require_selected=require_selected,
+        evidence_packet=evidence_packet,
+    )
+
+
+def require_valid_question_decomposition(
+    artifact: dict[str, Any],
+    *,
+    require_selected: bool = True,
+    evidence_packet: dict[str, Any] | None = None,
+) -> None:
+    result = validate_question_decomposition(
+        artifact,
+        require_selected=require_selected,
+        evidence_packet=evidence_packet,
+    )
     if not result.valid:
         raise QDTError("; ".join(result.errors))
 
@@ -912,6 +1091,7 @@ def select_qdt_candidate(candidates: list[dict[str, Any]]) -> dict[str, Any]:
         "reason_codes": [
             "question_decomposition_schema_valid",
             "depth_2_branch_leaf_contract_present",
+            "deterministic_structural_validation_passed",
             "research_sufficiency_requirement_fields_present",
             "model_provenance_fields_present",
             "forbidden_output_check_passed",

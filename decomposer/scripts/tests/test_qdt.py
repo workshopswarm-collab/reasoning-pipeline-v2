@@ -87,10 +87,73 @@ class QDTContractTest(unittest.TestCase):
             self.assertIn(leaf["parent_branch_id"], branch_ids)
             self.assertIn("leaf_dependency_group_id", leaf)
             self.assertIn("research_sufficiency_requirements", leaf)
+            self.assertEqual(leaf["structural_validation"]["answerability_status"], "answerable")
         model_context = selected["model_execution_context"]
         self.assertEqual(model_context["resolved_model_id"], DECOMPOSER_MODEL_ID)
         self.assertEqual(model_context["output_schema_version"], "question-decomposition/v1")
         self.assertTrue(model_context["prompt_template_sha256"].startswith("sha256:"))
+
+    def test_depth_three_tree_is_rejected_without_waiver(self):
+        selected = select_qdt_candidate([build_fixture_qdt_candidate(self.handoff)])
+        broken = copy.deepcopy(selected)
+        broken["branches"][0]["child_branches"] = [{"branch_id": "branch-nested"}]
+        broken["required_leaf_questions"][0]["structural_validation"]["depth"] = 3
+
+        result = validate_question_decomposition(broken)
+
+        self.assertFalse(result.valid)
+        self.assertIn("invalid_depth", "; ".join(result.errors))
+
+    def test_missing_required_purpose_from_evidence_packet_is_rejected_or_policy_waived(self):
+        selected = select_qdt_candidate([build_fixture_qdt_candidate(self.handoff)])
+        evidence_packet = {
+            "market_reality_constraints_digest": selected["market_reality_constraints_digest"],
+            "required_evidence_purposes": ["direct_evidence", "source_of_truth", "catalyst"],
+        }
+
+        result = validate_question_decomposition(selected, evidence_packet=evidence_packet)
+
+        self.assertFalse(result.valid)
+        self.assertIn("required_purpose_coverage_missing", "; ".join(result.errors))
+
+        waived = copy.deepcopy(selected)
+        waived["validation_summary"]["purpose_coverage_waiver"] = {"waiver_status": "approved"}
+        self.assertTrue(validate_question_decomposition(waived, evidence_packet=evidence_packet).valid)
+
+    def test_market_reality_constraints_digest_must_match_evidence_packet(self):
+        selected = select_qdt_candidate([build_fixture_qdt_candidate(self.handoff)])
+        evidence_packet = {"market_reality_constraints_digest": "sha256:" + "9" * 64}
+
+        result = validate_question_decomposition(selected, evidence_packet=evidence_packet)
+
+        self.assertFalse(result.valid)
+        self.assertIn("market_reality_constraints_digest", "; ".join(result.errors))
+
+    def test_invalid_condition_scoped_leaf_requires_anchor_contract(self):
+        selected = select_qdt_candidate([build_fixture_qdt_candidate(self.handoff)])
+        broken = copy.deepcopy(selected)
+        broken["required_leaf_questions"][1]["leaf_condition_scope"] = "target_given_upstream"
+
+        result = validate_question_decomposition(broken)
+
+        self.assertFalse(result.valid)
+        self.assertIn("requires valid anchor contract", "; ".join(result.errors))
+
+    def test_condition_scoped_leaf_accepts_valid_anchor_contract_ref(self):
+        selected = select_qdt_candidate([build_fixture_qdt_candidate(self.handoff)])
+        scoped = copy.deepcopy(selected)
+        leaf_id = scoped["required_leaf_questions"][1]["leaf_id"]
+        scoped["required_leaf_questions"][1]["leaf_condition_scope"] = "target_given_upstream"
+        scoped["amrg_anchor_dependency_contracts"] = [
+            {
+                "contract_id": "anchor-contract-1",
+                "related_market_ref": "artifact:amrg-1",
+                "anchor_role": "anchor_required",
+                "required_before_leaf_ids": [leaf_id],
+            }
+        ]
+
+        self.assertTrue(validate_question_decomposition(scoped).valid)
 
     def test_critical_or_source_of_truth_leaf_requires_primary_or_unanswerability_path(self):
         selected = select_qdt_candidate([build_fixture_qdt_candidate(self.handoff)])
@@ -107,6 +170,47 @@ class QDTContractTest(unittest.TestCase):
         result = validate_question_decomposition(broken)
         self.assertFalse(result.valid)
         self.assertIn("critical/source-of-truth", "; ".join(result.errors))
+
+    def test_unanswerable_critical_leaf_requires_explicit_policy_consequence(self):
+        selected = select_qdt_candidate([build_fixture_qdt_candidate(self.handoff)])
+        broken = copy.deepcopy(selected)
+        broken["required_leaf_questions"][0]["structural_validation"] = {
+            "depth": 2,
+            "answerability_status": "unanswerable_policy_candidate",
+        }
+
+        result = validate_question_decomposition(broken)
+
+        self.assertFalse(result.valid)
+        self.assertIn("unanswerable_policy_consequence", "; ".join(result.errors))
+
+        fixed = copy.deepcopy(broken)
+        fixed["required_leaf_questions"][0]["structural_validation"][
+            "unanswerable_policy_consequence"
+        ] = "requires_unanswerability_proof_before_dispatch"
+        self.assertTrue(validate_question_decomposition(fixed).valid)
+
+    def test_missing_research_sufficiency_requirements_are_rejected(self):
+        selected = select_qdt_candidate([build_fixture_qdt_candidate(self.handoff)])
+        broken = copy.deepcopy(selected)
+        del broken["required_leaf_questions"][1]["research_sufficiency_requirements"]
+
+        result = validate_question_decomposition(broken)
+
+        self.assertFalse(result.valid)
+        self.assertIn("research_sufficiency_requirements", "; ".join(result.errors))
+
+    def test_critical_leaf_cannot_allow_macro_fallback_as_sufficient_research(self):
+        selected = select_qdt_candidate([build_fixture_qdt_candidate(self.handoff)])
+        broken = copy.deepcopy(selected)
+        broken["required_leaf_questions"][0]["research_sufficiency_requirements"][
+            "allow_macro_fallback_for_leaf"
+        ] = True
+
+        result = validate_question_decomposition(broken)
+
+        self.assertFalse(result.valid)
+        self.assertIn("macro fallback", "; ".join(result.errors))
 
     def test_schema_rejects_prose_only_leaf_without_machine_fields(self):
         selected = select_qdt_candidate([build_fixture_qdt_candidate(self.handoff)])
@@ -188,6 +292,34 @@ class QDTContractTest(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr + completed.stdout)
         summary = json.loads(completed.stdout)
         self.assertTrue(summary["valid"])
+
+    def test_cli_rejects_evidence_packet_digest_mismatch(self):
+        selected = select_qdt_candidate([build_fixture_qdt_candidate(self.handoff)])
+        with tempfile.TemporaryDirectory() as temp:
+            qdt_path = Path(temp) / "question-decomposition.json"
+            evidence_path = Path(temp) / "evidence-packet.json"
+            qdt_path.write_text(dump_question_decomposition(selected), encoding="utf-8")
+            evidence_path.write_text(
+                json.dumps({"market_reality_constraints_digest": "sha256:" + "8" * 64}),
+                encoding="utf-8",
+            )
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "decomposer" / "scripts" / "bin" / "validate_question_decomposition.py"),
+                    str(qdt_path),
+                    "--evidence-packet",
+                    str(evidence_path),
+                ],
+                check=False,
+                text=True,
+                capture_output=True,
+            )
+
+        self.assertEqual(completed.returncode, 1, completed.stdout)
+        summary = json.loads(completed.stdout)
+        self.assertFalse(summary["valid"])
 
     def test_leaf_budget_helper_records_audit_fields(self):
         decision = build_leaf_budget_decision(
