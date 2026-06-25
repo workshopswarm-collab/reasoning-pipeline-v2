@@ -15,6 +15,7 @@ from predquant.ads_case_selector import (
     CaseLeaseRefused,
     CaseSelectionPolicy,
     acquire_case_lease,
+    read_case_lease,
     select_eligible_case,
 )
 from predquant.ads_pipeline_control import (
@@ -25,10 +26,14 @@ from predquant.ads_pipeline_control import (
     set_pipeline_enabled,
 )
 from predquant.ads_pipeline_runner import (
+    ADS_PIPELINE_STAGE_ORDER,
     DEFAULT_DISABLE_ACTION,
     PipelineRunnerPolicy,
+    TERMINAL_REASON_STOP_AFTER_CURRENT,
     build_pipeline_run,
+    read_pipeline_control_state,
     read_pipeline_stop_signal,
+    read_pipeline_run,
     run_ads_pipeline_loop,
     write_pipeline_run,
 )
@@ -54,7 +59,7 @@ class AdsPipelineControlTest(unittest.TestCase):
     def tearDown(self):
         self.conn.close()
 
-    def initialize_intake_case(self):
+    def initialize_intake_case(self, external_market_id="poly-auto006"):
         self.conn.executescript(SCHEMA)
         market_id = self.conn.execute(
             """
@@ -66,7 +71,7 @@ class AdsPipelineControlTest(unittest.TestCase):
             """,
             (
                 "polymarket",
-                "poly-auto006",
+                external_market_id,
                 "auto006-fixture",
                 "Will the AUTO-006 fixture pass?",
                 "Fixture description",
@@ -100,6 +105,7 @@ class AdsPipelineControlTest(unittest.TestCase):
                 json.dumps({"source": "fixture"}, sort_keys=True),
             ),
         )
+        return int(market_id)
 
     def create_pipeline_run(self) -> str:
         record = build_pipeline_run(
@@ -211,6 +217,81 @@ class AdsPipelineControlTest(unittest.TestCase):
         self.assertEqual(stored_signal["signal_status"], "pending")
         self.assertEqual(stored_signal["stop_policy"], "stop_after_current_case")
         self.assertEqual(stored_signal["metadata"], {"scope": "AUTO-004"})
+
+    def test_manual_stop_after_current_during_active_run_acknowledges_and_blocks_next_lease(self):
+        self.initialize_intake_case("poly-auto006-stop-a")
+        self.initialize_intake_case("poly-auto006-stop-b")
+        set_pipeline_enabled(
+            self.conn,
+            pipeline_enabled=True,
+            updated_by="fixture",
+            reason="unit test enables FIX-041 fixture",
+            desired_runner_mode="fixture",
+        )
+        calls = []
+
+        def make_handler(stage):
+            def handler(**kwargs):
+                lease = kwargs["lease"]
+                calls.append((lease["case_key"], stage))
+                result = {
+                    "output_artifact_refs": [f"artifact:{stage}:{lease['case_id']}"],
+                    "validation_result_refs": [f"validation:{stage}:{lease['case_id']}"],
+                    "safe_metadata": {"stage": stage, "handler_scope": "FIX-041"},
+                }
+                if stage == "decision":
+                    result["forecast_decision_record_id"] = f"forecast-decision:fix041:{lease['case_id']}"
+                    request_pipeline_stop(
+                        kwargs["conn"],
+                        stop_policy="stop_after_current_case",
+                        requested_by="fixture",
+                        reason="FIX-041 stops after active case",
+                        pipeline_run_id=kwargs["context"].pipeline_run_id,
+                        metadata={"scope": "FIX-041"},
+                    )
+                return result
+
+            return handler
+
+        result = run_ads_pipeline_loop(
+            self.conn,
+            PipelineRunnerPolicy(
+                runner_mode="fixture",
+                allow_downstream_execution=True,
+                allow_forecast_persistence=True,
+                max_cases=2,
+            ),
+            downstream_stage_handlers={stage: make_handler(stage) for stage in ADS_PIPELINE_STAGE_ORDER[1:]},
+            case_selection_policy=CaseSelectionPolicy(
+                forecast_timestamp="2026-06-24T18:00:00+00:00",
+                lease_duration_seconds=900,
+                metadata={"test_scope": "FIX-041"},
+            ),
+        )
+
+        self.assertEqual(result.terminal_status, TERMINAL_REASON_STOP_AFTER_CURRENT)
+        self.assertEqual(len({case_key for case_key, _ in calls}), 1)
+
+        run = read_pipeline_run(self.conn, result.pipeline_run_id)
+        self.assertEqual(run["metadata"]["processed_case_count"], 1)
+        self.assertEqual(len(run["metadata"]["completed_case_lease_ids"]), 1)
+        self.assertIsNone(run["active_case_lease_id"])
+
+        lease = read_case_lease(self.conn, result.case_lease_id)
+        self.assertEqual(lease["lease_status"], "released")
+        self.assertEqual(lease["release_reason"], "auto004_stop_after_current_case")
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) FROM ads_case_leases WHERE lease_status = 'leased'").fetchone()[0],
+            0,
+        )
+
+        control = read_pipeline_control_state(self.conn)
+        self.assertFalse(control["pipeline_enabled"])
+        self.assertEqual(control["acknowledged_by_run_id"], result.pipeline_run_id)
+        signal = read_pipeline_stop_signal(self.conn, control["metadata"]["stop_signal"]["stop_signal_id"])
+        self.assertEqual(signal["signal_status"], "acknowledged")
+        self.assertEqual(signal["acknowledged_by_run_id"], result.pipeline_run_id)
+        self.assertEqual(signal["stop_policy"], "stop_after_current_case")
 
     def test_set_and_get_cli_helpers_share_durable_state(self):
         set_cli = load_bin_module("set_ads_pipeline_enabled")
