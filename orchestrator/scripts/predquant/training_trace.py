@@ -10,6 +10,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .model_provenance_trace import ModelProvenanceTraceError, build_model_provenance_trace
+
 
 TRAINING_TRACE_MINIMAL_TABLE = "training_trace_minimal_pointers"
 TRAINING_TRACE_MINIMAL_SCHEMA_VERSION = "training-trace-minimal-pointer/v1"
@@ -281,6 +283,7 @@ def build_session5_minimal_training_trace(
     trace_id: str | None = None,
     created_at: str | None = None,
     metadata: dict[str, Any] | None = None,
+    model_execution_contexts: list[dict[str, Any]] | tuple[dict[str, Any], ...] | None = None,
 ) -> dict[str, Any]:
     role_refs = session5_artifact_role_refs(artifact_manifests)
     base_metadata = ensure_safe_metadata(metadata)
@@ -296,6 +299,13 @@ def build_session5_minimal_training_trace(
             "no_replay_scoring_or_calibration_writes": True,
         }
     }
+    if model_execution_contexts is not None:
+        try:
+            trace_metadata["model_provenance_trace"] = build_model_provenance_trace(
+                model_execution_contexts=model_execution_contexts
+            )
+        except ModelProvenanceTraceError as exc:
+            raise TrainingTraceContractError(str(exc)) from exc
     if base_metadata:
         trace_metadata["caller_metadata"] = base_metadata
     return build_minimal_training_trace(
@@ -315,6 +325,7 @@ def write_session5_minimal_training_trace(
     trace_id: str | None = None,
     created_at: str | None = None,
     metadata: dict[str, Any] | None = None,
+    model_execution_contexts: list[dict[str, Any]] | tuple[dict[str, Any], ...] | None = None,
 ) -> str:
     trace = build_session5_minimal_training_trace(
         context=context,
@@ -322,6 +333,7 @@ def write_session5_minimal_training_trace(
         trace_id=trace_id,
         created_at=created_at,
         metadata=metadata,
+        model_execution_contexts=model_execution_contexts,
     )
     return write_minimal_training_trace(conn, trace)
 

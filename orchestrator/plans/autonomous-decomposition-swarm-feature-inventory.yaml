@@ -278,7 +278,7 @@
     {"id": "CAL-003", "stage": "autonomous_optimization_maturity", "owner": "Session 6", "status": "not_started", "dependencies": ["CAL-002", "RET-003"]},
     {"id": "CAL-004", "stage": "autonomous_optimization_maturity", "owner": "Session 6", "status": "not_started", "dependencies": ["CAL-002", "QDT-003", "DEC-001"]},
     {"id": "CAL-005", "stage": "autonomous_optimization_maturity", "owner": "Session 6", "status": "not_started", "dependencies": ["CAL-002", "CAL-003", "CAL-004"]},
-    {"id": "MODEL-004", "stage": "v2_live_cutover", "owner": "Session 5", "status": "not_started", "dependencies": ["MODEL-002", "MODEL-003", "TRACE-001"]}
+    {"id": "MODEL-004", "stage": "v2_live_cutover", "owner": "Session 5", "status": "ready_for_integration", "dependencies": ["MODEL-002", "MODEL-003", "TRACE-001"], "acceptance_evidence": "2026-06-25 Session 05 MODEL-004 added deterministic predquant model provenance trace helpers plus optional TRACE-001 metadata wiring for decomposer_qdt_generation and researcher_leaf_nli_classification contexts; tests cover gpt-5.5-high lane/model refs, model policy refs/hashes, prompt sha256 enforcement, input/output artifact hashes, schema versions, MODEL-002/MODEL-003 source provenance, no live authority, no model calls, and no probability authoring."}
   ],
   "migrations": [
     {"id": "MIG-001", "owner": "Session 1", "status": "not_started", "feature_ids": ["FND-003", "FND-004"], "dependencies": ["FND-004"], "write_paths": ["write_artifact_manifest"]},

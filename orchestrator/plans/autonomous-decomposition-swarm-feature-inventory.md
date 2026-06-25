@@ -35,6 +35,7 @@ Status values:
 - `SCAE-001`: ready for integration on 2026-06-24. Session 05 Phase 1 added `/Users/agent2/.openclaw/SCAE/scripts/scae/policy.py`, `/Users/agent2/.openclaw/SCAE/scripts/data/scae-policy.json`, and focused tests covering identity post-ledger calibration defaults, calibration-debt active/cleared production taxonomy, canonical probability aliasing, SCAE-only numeric authority boundaries, cap-stack variables, and decision validity/execution downgrade enforcement.
 - `SCAE-002`: ready for integration on 2026-06-24. Session 05 Phase 2 added `/Users/agent2/.openclaw/SCAE/scripts/scae/prior.py` and focused tests covering valid market-live prior defaulting, validated structural/base-rate fallback, neutral fallback uncertainty flags, rolling microstructure reliability floor/ceiling controls, shrinkage toward structural or neutral targets, public priced-through evidence discounts, and structural/base-rate overlap zero-delta context.
 - `REPLAY-001`: ready for integration on 2026-06-25. Session 05 Phase 10 added `scripts/predquant/replay.py`, `scripts/migrations/009_replay_records.sql`, and focused tests covering first-100 replay manifests sourced only from `TRACE-001` minimal pointers, ref-only replay result records, no live authority, no production forecast writes, no probability replacement, no calibration policy promotion, and protected non-replay tables staying unchanged.
+- `MODEL-004`: ready for integration on 2026-06-25. Session 05 added `scripts/predquant/model_provenance_trace.py` and optional `TRACE-001` metadata wiring for decomposer and researcher `gpt-5.5-high` contexts, covering policy refs/hashes, prompt sha256 enforcement, input/output artifact hashes, schema versions, MODEL-002/MODEL-003 source provenance, no live authority, no model calls, and no probability authoring.
 
 ## Inventory Coordination Contract
 
@@ -206,7 +207,7 @@ These migration groups are the data backbone for replay, scoring, calibration, a
 
 | Feature ID | Stage | Component | Blocking | Owner | Dependencies | Output | Status |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| MODEL-004 | v2_live_cutover | Model provenance trace | cutover_blocker | Session 5 | MODEL-002, MODEL-003, TRACE-001 | Trace resolved model IDs, policy refs, prompt hashes, and schema versions | not_started |
+| MODEL-004 | v2_live_cutover | Model provenance trace | cutover_blocker | Session 5 | MODEL-002, MODEL-003, TRACE-001 | Trace resolved model IDs, policy refs, prompt hashes, artifact hashes, and schema versions | ready_for_integration |
 
 ## First Integration Target
 
