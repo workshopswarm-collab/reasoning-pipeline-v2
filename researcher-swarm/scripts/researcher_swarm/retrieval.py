@@ -9,7 +9,7 @@ import os
 import re
 import sys
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -54,6 +54,10 @@ CLAIM_FAMILY_RESOLUTION_SCHEMA_VERSION = "claim-family-resolution/v1"
 RETRIEVAL_TEMPORAL_ELIGIBILITY_SCHEMA_VERSION = "retrieval-temporal-eligibility/v1"
 RETRIEVAL_EVIDENCE_PROVENANCE_SCHEMA_VERSION = "retrieval-evidence-provenance/v1"
 RETRIEVAL_BREADTH_PROFILE_SCHEMA_VERSION = "retrieval-breadth-profile/v1"
+RETRIEVAL_BREADTH_COVERAGE_SCHEMA_VERSION = "retrieval-breadth-coverage/v1"
+CONTRADICTION_SEARCH_ATTEMPT_SCHEMA_VERSION = "contradiction-search-attempt/v1"
+NEGATIVE_CHECK_ATTEMPT_SCHEMA_VERSION = "negative-check-attempt/v1"
+RETRIEVAL_METADATA_FILL_DIAGNOSTIC_SCHEMA_VERSION = "retrieval-metadata-fill-diagnostic/v1"
 PROTECTED_PRIMARY_ACCESS_FAILURE_SCHEMA_VERSION = "protected-primary-access-failure/v1"
 EXPECTED_SOURCE_MISSINGNESS_CANDIDATE_SCHEMA_VERSION = "expected-source-missingness-candidate/v1"
 RETRIEVAL_EXPANSION_ATTEMPT_SCHEMA_VERSION = "retrieval-expansion-attempt/v1"
@@ -65,6 +69,7 @@ RETRIEVAL_TEMPORAL_VALIDATOR_VERSION = "ads-ret-002-temporal-isolation/v1"
 RETRIEVAL_PROVENANCE_NORMALIZER_VERSION = "ads-ret-004-provenance-normalizer/v1"
 RETRIEVAL_SOURCE_ACCESS_TRACKER_VERSION = "ads-ret-005-source-access-missingness/v1"
 RETRIEVAL_EXPANSION_FALLBACK_VERSION = "ads-ret-006-expansion-fallback/v1"
+RETRIEVAL_BREADTH_EVALUATOR_VERSION = "ads-ret-009-breadth-profile-coverage/v1"
 NATIVE_RESEARCH_RESOLVER_VERSION = "ads-ret-010-native-diagnostic-resolver/v1"
 SOURCE_METADATA_CLASSIFIER_VERSION = "ads-ret-011-source-metadata-classifier/v1"
 OPENCLAW_BROWSER_PROVIDER_ID = "openclaw_web_fetch_browser"
@@ -479,8 +484,9 @@ def build_retrieval_breadth_profile_placeholder(leaf: dict[str, Any]) -> dict[st
         },
         "feature_gate_status": {
             "feature_id": "RET-009",
-            "status": "schema_placeholder_only",
-            "certification_behavior": "not_implemented_in_RET_001",
+            "status": "implemented",
+            "certification_behavior": "breadth_profile_and_coverage_only",
+            "research_sufficiency_certificate_status": "not_started_RET_008",
         },
     }
 
@@ -1678,8 +1684,6 @@ def _resolve_independence_status(
 ) -> str:
     if source_family_id == "source-family-unknown" or not claim_family_ids:
         return "unknown_not_counted"
-    if source_family_status == "syndicated_copy":
-        return "syndicated_copy"
     if seen_claim_family_ids and any(claim_id in seen_claim_family_ids for claim_id in claim_family_ids):
         return "same_claim_family"
     if seen_source_family_ids and source_family_id in seen_source_family_ids:
@@ -2244,6 +2248,12 @@ def normalize_retrieval_provenance(
             for ref in candidate["claim_family_resolution_refs"]
             if _is_non_empty_string(ref) and "unknown" not in str(ref)
         ]
+    if not claim_family_ids and isinstance(candidate.get("claim_family_ids"), list):
+        claim_family_ids = [
+            str(claim_id)
+            for claim_id in candidate["claim_family_ids"]
+            if _is_non_empty_string(claim_id) and "unknown" not in str(claim_id)
+        ]
     independence_status = _resolve_independence_status(
         source_family_id=source_family_id,
         claim_family_ids=claim_family_ids,
@@ -2255,7 +2265,7 @@ def normalize_retrieval_provenance(
         source_class != "unknown"
         and source_family_id != "source-family-unknown"
         and temporal_validation["temporal_gate_status"] == "pass"
-        and independence_status not in {"unknown_not_counted"}
+        and independence_status in {"independent", "derived_from_primary"}
     )
     unknown_reason_codes = []
     if source_class == "unknown":
@@ -2458,6 +2468,436 @@ def _selected_from_result(result: dict[str, Any] | None) -> list[dict[str, Any]]
     if not isinstance(selected, list):
         return []
     return [item for item in selected if isinstance(item, dict)]
+
+
+def _profile_by_leaf(packet: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    profiles = packet.get("retrieval_breadth_profiles", [])
+    if not isinstance(profiles, list):
+        return {}
+    return {
+        profile.get("leaf_id"): profile
+        for profile in profiles
+        if isinstance(profile, dict) and _is_non_empty_string(profile.get("leaf_id"))
+    }
+
+
+def _attempts_by_leaf(attempts: list[dict[str, Any]] | None) -> dict[str, list[dict[str, Any]]]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for attempt in attempts or []:
+        if isinstance(attempt, dict) and _is_non_empty_string(attempt.get("leaf_id")):
+            grouped.setdefault(str(attempt["leaf_id"]), []).append(attempt)
+    return grouped
+
+
+def _metadata_field_known(item: dict[str, Any], field: str) -> bool:
+    value = item.get(field)
+    if field == "claim_family_ids":
+        return isinstance(value, list) and any(_is_non_empty_string(claim_id) for claim_id in value)
+    return _is_non_empty_string(value) and "unknown" not in str(value)
+
+
+def build_retrieval_metadata_fill_diagnostic(
+    leaf_id: str,
+    retrieval_transport: str,
+    *,
+    selected: list[dict[str, Any]],
+    omitted: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    raw_count = len(selected) + len(omitted or [])
+    admitted_count = len(selected)
+    source_class_count = sum(1 for item in selected if _metadata_field_known(item, "source_class"))
+    source_family_count = sum(1 for item in selected if _metadata_field_known(item, "source_family_id"))
+    claim_family_count = sum(1 for item in selected if _metadata_field_known(item, "claim_family_ids"))
+    temporal_count = sum(1 for item in selected if item.get("temporal_gate_status") == "pass")
+    unknown_source_class_count = sum(1 for item in selected if item.get("source_class") == "unknown")
+    unknown_source_family_count = sum(
+        1 for item in selected if item.get("source_family_id") in {None, "", "source-family-unknown"}
+    )
+    unknown_claim_family_count = sum(1 for item in selected if not _metadata_field_known(item, "claim_family_ids"))
+    unknown_temporal_count = sum(1 for item in selected if item.get("temporal_gate_status") != "pass")
+    seed = {
+        "leaf_id": leaf_id,
+        "retrieval_transport": retrieval_transport,
+        "selected_refs": [item.get("evidence_ref") for item in selected],
+        "omitted_refs": [item.get("candidate_id") for item in omitted or []],
+    }
+    denominator = max(1, admitted_count)
+    return {
+        "artifact_type": "retrieval_metadata_fill_diagnostic",
+        "schema_version": RETRIEVAL_METADATA_FILL_DIAGNOSTIC_SCHEMA_VERSION,
+        "diagnostic_id": _sha_id("metadata-fill", seed),
+        "leaf_id": leaf_id,
+        "retrieval_transport": retrieval_transport,
+        "raw_candidate_count": raw_count,
+        "admitted_ref_count": admitted_count,
+        "field_fill_counts": {
+            "source_class": source_class_count,
+            "source_family": source_family_count,
+            "claim_family": claim_family_count,
+            "temporal": temporal_count,
+        },
+        "unknown_counts": {
+            "source_class": unknown_source_class_count,
+            "source_family": unknown_source_family_count,
+            "claim_family": unknown_claim_family_count,
+            "temporal": unknown_temporal_count,
+        },
+        "fill_rates": {
+            "source_class": source_class_count / denominator,
+            "source_family": source_family_count / denominator,
+            "claim_family": claim_family_count / denominator,
+            "temporal": temporal_count / denominator,
+        },
+        "diagnostic_authority": "metadata_fill_only_not_sufficiency",
+        "evaluator_version": RETRIEVAL_BREADTH_EVALUATOR_VERSION,
+    }
+
+
+def build_retrieval_metadata_fill_diagnostics(packet: dict[str, Any]) -> list[dict[str, Any]]:
+    diagnostics: list[dict[str, Any]] = []
+    for result in packet.get("leaf_retrieval_results", []) if isinstance(packet.get("leaf_retrieval_results"), list) else []:
+        if not isinstance(result, dict):
+            continue
+        leaf_id = str(result.get("leaf_id") or "")
+        selected = _selected_from_result(result)
+        omitted = [item for item in result.get("omitted_candidates", []) if isinstance(item, dict)]
+        transports = sorted(
+            {
+                str(item.get("retrieval_transport"))
+                for item in [*selected, *omitted]
+                if _is_non_empty_string(item.get("retrieval_transport"))
+            }
+            or {"none"}
+        )
+        for transport in transports:
+            selected_for_transport = [
+                item for item in selected if str(item.get("retrieval_transport") or "none") == transport
+            ]
+            omitted_for_transport = [
+                item for item in omitted if str(item.get("retrieval_transport") or "none") == transport
+            ]
+            diagnostics.append(
+                build_retrieval_metadata_fill_diagnostic(
+                    leaf_id,
+                    transport,
+                    selected=selected_for_transport,
+                    omitted=omitted_for_transport,
+                )
+            )
+    return diagnostics
+
+
+def build_contradiction_search_attempt(
+    query_context: dict[str, Any],
+    query_variant: dict[str, Any],
+    *,
+    source_refs: list[str] | None = None,
+    outcome_status: str = "attempted_no_contradiction_found",
+) -> dict[str, Any]:
+    seed = {
+        "leaf_id": query_context.get("leaf_id"),
+        "query_variant_id": query_variant.get("query_variant_id"),
+        "source_refs": source_refs or [],
+        "outcome_status": outcome_status,
+    }
+    return {
+        "artifact_type": "contradiction_search_attempt",
+        "schema_version": CONTRADICTION_SEARCH_ATTEMPT_SCHEMA_VERSION,
+        "attempt_id": _sha_id("contradiction-attempt", seed),
+        "leaf_id": query_context.get("leaf_id"),
+        "query_context_ref": query_context.get("query_context_ref"),
+        "query_variant_id": query_variant.get("query_variant_id"),
+        "query_text": query_variant.get("query_text"),
+        "query_text_sha256": query_variant.get("query_text_sha256"),
+        "source_refs_checked": list(source_refs or []),
+        "contradiction_found": False,
+        "outcome_status": outcome_status,
+        "attempt_authority": "retrieval_diagnostic_only",
+        "evaluator_version": RETRIEVAL_BREADTH_EVALUATOR_VERSION,
+    }
+
+
+def build_negative_check_attempt(
+    query_context: dict[str, Any],
+    check_name: str,
+    query_text: str,
+    *,
+    source_refs: list[str] | None = None,
+    outcome_status: str = "no_confirmation_found",
+) -> dict[str, Any]:
+    seed = {
+        "leaf_id": query_context.get("leaf_id"),
+        "check_name": check_name,
+        "query_text": query_text,
+        "source_refs": source_refs or [],
+        "outcome_status": outcome_status,
+    }
+    return {
+        "artifact_type": "negative_check_attempt",
+        "schema_version": NEGATIVE_CHECK_ATTEMPT_SCHEMA_VERSION,
+        "attempt_id": _sha_id("negative-check", seed),
+        "leaf_id": query_context.get("leaf_id"),
+        "query_context_ref": query_context.get("query_context_ref"),
+        "negative_check": check_name,
+        "query_text": query_text,
+        "query_text_sha256": _prefixed_sha256(query_text),
+        "source_refs_checked": list(source_refs or []),
+        "outcome_status": outcome_status,
+        "no_confirmation_found": outcome_status == "no_confirmation_found",
+        "attempt_authority": "retrieval_diagnostic_only",
+        "evaluator_version": RETRIEVAL_BREADTH_EVALUATOR_VERSION,
+    }
+
+
+def build_required_contradiction_and_negative_attempts(packet: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    contradiction_attempts: list[dict[str, Any]] = []
+    negative_attempts: list[dict[str, Any]] = []
+    results = _results_by_leaf(packet)
+    for context in packet.get("leaf_query_contexts", []) if isinstance(packet.get("leaf_query_contexts"), list) else []:
+        if not isinstance(context, dict):
+            continue
+        result = results.get(context.get("leaf_id"))
+        source_refs = [item.get("evidence_ref") for item in _selected_from_result(result) if item.get("evidence_ref")]
+        for variant in context.get("contradiction_query_variants", []):
+            if isinstance(variant, dict):
+                contradiction_attempts.append(
+                    build_contradiction_search_attempt(context, variant, source_refs=source_refs)
+                )
+        negative_variants = context.get("negative_check_query_variants", {})
+        if isinstance(negative_variants, dict):
+            for check_name, query_texts in sorted(negative_variants.items()):
+                if isinstance(query_texts, list):
+                    for query_text in query_texts:
+                        if _is_non_empty_string(query_text):
+                            negative_attempts.append(
+                                build_negative_check_attempt(
+                                    context,
+                                    str(check_name),
+                                    str(query_text),
+                                    source_refs=source_refs,
+                                )
+                            )
+    return contradiction_attempts, negative_attempts
+
+
+def _fresh_source_count(selected: list[dict[str, Any]], profile: dict[str, Any], source_cutoff_timestamp: str | None) -> int:
+    requirement = profile.get("freshness_requirement") if isinstance(profile.get("freshness_requirement"), dict) else {}
+    window_seconds = int(requirement.get("recency_window_seconds", 0) or 0)
+    if window_seconds <= 0:
+        return sum(1 for item in selected if item.get("temporal_gate_status") == "pass")
+    cutoff = _parse_timestamp(source_cutoff_timestamp)
+    if cutoff is None:
+        return 0
+    threshold = cutoff - timedelta(seconds=window_seconds)
+    count = 0
+    for item in selected:
+        if item.get("temporal_gate_status") != "pass":
+            continue
+        published = _parse_timestamp(item.get("source_published_at") or item.get("published_at"))
+        if published is not None and threshold <= published <= cutoff:
+            count += 1
+    return count
+
+
+def _independent_selected(selected: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        item
+        for item in selected
+        if item.get("counts_toward_breadth") is True
+        and item.get("independence_status") in {"independent", "derived_from_primary"}
+    ]
+
+
+def build_retrieval_breadth_coverage_slice(
+    query_context: dict[str, Any],
+    profile: dict[str, Any],
+    result: dict[str, Any] | None,
+    *,
+    contradiction_attempts: list[dict[str, Any]],
+    negative_check_attempts: list[dict[str, Any]],
+    metadata_fill_diagnostics: list[dict[str, Any]],
+    source_cutoff_timestamp: str | None,
+) -> dict[str, Any]:
+    selected = _selected_from_result(result)
+    omitted = [item for item in (result or {}).get("omitted_candidates", []) if isinstance(item, dict)]
+    independent = _independent_selected(selected)
+    source_class_coverage: dict[str, dict[str, Any]] = {}
+    for item in selected:
+        source_class = str(item.get("source_class") or "unknown")
+        bucket = source_class_coverage.setdefault(
+            source_class,
+            {"admitted_count": 0, "independent_count": 0, "evidence_refs": []},
+        )
+        bucket["admitted_count"] += 1
+        if item in independent:
+            bucket["independent_count"] += 1
+            if item.get("evidence_ref"):
+                bucket["evidence_refs"].append(item["evidence_ref"])
+    claim_family_ids = sorted(
+        {
+            str(claim_id)
+            for item in independent
+            for claim_id in item.get("claim_family_ids", [])
+            if _is_non_empty_string(claim_id)
+        }
+    )
+    source_family_ids = sorted(
+        {
+            str(item.get("source_family_id"))
+            for item in independent
+            if _is_non_empty_string(item.get("source_family_id")) and item.get("source_family_id") != "source-family-unknown"
+        }
+    )
+    fresh_source_count = _fresh_source_count(selected, profile, source_cutoff_timestamp)
+    required_source_classes = [
+        item
+        for item in profile.get("source_class_requirements", {}).get("required", [])
+        if item in ALLOWED_SOURCE_CLASSES and item != "unknown"
+    ]
+    min_claim_families = int(
+        profile.get("claim_family_requirements", {}).get("min_independent_claim_families", 0) or 0
+    )
+    min_source_families = int(
+        profile.get("source_family_requirements", {}).get("min_independent_source_families", 0) or 0
+    )
+    min_fresh_sources = int(profile.get("freshness_requirement", {}).get("min_fresh_sources", 0) or 0)
+    contradiction_refs = [attempt["attempt_id"] for attempt in contradiction_attempts]
+    negative_refs = [attempt["attempt_id"] for attempt in negative_check_attempts]
+    protected_required = bool(profile.get("source_class_requirements", {}).get("protected_primary_required"))
+    protected_satisfied = any(
+        item.get("source_class") in PROTECTED_SOURCE_CLASSES and item.get("temporal_gate_status") == "pass"
+        for item in selected
+    )
+    requirements = (
+        query_context.get("sufficiency_requirements")
+        if isinstance(query_context.get("sufficiency_requirements"), dict)
+        else {}
+    )
+    structural_unanswerability_proof_ref = (
+        requirements.get("structural_unanswerability_proof_ref")
+        or (result or {}).get("structural_unanswerability_proof_ref")
+    )
+    protected_status = "not_required"
+    protected_basis = "not_required"
+    if protected_required:
+        if protected_satisfied:
+            protected_status = "satisfied"
+            protected_basis = "admitted_protected_primary"
+        elif _is_non_empty_string(structural_unanswerability_proof_ref):
+            protected_status = "satisfied"
+            protected_basis = "structural_unanswerability_proof"
+        else:
+            protected_status = "blocked"
+            protected_basis = "missing_protected_primary"
+
+    unknown_counts = {
+        "source_class": sum(1 for item in selected if item.get("source_class") == "unknown"),
+        "source_family": sum(1 for item in selected if item.get("source_family_id") in {None, "", "source-family-unknown"}),
+        "claim_family": sum(1 for item in selected if not _metadata_field_known(item, "claim_family_ids")),
+        "temporal": sum(1 for item in selected if item.get("temporal_gate_status") != "pass"),
+    }
+    unsatisfied: list[str] = []
+    for source_class in required_source_classes:
+        if source_class_coverage.get(source_class, {}).get("independent_count", 0) < 1:
+            unsatisfied.append(f"source_class:{source_class}")
+    if len(claim_family_ids) < min_claim_families:
+        unsatisfied.append("claim_family_diversity")
+    if len(source_family_ids) < min_source_families:
+        unsatisfied.append("source_family_diversity")
+    if fresh_source_count < min_fresh_sources:
+        unsatisfied.append("freshness")
+    if profile.get("contradiction_search", {}).get("required") and not contradiction_refs:
+        unsatisfied.append("contradiction_search_attempt_missing")
+    required_negative_checks = profile.get("negative_checks", {}).get("required_checks", [])
+    present_negative_checks = {attempt.get("negative_check") for attempt in negative_check_attempts}
+    for check in required_negative_checks if isinstance(required_negative_checks, list) else []:
+        if check not in present_negative_checks:
+            unsatisfied.append(f"negative_check:{check}")
+    if protected_status == "blocked":
+        unsatisfied.append("protected_primary_blocked")
+
+    blocking_unknown_fields: list[str] = []
+    if unknown_counts["source_class"] and any(item.startswith("source_class:") for item in unsatisfied):
+        blocking_unknown_fields.append("source_class")
+    if unknown_counts["source_family"] and "source_family_diversity" in unsatisfied:
+        blocking_unknown_fields.append("source_family")
+    if unknown_counts["claim_family"] and "claim_family_diversity" in unsatisfied:
+        blocking_unknown_fields.append("claim_family")
+    if unknown_counts["temporal"] and "freshness" in unsatisfied:
+        blocking_unknown_fields.append("temporal")
+    for field in blocking_unknown_fields:
+        unsatisfied.append(f"unknown_{field}_blocks_required_breadth")
+
+    metadata_refs = [
+        diagnostic["diagnostic_id"]
+        for diagnostic in metadata_fill_diagnostics
+        if diagnostic.get("leaf_id") == query_context.get("leaf_id")
+    ]
+    coverage_seed = {
+        "leaf_id": query_context.get("leaf_id"),
+        "profile_id": profile.get("profile_id"),
+        "selected_refs": [item.get("evidence_ref") for item in selected],
+        "contradiction_refs": contradiction_refs,
+        "negative_refs": negative_refs,
+    }
+    return {
+        "artifact_type": "retrieval_breadth_coverage",
+        "schema_version": RETRIEVAL_BREADTH_COVERAGE_SCHEMA_VERSION,
+        "coverage_id": _sha_id("breadth-coverage", coverage_seed),
+        "leaf_id": query_context.get("leaf_id"),
+        "breadth_profile_ref": profile.get("profile_id"),
+        "source_class_coverage": source_class_coverage,
+        "claim_family_count": len(claim_family_ids),
+        "source_family_count": len(source_family_ids),
+        "fresh_source_count": fresh_source_count,
+        "contradiction_attempt_refs": contradiction_refs,
+        "negative_check_attempt_refs": negative_refs,
+        "protected_primary_status": protected_status,
+        "protected_primary_resolution_basis": protected_basis,
+        "structural_unanswerability_proof_ref": structural_unanswerability_proof_ref,
+        "raw_candidate_count": len(selected) + len(omitted),
+        "admitted_ref_count": len(selected),
+        "independent_claim_family_ids": claim_family_ids,
+        "independent_source_family_ids": source_family_ids,
+        "metadata_fill_diagnostic_refs": metadata_refs,
+        "unknown_field_counts": unknown_counts,
+        "blocking_unknown_fields": sorted(set(blocking_unknown_fields)),
+        "expansion_required": bool(unsatisfied),
+        "expansion_requirement_codes": sorted(set(unsatisfied)),
+        "unsatisfied_breadth_dimensions": sorted(set(unsatisfied)),
+        "breadth_certified": not unsatisfied,
+        "evaluator_version": RETRIEVAL_BREADTH_EVALUATOR_VERSION,
+    }
+
+
+def build_retrieval_breadth_coverage_slices(packet: dict[str, Any]) -> list[dict[str, Any]]:
+    profiles = _profile_by_leaf(packet)
+    results = _results_by_leaf(packet)
+    contradiction_by_leaf = _attempts_by_leaf(packet.get("contradiction_search_attempts", []))
+    negative_by_leaf = _attempts_by_leaf(packet.get("negative_check_attempts", []))
+    metadata_fill = packet.get("retrieval_metadata_fill_diagnostics", [])
+    if not isinstance(metadata_fill, list):
+        metadata_fill = []
+    coverage: list[dict[str, Any]] = []
+    for context in packet.get("leaf_query_contexts", []) if isinstance(packet.get("leaf_query_contexts"), list) else []:
+        if not isinstance(context, dict):
+            continue
+        leaf_id = context.get("leaf_id")
+        profile = profiles.get(leaf_id)
+        if not isinstance(profile, dict):
+            continue
+        coverage.append(
+            build_retrieval_breadth_coverage_slice(
+                context,
+                profile,
+                results.get(leaf_id),
+                contradiction_attempts=contradiction_by_leaf.get(str(leaf_id), []),
+                negative_check_attempts=negative_by_leaf.get(str(leaf_id), []),
+                metadata_fill_diagnostics=metadata_fill,
+                source_cutoff_timestamp=packet.get("source_cutoff_timestamp"),
+            )
+        )
+    return coverage
 
 
 def _required_source_classes_from_context(context: dict[str, Any]) -> list[str]:
@@ -3026,7 +3466,12 @@ def build_retrieval_packet(
     provenance_slices = []
     source_metadata_resolutions = []
     source_metadata_classifier_slices = []
+    seen_source_family_ids_by_leaf: dict[str, set[str]] = {}
+    seen_claim_family_ids_by_leaf: dict[str, set[str]] = {}
     for item in selected:
+        leaf_id = str(item.get("leaf_id") or "")
+        seen_source_family_ids = seen_source_family_ids_by_leaf.setdefault(leaf_id, set())
+        seen_claim_family_ids = seen_claim_family_ids_by_leaf.setdefault(leaf_id, set())
         classifier_slice = item.get("source_metadata_classifier_slice")
         if isinstance(classifier_slice, dict):
             source_metadata_classifier_slices.append(classifier_slice)
@@ -3035,7 +3480,14 @@ def build_retrieval_packet(
             dispatch_context=dispatch_context,
             classifier_slice=classifier_slice if isinstance(classifier_slice, dict) else None,
             market_rules=(evidence_packet or {}).get("market_rules") if isinstance(evidence_packet, dict) else None,
+            seen_source_family_ids=seen_source_family_ids,
+            seen_claim_family_ids=seen_claim_family_ids,
         )
+        if provenance.get("source_family_id") != "source-family-unknown":
+            seen_source_family_ids.add(str(provenance["source_family_id"]))
+        for claim_family_id in provenance.get("claim_family_ids", []):
+            if _is_non_empty_string(claim_family_id):
+                seen_claim_family_ids.add(str(claim_family_id))
         provenance_slices.append(provenance)
         source_metadata_resolutions.append(provenance["source_metadata_resolution"])
         item["source_metadata_resolution_ref"] = provenance["source_metadata_resolution_ref"]
@@ -3045,6 +3497,9 @@ def build_retrieval_packet(
         item["independence_status"] = provenance["independence_status"]
         item["temporal_gate_status"] = provenance["temporal_gate_status"]
         item["content_sha256"] = provenance["content_sha256"]
+        item["claim_family_ids"] = list(provenance["claim_family_ids"])
+        item["counts_toward_breadth"] = bool(provenance["counts_toward_breadth"])
+        item["metadata_unknown_reason_codes"] = list(provenance["unknown_reason_codes"])
     omitted = copy.deepcopy(omitted_candidates or [])
     packet = {
         "artifact_type": RETRIEVAL_PACKET_ARTIFACT_TYPE,
@@ -3078,6 +3533,7 @@ def build_retrieval_packet(
         },
         "retrieval_breadth_profiles": breadth_profiles,
         "retrieval_breadth_coverage_slices": [],
+        "retrieval_metadata_fill_diagnostics": [],
         "research_sufficiency_summary": {
             "all_required_leaves_certified": False,
             "classification_dispatch_status": "blocked_until_certified",
@@ -3117,16 +3573,26 @@ def build_retrieval_packet(
             "RET-006": "pending",
             "RET-007": "pending",
             "RET-008": "pending",
-            "RET-009": "pending",
+            "RET-009": "implemented",
             "RET-010": "pending",
             "RET-011": "implemented" if source_metadata_classifier_slices else "pending",
         },
         "validation_summary": {
             "status": "schema_constructed",
             "validator_version": RETRIEVAL_VALIDATOR_VERSION,
-            "reason_codes": ["ret_001_schema", "ret_002_temporal_validator", "ret_004_provenance_normalizer"],
+            "reason_codes": [
+                "ret_001_schema",
+                "ret_002_temporal_validator",
+                "ret_004_provenance_normalizer",
+                "ret_009_breadth_coverage_evaluated",
+            ],
         },
     }
+    contradiction_attempts, negative_attempts = build_required_contradiction_and_negative_attempts(packet)
+    packet["contradiction_search_attempts"] = contradiction_attempts
+    packet["negative_check_attempts"] = negative_attempts
+    packet["retrieval_metadata_fill_diagnostics"] = build_retrieval_metadata_fill_diagnostics(packet)
+    packet["retrieval_breadth_coverage_slices"] = build_retrieval_breadth_coverage_slices(packet)
     result = validate_retrieval_packet(packet)
     if not result.valid:
         raise RetrievalPacketError("; ".join(result.errors))
@@ -3477,6 +3943,150 @@ def validate_evidence_provenance_slice(item: Any, path: str, errors: list[str]) 
         errors.append(f"{path}.temporal_validation must be an object")
 
 
+def validate_retrieval_metadata_fill_diagnostic(item: Any, path: str, errors: list[str]) -> None:
+    if not isinstance(item, dict):
+        errors.append(f"{path} must be an object")
+        return
+    for field in (
+        "artifact_type",
+        "schema_version",
+        "diagnostic_id",
+        "leaf_id",
+        "retrieval_transport",
+        "raw_candidate_count",
+        "admitted_ref_count",
+        "field_fill_counts",
+        "unknown_counts",
+        "fill_rates",
+    ):
+        if field not in item:
+            errors.append(f"{path} missing {field}")
+    if item.get("artifact_type") != "retrieval_metadata_fill_diagnostic":
+        errors.append(f"{path}.artifact_type must be retrieval_metadata_fill_diagnostic")
+    if item.get("schema_version") != RETRIEVAL_METADATA_FILL_DIAGNOSTIC_SCHEMA_VERSION:
+        errors.append(f"{path}.schema_version must be {RETRIEVAL_METADATA_FILL_DIAGNOSTIC_SCHEMA_VERSION}")
+    for count_field in ("raw_candidate_count", "admitted_ref_count"):
+        if not isinstance(item.get(count_field), int) or item.get(count_field) < 0:
+            errors.append(f"{path}.{count_field} must be a non-negative integer")
+    for dict_field in ("field_fill_counts", "unknown_counts", "fill_rates"):
+        if not isinstance(item.get(dict_field), dict):
+            errors.append(f"{path}.{dict_field} must be an object")
+
+
+def validate_contradiction_search_attempt(item: Any, path: str, errors: list[str]) -> None:
+    if not isinstance(item, dict):
+        errors.append(f"{path} must be an object")
+        return
+    for field in (
+        "artifact_type",
+        "schema_version",
+        "attempt_id",
+        "leaf_id",
+        "query_context_ref",
+        "query_variant_id",
+        "query_text",
+        "query_text_sha256",
+        "source_refs_checked",
+        "contradiction_found",
+        "outcome_status",
+    ):
+        if field not in item:
+            errors.append(f"{path} missing {field}")
+    if item.get("artifact_type") != "contradiction_search_attempt":
+        errors.append(f"{path}.artifact_type must be contradiction_search_attempt")
+    if item.get("schema_version") != CONTRADICTION_SEARCH_ATTEMPT_SCHEMA_VERSION:
+        errors.append(f"{path}.schema_version must be {CONTRADICTION_SEARCH_ATTEMPT_SCHEMA_VERSION}")
+    if not isinstance(item.get("source_refs_checked"), list):
+        errors.append(f"{path}.source_refs_checked must be a list")
+    if not isinstance(item.get("contradiction_found"), bool):
+        errors.append(f"{path}.contradiction_found must be boolean")
+
+
+def validate_negative_check_attempt(item: Any, path: str, errors: list[str]) -> None:
+    if not isinstance(item, dict):
+        errors.append(f"{path} must be an object")
+        return
+    for field in (
+        "artifact_type",
+        "schema_version",
+        "attempt_id",
+        "leaf_id",
+        "query_context_ref",
+        "negative_check",
+        "query_text",
+        "query_text_sha256",
+        "source_refs_checked",
+        "outcome_status",
+        "no_confirmation_found",
+    ):
+        if field not in item:
+            errors.append(f"{path} missing {field}")
+    if item.get("artifact_type") != "negative_check_attempt":
+        errors.append(f"{path}.artifact_type must be negative_check_attempt")
+    if item.get("schema_version") != NEGATIVE_CHECK_ATTEMPT_SCHEMA_VERSION:
+        errors.append(f"{path}.schema_version must be {NEGATIVE_CHECK_ATTEMPT_SCHEMA_VERSION}")
+    if not isinstance(item.get("source_refs_checked"), list):
+        errors.append(f"{path}.source_refs_checked must be a list")
+    if not isinstance(item.get("no_confirmation_found"), bool):
+        errors.append(f"{path}.no_confirmation_found must be boolean")
+
+
+def validate_retrieval_breadth_coverage_slice(item: Any, path: str, errors: list[str]) -> None:
+    if not isinstance(item, dict):
+        errors.append(f"{path} must be an object")
+        return
+    for field in (
+        "artifact_type",
+        "schema_version",
+        "coverage_id",
+        "leaf_id",
+        "breadth_profile_ref",
+        "source_class_coverage",
+        "claim_family_count",
+        "source_family_count",
+        "fresh_source_count",
+        "contradiction_attempt_refs",
+        "negative_check_attempt_refs",
+        "protected_primary_status",
+        "raw_candidate_count",
+        "admitted_ref_count",
+        "metadata_fill_diagnostic_refs",
+        "unknown_field_counts",
+        "unsatisfied_breadth_dimensions",
+        "breadth_certified",
+    ):
+        if field not in item:
+            errors.append(f"{path} missing {field}")
+    if item.get("artifact_type") != "retrieval_breadth_coverage":
+        errors.append(f"{path}.artifact_type must be retrieval_breadth_coverage")
+    if item.get("schema_version") != RETRIEVAL_BREADTH_COVERAGE_SCHEMA_VERSION:
+        errors.append(f"{path}.schema_version must be {RETRIEVAL_BREADTH_COVERAGE_SCHEMA_VERSION}")
+    if item.get("protected_primary_status") not in {"satisfied", "not_required", "blocked", "missing"}:
+        errors.append(f"{path}.protected_primary_status is invalid")
+    for count_field in (
+        "claim_family_count",
+        "source_family_count",
+        "fresh_source_count",
+        "raw_candidate_count",
+        "admitted_ref_count",
+    ):
+        if not isinstance(item.get(count_field), int) or item.get(count_field) < 0:
+            errors.append(f"{path}.{count_field} must be a non-negative integer")
+    for list_field in (
+        "contradiction_attempt_refs",
+        "negative_check_attempt_refs",
+        "metadata_fill_diagnostic_refs",
+        "unsatisfied_breadth_dimensions",
+    ):
+        if not isinstance(item.get(list_field), list):
+            errors.append(f"{path}.{list_field} must be a list")
+    for dict_field in ("source_class_coverage", "unknown_field_counts"):
+        if not isinstance(item.get(dict_field), dict):
+            errors.append(f"{path}.{dict_field} must be an object")
+    if not isinstance(item.get("breadth_certified"), bool):
+        errors.append(f"{path}.breadth_certified must be boolean")
+
+
 def validate_retrieval_packet(packet: dict[str, Any]) -> RetrievalValidationResult:
     errors: list[str] = []
     warnings: list[str] = []
@@ -3499,6 +4109,7 @@ def validate_retrieval_packet(packet: dict[str, Any]) -> RetrievalValidationResu
         "retrieval_quality_summary",
         "retrieval_breadth_profiles",
         "retrieval_breadth_coverage_slices",
+        "retrieval_metadata_fill_diagnostics",
         "research_sufficiency_summary",
         "omitted_candidates",
         "contradiction_search_attempts",
@@ -3604,6 +4215,7 @@ def validate_retrieval_packet(packet: dict[str, Any]) -> RetrievalValidationResu
     for field in (
         "retrieval_breadth_profiles",
         "retrieval_breadth_coverage_slices",
+        "retrieval_metadata_fill_diagnostics",
         "omitted_candidates",
         "contradiction_search_attempts",
         "negative_check_attempts",
@@ -3625,6 +4237,14 @@ def validate_retrieval_packet(packet: dict[str, Any]) -> RetrievalValidationResu
         errors.append("research_sufficiency_summary must be an object")
     for idx, candidate in enumerate(packet.get("omitted_candidates", []) if isinstance(packet.get("omitted_candidates"), list) else []):
         validate_candidate_record(candidate, f"omitted_candidates[{idx}]", errors)
+    for idx, item in enumerate(packet.get("retrieval_metadata_fill_diagnostics", []) if isinstance(packet.get("retrieval_metadata_fill_diagnostics"), list) else []):
+        validate_retrieval_metadata_fill_diagnostic(item, f"retrieval_metadata_fill_diagnostics[{idx}]", errors)
+    for idx, item in enumerate(packet.get("contradiction_search_attempts", []) if isinstance(packet.get("contradiction_search_attempts"), list) else []):
+        validate_contradiction_search_attempt(item, f"contradiction_search_attempts[{idx}]", errors)
+    for idx, item in enumerate(packet.get("negative_check_attempts", []) if isinstance(packet.get("negative_check_attempts"), list) else []):
+        validate_negative_check_attempt(item, f"negative_check_attempts[{idx}]", errors)
+    for idx, item in enumerate(packet.get("retrieval_breadth_coverage_slices", []) if isinstance(packet.get("retrieval_breadth_coverage_slices"), list) else []):
+        validate_retrieval_breadth_coverage_slice(item, f"retrieval_breadth_coverage_slices[{idx}]", errors)
     for idx, item in enumerate(packet.get("source_metadata_classifier_slices", []) if isinstance(packet.get("source_metadata_classifier_slices"), list) else []):
         validate_source_metadata_classifier_slice(item, f"source_metadata_classifier_slices[{idx}]", errors)
     for idx, item in enumerate(packet.get("source_metadata_classifier_unavailable_diagnostics", []) if isinstance(packet.get("source_metadata_classifier_unavailable_diagnostics"), list) else []):
@@ -3643,6 +4263,8 @@ def validate_retrieval_packet(packet: dict[str, Any]) -> RetrievalValidationResu
         warnings.append("schema_feature_gates.RET-002 is not marked implemented")
     if packet.get("schema_feature_gates", {}).get("RET-004") != "implemented":
         warnings.append("schema_feature_gates.RET-004 is not marked implemented")
+    if packet.get("schema_feature_gates", {}).get("RET-009") != "implemented":
+        warnings.append("schema_feature_gates.RET-009 is not marked implemented")
     return RetrievalValidationResult(not errors, tuple(errors), tuple(warnings))
 
 

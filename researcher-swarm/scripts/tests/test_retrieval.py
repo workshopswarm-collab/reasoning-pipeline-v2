@@ -95,6 +95,39 @@ class RetrievalPacketContractTest(unittest.TestCase):
             "official_source_hints": ["https://example.com/official"],
         }
 
+    def _evidence(
+        self,
+        context: dict,
+        *,
+        attempt_ref: str,
+        canonical_url: str,
+        source_class: str = "independent_secondary",
+        source_family_id: str | None = None,
+        claim_family_id: str = "claim-family-default",
+        source_published_at: str = "2026-06-24T11:30:00+00:00",
+        temporal_gate_status: str = "pass",
+    ) -> dict:
+        return build_retrieval_evidence_item(
+            case_id="case-1",
+            dispatch_id="dispatch-1",
+            leaf_id=context["leaf_id"],
+            parent_branch_id=context["parent_branch_id"],
+            retrieval_transport="browser",
+            transport_attempt_ref=attempt_ref,
+            requested_url=canonical_url,
+            final_url=canonical_url,
+            canonical_url=canonical_url,
+            source_family_id=source_family_id or f"source-family-{attempt_ref}",
+            source_class=source_class,
+            temporal_gate_status=temporal_gate_status,
+            source_published_at=source_published_at,
+            captured_at="2026-06-24T12:01:00+00:00",
+            artifact_generated_at="2026-06-24T12:01:00+00:00",
+            retrieval_capture_for_dispatch=True,
+            claim_family_resolution_refs=[claim_family_id],
+            admission_reason_codes=["manual_fixture_selected"],
+        )
+
     def test_query_contexts_cover_every_leaf_with_sufficiency_and_breadth_targets(self) -> None:
         contexts = build_retrieval_query_contexts(self.qdt, evidence_packet=self.evidence_packet)
 
@@ -146,7 +179,10 @@ class RetrievalPacketContractTest(unittest.TestCase):
         self.assertEqual(packet["schema_feature_gates"]["RET-001"], "implemented")
         self.assertEqual(packet["schema_feature_gates"]["RET-002"], "implemented")
         self.assertEqual(packet["schema_feature_gates"]["RET-004"], "implemented")
-        for feature_id in ["RET-003", "RET-008", "RET-009", "RET-010", "RET-011"]:
+        self.assertEqual(packet["schema_feature_gates"]["RET-009"], "implemented")
+        self.assertEqual(len(packet["retrieval_breadth_profiles"]), len(self.qdt["required_leaf_questions"]))
+        self.assertEqual(len(packet["retrieval_breadth_coverage_slices"]), len(self.qdt["required_leaf_questions"]))
+        for feature_id in ["RET-003", "RET-008", "RET-010", "RET-011"]:
             self.assertEqual(packet["schema_feature_gates"][feature_id], "pending")
         self.assertEqual(packet["temporal_isolation_schema_gate"]["status"], "strict_validator_implemented")
         self.assertEqual(packet["research_sufficiency_summary"]["classification_dispatch_status"], "blocked_until_certified")
@@ -265,6 +301,164 @@ class RetrievalPacketContractTest(unittest.TestCase):
         self.assertTrue(claim_family["claim_family_id"].startswith("claim-family-"))
         self.assertEqual(claim_family["counts_toward_claim_family_breadth"], True)
         self.assertEqual(source_metadata["temporal_safety_status"], "unknown_not_counted")
+
+    def test_breadth_coverage_attempts_and_metadata_fill_can_certify_leaf_breadth(self) -> None:
+        qdt = copy.deepcopy(self.qdt)
+        leaf = qdt["required_leaf_questions"][0]
+        leaf["purpose"] = "source_of_truth"
+        leaf["research_sufficiency_requirements"].update(
+            {
+                "required_source_classes": ["official_or_primary", "independent_secondary"],
+                "min_independent_claim_families": 2,
+                "min_independent_source_families": 2,
+                "min_temporally_fresh_sources": 1,
+                "recency_window_seconds": 3600,
+                "contradiction_search_required": True,
+                "required_negative_checks": ["no_official_confirmation"],
+                "protected_primary_required": True,
+            }
+        )
+        evidence_packet = copy.deepcopy(self.evidence_packet)
+        evidence_packet["market_rules"]["official_source_hints"] = ["https://example.com/official"]
+        context = build_retrieval_query_contexts(qdt, evidence_packet=evidence_packet)[0]
+        official = self._evidence(
+            context,
+            attempt_ref="official",
+            canonical_url="https://example.com/official",
+            source_class="official_or_primary",
+            source_family_id="source-family-official",
+            claim_family_id="claim-family-official",
+        )
+        secondary = self._evidence(
+            context,
+            attempt_ref="secondary",
+            canonical_url="https://news.example.com/story",
+            source_class="independent_secondary",
+            source_family_id="source-family-secondary",
+            claim_family_id="claim-family-secondary",
+        )
+
+        packet = build_retrieval_packet(qdt, evidence_packet=evidence_packet, selected_evidence=[official, secondary])
+        coverage = next(
+            item for item in packet["retrieval_breadth_coverage_slices"] if item["leaf_id"] == leaf["leaf_id"]
+        )
+
+        self.assertTrue(validate_retrieval_packet(packet).valid)
+        self.assertEqual(packet["schema_feature_gates"]["RET-009"], "implemented")
+        self.assertTrue(packet["contradiction_search_attempts"])
+        self.assertTrue(packet["negative_check_attempts"])
+        self.assertEqual(packet["negative_check_attempts"][0]["outcome_status"], "no_confirmation_found")
+        self.assertTrue(coverage["breadth_certified"], coverage["unsatisfied_breadth_dimensions"])
+        self.assertEqual(coverage["protected_primary_status"], "satisfied")
+        self.assertEqual(coverage["raw_candidate_count"], 2)
+        self.assertEqual(coverage["admitted_ref_count"], 2)
+        self.assertEqual(coverage["claim_family_count"], 2)
+        self.assertEqual(coverage["source_family_count"], 2)
+        self.assertGreaterEqual(coverage["fresh_source_count"], 1)
+        self.assertTrue(coverage["metadata_fill_diagnostic_refs"])
+        diagnostic = packet["retrieval_metadata_fill_diagnostics"][0]
+        self.assertEqual(diagnostic["leaf_id"], leaf["leaf_id"])
+        self.assertEqual(diagnostic["admitted_ref_count"], 2)
+        self.assertEqual(diagnostic["unknown_counts"]["source_class"], 0)
+        self.assertEqual(packet["research_sufficiency_summary"]["certificate_status"], "not_run_schema_only")
+
+    def test_duplicate_claim_or_source_family_does_not_satisfy_independent_breadth(self) -> None:
+        qdt = copy.deepcopy(self.qdt)
+        leaf = qdt["required_leaf_questions"][0]
+        leaf["research_sufficiency_requirements"].update(
+            {
+                "required_source_classes": ["independent_secondary"],
+                "min_independent_claim_families": 2,
+                "min_independent_source_families": 2,
+                "min_temporally_fresh_sources": 0,
+                "contradiction_search_required": False,
+                "required_negative_checks": [],
+            }
+        )
+        context = build_retrieval_query_contexts(qdt, evidence_packet=self.evidence_packet)[0]
+        same_claim = [
+            self._evidence(
+                context,
+                attempt_ref=f"same-claim-{idx}",
+                canonical_url=f"https://publisher-{idx}.example.com/story",
+                source_family_id=f"source-family-{idx}",
+                claim_family_id="claim-family-repeated",
+            )
+            for idx in range(5)
+        ]
+        same_source = [
+            self._evidence(
+                context,
+                attempt_ref=f"same-source-{idx}",
+                canonical_url=f"https://wire-{idx}.example.com/story",
+                source_family_id="source-family-wire",
+                claim_family_id=f"claim-family-{idx}",
+            )
+            for idx in range(5)
+        ]
+
+        same_claim_packet = build_retrieval_packet(qdt, evidence_packet=self.evidence_packet, selected_evidence=same_claim)
+        same_claim_coverage = next(
+            item for item in same_claim_packet["retrieval_breadth_coverage_slices"] if item["leaf_id"] == leaf["leaf_id"]
+        )
+        same_source_packet = build_retrieval_packet(qdt, evidence_packet=self.evidence_packet, selected_evidence=same_source)
+        same_source_coverage = next(
+            item for item in same_source_packet["retrieval_breadth_coverage_slices"] if item["leaf_id"] == leaf["leaf_id"]
+        )
+
+        self.assertEqual(same_claim_coverage["claim_family_count"], 1)
+        self.assertFalse(same_claim_coverage["breadth_certified"])
+        self.assertIn("claim_family_diversity", same_claim_coverage["unsatisfied_breadth_dimensions"])
+        self.assertIn(
+            "same_claim_family",
+            {item["independence_status"] for item in same_claim_packet["retrieval_evidence_provenance_slices"]},
+        )
+        self.assertEqual(same_source_coverage["source_family_count"], 1)
+        self.assertFalse(same_source_coverage["breadth_certified"])
+        self.assertIn("source_family_diversity", same_source_coverage["unsatisfied_breadth_dimensions"])
+        self.assertIn(
+            "same_source_family",
+            {item["independence_status"] for item in same_source_packet["retrieval_evidence_provenance_slices"]},
+        )
+
+    def test_unknown_metadata_and_protected_primary_gaps_block_breadth(self) -> None:
+        qdt = copy.deepcopy(self.qdt)
+        leaf = qdt["required_leaf_questions"][0]
+        leaf["purpose"] = "source_of_truth"
+        leaf["research_sufficiency_requirements"].update(
+            {
+                "required_source_classes": ["official_or_primary"],
+                "min_independent_claim_families": 1,
+                "min_independent_source_families": 1,
+                "min_temporally_fresh_sources": 1,
+                "recency_window_seconds": 3600,
+                "protected_primary_required": True,
+                "required_negative_checks": [],
+            }
+        )
+        context = build_retrieval_query_contexts(qdt, evidence_packet=self.evidence_packet)[0]
+        unknown = self._evidence(
+            context,
+            attempt_ref="unknown",
+            canonical_url="",
+            source_class="unknown",
+            source_family_id="source-family-unknown",
+            claim_family_id="claim-family-unknown",
+            temporal_gate_status="unknown_not_counted",
+            source_published_at=None,
+        )
+
+        packet = build_retrieval_packet(qdt, evidence_packet=self.evidence_packet, selected_evidence=[unknown])
+        coverage = next(
+            item for item in packet["retrieval_breadth_coverage_slices"] if item["leaf_id"] == leaf["leaf_id"]
+        )
+
+        self.assertFalse(coverage["breadth_certified"])
+        self.assertEqual(coverage["protected_primary_status"], "blocked")
+        self.assertTrue(coverage["expansion_required"])
+        self.assertIn("protected_primary_blocked", coverage["unsatisfied_breadth_dimensions"])
+        self.assertIn("unknown_source_class_blocks_required_breadth", coverage["unsatisfied_breadth_dimensions"])
+        self.assertIn("unknown_temporal_blocks_required_breadth", coverage["unsatisfied_breadth_dimensions"])
 
     def test_temporal_validator_rejects_post_cutoff_source_time(self) -> None:
         result = validate_temporal_eligibility(

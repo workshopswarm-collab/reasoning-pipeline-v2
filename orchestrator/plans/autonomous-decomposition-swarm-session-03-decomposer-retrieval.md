@@ -1394,13 +1394,13 @@ Testing suite:
 
 Completion checklist:
 
-- [ ] `retrieval-breadth-profile/v1` schema written.
-- [ ] Breadth coverage slice schema written.
-- [ ] Contradiction-search attempt record written.
-- [ ] Negative-check attempt record written.
-- [ ] Source-class/source-family/claim-family classification tests written.
-- [ ] Metadata fill-rate diagnostics written.
-- [ ] `RET-011` and `RET-009` inventory rows updated.
+- [x] `retrieval-breadth-profile/v1` schema written.
+- [x] Breadth coverage slice schema written.
+- [x] Contradiction-search attempt record written.
+- [x] Negative-check attempt record written.
+- [x] Source-class/source-family/claim-family classification tests written.
+- [x] Metadata fill-rate diagnostics written.
+- [x] `RET-009` inventory row updated; `RET-011` was already ready before this task.
 
 ## Phase 8: Retrieval Quality, Source Access, Missingness, Fallback, and Model Preflight
 
