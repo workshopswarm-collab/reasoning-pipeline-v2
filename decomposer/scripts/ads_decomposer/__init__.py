@@ -24,6 +24,12 @@ from .qdt import (
     validate_qdt_structure,
     validate_question_decomposition,
 )
+from .persistence import (
+    QDTPersistenceError,
+    ensure_qdt_persistence_schema,
+    write_decomposition_run,
+    write_qdt_research_sufficiency_requirements,
+)
 from .sufficiency_requirements import (
     RESEARCH_SUFFICIENCY_REQUIREMENTS_SCHEMA_VERSION,
     RESEARCH_SUFFICIENCY_TEMPLATE_VERSION,
@@ -35,6 +41,7 @@ __all__ = [
     "DECOMPOSER_MODEL_ID",
     "DecomposerHandoffError",
     "ANCHOR_DEPENDENCY_CONTRACT_SCHEMA_VERSION",
+    "QDTPersistenceError",
     "QDTError",
     "QUESTION_DECOMPOSITION_ARTIFACT_TYPE",
     "RESEARCH_SUFFICIENCY_REQUIREMENTS_SCHEMA_VERSION",
@@ -45,6 +52,7 @@ __all__ = [
     "build_leaf_budget_decision",
     "build_qdt_candidate",
     "build_research_sufficiency_requirements",
+    "ensure_qdt_persistence_schema",
     "repair_anchor_dependency_contracts",
     "resolve_decomposer_model_lane",
     "select_qdt_candidate",
@@ -52,4 +60,6 @@ __all__ = [
     "validate_decomposer_handoff",
     "validate_qdt_structure",
     "validate_question_decomposition",
+    "write_decomposition_run",
+    "write_qdt_research_sufficiency_requirements",
 ]
