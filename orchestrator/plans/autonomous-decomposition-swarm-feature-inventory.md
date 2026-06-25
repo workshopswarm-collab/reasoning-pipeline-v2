@@ -152,7 +152,7 @@ These migration groups are the data backbone for replay, scoring, calibration, a
 
 | Feature ID | Stage | Component | Blocking | Owner | Dependencies | Output | Status |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| CLS-001 | v2_live_cutover | Researcher prompt | cutover_blocker | Session 4 | QDT-002, QDT-005, RET-001, RET-008 | NLI classification prompt contract | not_started |
+| CLS-001 | v2_live_cutover | Researcher prompt | cutover_blocker | Session 4 | QDT-002, QDT-005, RET-001, RET-008 | Ready 2026-06-25: deterministic `researcher-leaf-nli/v1` prompt contract in researcher_swarm/classification.py with fail-closed RET-008 dispatch gate handling, macro question/read-only market constraints, flattened QDT leaves, per-leaf sufficiency requirements, certificate and breadth refs, sidecar/classification/coverage refs, no probability/fair value/interval/decision authority, and forbidden peer/SCAE/replay/scoring refs | ready_for_integration |
 | CLS-006 | v2_live_cutover | Leaf assignment artifact | cutover_blocker | Session 4 | CLS-001, QDT-005, RET-008, MODEL-003, FND-003 | Compact `leaf-research-assignment/v1` subagent packet using refs instead of duplicated evidence text | not_started |
 | CLS-008 | v2_live_cutover | Researcher context isolation | cutover_blocker | Session 4 | CLS-006, MODEL-003, FND-003, FND-006 | Per-subagent context silo contract and audit proving leaf researchers cannot see sibling assignments, peer sidecars, aggregate conclusions, SCAE refs, or replay/scoring outcomes | not_started |
 | CLS-002 | v2_live_cutover | Sidecar schema | cutover_blocker | Session 4 | CLS-001, FND-003 | No-probability sidecar schema | not_started |
