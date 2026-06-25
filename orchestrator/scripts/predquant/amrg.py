@@ -10,7 +10,7 @@ import re
 import sqlite3
 from collections import Counter
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -41,6 +41,7 @@ AMRG_MODEL_ASSIST_LANE_ID = "amrg_model_assist"
 AMRG_MODEL_ASSIST_PACKET_SCHEMA_VERSION = "amrg-model-assist-packet/v1"
 AMRG_MODEL_ASSIST_OUTPUT_SCHEMA_VERSION = "amrg-model-assist-output/v1"
 AMRG_MODEL_ASSIST_PROVENANCE_SCHEMA_VERSION = "amrg-model-assist-provenance/v1"
+AMRG_REFRESH_LIFECYCLE_SCHEMA_VERSION = "amrg-refresh-lifecycle/v1"
 AMRG_VECTOR_MODEL_ID = "BAAI/bge-base-en-v1.5"
 AMRG_VECTOR_ROUTE_ID = "ollama/local"
 AMRG_VECTOR_PROVIDER = "ollama"
@@ -83,6 +84,14 @@ REFRESH_STATUSES = {
     "not_requested_phase7_placeholder",
     "refresh_required_later",
     "unavailable_not_blocking",
+    "not_requested_no_promoted_effect",
+    "fresh_no_refresh_needed",
+    "refresh_succeeded",
+    "material_change_revalidated",
+    "refresh_failed_downgraded_weak_context_only",
+    "refresh_budget_exhausted_downgraded_weak_context_only",
+    "stale_promoted_effect_downgraded_weak_context_only",
+    "material_change_downgraded_weak_context_only",
 }
 MODEL_ASSIST_STATUSES = {
     "not_requested",
@@ -96,6 +105,7 @@ AMRG_ALLOWED_EFFECTS_BY_STATUS = {
     "timing_mismatch_weak_context_only": ["decomposition_context_hint"],
     "deterministic_context_candidate": ["decomposition_context_hint", "retrieval_query_hint"],
 }
+AMRG_WEAK_ALLOWED_EFFECTS = set(AMRG_ALLOWED_EFFECTS_BY_STATUS[WEAK_CONTEXT_ONLY])
 AMRG_FORBIDDEN_EFFECTS = [
     "probability_authority",
     "scae_delta",
@@ -152,6 +162,16 @@ AMRG_FORBIDDEN_ARTIFACT_KEYS = UNSAFE_MARKET_FIELDS | {
     "body",
     "html",
     "page_text",
+    "probability",
+    "probabilities",
+    "fair_value",
+    "fair_value_probability",
+    "probability_interval",
+    "confidence_interval",
+    "posterior_probability",
+    "production_forecast_prob",
+    "scae_delta",
+    "scae_evidence_delta",
 }
 AMRG_FORBIDDEN_MODEL_OUTPUT_KEYS = AMRG_FORBIDDEN_ARTIFACT_KEYS | {
     "probability",
@@ -1632,6 +1652,478 @@ def graph_safety_for_edge(edge: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def normalize_refresh_policy(context: dict[str, Any], refresh_policy: dict[str, Any] | None = None) -> dict[str, Any]:
+    policy = dict(refresh_policy or {})
+    refresh_as_of = policy.get("refresh_as_of_timestamp") or context["forecast_timestamp"]
+    ttl_seconds = int(policy.get("ttl_seconds", 900))
+    if ttl_seconds < 0:
+        raise AMRGError("refresh ttl_seconds must be non-negative")
+    refresh_budget = int(policy.get("refresh_budget", DEFAULT_AMRG_CANDIDATE_CAP))
+    if refresh_budget < 0:
+        raise AMRGError("refresh_budget must be non-negative")
+    return {
+        "refresh_as_of_timestamp": parse_timestamp(refresh_as_of, "refresh_as_of_timestamp").isoformat(),
+        "ttl_seconds": ttl_seconds,
+        "refresh_budget": refresh_budget,
+        "max_snapshot_skew_seconds": int(policy.get("max_snapshot_skew_seconds", 900)),
+    }
+
+
+def edge_has_promoted_effect(edge: dict[str, Any]) -> bool:
+    return any(effect not in AMRG_WEAK_ALLOWED_EFFECTS for effect in edge.get("allowed_effects", []))
+
+
+def edge_snapshot_timestamp(edge: dict[str, Any]) -> str | None:
+    return edge.get("related_market_snapshot_as_of") or edge.get("selected_market_snapshot_as_of")
+
+
+def next_refresh_after_for_edge(edge: dict[str, Any], ttl_seconds: int) -> str | None:
+    snapshot = edge_snapshot_timestamp(edge)
+    if not snapshot:
+        return None
+    return (parse_timestamp(snapshot, "related_market_snapshot_as_of") + timedelta(seconds=ttl_seconds)).isoformat()
+
+
+def edge_is_stale(edge: dict[str, Any], *, refresh_as_of_timestamp: str, ttl_seconds: int) -> bool:
+    snapshot = edge_snapshot_timestamp(edge)
+    if not snapshot:
+        return True
+    snapshot_at = parse_timestamp(snapshot, "related_market_snapshot_as_of")
+    refresh_as_of = parse_timestamp(refresh_as_of_timestamp, "refresh_as_of_timestamp")
+    return refresh_as_of - snapshot_at > timedelta(seconds=ttl_seconds)
+
+
+def normalize_refresh_result(result: dict[str, Any] | None) -> dict[str, Any] | None:
+    if result is None:
+        return None
+    if not isinstance(result, dict):
+        raise AMRGError("refresh result must be an object")
+    ensure_no_raw_amrg_fields(result, "refresh_result")
+    reason_codes = normalize_list(result.get("reason_codes") or result.get("reason_code"))
+    normalized = dict(result)
+    normalized["ok"] = bool(result.get("ok"))
+    normalized["reason_codes"] = sorted(set(reason_codes))
+    return normalized
+
+
+def normalize_refresh_results(refresh_results: Any) -> dict[str, dict[str, Any]]:
+    if refresh_results is None:
+        return {}
+    if isinstance(refresh_results, list):
+        items = refresh_results
+    elif isinstance(refresh_results, dict) and ("ok" in refresh_results or "edge_id" in refresh_results):
+        items = [refresh_results]
+    elif isinstance(refresh_results, dict):
+        items = []
+        for key, value in refresh_results.items():
+            if not isinstance(value, dict):
+                raise AMRGError("refresh result mapping values must be objects")
+            item = dict(value)
+            item.setdefault("edge_id", key)
+            items.append(item)
+    else:
+        raise AMRGError("refresh_results must be a mapping or list")
+
+    normalized: dict[str, dict[str, Any]] = {}
+    for item in items:
+        result = normalize_refresh_result(item)
+        for key in (
+            result.get("edge_id"),
+            result.get("candidate_id"),
+            result.get("market_id"),
+            result.get("related_market_id"),
+        ):
+            if key is not None:
+                normalized[str(key)] = result
+    return normalized
+
+
+def explicit_refresh_result_for_edge(
+    edge: dict[str, Any],
+    candidate: dict[str, Any],
+    refresh_results: dict[str, dict[str, Any]],
+) -> dict[str, Any] | None:
+    for key in (
+        edge.get("edge_id"),
+        edge.get("candidate_id"),
+        candidate.get("candidate_id"),
+        candidate.get("market_id"),
+        candidate.get("external_market_id"),
+    ):
+        if key is not None and str(key) in refresh_results:
+            return refresh_results[str(key)]
+    return None
+
+
+def active_index_refresh_result_for_candidate(
+    candidate: dict[str, Any],
+    active_market_index: list[dict[str, Any] | Any] | None,
+    *,
+    refresh_as_of_timestamp: str,
+) -> dict[str, Any] | None:
+    if active_market_index is None:
+        return None
+    candidate_ids = {str(value) for value in (candidate.get("market_id"), candidate.get("external_market_id")) if value is not None}
+    for row in active_market_index:
+        market = row_to_dict(row)
+        if not (market_identity_strings(market) & candidate_ids):
+            continue
+        try:
+            active_safe = active_safe_market_fields(market, refresh_as_of_timestamp)
+        except AMRGError as exc:
+            return {
+                "ok": False,
+                "market_id": candidate.get("market_id"),
+                "reason_codes": [classify_active_safe_exclusion(exc)],
+                "material_change": False,
+            }
+        if is_before_or_at_cutoff(active_safe.get("close_timestamp"), refresh_as_of_timestamp, "candidate_close_timestamp"):
+            return {
+                "ok": False,
+                "market_id": candidate.get("market_id"),
+                "reason_codes": ["past_market"],
+                "material_change": False,
+            }
+        if is_before_or_at_cutoff(active_safe.get("resolve_timestamp"), refresh_as_of_timestamp, "candidate_resolve_timestamp"):
+            return {
+                "ok": False,
+                "market_id": candidate.get("market_id"),
+                "reason_codes": ["past_market"],
+                "material_change": False,
+            }
+        active_safe_hash = prefixed_sha256(canonical_json(active_safe))
+        return {
+            "ok": True,
+            "market_id": candidate.get("market_id"),
+            "related_market_snapshot_as_of": refresh_as_of_timestamp,
+            "active_safe_fields_hash": active_safe_hash,
+            "material_change": active_safe_hash != candidate.get("active_safe_fields_hash"),
+            "reason_codes": ["active_market_index_refresh"],
+        }
+    return {
+        "ok": False,
+        "market_id": candidate.get("market_id"),
+        "reason_codes": ["related_market_not_found"],
+        "material_change": False,
+    }
+
+
+def refresh_result_for_edge(
+    edge: dict[str, Any],
+    candidate: dict[str, Any],
+    *,
+    refresh_results: dict[str, dict[str, Any]],
+    active_market_index: list[dict[str, Any] | Any] | None,
+    refresh_as_of_timestamp: str,
+) -> dict[str, Any] | None:
+    explicit = explicit_refresh_result_for_edge(edge, candidate, refresh_results)
+    if explicit is not None:
+        return explicit
+    return normalize_refresh_result(
+        active_index_refresh_result_for_candidate(
+            candidate,
+            active_market_index,
+            refresh_as_of_timestamp=refresh_as_of_timestamp,
+        )
+    )
+
+
+def refreshed_timing_for_edge(edge: dict[str, Any], result: dict[str, Any], policy: dict[str, Any]) -> dict[str, Any]:
+    selected_snapshot = result.get("selected_market_snapshot_as_of", edge.get("selected_market_snapshot_as_of"))
+    related_snapshot = (
+        result.get("related_market_snapshot_as_of")
+        or result.get("snapshot_as_of")
+        or result.get("refreshed_snapshot_as_of")
+        or edge.get("related_market_snapshot_as_of")
+    )
+    refresh_as_of = parse_timestamp(policy["refresh_as_of_timestamp"], "refresh_as_of_timestamp")
+    if not related_snapshot:
+        status = "missing_related_snapshot"
+        skew = None
+    else:
+        related_at = parse_timestamp(related_snapshot, "related_market_snapshot_as_of")
+        if related_at > refresh_as_of:
+            status = "lookahead_blocked"
+            skew = None
+        elif selected_snapshot:
+            selected_at = parse_timestamp(selected_snapshot, "selected_market_snapshot_as_of")
+            if selected_at > refresh_as_of:
+                status = "lookahead_blocked"
+                skew = None
+            else:
+                skew = int(abs((selected_at - related_at).total_seconds()))
+                status = "aligned" if skew <= policy["max_snapshot_skew_seconds"] else "skew_exceeds_policy"
+        else:
+            status = "skew_warning"
+            skew = None
+    return {
+        "timing_alignment_status": status,
+        "selected_market_snapshot_as_of": selected_snapshot,
+        "related_market_snapshot_as_of": related_snapshot,
+        "max_snapshot_skew_seconds": policy["max_snapshot_skew_seconds"],
+        "snapshot_skew_seconds": skew,
+    }
+
+
+def refresh_lifecycle_state(
+    *,
+    edge: dict[str, Any],
+    refresh_status: str,
+    reason_codes: list[str],
+    policy: dict[str, Any],
+    stale_before_refresh: bool,
+    material_change: bool = False,
+    refresh_attempted: bool = False,
+    refresh_budget_consumed: int = 0,
+    stale_effect_downgrade_applied: bool = False,
+    deterministic_validation_status: str | None = None,
+    next_refresh_after: str | None = None,
+) -> dict[str, Any]:
+    if refresh_status not in REFRESH_STATUSES:
+        raise AMRGError("unknown refresh lifecycle status")
+    generation_id = stable_id(
+        "amrg-refresh-generation",
+        edge["edge_id"],
+        policy["refresh_as_of_timestamp"],
+        refresh_status,
+        sorted(set(reason_codes)),
+    )
+    state = {
+        "schema_version": AMRG_REFRESH_LIFECYCLE_SCHEMA_VERSION,
+        "refresh_status": refresh_status,
+        "refresh_reason_codes": sorted(set(reason_codes)),
+        "refresh_generation_id": generation_id,
+        "refresh_as_of_timestamp": policy["refresh_as_of_timestamp"],
+        "ttl_seconds": policy["ttl_seconds"],
+        "stale_before_refresh": stale_before_refresh,
+        "material_change_detected": material_change,
+        "refresh_attempted": refresh_attempted,
+        "refresh_budget_consumed": refresh_budget_consumed,
+        "stale_effect_downgrade_applied": stale_effect_downgrade_applied,
+        "deterministic_validation_status": deterministic_validation_status,
+        "next_refresh_after": next_refresh_after,
+    }
+    ensure_no_raw_amrg_fields(state, "refresh_lifecycle_state")
+    return state
+
+
+def apply_refresh_state_to_edge(edge: dict[str, Any], state: dict[str, Any], *, downgrade_reasons: list[str] | None = None) -> dict[str, Any]:
+    updated = dict(edge)
+    if state["stale_effect_downgrade_applied"]:
+        updated["relationship_status"] = WEAK_CONTEXT_ONLY
+        updated["allowed_effects"] = AMRG_ALLOWED_EFFECTS_BY_STATUS[WEAK_CONTEXT_ONLY]
+    updated["refresh_lifecycle_state"] = state
+    updated["refresh_generation_id"] = state["refresh_generation_id"]
+    updated.update(graph_safety_for_edge(updated))
+    updated["refresh_generation_id"] = state["refresh_generation_id"]
+    if state["stale_effect_downgrade_applied"]:
+        updated["downgrade_applied"] = True
+        updated["downgrade_reason_codes"] = sorted(set((downgrade_reasons or []) + state["refresh_reason_codes"]))
+    validate_relationship_edge(updated)
+    return updated
+
+
+def downgrade_edge_for_refresh(
+    edge: dict[str, Any],
+    *,
+    refresh_status: str,
+    reason_codes: list[str],
+    policy: dict[str, Any],
+    stale_before_refresh: bool,
+    material_change: bool = False,
+    refresh_attempted: bool = False,
+    refresh_budget_consumed: int = 0,
+    deterministic_validation_status: str | None = None,
+) -> dict[str, Any]:
+    state = refresh_lifecycle_state(
+        edge=edge,
+        refresh_status=refresh_status,
+        reason_codes=reason_codes,
+        policy=policy,
+        stale_before_refresh=stale_before_refresh,
+        material_change=material_change,
+        refresh_attempted=refresh_attempted,
+        refresh_budget_consumed=refresh_budget_consumed,
+        stale_effect_downgrade_applied=True,
+        deterministic_validation_status=deterministic_validation_status,
+        next_refresh_after=None,
+    )
+    return apply_refresh_state_to_edge(edge, state, downgrade_reasons=reason_codes)
+
+
+def refresh_lifecycle_for_edge(
+    edge: dict[str, Any],
+    *,
+    candidate: dict[str, Any],
+    policy: dict[str, Any],
+    refresh_results: dict[str, dict[str, Any]],
+    active_market_index: list[dict[str, Any] | Any] | None,
+    budget_remaining: int,
+) -> tuple[dict[str, Any], int]:
+    promoted = edge_has_promoted_effect(edge)
+    stale = edge_is_stale(
+        edge,
+        refresh_as_of_timestamp=policy["refresh_as_of_timestamp"],
+        ttl_seconds=policy["ttl_seconds"],
+    )
+    result = refresh_result_for_edge(
+        edge,
+        candidate,
+        refresh_results=refresh_results,
+        active_market_index=active_market_index,
+        refresh_as_of_timestamp=policy["refresh_as_of_timestamp"],
+    )
+    material_change = bool(result and result.get("material_change"))
+
+    if not promoted:
+        state = refresh_lifecycle_state(
+            edge=edge,
+            refresh_status="not_requested_no_promoted_effect",
+            reason_codes=["weak_or_advisory_or_vector_only_no_promoted_effect"],
+            policy=policy,
+            stale_before_refresh=stale,
+            material_change=material_change,
+            next_refresh_after=next_refresh_after_for_edge(edge, policy["ttl_seconds"]),
+        )
+        return apply_refresh_state_to_edge(edge, state), 0
+
+    if not stale and not material_change:
+        state = refresh_lifecycle_state(
+            edge=edge,
+            refresh_status="fresh_no_refresh_needed",
+            reason_codes=["within_refresh_ttl"],
+            policy=policy,
+            stale_before_refresh=False,
+            next_refresh_after=next_refresh_after_for_edge(edge, policy["ttl_seconds"]),
+        )
+        return apply_refresh_state_to_edge(edge, state), 0
+
+    if budget_remaining <= 0:
+        return (
+            downgrade_edge_for_refresh(
+                edge,
+                refresh_status="refresh_budget_exhausted_downgraded_weak_context_only",
+                reason_codes=["refresh_budget_exhausted"],
+                policy=policy,
+                stale_before_refresh=stale,
+                material_change=material_change,
+            ),
+            0,
+        )
+
+    if result is None:
+        return (
+            downgrade_edge_for_refresh(
+                edge,
+                refresh_status="stale_promoted_effect_downgraded_weak_context_only",
+                reason_codes=["stale_promoted_effect_without_refresh"],
+                policy=policy,
+                stale_before_refresh=stale,
+            ),
+            1,
+        )
+
+    result_reason_codes = normalize_list(result.get("reason_codes")) or (["refresh_ok"] if result.get("ok") else ["refresh_failed"])
+    if not result.get("ok"):
+        return (
+            downgrade_edge_for_refresh(
+                edge,
+                refresh_status="refresh_failed_downgraded_weak_context_only",
+                reason_codes=result_reason_codes,
+                policy=policy,
+                stale_before_refresh=stale,
+                material_change=material_change,
+                refresh_attempted=True,
+                refresh_budget_consumed=1,
+            ),
+            1,
+        )
+
+    timing = refreshed_timing_for_edge(edge, result, policy)
+    refreshed_edge = {
+        **edge,
+        **timing,
+    }
+    deterministic_validation_status = result.get("deterministic_validation_status") or result.get("deterministic_validation")
+    if timing["timing_alignment_status"] != "aligned":
+        return (
+            downgrade_edge_for_refresh(
+                refreshed_edge,
+                refresh_status="refresh_failed_downgraded_weak_context_only",
+                reason_codes=sorted(set(result_reason_codes + [timing["timing_alignment_status"]])),
+                policy=policy,
+                stale_before_refresh=stale,
+                material_change=material_change,
+                refresh_attempted=True,
+                refresh_budget_consumed=1,
+                deterministic_validation_status=deterministic_validation_status,
+            ),
+            1,
+        )
+    if material_change and deterministic_validation_status != "passed":
+        return (
+            downgrade_edge_for_refresh(
+                refreshed_edge,
+                refresh_status="material_change_downgraded_weak_context_only",
+                reason_codes=sorted(set(result_reason_codes + ["material_change_requires_deterministic_revalidation"])),
+                policy=policy,
+                stale_before_refresh=stale,
+                material_change=True,
+                refresh_attempted=True,
+                refresh_budget_consumed=1,
+                deterministic_validation_status=deterministic_validation_status,
+            ),
+            1,
+        )
+
+    refresh_status = "material_change_revalidated" if material_change else "refresh_succeeded"
+    success_reasons = sorted(set(result_reason_codes + ["deterministic_effect_retained_after_refresh"]))
+    state = refresh_lifecycle_state(
+        edge=refreshed_edge,
+        refresh_status=refresh_status,
+        reason_codes=success_reasons,
+        policy=policy,
+        stale_before_refresh=stale,
+        material_change=material_change,
+        refresh_attempted=True,
+        refresh_budget_consumed=1,
+        deterministic_validation_status=deterministic_validation_status,
+        next_refresh_after=next_refresh_after_for_edge(refreshed_edge, policy["ttl_seconds"]),
+    )
+    return apply_refresh_state_to_edge(refreshed_edge, state), 1
+
+
+def apply_refresh_lifecycle(
+    context: dict[str, Any],
+    *,
+    refresh_policy: dict[str, Any] | None = None,
+    refresh_results: Any = None,
+    active_market_index: list[dict[str, Any] | Any] | None = None,
+) -> dict[str, Any]:
+    validate_related_live_market_context(context)
+    if context["artifact_type"] != "related_live_market_context":
+        return dict(context)
+    policy = normalize_refresh_policy(context, refresh_policy)
+    normalized_results = normalize_refresh_results(refresh_results)
+    candidates_by_id = {candidate["candidate_id"]: candidate for candidate in context["candidates"]}
+    budget_remaining = policy["refresh_budget"]
+    refreshed_edges: list[dict[str, Any]] = []
+    for edge in context["relationship_edges"]:
+        refreshed_edge, consumed = refresh_lifecycle_for_edge(
+            edge,
+            candidate=candidates_by_id[edge["candidate_id"]],
+            policy=policy,
+            refresh_results=normalized_results,
+            active_market_index=active_market_index,
+            budget_remaining=budget_remaining,
+        )
+        budget_remaining -= consumed
+        refreshed_edges.append(refreshed_edge)
+    refreshed = {**context, "relationship_edges": refreshed_edges}
+    validate_related_live_market_context(refreshed)
+    return refreshed
+
+
 def type_and_validate_edge(
     edge: dict[str, Any],
     *,
@@ -1695,6 +2187,9 @@ def enrich_related_live_market_context(
     *,
     evidence_packet: dict[str, Any],
     model_assist_status: str = "not_requested",
+    refresh_policy: dict[str, Any] | None = None,
+    refresh_results: Any = None,
+    active_market_index: list[dict[str, Any] | Any] | None = None,
 ) -> dict[str, Any]:
     validate_related_live_market_context(context)
     if context["artifact_type"] != "related_live_market_context":
@@ -1710,6 +2205,12 @@ def enrich_related_live_market_context(
         for edge in context["relationship_edges"]
     ]
     enriched = {**context, "relationship_edges": enriched_edges}
+    enriched = apply_refresh_lifecycle(
+        enriched,
+        refresh_policy=refresh_policy,
+        refresh_results=refresh_results,
+        active_market_index=active_market_index,
+    )
     validate_related_live_market_context(enriched)
     return enriched
 
@@ -2201,6 +2702,9 @@ def write_related_market_context(
     model_assist_provenance: dict[str, Any] | None = None,
     artifact_path: str | None = None,
     artifact_sha256: str | None = None,
+    refresh_policy: dict[str, Any] | None = None,
+    refresh_results: Any = None,
+    active_market_index: list[dict[str, Any] | Any] | None = None,
 ) -> dict[str, Any]:
     ensure_amrg_context_schema(conn)
     model_assist_status = model_assist_provenance["model_assist_status"] if model_assist_provenance else "not_requested"
@@ -2208,6 +2712,9 @@ def write_related_market_context(
         context,
         evidence_packet=evidence_packet,
         model_assist_status=model_assist_status,
+        refresh_policy=refresh_policy,
+        refresh_results=refresh_results,
+        active_market_index=active_market_index,
     )
     selected_market_id = selected_market_id_for_context(enriched, evidence_packet)
     generated_at = utc_now_iso()
@@ -2407,7 +2914,14 @@ def write_related_market_context(
         )
         graph_row_ids.append(graph_slice_id)
 
-        refresh_event_id = stable_id("amrg-refresh-event", edge["edge_id"], "phase7")
+        lifecycle = edge.get("refresh_lifecycle_state") or refresh_lifecycle_state(
+            edge=edge,
+            refresh_status="refresh_required_later",
+            reason_codes=["missing_refresh_lifecycle_state"],
+            policy=normalize_refresh_policy(enriched, refresh_policy),
+            stale_before_refresh=True,
+        )
+        refresh_event_id = stable_id("amrg-refresh-event", edge["edge_id"], lifecycle["refresh_generation_id"])
         conn.execute(
             """
             INSERT INTO related_market_refresh_events (
@@ -2421,6 +2935,10 @@ def write_related_market_context(
             ON CONFLICT(refresh_event_id) DO UPDATE SET
               refresh_status=excluded.refresh_status,
               refresh_reason_codes=excluded.refresh_reason_codes,
+              refresh_generation_id=excluded.refresh_generation_id,
+              max_refresh_hop_depth=excluded.max_refresh_hop_depth,
+              stale_effect_downgrade_applied=excluded.stale_effect_downgrade_applied,
+              next_refresh_after=excluded.next_refresh_after,
               metadata=excluded.metadata
             """,
             (
@@ -2430,14 +2948,25 @@ def write_related_market_context(
                 enriched["dispatch_id"],
                 edge["edge_id"],
                 enriched["candidate_set_id"],
-                "not_requested_phase7_placeholder",
-                canonical_json(["refresh_lifecycle_owned_by_amrg_006"]),
-                edge["refresh_generation_id"],
+                lifecycle["refresh_status"],
+                canonical_json(lifecycle["refresh_reason_codes"]),
+                lifecycle["refresh_generation_id"],
                 edge["max_refresh_hop_depth"],
-                0,
-                None,
+                1 if lifecycle["stale_effect_downgrade_applied"] else 0,
+                lifecycle.get("next_refresh_after"),
                 generated_at,
-                canonical_json({"phase": "phase7_persistence_placeholder"}),
+                canonical_json(
+                    {
+                        "schema_version": lifecycle["schema_version"],
+                        "refresh_as_of_timestamp": lifecycle["refresh_as_of_timestamp"],
+                        "ttl_seconds": lifecycle["ttl_seconds"],
+                        "stale_before_refresh": lifecycle["stale_before_refresh"],
+                        "material_change_detected": lifecycle["material_change_detected"],
+                        "refresh_attempted": lifecycle["refresh_attempted"],
+                        "refresh_budget_consumed": lifecycle["refresh_budget_consumed"],
+                        "deterministic_validation_status": lifecycle.get("deterministic_validation_status"),
+                    }
+                ),
             ),
         )
         refresh_row_ids.append(refresh_event_id)

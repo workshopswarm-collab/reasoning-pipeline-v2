@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from predquant.amrg import (
     AMRG_VECTOR_CANDIDATE_SOURCE,
     AMRG_MODEL_ASSIST_OUTPUT_SCHEMA_VERSION,
+    AMRG_REFRESH_LIFECYCLE_SCHEMA_VERSION,
     AMRG_VECTOR_NEIGHBOR_CANDIDATE_SCHEMA_VERSION,
     NO_RELATED_CONTEXT_WAIVER_SCHEMA_VERSION,
     RELATED_LIVE_MARKET_CONTEXT_SCHEMA_VERSION,
@@ -457,6 +458,161 @@ class AMRGContextTest(unittest.TestCase):
         self.assertEqual(degraded["model_assist_status"], "not_invoked_missing_active_safe_manifest")
         self.assertEqual(degraded["forbidden_output_check_status"], "not_applicable")
 
+    def test_refresh_success_retains_deterministic_effect_after_ttl_refresh(self):
+        artifact = self.build_artifact([self.market(2)])
+        edge_id = artifact["relationship_edges"][0]["edge_id"]
+        refreshed = enrich_related_live_market_context(
+            artifact,
+            evidence_packet=self.evidence_packet(),
+            refresh_policy={
+                "refresh_as_of_timestamp": "2026-06-24T18:30:00+00:00",
+                "ttl_seconds": 900,
+                "refresh_budget": 1,
+            },
+            refresh_results={
+                edge_id: {
+                    "ok": True,
+                    "reason_codes": ["refresh_ok"],
+                    "related_market_snapshot_as_of": "2026-06-24T18:29:00+00:00",
+                    "selected_market_snapshot_as_of": "2026-06-24T18:28:00+00:00",
+                    "material_change": False,
+                }
+            },
+        )
+
+        edge = refreshed["relationship_edges"][0]
+        lifecycle = edge["refresh_lifecycle_state"]
+        self.assertEqual(lifecycle["schema_version"], AMRG_REFRESH_LIFECYCLE_SCHEMA_VERSION)
+        self.assertEqual(lifecycle["refresh_status"], "refresh_succeeded")
+        self.assertTrue(lifecycle["refresh_attempted"])
+        self.assertEqual(lifecycle["refresh_budget_consumed"], 1)
+        self.assertFalse(lifecycle["stale_effect_downgrade_applied"])
+        self.assertEqual(edge["relationship_status"], "deterministic_context_candidate")
+        self.assertIn("retrieval_query_hint", edge["allowed_effects"])
+
+    def test_stale_promoted_effect_without_refresh_downgrades_to_weak_context(self):
+        artifact = self.build_artifact([self.market(2)])
+        refreshed = enrich_related_live_market_context(
+            artifact,
+            evidence_packet=self.evidence_packet(),
+            refresh_policy={
+                "refresh_as_of_timestamp": "2026-06-24T18:30:00+00:00",
+                "ttl_seconds": 900,
+                "refresh_budget": 1,
+            },
+        )
+
+        edge = refreshed["relationship_edges"][0]
+        lifecycle = edge["refresh_lifecycle_state"]
+        self.assertEqual(lifecycle["refresh_status"], "stale_promoted_effect_downgraded_weak_context_only")
+        self.assertTrue(lifecycle["stale_effect_downgrade_applied"])
+        self.assertEqual(edge["relationship_status"], WEAK_CONTEXT_ONLY)
+        self.assertEqual(edge["allowed_effects"], ["decomposition_context_hint"])
+
+    def test_refresh_budget_exhaustion_downgrades_stale_promoted_effect(self):
+        artifact = self.build_artifact([self.market(2)])
+        refreshed = enrich_related_live_market_context(
+            artifact,
+            evidence_packet=self.evidence_packet(),
+            refresh_policy={
+                "refresh_as_of_timestamp": "2026-06-24T18:30:00+00:00",
+                "ttl_seconds": 900,
+                "refresh_budget": 0,
+            },
+        )
+
+        edge = refreshed["relationship_edges"][0]
+        self.assertEqual(
+            edge["refresh_lifecycle_state"]["refresh_status"],
+            "refresh_budget_exhausted_downgraded_weak_context_only",
+        )
+        self.assertEqual(edge["relationship_status"], WEAK_CONTEXT_ONLY)
+        self.assertIn("refresh_budget_exhausted", edge["downgrade_reason_codes"])
+
+    def test_material_change_requires_deterministic_revalidation(self):
+        artifact = self.build_artifact([self.market(2)])
+        edge_id = artifact["relationship_edges"][0]["edge_id"]
+        refreshed = enrich_related_live_market_context(
+            artifact,
+            evidence_packet=self.evidence_packet(),
+            refresh_policy={
+                "refresh_as_of_timestamp": "2026-06-24T18:30:00+00:00",
+                "ttl_seconds": 900,
+                "refresh_budget": 1,
+            },
+            refresh_results={
+                edge_id: {
+                    "ok": True,
+                    "reason_codes": ["refresh_ok"],
+                    "related_market_snapshot_as_of": "2026-06-24T18:29:00+00:00",
+                    "selected_market_snapshot_as_of": "2026-06-24T18:28:00+00:00",
+                    "material_change": True,
+                    "deterministic_validation_status": "not_evaluated",
+                }
+            },
+        )
+
+        edge = refreshed["relationship_edges"][0]
+        lifecycle = edge["refresh_lifecycle_state"]
+        self.assertEqual(lifecycle["refresh_status"], "material_change_downgraded_weak_context_only")
+        self.assertTrue(lifecycle["material_change_detected"])
+        self.assertEqual(edge["relationship_status"], WEAK_CONTEXT_ONLY)
+        self.assertIn("material_change_requires_deterministic_revalidation", edge["downgrade_reason_codes"])
+
+    def test_refresh_never_upgrades_advisory_or_vector_only_candidates(self):
+        artifact = self.build_artifact(
+            [
+                self.market(
+                    2,
+                    title="Will a policy bill pass?",
+                    normalized_entities=[],
+                    contract_terms=[],
+                    source_of_truth_kind="different",
+                    source_url="https://example.test/other",
+                )
+            ]
+        )
+        edge_id = artifact["relationship_edges"][0]["edge_id"]
+        refreshed = enrich_related_live_market_context(
+            artifact,
+            evidence_packet=self.evidence_packet(),
+            model_assist_status="advisory_validated",
+            refresh_policy={
+                "refresh_as_of_timestamp": "2026-06-24T18:30:00+00:00",
+                "ttl_seconds": 1,
+                "refresh_budget": 1,
+            },
+            refresh_results={
+                edge_id: {
+                    "ok": True,
+                    "material_change": True,
+                    "deterministic_validation_status": "passed",
+                    "related_market_snapshot_as_of": "2026-06-24T18:29:00+00:00",
+                    "selected_market_snapshot_as_of": "2026-06-24T18:28:00+00:00",
+                }
+            },
+        )
+
+        edge = refreshed["relationship_edges"][0]
+        self.assertEqual(edge["relationship_status"], "model_assisted_weak_context_only")
+        self.assertEqual(edge["allowed_effects"], ["decomposition_context_hint"])
+        self.assertEqual(edge["refresh_lifecycle_state"]["refresh_status"], "not_requested_no_promoted_effect")
+
+    def test_refresh_result_forbids_scae_delta_payloads(self):
+        artifact = self.build_artifact([self.market(2)])
+        edge_id = artifact["relationship_edges"][0]["edge_id"]
+        with self.assertRaisesRegex(Exception, "scae_evidence_delta"):
+            enrich_related_live_market_context(
+                artifact,
+                evidence_packet=self.evidence_packet(),
+                refresh_policy={
+                    "refresh_as_of_timestamp": "2026-06-24T18:30:00+00:00",
+                    "ttl_seconds": 900,
+                    "refresh_budget": 1,
+                },
+                refresh_results={edge_id: {"ok": True, "scae_evidence_delta": 0.2}},
+            )
+
     def test_amrg_persistence_schema_and_write_rows(self):
         conn = sqlite3.connect(":memory:")
         conn.row_factory = sqlite3.Row
@@ -501,11 +657,20 @@ class AMRGContextTest(unittest.TestCase):
                 artifact_path="/tmp/related-live-market-context.json",
                 artifact_sha256="sha256:artifact",
             )
+            second = write_related_market_context(
+                conn,
+                artifact,
+                evidence_packet=self.evidence_packet(),
+                model_assist_provenance=provenance,
+                artifact_path="/tmp/related-live-market-context.json",
+                artifact_sha256="sha256:artifact",
+            )
 
             self.assertEqual(len(result["candidate_row_ids"]), 1)
             self.assertEqual(len(result["relationship_slice_ids"]), 1)
             self.assertEqual(len(result["graph_safety_slice_ids"]), 1)
             self.assertEqual(len(result["refresh_event_ids"]), 1)
+            self.assertEqual(result["refresh_event_ids"], second["refresh_event_ids"])
             self.assertIsNotNone(result["model_assist_id"])
 
             relationship = conn.execute(
@@ -516,9 +681,27 @@ class AMRGContextTest(unittest.TestCase):
             self.assertIn("retrieval_query_hint", json.loads(relationship["allowed_effects"]))
             self.assertIn("probability_authority", json.loads(relationship["forbidden_effects"]))
 
-            refresh = conn.execute("SELECT refresh_status, refresh_reason_codes FROM related_market_refresh_events").fetchone()
-            self.assertEqual(refresh["refresh_status"], "not_requested_phase7_placeholder")
-            self.assertIn("refresh_lifecycle_owned_by_amrg_006", json.loads(refresh["refresh_reason_codes"]))
+            refresh = conn.execute(
+                """
+                SELECT refresh_status, refresh_reason_codes, stale_effect_downgrade_applied,
+                       next_refresh_after, metadata
+                FROM related_market_refresh_events
+                """
+            ).fetchone()
+            self.assertEqual(refresh["refresh_status"], "fresh_no_refresh_needed")
+            self.assertIn("within_refresh_ttl", json.loads(refresh["refresh_reason_codes"]))
+            self.assertEqual(refresh["stale_effect_downgrade_applied"], 0)
+            self.assertIsNotNone(refresh["next_refresh_after"])
+            self.assertEqual(json.loads(refresh["metadata"])["schema_version"], AMRG_REFRESH_LIFECYCLE_SCHEMA_VERSION)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM related_market_refresh_events").fetchone()[0], 1)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM related_market_prior_anchor_slices").fetchone()[0], 0)
+            scae_tables = [
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'scae_%'"
+                ).fetchall()
+            ]
+            self.assertEqual(scae_tables, [])
         finally:
             conn.close()
 
