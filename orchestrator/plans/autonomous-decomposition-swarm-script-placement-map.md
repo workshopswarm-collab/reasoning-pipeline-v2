@@ -137,7 +137,8 @@ Root-level runtime entrypoints should be avoided except for compatibility shims 
 | `/Users/agent2/.openclaw/SCAE/scripts/scae/family.py` | `SCAE-009` | Family-aware binary child displacement and consistency diagnostics with sibling prices as context only. |
 | `/Users/agent2/.openclaw/SCAE/scripts/scae/netting.py` | `SCAE-005`, `SCAE-006`, `SCAE-007` | SCAE-005 intra-leaf representative cluster netting; later cross-leaf dependence and branch netting remain future work. |
 | `/Users/agent2/.openclaw/SCAE/scripts/scae/intervals.py` | `SCAE-011` | Deterministic logit uncertainty interval builder. |
-| `/Users/agent2/.openclaw/SCAE/scripts/scae/persistence.py` | `PERSIST-001`, `PERSIST-002`, `SCORE-001` | Forecast and scoring persistence helpers. |
+| `/Users/agent2/.openclaw/SCAE/scripts/scae/persistence.py` | `MIG-007`, `SCAE-001` to `SCAE-013` | Deterministic SCAE-local ledger, probability-audit, log-odds, sufficiency-input, and diagnostic slice persistence helpers without forecast bridge, scoring, or calibration-promotion authority. |
+| `/Users/agent2/.openclaw/SCAE/scripts/migrations/007_scae_ledger_probability_audit.sql` | `MIG-007` | Named SCAE-local SQLite migration for ledger outputs, log-odds update slices, cross-leaf dependence, branch, conditional, calibration diagnostic, mechanism-family, research sufficiency input, missingness, and reconciliation slices. |
 
 ## Enforcement Rules
 
