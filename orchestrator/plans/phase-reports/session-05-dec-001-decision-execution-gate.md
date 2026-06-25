@@ -18,4 +18,4 @@
 - Shared Inventory Updates Requested: Mark `DEC-001` `ready_for_integration` after coordinator review, with acceptance evidence covering SCAE-only probability consumption, downgrade-only forecast validity/execution/actionability behavior, non-authoritative SYN-001 context, and rejection of replacement probability, persistence, market prediction, scoring, and calibration-debt authority. After reconciliation, `PERSIST-001` should become dependency-ready; `PERSIST-002` and `MIG-008` remain blocked by later persistence rows.
 - Shared Map/Matrix Updates Requested: No direct edits. The existing script-placement map already lists `/Users/agent2/.openclaw/orchestrator/scripts/bin/run_decision_gate.py` for `DEC-001`/`PERSIST-001`.
 - Blockers: No implementation blocker. Push is held for the coordinator window.
-- Commit SHA: Pending final detached-HEAD commit.
+- Commit SHA: Original held implementation commit `f9f8990de929a9648b0f646ed69958a499a247de`; rebased implementation commit `81e4edf5f7a792d2eecf0d3d3b593c79b80c2531`. This report-only bookkeeping correction is included before push.
