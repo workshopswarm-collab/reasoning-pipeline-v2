@@ -56,6 +56,8 @@ Root-level runtime entrypoints should be avoided except for compatibility shims 
 | `/Users/agent2/.openclaw/orchestrator/scripts/bin/kick_scae.py` | `SCAE-001` to `SCAE-013` | Orchestrator-owned post-research SCAE invocation. |
 | `/Users/agent2/.openclaw/orchestrator/scripts/predquant/ads_handoff.py` | `FND-002`, `FND-003`, handoff rows | Shared stage handoff validation and artifact-ref packing. |
 | `/Users/agent2/.openclaw/orchestrator/scripts/bin/check_ads_script_placement.py` | `FND-001`, `FND-005`, `FIX-039`, `BLK-032` | Static scan that enforces this placement map before implementation/runtime integration. |
+| `/Users/agent2/.openclaw/orchestrator/scripts/bin/run_golden_fixture.py` | `FND-005`, `FND-006`, `FIX-001` to `FIX-007`, `BLK-012` | Run the Orchestrator-owned golden fixture registry/result harness in fixture or runtime-dependency-check mode. |
+| `/Users/agent2/.openclaw/orchestrator/scripts/predquant/golden_fixtures.py` | `FND-005`, `FND-006`, `FIX-001` to `FIX-007`, `BLK-012` | Importable golden fixture matrix parser, registry writer, starter fixture specs, result writer, and fail-closed validation/error-event harness. |
 | `/Users/agent2/.openclaw/orchestrator/scripts/bin/run_synthesis_annotation.py` | `SYN-001` | Run qualitative synthesis annotation after SCAE. |
 | `/Users/agent2/.openclaw/orchestrator/scripts/bin/run_decision_gate.py` | `DEC-001`, `PERSIST-001` | Run decision/actionability gate after SCAE. |
 

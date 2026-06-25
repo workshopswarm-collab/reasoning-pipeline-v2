@@ -852,13 +852,13 @@ Testing suite:
 
 Completion checklist:
 
-- [ ] Fixture registry schema written.
-- [ ] Fixture result schema written.
-- [ ] Minimal fixture spec written.
-- [ ] Negative fixture specs written.
-- [ ] Golden fixture matrix linked and treated as authoritative.
-- [ ] Error event contract written.
-- [ ] `FND-005` and `FND-006` updated in inventory.
+- [x] Fixture registry schema written.
+- [x] Fixture result schema written.
+- [x] Minimal fixture spec written.
+- [x] Negative fixture specs written.
+- [x] Golden fixture matrix linked and treated as authoritative.
+- [x] Error event contract written.
+- [x] `FND-005` and `FND-006` updated in inventory.
 
 ## Phase 6: Minimal Training Trace Pointer Contract
 

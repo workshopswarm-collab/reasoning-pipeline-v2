@@ -49,6 +49,7 @@ Root files should stay minimal. New runnable scripts belong in `bin/`; new reusa
 | `bin/settle_market_outcome.py` | Manually settle a market and score its predictions. | Override or backfill outcomes when source sync is insufficient. |
 | `bin/report_brier_scores.py` | Summarize pipeline Brier scores against prediction-time market baselines. | Accuracy reporting. |
 | `bin/ingest_market.py` | Compatibility wrapper for the SQLite store ingestion CLI. | Legacy/manual single-market ingestion path. |
+| `bin/run_golden_fixture.py` | Run the ADS v2 golden fixture registry/result harness in fixture or runtime-dependency-check mode. | Fixture-first integration checks for Session 1-owned foundation contracts. |
 
 ## Source Index
 
@@ -60,7 +61,9 @@ Root files should stay minimal. New runnable scripts belong in `bin/`; new reusa
 | `predquant/polymarket_resolution.py` | Source-backed Polymarket resolution sync. |
 | `predquant/sqlite_store.py` | SQLite schema, market snapshot storage, prediction recording, settlement, and Brier persistence. |
 | `predquant/foundation_schema.py` | Foundation schema dependency used by `sqlite_store.py`. |
+| `predquant/golden_fixtures.py` | Golden fixture matrix parser, starter fixture specs, fail-closed validation harness, and fixture registry/result writers. |
 | `migrations/001_foundation_persistence_and_artifacts.sql` | Ordered schema migration required by this bundle. |
+| `migrations/006_golden_fixture_harness.sql` | Typed golden fixture registry and result tables for ADS v2 fixture-first integration. |
 | `tests/test_prediction_provenance.py` | Regression coverage for prediction provenance, idempotent recording, stale snapshots, and Brier scoring metadata. |
 
 ## Adding Future Scripts

@@ -8,17 +8,22 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from predquant.ads_stage_logging import (
+    FAILURE_PATTERN_GROUP_TABLE,
+    PIPELINE_ERROR_EVENT_TABLE,
     STAGE_EXECUTION_EVENT_TABLE,
     STAGE_STATUS_TABLE,
     StageContext,
     StageContractError,
+    build_pipeline_error_event,
     build_stage_execution_event,
     build_stage_status_snapshot,
     command_sha256,
+    validate_pipeline_error_event,
     validate_stage_execution_event,
     validate_stage_status_snapshot,
     validate_stage,
     validate_transition,
+    write_pipeline_error_event,
 )
 
 
@@ -164,8 +169,52 @@ class AdsStageLoggingTest(unittest.TestCase):
 
         self.assertIn("v2_stage_status_snapshots", tables)
         self.assertIn("v2_stage_execution_events", tables)
+        self.assertIn("v2_pipeline_error_events", tables)
+        self.assertIn("v2_failure_pattern_groups", tables)
+
+    def test_pipeline_error_event_contract_and_persistence(self):
+        error = build_pipeline_error_event(
+            error_event_id="pipeline-error-1",
+            execution_event_id="stage-exec-event-1",
+            context=self.context("retrieval"),
+            failure_class="missing_required_artifact",
+            failure_grouping_key="retrieval:missing_required_artifact:retrieval-packet",
+            retryability="terminal",
+            safe_message="retrieval packet artifact was missing",
+            safe_metadata={"artifact_ref": "artifact:retrieval-packet"},
+            replay_command="python3 wake_researcher_swarm.py --case-id case-1 --dispatch-id dispatch-1",
+        )
+        validate_pipeline_error_event(error)
+        self.assertEqual(error["table"], PIPELINE_ERROR_EVENT_TABLE)
+
+        contaminated = dict(error)
+        contaminated["safe_metadata"] = {"raw_payload": "must not be stored"}
+        with self.assertRaisesRegex(StageContractError, "raw payload"):
+            validate_pipeline_error_event(contaminated)
+
+        migration = (
+            Path(__file__).resolve().parents[1]
+            / "migrations"
+            / "002_v2_stage_status_model.sql"
+        ).read_text(encoding="utf-8")
+        conn = sqlite3.connect(":memory:")
+        try:
+            conn.executescript(migration)
+            write_pipeline_error_event(conn, error)
+            event_count = conn.execute(
+                f"SELECT COUNT(*) FROM {PIPELINE_ERROR_EVENT_TABLE}"
+            ).fetchone()[0]
+            group_count = conn.execute(
+                f"SELECT event_count FROM {FAILURE_PATTERN_GROUP_TABLE} "
+                "WHERE failure_grouping_key = ?",
+                (error["failure_grouping_key"],),
+            ).fetchone()[0]
+        finally:
+            conn.close()
+
+        self.assertEqual(event_count, 1)
+        self.assertEqual(group_count, 1)
 
 
 if __name__ == "__main__":
     unittest.main()
-
