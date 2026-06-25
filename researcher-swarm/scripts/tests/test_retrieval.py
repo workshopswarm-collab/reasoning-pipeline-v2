@@ -25,6 +25,9 @@ from ads_decomposer.qdt import build_fixture_qdt_candidate, select_qdt_candidate
 from predquant.ads_handoff import validate_artifact_manifest  # noqa: E402
 from researcher_swarm.retrieval import (  # noqa: E402
     RetrievalPacketError,
+    attach_native_research_transport_diagnostics,
+    attach_retrieval_expansion_and_fallback_plan,
+    attach_source_access_and_missingness,
     build_atomic_claim_candidate,
     build_browser_retrieval_attempt,
     build_claim_family_resolution,
@@ -36,6 +39,7 @@ from researcher_swarm.retrieval import (  # noqa: E402
     build_retrieval_packet,
     build_retrieval_packet_manifest,
     build_retrieval_query_contexts,
+    build_retrieval_fallback_state,
     build_source_metadata_resolution_placeholder,
     normalize_retrieval_provenance,
     validate_temporal_eligibility,
@@ -601,6 +605,152 @@ class RetrievalPacketContractTest(unittest.TestCase):
         self.assertNotEqual(family_a["claim_family_id"], family_c["claim_family_id"])
         self.assertNotEqual(family_a["claim_family_id"], family_d["claim_family_id"])
         self.assertEqual(family_a["contradiction_family_id"], family_d["contradiction_family_id"])
+
+    def test_protected_primary_and_missingness_candidates_are_candidate_only(self) -> None:
+        qdt = copy.deepcopy(self.qdt)
+        leaf = qdt["required_leaf_questions"][0]
+        leaf["purpose"] = "source_of_truth"
+        leaf["research_sufficiency_requirements"]["protected_primary_required"] = True
+        leaf["research_sufficiency_requirements"]["required_source_classes"] = [
+            "official_or_primary",
+            "independent_secondary",
+        ]
+        packet = build_retrieval_packet(qdt, evidence_packet=self.evidence_packet)
+
+        packet = attach_source_access_and_missingness(packet)
+
+        self.assertTrue(validate_retrieval_packet(packet).valid)
+        self.assertEqual(packet["schema_feature_gates"]["RET-005"], "implemented")
+        self.assertEqual(len(packet["protected_primary_access_failures"]), 1)
+        failure = packet["protected_primary_access_failures"][0]
+        self.assertEqual(failure["access_status"], "missing")
+        self.assertFalse(failure["authority_boundary"]["signed_missingness_authority"])
+        missing_classes = {item["expected_source_class"] for item in packet["missingness_candidates"]}
+        self.assertIn("official_or_primary", missing_classes)
+        self.assertIn("independent_secondary", missing_classes)
+        self.assertTrue(
+            all(
+                item["distinct_absence_mechanism_proof_ref"] is None
+                and item["authority_boundary"]["scae_missingness_authority"] is False
+                for item in packet["missingness_candidates"]
+            )
+        )
+
+    def test_bounded_starvation_expansion_precedes_macro_fallback(self) -> None:
+        qdt = copy.deepcopy(self.qdt)
+        leaf = qdt["required_leaf_questions"][0]
+        leaf["purpose"] = "source_of_truth"
+        leaf["research_sufficiency_requirements"]["protected_primary_required"] = True
+        leaf["research_sufficiency_requirements"]["max_targeted_expansion_attempts"] = 2
+        packet = build_retrieval_packet(qdt, evidence_packet=self.evidence_packet)
+
+        packet = attach_retrieval_expansion_and_fallback_plan(packet, macro_fallback_requested=True)
+
+        self.assertTrue(validate_retrieval_packet(packet).valid)
+        self.assertEqual(packet["schema_feature_gates"]["RET-006"], "implemented")
+        first_leaf_attempts = [
+            item for item in packet["retrieval_expansion_attempts"] if item["leaf_id"] == leaf["leaf_id"]
+        ]
+        self.assertEqual([item["attempt_index"] for item in first_leaf_attempts], [1, 2])
+        self.assertTrue(all(item["bounded_by_requirement_max"] for item in first_leaf_attempts))
+        fallback = next(
+            item for item in packet["retrieval_fallback_states"] if item["leaf_id"] == leaf["leaf_id"]
+        )
+        self.assertEqual(
+            fallback["targeted_expansion_attempt_refs"],
+            [item["attempt_id"] for item in first_leaf_attempts],
+        )
+        self.assertFalse(fallback["macro_fallback_used"])
+        self.assertFalse(fallback["classification_dispatch_allowed_from_macro_fallback"])
+        self.assertIn(
+            "macro_fallback_not_sufficient_for_critical_or_source_of_truth",
+            fallback["reason_codes"],
+        )
+
+    def test_macro_fallback_can_be_marked_discovery_only_for_noncritical_leaf(self) -> None:
+        context = build_retrieval_query_contexts(self.qdt, evidence_packet=self.evidence_packet)[0]
+        context = copy.deepcopy(context)
+        context["purpose"] = "direct_evidence"
+        context["breadth_targets"]["protected_primary_required"] = False
+        context["sufficiency_requirements"]["static_information_weight"] = "medium"
+        context["sufficiency_requirements"]["allow_macro_fallback_for_leaf"] = True
+
+        fallback = build_retrieval_fallback_state(
+            context,
+            ["retrieval-expansion-a", "retrieval-expansion-b"],
+            macro_fallback_requested=True,
+        )
+
+        self.assertTrue(fallback["macro_fallback_used"])
+        self.assertEqual(fallback["macro_fallback_policy"], "explicit_last_resort_discovery_only")
+        self.assertEqual(fallback["macro_fallback_sufficiency_status"], "not_research_sufficiency_authority")
+        self.assertFalse(fallback["authority_boundary"]["research_sufficiency_authority"])
+
+    def test_native_transport_unavailability_is_diagnostic_and_resolver_owns_metadata(self) -> None:
+        packet = build_retrieval_packet(self.qdt, evidence_packet=self.evidence_packet)
+
+        packet = attach_native_research_transport_diagnostics(
+            packet,
+            availability_status="unavailable",
+            unavailable_reason="native_transport_not_configured",
+        )
+
+        self.assertTrue(validate_retrieval_packet(packet).valid)
+        self.assertEqual(packet["schema_feature_gates"]["RET-010"], "implemented")
+        diagnostic = packet["native_research_transport_diagnostics"][0]
+        self.assertEqual(diagnostic["availability_status"], "unavailable")
+        self.assertTrue(diagnostic["non_blocking_when_alternative_transport_satisfies_requirements"])
+        self.assertFalse(diagnostic["native_output_authority"]["source_metadata_final_authority"])
+        self.assertTrue(packet["native_research_attempts"])
+        self.assertTrue(
+            all(
+                attempt["diagnostic_only_when_unavailable"]
+                and attempt["metadata_authority_boundary"]["source_class_final_authority"] is False
+                for attempt in packet["native_research_attempts"]
+            )
+        )
+        self.assertEqual(
+            packet["research_sufficiency_summary"]["classification_dispatch_status"],
+            "blocked_until_certified",
+        )
+
+        native_proposal_only = normalize_retrieval_provenance(
+            {
+                "retrieval_transport": "native_gpt_research",
+                "transport_attempt_ref": "native:proposal",
+                "model_proposed_source_class": "official_or_primary",
+                "source_published_at": "2026-06-24T11:00:00+00:00",
+            },
+            dispatch_context={
+                "forecast_timestamp": "2026-06-24T12:00:00+00:00",
+                "source_cutoff_timestamp": "2026-06-24T12:00:00+00:00",
+            },
+        )
+        self.assertEqual(native_proposal_only["source_class"], "unknown")
+        self.assertIn(
+            "native_research_proposed_metadata_not_final_authority",
+            native_proposal_only["unknown_reason_codes"],
+        )
+
+        deterministic_official = normalize_retrieval_provenance(
+            {
+                "retrieval_transport": "native_gpt_research",
+                "transport_attempt_ref": "native:official",
+                "canonical_url": "https://example.com/official",
+                "official_source_hints": ["https://example.com/official"],
+                "source_class": "official_or_primary",
+                "source_published_at": "2026-06-24T11:00:00+00:00",
+            },
+            dispatch_context={
+                "forecast_timestamp": "2026-06-24T12:00:00+00:00",
+                "source_cutoff_timestamp": "2026-06-24T12:00:00+00:00",
+            },
+        )
+        resolution = deterministic_official["source_metadata_resolution"]
+        self.assertEqual(deterministic_official["source_class"], "official_or_primary")
+        self.assertEqual(resolution["accepted_metadata_authority"], "deterministic_source_metadata_resolver")
+        self.assertIn("source_class", resolution["deterministic_resolver_accepted_fields"])
+        self.assertFalse(resolution["model_proposed_metadata_counted"])
 
     def test_forbidden_probability_field_is_rejected(self) -> None:
         packet = build_retrieval_packet(self.qdt, evidence_packet=self.evidence_packet)

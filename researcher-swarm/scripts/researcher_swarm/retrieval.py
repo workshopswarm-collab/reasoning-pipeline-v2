@@ -52,10 +52,18 @@ CLAIM_FAMILY_RESOLUTION_SCHEMA_VERSION = "claim-family-resolution/v1"
 RETRIEVAL_TEMPORAL_ELIGIBILITY_SCHEMA_VERSION = "retrieval-temporal-eligibility/v1"
 RETRIEVAL_EVIDENCE_PROVENANCE_SCHEMA_VERSION = "retrieval-evidence-provenance/v1"
 RETRIEVAL_BREADTH_PROFILE_SCHEMA_VERSION = "retrieval-breadth-profile/v1"
+PROTECTED_PRIMARY_ACCESS_FAILURE_SCHEMA_VERSION = "protected-primary-access-failure/v1"
+EXPECTED_SOURCE_MISSINGNESS_CANDIDATE_SCHEMA_VERSION = "expected-source-missingness-candidate/v1"
+RETRIEVAL_EXPANSION_ATTEMPT_SCHEMA_VERSION = "retrieval-expansion-attempt/v1"
+RETRIEVAL_FALLBACK_STATE_SCHEMA_VERSION = "retrieval-fallback-state/v1"
+NATIVE_RESEARCH_TRANSPORT_DIAGNOSTIC_SCHEMA_VERSION = "native-research-transport-diagnostic/v1"
 RETRIEVAL_VALIDATOR_VERSION = "ads-ret-002-004-retrieval-schema/v1"
 RETRIEVAL_QUERY_PLANNER_VERSION = "ads-ret-001-query-planner/v1"
 RETRIEVAL_TEMPORAL_VALIDATOR_VERSION = "ads-ret-002-temporal-isolation/v1"
 RETRIEVAL_PROVENANCE_NORMALIZER_VERSION = "ads-ret-004-provenance-normalizer/v1"
+RETRIEVAL_SOURCE_ACCESS_TRACKER_VERSION = "ads-ret-005-source-access-missingness/v1"
+RETRIEVAL_EXPANSION_FALLBACK_VERSION = "ads-ret-006-expansion-fallback/v1"
+NATIVE_RESEARCH_RESOLVER_VERSION = "ads-ret-010-native-diagnostic-resolver/v1"
 OPENCLAW_BROWSER_PROVIDER_ID = "openclaw_web_fetch_browser"
 
 ALLOWED_RETRIEVAL_TRANSPORTS = {
@@ -100,6 +108,7 @@ ALLOWED_BROWSER_EXTRACTION_STATUSES = {
     "temporal_fail",
 }
 ALLOWED_NATIVE_ATTEMPT_STATUSES = {"accepted", "partial", "failed"}
+ALLOWED_NATIVE_TRANSPORT_AVAILABILITY_STATUSES = {"available", "unavailable", "partial"}
 ALLOWED_CLAIM_VALIDATION_STATUSES = {
     "accepted_for_normalization",
     "rejected_multi_claim",
@@ -769,13 +778,25 @@ def build_native_research_attempt(
     *,
     resolved_model_id: str = "gpt-5.5-high",
     attempt_status: str = "failed",
+    transport_availability_status: str = "unavailable",
+    failure_reason_codes: list[str] | None = None,
+    candidate_citation_refs: list[str] | None = None,
+    candidate_claim_refs: list[str] | None = None,
+    contradiction_candidate_refs: list[str] | None = None,
+    negative_check_candidate_refs: list[str] | None = None,
+    model_proposed_source_metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if attempt_status not in ALLOWED_NATIVE_ATTEMPT_STATUSES:
         raise RetrievalPacketError(f"unknown native research attempt status: {attempt_status}")
+    if transport_availability_status not in ALLOWED_NATIVE_TRANSPORT_AVAILABILITY_STATUSES:
+        raise RetrievalPacketError(f"unknown native transport availability: {transport_availability_status}")
+    proposed_metadata = copy.deepcopy(model_proposed_source_metadata or {})
+    _ensure_no_forbidden_keys(proposed_metadata, "model_proposed_source_metadata")
     seed = {
         "leaf_id": query_context.get("leaf_id"),
         "query_variant_id": query_variant.get("query_variant_id"),
         "query_sha": query_variant.get("query_text_sha256"),
+        "transport_availability_status": transport_availability_status,
     }
     return {
         "artifact_type": "native_research_attempt",
@@ -788,15 +809,72 @@ def build_native_research_attempt(
         "prompt_template_id": "native-gpt-research/v1",
         "query_manifest_sha256": _prefixed_sha256(query_context),
         "research_transport": "native_gpt_research",
-        "candidate_citation_refs": [],
-        "candidate_claim_refs": [],
-        "contradiction_candidate_refs": [],
-        "negative_check_candidate_refs": [],
-        "model_proposed_source_metadata": {},
+        "candidate_citation_refs": list(candidate_citation_refs or []),
+        "candidate_claim_refs": list(candidate_claim_refs or []),
+        "contradiction_candidate_refs": list(contradiction_candidate_refs or []),
+        "negative_check_candidate_refs": list(negative_check_candidate_refs or []),
+        "model_proposed_source_metadata": proposed_metadata,
         "candidate_output_schema_version": "native-research-candidates/v1",
         "attempt_status": attempt_status,
-        "failure_reason_codes": ["not_executed_schema_only_RET_001"],
-        "feature_gate_status": "native_transport_invocation_pending_RET_010",
+        "native_transport_availability_status": transport_availability_status,
+        "failure_reason_codes": list(failure_reason_codes or ["native_transport_unavailable_not_blocking"]),
+        "diagnostic_only_when_unavailable": transport_availability_status != "available",
+        "non_blocking_when_alternative_transport_satisfies_requirements": True,
+        "metadata_authority_boundary": {
+            "source_class_final_authority": False,
+            "source_family_final_authority": False,
+            "claim_family_final_authority": False,
+            "temporal_safety_final_authority": False,
+            "research_sufficiency_authority": False,
+        },
+        "resolver_required_for_accepted_metadata": "deterministic_source_metadata_resolver",
+        "feature_gate_status": "ret_010_native_transport_diagnostic",
+    }
+
+
+def build_native_research_transport_diagnostic(
+    *,
+    availability_status: str = "unavailable",
+    checked_at: str | None = None,
+    unavailable_reason: str | None = "native_research_transport_not_exposed",
+    resolved_model_id: str = "gpt-5.5-high",
+) -> dict[str, Any]:
+    if availability_status not in ALLOWED_NATIVE_TRANSPORT_AVAILABILITY_STATUSES:
+        raise RetrievalPacketError(f"unknown native transport availability: {availability_status}")
+    return {
+        "artifact_type": "native_research_transport_diagnostic",
+        "schema_version": NATIVE_RESEARCH_TRANSPORT_DIAGNOSTIC_SCHEMA_VERSION,
+        "diagnostic_id": _sha_id(
+            "native-research-diagnostic",
+            {
+                "availability_status": availability_status,
+                "checked_at": checked_at,
+                "resolved_model_id": resolved_model_id,
+            },
+        ),
+        "model_lane_id": "native_research_candidate_discovery",
+        "resolved_model_id": resolved_model_id,
+        "research_transport": "native_gpt_research",
+        "availability_status": availability_status,
+        "unavailable_reason": unavailable_reason if availability_status != "available" else None,
+        "checked_at": checked_at,
+        "candidate_discovery_role": "optional_transport",
+        "non_blocking_when_alternative_transport_satisfies_requirements": True,
+        "native_output_authority": {
+            "candidate_discovery": True,
+            "source_metadata_final_authority": False,
+            "claim_family_final_authority": False,
+            "temporal_safety_final_authority": False,
+            "research_sufficiency_authority": False,
+        },
+        "deterministic_resolver_authority": [
+            "source_class",
+            "source_family",
+            "claim_family",
+            "temporal_safety",
+        ],
+        "feature_id": "RET-010",
+        "diagnostic_version": NATIVE_RESEARCH_RESOLVER_VERSION,
     }
 
 
@@ -1107,6 +1185,8 @@ def _resolve_source_class(
     proposed_native = candidate.get("model_proposed_source_class")
     if _is_non_empty_string(proposed_native) and str(proposed_native) not in ALLOWED_SOURCE_CLASSES:
         return "unknown", "unknown", "unsupported_source_class", ["unsupported_model_proposed_source_class"]
+    if _is_non_empty_string(proposed_native):
+        return "unknown", "unknown", "not_used", ["native_research_proposed_metadata_not_final_authority"]
     classifier_status, classifier_class, classifier_reasons = _resolve_classifier_source_class(
         candidate,
         classifier_slice,
@@ -1235,8 +1315,26 @@ def build_source_metadata_resolution(
         "metadata_confidence": metadata_confidence,
         "counts_toward_breadth": bool(counts_toward_breadth),
         "unknown_reason_codes": list(unknown_reason_codes or []),
+        "accepted_metadata_authority": "deterministic_source_metadata_resolver",
+        "deterministic_resolver_accepted_fields": [
+            field
+            for field, accepted in (
+                ("source_class", source_class != "unknown"),
+                ("source_family", source_family_id != "source-family-unknown"),
+                ("claim_family", bool(claim_family_ids)),
+                ("temporal_safety", temporal_safety_status == "pass"),
+            )
+            if accepted
+        ],
+        "model_proposed_metadata_counted": False,
+        "authority_boundary": {
+            "native_research_final_authority": False,
+            "classifier_protected_primary_final_authority": False,
+            "research_sufficiency_authority": False,
+        },
         "feature_gate_status": "ret_004_deterministic_resolution",
         "normalizer_version": RETRIEVAL_PROVENANCE_NORMALIZER_VERSION,
+        "ret_010_resolver_version": NATIVE_RESEARCH_RESOLVER_VERSION,
     }
 
 
@@ -1778,6 +1876,527 @@ def build_leaf_retrieval_result(
     }
 
 
+def _contexts_by_leaf(packet: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    contexts = packet.get("leaf_query_contexts", [])
+    if not isinstance(contexts, list):
+        return {}
+    return {
+        context.get("leaf_id"): context
+        for context in contexts
+        if isinstance(context, dict) and _is_non_empty_string(context.get("leaf_id"))
+    }
+
+
+def _results_by_leaf(packet: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    results = packet.get("leaf_retrieval_results", [])
+    if not isinstance(results, list):
+        return {}
+    return {
+        result.get("leaf_id"): result
+        for result in results
+        if isinstance(result, dict) and _is_non_empty_string(result.get("leaf_id"))
+    }
+
+
+def _selected_from_result(result: dict[str, Any] | None) -> list[dict[str, Any]]:
+    selected = (result or {}).get("selected_evidence", [])
+    if not isinstance(selected, list):
+        return []
+    return [item for item in selected if isinstance(item, dict)]
+
+
+def _required_source_classes_from_context(context: dict[str, Any]) -> list[str]:
+    targets = context.get("breadth_targets") if isinstance(context.get("breadth_targets"), dict) else {}
+    raw = targets.get("source_class_targets", [])
+    if not isinstance(raw, list):
+        return []
+    return sorted({str(item) for item in raw if item in ALLOWED_SOURCE_CLASSES and item != "unknown"})
+
+
+def _selected_source_classes(selected: list[dict[str, Any]]) -> set[str]:
+    return {
+        str(item.get("source_class"))
+        for item in selected
+        if item.get("temporal_gate_status") == "pass" and item.get("source_class") in ALLOWED_SOURCE_CLASSES
+    }
+
+
+def _protected_primary_required(context: dict[str, Any]) -> bool:
+    targets = context.get("breadth_targets") if isinstance(context.get("breadth_targets"), dict) else {}
+    return bool(targets.get("protected_primary_required") is True)
+
+
+def _protected_primary_admitted_for_context(selected: list[dict[str, Any]]) -> bool:
+    return any(
+        item.get("source_class") in PROTECTED_SOURCE_CLASSES and item.get("temporal_gate_status") == "pass"
+        for item in selected
+    )
+
+
+def _leaf_static_weight_from_context(context: dict[str, Any]) -> str:
+    requirements = context.get("sufficiency_requirements")
+    if isinstance(requirements, dict) and _is_non_empty_string(requirements.get("static_information_weight")):
+        return str(requirements["static_information_weight"])
+    return "medium"
+
+
+def _leaf_is_critical_or_source_of_truth(context: dict[str, Any]) -> bool:
+    return (
+        context.get("purpose") == "source_of_truth"
+        or _leaf_static_weight_from_context(context) == "critical"
+        or _protected_primary_required(context)
+    )
+
+
+def _minimum_selected_for_context(context: dict[str, Any]) -> int:
+    targets = context.get("breadth_targets") if isinstance(context.get("breadth_targets"), dict) else {}
+    minimum = 1
+    for field in (
+        "min_independent_source_families",
+        "min_independent_claim_families",
+        "min_temporally_fresh_sources",
+    ):
+        value = targets.get(field, 0)
+        if isinstance(value, int) and not isinstance(value, bool):
+            minimum = max(minimum, value)
+    return minimum
+
+
+def _expected_source_refs(context: dict[str, Any]) -> list[dict[str, Any]]:
+    refs = context.get("direct_url_candidates", [])
+    if not isinstance(refs, list):
+        return []
+    compact = []
+    for item in refs[:8]:
+        if not isinstance(item, dict):
+            continue
+        compact.append(
+            {
+                "url": item.get("url"),
+                "source_ref": item.get("source_ref"),
+                "direct_url_priority": item.get("direct_url_priority"),
+            }
+        )
+    return compact
+
+
+def build_protected_primary_access_failure(
+    query_context: dict[str, Any],
+    result: dict[str, Any] | None = None,
+    *,
+    reason_codes: list[str] | None = None,
+) -> dict[str, Any]:
+    selected = _selected_from_result(result)
+    browser_attempt_refs = list((result or {}).get("browser_retrieval_attempt_refs") or [])
+    native_attempt_refs = list((result or {}).get("native_research_attempt_refs") or [])
+    observed_attempt_refs = browser_attempt_refs + native_attempt_refs
+    reasons = list(reason_codes or [])
+    if not reasons:
+        reasons.append("no_admitted_protected_primary")
+    if observed_attempt_refs:
+        reasons.append("protected_primary_not_admitted_after_attempts")
+    else:
+        reasons.append("protected_primary_not_attempted")
+    if not _expected_source_refs(query_context):
+        reasons.append("expected_protected_source_unknown")
+    seed = {
+        "leaf_id": query_context.get("leaf_id"),
+        "query_context_ref": query_context.get("query_context_ref"),
+        "reasons": sorted(set(reasons)),
+        "selected": [item.get("evidence_ref") for item in selected],
+    }
+    return {
+        "artifact_type": "protected_primary_access_failure",
+        "schema_version": PROTECTED_PRIMARY_ACCESS_FAILURE_SCHEMA_VERSION,
+        "failure_id": _sha_id("protected-primary-failure", seed),
+        "leaf_id": query_context.get("leaf_id"),
+        "query_context_ref": query_context.get("query_context_ref"),
+        "required_source_classes": [
+            item for item in _required_source_classes_from_context(query_context) if item in PROTECTED_SOURCE_CLASSES
+        ],
+        "expected_source_refs": _expected_source_refs(query_context),
+        "observed_attempt_refs": observed_attempt_refs,
+        "admitted_evidence_refs": [
+            item.get("evidence_ref")
+            for item in selected
+            if item.get("source_class") in PROTECTED_SOURCE_CLASSES and item.get("temporal_gate_status") == "pass"
+        ],
+        "access_status": "missing" if not observed_attempt_refs else "attempted_without_admitted_primary",
+        "reason_codes": sorted(set(reasons)),
+        "candidate_tracking_only": True,
+        "authority_boundary": {
+            "authors_new_evidence": False,
+            "signed_missingness_authority": False,
+            "classification_dispatch_authority": False,
+            "research_sufficiency_authority": False,
+        },
+        "tracker_version": RETRIEVAL_SOURCE_ACCESS_TRACKER_VERSION,
+    }
+
+
+def build_expected_source_missingness_candidate(
+    query_context: dict[str, Any],
+    result: dict[str, Any] | None,
+    *,
+    expected_source_class: str,
+    reason_codes: list[str] | None = None,
+    expected_source_ref: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    selected = _selected_from_result(result)
+    reasons = list(reason_codes or ["required_source_class_absent"])
+    seed = {
+        "leaf_id": query_context.get("leaf_id"),
+        "expected_source_class": expected_source_class,
+        "expected_source_ref": expected_source_ref,
+        "selected": [item.get("evidence_ref") for item in selected],
+        "reasons": sorted(set(reasons)),
+    }
+    return {
+        "artifact_type": "expected_source_missingness_candidate",
+        "schema_version": EXPECTED_SOURCE_MISSINGNESS_CANDIDATE_SCHEMA_VERSION,
+        "candidate_id": _sha_id("missingness-candidate", seed),
+        "leaf_id": query_context.get("leaf_id"),
+        "query_context_ref": query_context.get("query_context_ref"),
+        "expected_source_class": expected_source_class,
+        "expected_source_ref": expected_source_ref,
+        "missingness_status": "candidate_unresolved",
+        "missingness_basis": "expected_source_not_admitted",
+        "evidence_refs_checked": [item.get("evidence_ref") for item in selected if item.get("evidence_ref")],
+        "attempt_refs_checked": list((result or {}).get("browser_retrieval_attempt_refs") or [])
+        + list((result or {}).get("native_research_attempt_refs") or []),
+        "distinct_absence_mechanism_proof_ref": None,
+        "reason_codes": sorted(set(reasons)),
+        "candidate_tracking_only": True,
+        "authority_boundary": {
+            "authors_new_evidence": False,
+            "signed_missingness_authority": False,
+            "scae_missingness_authority": False,
+            "classification_dispatch_authority": False,
+            "research_sufficiency_authority": False,
+        },
+        "tracker_version": RETRIEVAL_SOURCE_ACCESS_TRACKER_VERSION,
+    }
+
+
+def build_source_access_and_missingness_report(packet: dict[str, Any]) -> dict[str, Any]:
+    contexts = _contexts_by_leaf(packet)
+    results = _results_by_leaf(packet)
+    failures: list[dict[str, Any]] = []
+    missingness: list[dict[str, Any]] = []
+    for leaf_id, context in sorted(contexts.items()):
+        result = results.get(leaf_id, {})
+        selected = _selected_from_result(result)
+        present_classes = _selected_source_classes(selected)
+        missing_classes = [
+            source_class
+            for source_class in _required_source_classes_from_context(context)
+            if source_class not in present_classes
+        ]
+        if _protected_primary_required(context) and not _protected_primary_admitted_for_context(selected):
+            failures.append(build_protected_primary_access_failure(context, result))
+        for source_class in missing_classes:
+            missingness.append(
+                build_expected_source_missingness_candidate(
+                    context,
+                    result,
+                    expected_source_class=source_class,
+                    reason_codes=[
+                        "required_source_class_absent",
+                        "protected_primary_missing" if source_class in PROTECTED_SOURCE_CLASSES else "expected_source_class_missing",
+                    ],
+                )
+            )
+        for expected in _expected_source_refs(context):
+            url = canonicalize_source_url(expected.get("url"))
+            if not url:
+                continue
+            if any(
+                canonicalize_source_url(item.get("canonical_url"), item.get("final_url"), item.get("requested_url")) == url
+                for item in selected
+            ):
+                continue
+            missingness.append(
+                build_expected_source_missingness_candidate(
+                    context,
+                    result,
+                    expected_source_class="unknown",
+                    expected_source_ref=expected,
+                    reason_codes=["direct_expected_source_not_admitted"],
+                )
+            )
+    return {
+        "feature_id": "RET-005",
+        "tracker_version": RETRIEVAL_SOURCE_ACCESS_TRACKER_VERSION,
+        "protected_primary_access_failures": failures,
+        "missingness_candidates": missingness,
+        "summary": {
+            "leaf_count": len(contexts),
+            "protected_primary_failure_count": len(failures),
+            "missingness_candidate_count": len(missingness),
+            "candidate_tracking_only": True,
+        },
+    }
+
+
+def attach_source_access_and_missingness(packet: dict[str, Any]) -> dict[str, Any]:
+    packet_copy = copy.deepcopy(packet)
+    report = build_source_access_and_missingness_report(packet_copy)
+    packet_copy["protected_primary_access_failures"] = report["protected_primary_access_failures"]
+    packet_copy["missingness_candidates"] = report["missingness_candidates"]
+    packet_copy["source_access_missingness_summary"] = report["summary"]
+    packet_copy.setdefault("schema_feature_gates", {})["RET-005"] = "implemented"
+    packet_copy.setdefault("validation_summary", {}).setdefault("reason_codes", []).append(
+        "ret_005_source_access_missingness_tracked"
+    )
+    result = validate_retrieval_packet(packet_copy)
+    if not result.valid:
+        raise RetrievalPacketError("; ".join(result.errors))
+    return packet_copy
+
+
+def _unsatisfied_requirement_codes_for_expansion(context: dict[str, Any], result: dict[str, Any] | None) -> list[str]:
+    selected = _selected_from_result(result)
+    selected_count = len(selected)
+    minimum = _minimum_selected_for_context(context)
+    codes: list[str] = []
+    if selected_count == 0:
+        codes.append("empty_retrieval")
+    elif selected_count < minimum:
+        codes.append("thin_retrieval")
+    present_classes = _selected_source_classes(selected)
+    if any(source_class not in present_classes for source_class in _required_source_classes_from_context(context)):
+        codes.append("required_source_class_missing")
+    if _protected_primary_required(context) and not _protected_primary_admitted_for_context(selected):
+        codes.append("protected_primary_missing")
+    return sorted(set(codes))
+
+
+def build_retrieval_expansion_attempt(
+    query_context: dict[str, Any],
+    *,
+    attempt_index: int,
+    unsatisfied_requirement_codes: list[str],
+    attempt_status: str = "planned_not_executed",
+) -> dict[str, Any]:
+    requirements = query_context.get("sufficiency_requirements")
+    if not isinstance(requirements, dict):
+        requirements = {}
+    max_attempts = int(requirements.get("max_targeted_expansion_attempts", 1) or 1)
+    if attempt_index < 1 or attempt_index > max_attempts:
+        raise RetrievalPacketError("attempt_index must be within max_targeted_expansion_attempts")
+    base_terms = " ".join(query_context.get("market_component_terms", [])[:6])
+    unsatisfied = " ".join(unsatisfied_requirement_codes).replace("_", " ")
+    query_text = _bounded_query_text(
+        f"{query_context.get('leaf_question', '')} targeted expansion {attempt_index} {unsatisfied} {base_terms} before cutoff"
+    )
+    seed = {
+        "leaf_id": query_context.get("leaf_id"),
+        "query_context_ref": query_context.get("query_context_ref"),
+        "attempt_index": attempt_index,
+        "unsatisfied": sorted(set(unsatisfied_requirement_codes)),
+    }
+    return {
+        "artifact_type": "retrieval_expansion_attempt",
+        "schema_version": RETRIEVAL_EXPANSION_ATTEMPT_SCHEMA_VERSION,
+        "attempt_id": _sha_id("retrieval-expansion", seed),
+        "leaf_id": query_context.get("leaf_id"),
+        "query_context_ref": query_context.get("query_context_ref"),
+        "attempt_index": int(attempt_index),
+        "max_attempts": max_attempts,
+        "expansion_strategy": "targeted_requirement_expansion",
+        "attempt_status": attempt_status,
+        "unsatisfied_requirement_codes": sorted(set(unsatisfied_requirement_codes)),
+        "query_variant_refs": [
+            item.get("query_variant_id")
+            for item in query_context.get("query_variants", [])
+            if isinstance(item, dict) and item.get("query_variant_id")
+        ],
+        "expansion_query_text_sha256": _prefixed_sha256(query_text),
+        "candidate_refs": [],
+        "admitted_evidence_refs": [],
+        "bounded_by_requirement_max": True,
+        "macro_fallback_phase": False,
+        "authority_boundary": {
+            "authors_new_evidence": False,
+            "classification_dispatch_authority": False,
+            "research_sufficiency_authority": False,
+        },
+        "planner_version": RETRIEVAL_EXPANSION_FALLBACK_VERSION,
+    }
+
+
+def build_retrieval_fallback_state(
+    query_context: dict[str, Any],
+    expansion_attempt_refs: list[str],
+    *,
+    macro_fallback_requested: bool = False,
+) -> dict[str, Any]:
+    requirements = query_context.get("sufficiency_requirements")
+    if not isinstance(requirements, dict):
+        requirements = {}
+    critical_or_source = _leaf_is_critical_or_source_of_truth(query_context)
+    allowed_by_leaf = bool(requirements.get("allow_macro_fallback_for_leaf") is True)
+    macro_fallback_used = bool(macro_fallback_requested and allowed_by_leaf and not critical_or_source)
+    reason_codes = ["macro_fallback_last_resort_discovery_only"]
+    if critical_or_source:
+        reason_codes.append("macro_fallback_not_sufficient_for_critical_or_source_of_truth")
+    if not allowed_by_leaf:
+        reason_codes.append("macro_fallback_not_allowed_by_leaf_requirements")
+    if not expansion_attempt_refs:
+        reason_codes.append("targeted_expansion_required_before_macro_fallback")
+    seed = {
+        "leaf_id": query_context.get("leaf_id"),
+        "expansion_attempt_refs": expansion_attempt_refs,
+        "macro_fallback_requested": macro_fallback_requested,
+        "macro_fallback_used": macro_fallback_used,
+    }
+    return {
+        "artifact_type": "retrieval_fallback_state",
+        "schema_version": RETRIEVAL_FALLBACK_STATE_SCHEMA_VERSION,
+        "fallback_state_id": _sha_id("retrieval-fallback", seed),
+        "leaf_id": query_context.get("leaf_id"),
+        "query_context_ref": query_context.get("query_context_ref"),
+        "targeted_expansion_attempt_refs": list(expansion_attempt_refs),
+        "targeted_expansion_required_before_macro_fallback": True,
+        "macro_fallback_requested": bool(macro_fallback_requested),
+        "macro_fallback_used": macro_fallback_used,
+        "macro_fallback_policy": "explicit_last_resort_discovery_only",
+        "macro_fallback_sufficiency_status": (
+            "not_sufficient_for_critical_or_source_of_truth"
+            if critical_or_source
+            else "not_research_sufficiency_authority"
+        ),
+        "classification_dispatch_allowed_from_macro_fallback": False,
+        "reason_codes": sorted(set(reason_codes)),
+        "authority_boundary": {
+            "authors_new_evidence": False,
+            "critical_or_source_of_truth_sufficiency_authority": False,
+            "classification_dispatch_authority": False,
+            "research_sufficiency_authority": False,
+        },
+        "planner_version": RETRIEVAL_EXPANSION_FALLBACK_VERSION,
+    }
+
+
+def build_retrieval_expansion_and_fallback_plan(
+    packet: dict[str, Any],
+    *,
+    macro_fallback_requested: bool = False,
+) -> dict[str, Any]:
+    contexts = _contexts_by_leaf(packet)
+    results = _results_by_leaf(packet)
+    attempts: list[dict[str, Any]] = []
+    fallback_states: list[dict[str, Any]] = []
+    for leaf_id, context in sorted(contexts.items()):
+        result = results.get(leaf_id, {})
+        unsatisfied = _unsatisfied_requirement_codes_for_expansion(context, result)
+        if not unsatisfied:
+            continue
+        requirements = context.get("sufficiency_requirements")
+        max_attempts = 1
+        if isinstance(requirements, dict):
+            max_attempts = int(requirements.get("max_targeted_expansion_attempts", 1) or 1)
+        leaf_attempts = [
+            build_retrieval_expansion_attempt(
+                context,
+                attempt_index=attempt_index,
+                unsatisfied_requirement_codes=unsatisfied,
+            )
+            for attempt_index in range(1, max_attempts + 1)
+        ]
+        attempts.extend(leaf_attempts)
+        fallback_states.append(
+            build_retrieval_fallback_state(
+                context,
+                [attempt["attempt_id"] for attempt in leaf_attempts],
+                macro_fallback_requested=macro_fallback_requested,
+            )
+        )
+    return {
+        "feature_id": "RET-006",
+        "planner_version": RETRIEVAL_EXPANSION_FALLBACK_VERSION,
+        "retrieval_expansion_attempts": attempts,
+        "retrieval_fallback_states": fallback_states,
+        "summary": {
+            "leaf_count": len(contexts),
+            "starved_leaf_count": len(fallback_states),
+            "targeted_expansion_attempt_count": len(attempts),
+            "macro_fallback_state_count": len(fallback_states),
+            "macro_fallback_discovery_only": True,
+        },
+    }
+
+
+def attach_retrieval_expansion_and_fallback_plan(
+    packet: dict[str, Any],
+    *,
+    macro_fallback_requested: bool = False,
+) -> dict[str, Any]:
+    packet_copy = copy.deepcopy(packet)
+    plan = build_retrieval_expansion_and_fallback_plan(
+        packet_copy,
+        macro_fallback_requested=macro_fallback_requested,
+    )
+    packet_copy["retrieval_expansion_attempts"] = plan["retrieval_expansion_attempts"]
+    packet_copy["retrieval_fallback_states"] = plan["retrieval_fallback_states"]
+    packet_copy["retrieval_fallback_summary"] = plan["summary"]
+    packet_copy.setdefault("schema_feature_gates", {})["RET-006"] = "implemented"
+    packet_copy.setdefault("validation_summary", {}).setdefault("reason_codes", []).append(
+        "ret_006_expansion_fallback_planned"
+    )
+    result = validate_retrieval_packet(packet_copy)
+    if not result.valid:
+        raise RetrievalPacketError("; ".join(result.errors))
+    return packet_copy
+
+
+def attach_native_research_transport_diagnostics(
+    packet: dict[str, Any],
+    *,
+    availability_status: str = "unavailable",
+    unavailable_reason: str | None = "native_research_transport_not_exposed",
+    resolved_model_id: str = "gpt-5.5-high",
+) -> dict[str, Any]:
+    packet_copy = copy.deepcopy(packet)
+    diagnostic = build_native_research_transport_diagnostic(
+        availability_status=availability_status,
+        checked_at=packet_copy.get("forecast_timestamp"),
+        unavailable_reason=unavailable_reason,
+        resolved_model_id=resolved_model_id,
+    )
+    attempts: list[dict[str, Any]] = []
+    if availability_status != "available":
+        for context in packet_copy.get("leaf_query_contexts", []):
+            if not isinstance(context, dict) or not context.get("query_variants"):
+                continue
+            variant = context["query_variants"][0]
+            attempt = build_native_research_attempt(
+                context,
+                variant,
+                resolved_model_id=resolved_model_id,
+                attempt_status="failed",
+                transport_availability_status=availability_status,
+                failure_reason_codes=[unavailable_reason or "native_research_transport_unavailable"],
+            )
+            attempts.append(attempt)
+    packet_copy["native_research_transport_diagnostics"] = [diagnostic]
+    packet_copy["native_research_attempts"] = attempts
+    attempt_refs_by_leaf: dict[str, list[str]] = {}
+    for attempt in attempts:
+        attempt_refs_by_leaf.setdefault(str(attempt.get("leaf_id")), []).append(attempt["attempt_id"])
+    for result in packet_copy.get("leaf_retrieval_results", []):
+        if isinstance(result, dict):
+            result["native_research_attempt_refs"] = attempt_refs_by_leaf.get(str(result.get("leaf_id")), [])
+    packet_copy.setdefault("schema_feature_gates", {})["RET-010"] = "implemented"
+    packet_copy.setdefault("validation_summary", {}).setdefault("reason_codes", []).append(
+        "ret_010_native_transport_diagnostic_recorded"
+    )
+    result = validate_retrieval_packet(packet_copy)
+    if not result.valid:
+        raise RetrievalPacketError("; ".join(result.errors))
+    return packet_copy
+
+
 def build_retrieval_packet(
     qdt: dict[str, Any],
     *,
@@ -1881,6 +2500,7 @@ def build_retrieval_packet(
         "contradiction_search_attempts": [],
         "negative_check_attempts": [],
         "retrieval_expansion_attempts": [],
+        "retrieval_fallback_states": [],
         "leaf_research_sufficiency_certificates": [],
         "protected_primary_access_failures": [],
         "missingness_candidates": [],
@@ -1888,6 +2508,7 @@ def build_retrieval_packet(
             build_browser_search_provider_diagnostic(checked_at=forecast)
         ],
         "native_research_attempts": [],
+        "native_research_transport_diagnostics": [],
         "browser_retrieval_attempts": [],
         "source_metadata_resolutions": source_metadata_resolutions,
         "atomic_claim_candidates": [],
@@ -2176,9 +2797,12 @@ def validate_retrieval_packet(packet: dict[str, Any]) -> RetrievalValidationResu
         "contradiction_search_attempts",
         "negative_check_attempts",
         "retrieval_expansion_attempts",
+        "retrieval_fallback_states",
         "leaf_research_sufficiency_certificates",
         "protected_primary_access_failures",
         "missingness_candidates",
+        "native_research_attempts",
+        "native_research_transport_diagnostics",
         "source_metadata_resolutions",
         "retrieval_evidence_provenance_slices",
         "policy_context_ref",
@@ -2275,9 +2899,12 @@ def validate_retrieval_packet(packet: dict[str, Any]) -> RetrievalValidationResu
         "contradiction_search_attempts",
         "negative_check_attempts",
         "retrieval_expansion_attempts",
+        "retrieval_fallback_states",
         "leaf_research_sufficiency_certificates",
         "protected_primary_access_failures",
         "missingness_candidates",
+        "native_research_attempts",
+        "native_research_transport_diagnostics",
         "source_metadata_resolutions",
         "retrieval_evidence_provenance_slices",
     ):
