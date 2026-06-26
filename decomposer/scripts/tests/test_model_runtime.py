@@ -154,6 +154,12 @@ class ModelRuntimeContractTest(unittest.TestCase):
         self.assertEqual(result.runtime_call["repair_count"], 1)
         self.assertEqual(result.runtime_call["execution_status"], "succeeded")
 
+    def test_wrapped_json_text_response_is_parsed_before_validation(self) -> None:
+        result = self._call(fixture_response='```json\\n{"ok": true}\\n```')
+
+        self.assertEqual(result.response_payload, {"ok": True})
+        self.assertEqual(result.runtime_call["execution_status"], "succeeded")
+
     def test_exhausted_transport_retry_returns_failed_runtime_call(self) -> None:
         def transport(_payload: dict[str, Any]) -> dict[str, Any]:
             raise RuntimeError("down")

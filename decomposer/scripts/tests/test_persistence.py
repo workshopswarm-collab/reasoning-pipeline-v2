@@ -209,6 +209,19 @@ class QDTPersistenceTest(unittest.TestCase):
             len(qdt["required_leaf_questions"]),
         )
 
+    def test_accepts_orchestrator_hyphenated_question_decomposition_manifest_type(self) -> None:
+        qdt = self._selected_qdt()
+        with tempfile.TemporaryDirectory() as temp:
+            manifest = self._manifest(qdt, Path(temp))
+            manifest["artifact_type"] = "question-decomposition"
+
+            run_id = write_decomposition_run(self.conn, qdt, manifest=manifest)
+
+        self.assertEqual(run_id, decomposition_run_id_for(qdt))
+        run = self.conn.execute("SELECT qdt_artifact_id, artifact_path FROM qdt_decomposition_runs").fetchone()
+        self.assertEqual(run["qdt_artifact_id"], manifest["artifact_id"])
+        self.assertEqual(run["artifact_path"], manifest["path"])
+
     def test_rejects_scae_and_probability_authority_fields(self) -> None:
         qdt = self._selected_qdt()
         unsafe = copy.deepcopy(qdt)

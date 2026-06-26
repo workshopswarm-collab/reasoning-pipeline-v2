@@ -21,6 +21,14 @@ from .qdt import (
     QDT_SCHEMA_VALIDATOR_VERSION,
     validate_question_decomposition,
 )
+
+
+QUESTION_DECOMPOSITION_MANIFEST_ARTIFACT_TYPES = {
+    QUESTION_DECOMPOSITION_ARTIFACT_TYPE,
+    QUESTION_DECOMPOSITION_ARTIFACT_TYPE.replace("_", "-"),
+}
+
+
 def _add_orchestrator_scripts_to_path() -> None:
     configured = os.environ.get("ADS_ORCHESTRATOR_SCRIPTS")
     candidates = []
@@ -319,7 +327,7 @@ def _manifest_context(
         manifest,
         expected_artifact_schema_version="question-decomposition/v1",
     )
-    if manifest.get("artifact_type") != QUESTION_DECOMPOSITION_ARTIFACT_TYPE:
+    if manifest.get("artifact_type") not in QUESTION_DECOMPOSITION_MANIFEST_ARTIFACT_TYPES:
         raise QDTPersistenceError("artifact manifest must be for question_decomposition")
     artifact_id = write_artifact_manifest(conn, manifest)
     numeric_id = _artifact_manifest_numeric_id(conn, artifact_id)

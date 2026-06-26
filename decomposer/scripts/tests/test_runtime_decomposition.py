@@ -12,14 +12,20 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "decomposer" / "scripts"))
+sys.path.insert(0, str(ROOT / "decomposer" / "scripts" / "bin"))
 sys.path.insert(0, str(ROOT / "orchestrator" / "scripts"))
 
+from ads_decomposer.model_runtime import MODEL_RUNTIME_TRANSPORT_RESPONSE_SCHEMA_VERSION  # noqa: E402
 from ads_decomposer.handoff import (  # noqa: E402
     DECOMPOSER_MODEL_ID,
     DECOMPOSER_MODEL_LANE_ID,
     DECOMPOSER_PROMPT_TEMPLATE_ID,
 )
 from ads_decomposer.qdt import validate_question_decomposition  # noqa: E402
+from run_decomposition import (  # noqa: E402
+    build_question_decomposition_from_handoff,
+    build_question_specific_fixture_response,
+)
 
 
 class RuntimeDecompositionEntrypointTest(unittest.TestCase):
@@ -112,6 +118,104 @@ class RuntimeDecompositionEntrypointTest(unittest.TestCase):
         self.assertEqual(runtime["execution_status"], "succeeded")
         self.assertEqual(runtime["forbidden_output_scan"]["status"], "passed")
         self.assertTrue(qdt["question_specificity_check"]["generic_fixture_leaf_ids_absent"])
+
+    def test_live_transport_builds_question_specific_qdt_without_fixture_mode(self) -> None:
+        handoff = self._handoff()
+        model_response = build_question_specific_fixture_response(handoff)
+        requests: list[dict] = []
+
+        def transport(payload: dict) -> dict:
+            requests.append(payload)
+            self.assertEqual(payload["provider_route"], "openai/gpt-5.5-high")
+            self.assertEqual(payload["prompt_template_id"], DECOMPOSER_PROMPT_TEMPLATE_ID)
+            self.assertEqual(payload["request_payload"]["macro_question"], handoff["macro_question"])
+            return {
+                "schema_version": MODEL_RUNTIME_TRANSPORT_RESPONSE_SCHEMA_VERSION,
+                "response_payload": model_response,
+                "token_usage": {"input_tokens": 20, "output_tokens": 10, "total_tokens": 30},
+                "provider_status": {"finish_reason": "stop"},
+            }
+
+        qdt, runtime = build_question_decomposition_from_handoff(
+            handoff,
+            runtime_mode="live",
+            transport=transport,
+        )
+
+        self.assertEqual(len(requests), 1)
+        self.assertTrue(validate_question_decomposition(qdt).valid)
+        self.assertEqual(qdt["adapter_mode"], "decomposer_model_runtime_live")
+        self.assertFalse(qdt["model_execution_context"]["fixture_mode"])
+        self.assertTrue(qdt["model_execution_context"]["model_executed"])
+        self.assertEqual(qdt["model_execution_context"]["resolved_model_id"], "gpt-5.5-high")
+        self.assertEqual(qdt["model_execution_context"]["token_usage"]["total_tokens"], 30)
+        self.assertEqual(runtime["mode"], "live")
+        self.assertFalse(runtime["fixture_mode"])
+        self.assertIn("live_transport_called", runtime["runtime_reason_codes"])
+
+    def test_schema_repair_is_bounded_before_qdt_materialization(self) -> None:
+        handoff = self._handoff()
+        repairable = build_question_specific_fixture_response(handoff)
+        repairable["leaves"] = repairable.pop("required_leaf_questions")
+
+        qdt, runtime = build_question_decomposition_from_handoff(
+            handoff,
+            runtime_mode="fixture",
+            fixture_response=repairable,
+        )
+
+        self.assertTrue(validate_question_decomposition(qdt).valid)
+        self.assertEqual(runtime["repair_count"], 1)
+        self.assertEqual(qdt["model_execution_context"]["repair_count"], 1)
+
+    def test_cli_live_mode_accepts_transport_response_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            temp = Path(tempdir)
+            handoff = self._handoff()
+            handoff_path = temp / "handoff.json"
+            qdt_path = temp / "question-decomposition.json"
+            runtime_path = temp / "model-runtime-call.json"
+            transport_path = temp / "transport-response.json"
+            handoff_path.write_text(json.dumps(handoff, sort_keys=True), encoding="utf-8")
+            transport_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": MODEL_RUNTIME_TRANSPORT_RESPONSE_SCHEMA_VERSION,
+                        "response_payload": build_question_specific_fixture_response(handoff),
+                    },
+                    sort_keys=True,
+                ),
+                encoding="utf-8",
+            )
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "decomposer" / "scripts" / "bin" / "run_decomposition.py"),
+                    "--handoff",
+                    str(handoff_path),
+                    "--output",
+                    str(qdt_path),
+                    "--runtime-call-output",
+                    str(runtime_path),
+                    "--runtime-mode",
+                    "live",
+                    "--transport-response",
+                    str(transport_path),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+            qdt = json.loads(qdt_path.read_text(encoding="utf-8"))
+            runtime = json.loads(runtime_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(qdt["adapter_mode"], "decomposer_model_runtime_live")
+        self.assertFalse(qdt["model_execution_context"]["fixture_mode"])
+        self.assertEqual(runtime["mode"], "live")
+        self.assertFalse(runtime["fixture_mode"])
 
 
 if __name__ == "__main__":

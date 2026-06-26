@@ -25,7 +25,7 @@ def build_stage_handlers(**kwargs: Any) -> dict[str, Callable[..., Any]]:
     kwargs.pop("live_policy_overlay", None)
     kwargs.pop("live_fixture_retrieval", None)
     kwargs.pop("block_at_leaf_research_barrier", None)
-    runtime_mode = kwargs.pop("decomposer_runtime_mode", "fixture")
+    runtime_mode = kwargs.pop("decomposer_runtime_mode", "live")
     return _build_stage_handlers(
         **kwargs,
         handler_factory_ref=TRUE_PRODUCTION_HANDLER_FACTORY_REF,

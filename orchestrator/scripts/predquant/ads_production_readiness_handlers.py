@@ -50,6 +50,10 @@ from ads_decomposer.handoff import (  # noqa: E402
     DECOMPOSER_HANDOFF_SCHEMA_VERSION,
     build_decomposer_handoff,
 )
+from ads_decomposer.persistence import (  # noqa: E402
+    write_decomposition_run,
+    write_qdt_research_sufficiency_requirements,
+)
 from ads_decomposer.qdt import (  # noqa: E402
     QUESTION_DECOMPOSITION_ARTIFACT_TYPE,
     QUESTION_DECOMPOSITION_SCHEMA_VERSION,
@@ -744,6 +748,7 @@ def build_stage_handlers(
     handler_scope: str | None = None,
     decomposer_runtime: bool = False,
     decomposer_runtime_mode: str = "fixture",
+    decomposer_runtime_transport_response_path: str | Path | None = None,
     live_policy_overlay: bool = False,
     live_fixture_retrieval: bool = False,
     block_at_leaf_research_barrier: bool = False,
@@ -907,6 +912,8 @@ def build_stage_handlers(
                 "--runtime-mode",
                 decomposer_runtime_mode,
             ]
+            if decomposer_runtime_transport_response_path is not None:
+                command.extend(["--transport-response", str(decomposer_runtime_transport_response_path)])
             completed = subprocess.run(command, check=False, capture_output=True, text=True)
             if completed.returncode != 0:
                 raise RuntimeError(
@@ -984,6 +991,13 @@ def build_stage_handlers(
         )
         write_artifact_manifest(conn, qdt_manifest, validation_results=[qdt_validation])
         qdt_manifest = resolve_artifact_manifest(conn, qdt_manifest["artifact_id"])
+        decomposition_run_id = write_decomposition_run(conn, qdt, manifest=qdt_manifest)
+        persistence_result = write_qdt_research_sufficiency_requirements(
+            conn,
+            qdt,
+            decomposition_run_id=decomposition_run_id,
+            qdt_artifact_id=qdt_manifest["artifact_id"],
+        )
         validation_ids = [qdt_validation["validation_result_id"], handoff_validation_id]
         artifact_ids = [qdt_manifest["artifact_id"], handoff_manifest["artifact_id"]]
         if runtime_manifest is not None:
@@ -999,6 +1013,10 @@ def build_stage_handlers(
                 "qdt_adapter_mode": qdt.get("adapter_mode") or PILOT_QDT_ADAPTER_MODE,
                 "decomposer_handoff_ref": handoff_manifest["artifact_id"],
                 "runtime_call_ref": (runtime_manifest or {}).get("artifact_id"),
+                "decomposition_run_id": decomposition_run_id,
+                "sufficiency_requirement_record_count": len(
+                    persistence_result["sufficiency_requirement_record_ids"]
+                ),
             },
         )
 

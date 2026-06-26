@@ -10,10 +10,13 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 
 
 MODEL_RUNTIME_CALL_SCHEMA_VERSION = "model-runtime-call/v1"
@@ -30,6 +33,7 @@ DEFAULT_MAX_TRANSPORT_RETRIES = 1
 DEFAULT_MAX_SCHEMA_REPAIRS = 1
 MODEL_RUNTIME_TRANSPORT_REQUEST_SCHEMA_VERSION = "model-runtime-transport-request/v1"
 MODEL_RUNTIME_TRANSPORT_RESPONSE_SCHEMA_VERSION = "model-runtime-transport-response/v1"
+OPENAI_RESPONSES_PATH = "/responses"
 DEFAULT_MODEL_LANE_POLICY_PATH = (
     Path(__file__).resolve().parents[3]
     / "orchestrator"
@@ -219,8 +223,41 @@ def scan_forbidden_model_outputs(value: Any) -> dict[str, Any]:
 
 def _json_payload(value: Any) -> Any:
     if isinstance(value, str):
-        return json.loads(value)
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            extracted = _extract_json_object_text(value)
+            if extracted is None:
+                raise
+            return json.loads(extracted)
     return copy.deepcopy(value)
+
+
+def _extract_json_object_text(value: str) -> str | None:
+    start = value.find("{")
+    if start < 0:
+        return None
+    depth = 0
+    in_string = False
+    escaped = False
+    for index, ch in enumerate(value[start:], start=start):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return value[start : index + 1]
+    return None
 
 
 def _transport_request(runtime_call: dict[str, Any], request_payload: dict[str, Any]) -> dict[str, Any]:
@@ -251,6 +288,117 @@ def _unwrap_transport_response(raw: Any) -> tuple[Any, Any, Any]:
             copy.deepcopy(raw.get("provider_status")),
         )
     return raw, None, None
+
+
+def _responses_api_body(request_payload: dict[str, Any]) -> dict[str, Any]:
+    system_text = (
+        "You are the ADS Decomposer. Produce only JSON for the requested "
+        "question-decomposition candidate. Do not include probabilities, fair "
+        "values, SCAE deltas, decisions, or forecast outputs."
+    )
+    return {
+        "model": request_payload["resolved_model_id"],
+        "input": [
+            {
+                "role": "system",
+                "content": [{"type": "input_text", "text": system_text}],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": canonical_json(request_payload["request_payload"]),
+                    }
+                ],
+            },
+        ],
+        "store": False,
+        "text": {"format": {"type": "json_object"}},
+        "metadata": {
+            "runtime_call_id": request_payload["runtime_call_id"],
+            "model_lane_id": request_payload["model_lane_id"],
+            "prompt_template_id": request_payload["prompt_template_id"],
+        },
+    }
+
+
+def _extract_responses_output_payload(payload: dict[str, Any]) -> Any:
+    output_text = payload.get("output_text")
+    if isinstance(output_text, str) and output_text.strip():
+        return _json_payload(output_text)
+    texts: list[str] = []
+    output = payload.get("output")
+    if isinstance(output, list):
+        for item in output:
+            if not isinstance(item, dict):
+                continue
+            content = item.get("content")
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                text = part.get("text")
+                if isinstance(text, str) and text.strip():
+                    texts.append(text)
+    if texts:
+        return _json_payload("\n".join(texts))
+    raise ModelRuntimeError("OpenAI Responses payload did not contain JSON text output")
+
+
+def openai_responses_transport_from_env() -> Transport:
+    """Return a stdlib HTTPS OpenAI Responses API transport.
+
+    The transport intentionally depends only on environment configuration so the
+    runtime contract can be exercised without adding an SDK dependency.
+    """
+
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        raise ModelRuntimeError("OPENAI_API_KEY is required for live OpenAI model runtime")
+    base_url = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
+    url = base_url + OPENAI_RESPONSES_PATH
+
+    def transport(request_payload: dict[str, Any]) -> dict[str, Any]:
+        body = _responses_api_body(request_payload)
+        data = canonical_json(body).encode("utf-8")
+        request = urllib_request.Request(
+            url,
+            data=data,
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+        )
+        try:
+            with urllib_request.urlopen(
+                request,
+                timeout=int(request_payload.get("timeout_seconds") or DEFAULT_TIMEOUT_SECONDS),
+            ) as response:
+                raw = response.read().decode("utf-8")
+        except urllib_error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"OpenAI Responses API HTTP {exc.code}: {detail[:500]}") from exc
+        payload = json.loads(raw)
+        if not isinstance(payload, dict):
+            raise RuntimeError("OpenAI Responses API returned a non-object payload")
+        response_payload = _extract_responses_output_payload(payload)
+        return {
+            "schema_version": MODEL_RUNTIME_TRANSPORT_RESPONSE_SCHEMA_VERSION,
+            "response_payload": response_payload,
+            "token_usage": copy.deepcopy(payload.get("usage")),
+            "provider_status": {
+                "provider": "openai",
+                "api": "responses",
+                "response_id": payload.get("id"),
+                "status": payload.get("status"),
+                "model": payload.get("model"),
+            },
+        }
+
+    return transport
 
 
 def _base_runtime_call(
@@ -531,6 +679,7 @@ __all__ = [
     "execute_model_runtime_call",
     "execute_model_runtime_call_for_lane",
     "model_execution_context_from_runtime_call",
+    "openai_responses_transport_from_env",
     "prefixed_sha256",
     "resolve_model_runtime_lane",
     "scan_forbidden_model_outputs",

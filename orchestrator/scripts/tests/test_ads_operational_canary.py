@@ -116,6 +116,94 @@ class AdsOperationalCanaryTest(unittest.TestCase):
 
         return {stage: make_handler(stage) for stage in ADS_PIPELINE_STAGE_ORDER[1:]}
 
+    def _decomposer_live_response_path(self):
+        path = Path(self.tempdir.name) / "decomposer-live-response.json"
+        branch_resolution = "branch-operational-canary-resolution"
+        branch_mechanics = "branch-operational-canary-mechanics"
+        payload = {
+            "schema_version": "model-runtime-transport-response/v1",
+            "response_payload": {
+                "candidate_id": "qdt-candidate-operational-canary",
+                "market_complexity_score": 0.62,
+                "branches": [
+                    {
+                        "branch_id": branch_resolution,
+                        "branch_question": "Resolve whether the operational canary completes using official status and direct evidence.",
+                        "branch_role": "question_specific_resolution_evidence",
+                        "dependency_group_id": "dep-group-operational-canary-resolution",
+                        "required_evidence_purposes": ["source_of_truth", "direct_evidence"],
+                        "leaf_ids": [
+                            "leaf-operational-canary-official-status",
+                            "leaf-operational-canary-direct-status",
+                        ],
+                        "amrg_usage_refs": [],
+                        "structural_validation": {"depth": 1},
+                    },
+                    {
+                        "branch_id": branch_mechanics,
+                        "branch_question": "Identify the operational canary market rules and timing window.",
+                        "branch_role": "question_specific_resolution_mechanics",
+                        "dependency_group_id": "dep-group-operational-canary-mechanics",
+                        "required_evidence_purposes": ["resolution_mechanics"],
+                        "leaf_ids": ["leaf-operational-canary-rules-window"],
+                        "amrg_usage_refs": [],
+                        "structural_validation": {"depth": 1},
+                    },
+                ],
+                "required_leaf_questions": [
+                    {
+                        "leaf_id": "leaf-operational-canary-official-status",
+                        "parent_branch_id": branch_resolution,
+                        "question_text": "Which official source can establish whether the operational canary completes?",
+                        "purpose": "source_of_truth",
+                        "bayesian_weighting": {
+                            "static_information_weight": "critical",
+                            "weight_reason_codes": ["official_resolution_authority"],
+                        },
+                        "leaf_dependency_group_id": "dep-group-operational-canary-resolution",
+                        "leaf_condition_scope": "unconditional",
+                        "required_evidence_fields": ["official_status", "resolution_criteria"],
+                        "market_component_terms": ["operational canary", "official status"],
+                        "structural_validation": {"depth": 2, "answerability_status": "answerable"},
+                    },
+                    {
+                        "leaf_id": "leaf-operational-canary-direct-status",
+                        "parent_branch_id": branch_resolution,
+                        "question_text": "What direct event evidence before the cutoff bears on operational canary completion?",
+                        "purpose": "direct_evidence",
+                        "bayesian_weighting": {
+                            "static_information_weight": "high",
+                            "weight_reason_codes": ["question_specific_event_status"],
+                        },
+                        "leaf_dependency_group_id": "dep-group-operational-canary-resolution",
+                        "leaf_condition_scope": "unconditional",
+                        "required_evidence_fields": ["event_status", "event_timestamp"],
+                        "market_component_terms": ["operational canary", "event status"],
+                        "structural_validation": {"depth": 2, "answerability_status": "answerable"},
+                    },
+                    {
+                        "leaf_id": "leaf-operational-canary-rules-window",
+                        "parent_branch_id": branch_mechanics,
+                        "question_text": "Which rules and dates govern operational canary market resolution?",
+                        "purpose": "resolution_mechanics",
+                        "bayesian_weighting": {
+                            "static_information_weight": "medium",
+                            "weight_reason_codes": ["market_specific_contract_terms"],
+                        },
+                        "leaf_dependency_group_id": "dep-group-operational-canary-mechanics",
+                        "leaf_condition_scope": "shared_context",
+                        "required_evidence_fields": ["resolution_deadline", "rules_text"],
+                        "market_component_terms": ["operational canary", "rules"],
+                        "structural_validation": {"depth": 2, "answerability_status": "answerable"},
+                    },
+                ],
+            },
+            "token_usage": {"input_tokens": 40, "output_tokens": 20, "total_tokens": 60},
+            "provider_status": {"finish_reason": "stop", "transport": "unit-test"},
+        }
+        path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+        return path
+
     def test_preflight_rejects_missing_handler_stage(self):
         handlers = self.stage_handlers()
         handlers.pop("decision")
@@ -261,6 +349,7 @@ class AdsOperationalCanaryTest(unittest.TestCase):
             forecast_timestamp=config.forecast_timestamp,
             max_cases=config.max_cases,
             metadata=config.metadata,
+            decomposer_runtime_transport_response_path=self._decomposer_live_response_path(),
         )
 
         result = run_one_case_canary(config, handlers)
@@ -307,6 +396,11 @@ class AdsOperationalCanaryTest(unittest.TestCase):
                 LIMIT 1
                 """
             ).fetchone()
+            qdt_run_count = conn.execute("SELECT COUNT(*) FROM qdt_decomposition_runs").fetchone()[0]
+            qdt_leaf_count = conn.execute("SELECT COUNT(*) FROM qdt_required_research_questions").fetchone()[0]
+            qdt_sufficiency_count = conn.execute(
+                "SELECT COUNT(*) FROM qdt_leaf_research_sufficiency_requirements"
+            ).fetchone()[0]
             decision = conn.execute(
                 """
                 SELECT production_persistence_status, production_forecast_persisted,
@@ -330,11 +424,16 @@ class AdsOperationalCanaryTest(unittest.TestCase):
         self.assertFalse(
             {"leaf-source-of-truth", "leaf-direct-evidence", "leaf-resolution-mechanics"} & leaf_ids
         )
-        self.assertEqual(qdt["adapter_mode"], "decomposer_model_runtime_fixture")
+        self.assertEqual(qdt["adapter_mode"], "decomposer_model_runtime_live")
         self.assertEqual(qdt["runtime_call_ref"], runtime["runtime_call_id"])
         self.assertIn(runtime_row["artifact_id"], qdt_input_manifest_ids)
         self.assertEqual(runtime["resolved_model_id"], "gpt-5.5-high")
+        self.assertEqual(runtime["mode"], "live")
+        self.assertFalse(runtime["fixture_mode"])
         self.assertEqual(runtime["execution_status"], "succeeded")
+        self.assertEqual(qdt_run_count, 1)
+        self.assertEqual(qdt_leaf_count, len(qdt["required_leaf_questions"]))
+        self.assertEqual(qdt_sufficiency_count, len(qdt["required_leaf_questions"]))
         self.assertEqual(retrieval["adapter_mode"], "live_candidate_fixture_retrieval_runtime")
         self.assertEqual(retrieval["retrieval_runtime_summary"]["runtime_mode"], "live_candidate_fixture")
         self.assertTrue(retrieval["leaf_evidence_dockets"])
