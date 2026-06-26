@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
+import sqlite3
 import sys
 from pathlib import Path
 from typing import Any
@@ -14,6 +15,7 @@ for relative in (
     "decomposer/scripts",
     "researcher-swarm/scripts",
     "orchestrator/scripts",
+    "SCAE/scripts",
 ):
     candidate = str(REPO_ROOT / relative)
     if candidate not in sys.path:
@@ -62,11 +64,22 @@ from predquant.model_provenance_trace import (  # noqa: E402
     prefixed_sha256,
     validate_model_provenance_trace,
 )
+from predquant.decision_gate import (  # noqa: E402
+    build_decision_gate,
+    validate_decision_gate_artifact,
+)
+from predquant.synthesis_annotation import (  # noqa: E402
+    build_synthesis_annotation,
+    validate_synthesis_annotation,
+)
+from scae.persistence import write_forecast_decision  # noqa: E402
 
 
 CANONICAL_MACHINE_ARTIFACT_SCAN_SCHEMA_VERSION = "ads-canonical-machine-artifact-scan/v1"
 CANONICAL_MACHINE_ARTIFACT_FIXTURE_ID = "FIX-031"
 CANONICAL_MACHINE_ARTIFACT_BLOCKER_ID = "BLK-027"
+NON_SCAE_AUTHORITY_SCAN_SCHEMA_VERSION = "ads-non-scae-authority-scan/v1"
+NON_SCAE_AUTHORITY_BLOCKER_ID = "BLK-001"
 
 ACTIVE_AUTHORITY_KEYS = {
     "own_probability",
@@ -357,6 +370,64 @@ def _check_result(name: str, valid: bool, errors: list[str] | tuple[str, ...] | 
     }
 
 
+def _fixture_scae_ledger() -> dict[str, Any]:
+    return {
+        "artifact_type": "scae_ledger",
+        "schema_version": "scae-ledger/v1",
+        "case_id": "case-1",
+        "case_key": "case:key:1",
+        "dispatch_id": "dispatch-1",
+        "run_id": "run-1",
+        "forecast_timestamp": "2026-06-25T12:00:00+00:00",
+        "final_probability_ledger_id": "scae-final-probability-ledger:1",
+        "final_probability_ledger_digest": "sha256:" + "a" * 64,
+        "forecast_validity_status": "valid_for_forecast",
+        "execution_authority_status": "normal_execution_allowed",
+        "final_probability_fields_status": "final_probability_fields_ready",
+        "raw_ledger_probability": 0.56,
+        "post_ledger_probability": 0.58,
+        "debt_adjusted_probability": 0.58,
+        "production_forecast_prob": 0.58,
+        "canonical_probability": 0.58,
+        "writes_production_forecast": False,
+        "writes_persistence": False,
+    }
+
+
+def _fixture_synthesis(scae_ledger: dict[str, Any]) -> dict[str, Any]:
+    return build_synthesis_annotation(
+        scae_ledger=scae_ledger,
+        qualitative_annotations=[
+            {
+                "annotation_type": "key_evidence",
+                "summary": "Official-source coverage is the main qualitative leverage point.",
+                "leverage_direction": "supports_yes_qualitatively",
+                "source_refs": ["researcher-sidecar:1"],
+                "reason_codes": ["qualitative_leverage_only"],
+            }
+        ],
+        generated_at="2026-06-25T12:01:00+00:00",
+    )
+
+
+def _expect_rejection(name: str, expected_fragment: str, callback) -> dict[str, Any]:
+    try:
+        callback()
+    except Exception as exc:  # noqa: BLE001 - scan reports expected validator failures.
+        if expected_fragment in str(exc):
+            return _check_result(name, True)
+        return _check_result(name, False, [f"unexpected rejection: {exc}"])
+    return _check_result(name, False, [f"expected rejection containing {expected_fragment!r}"])
+
+
+def _write_forecast_decision_with_replacement_context(
+    scae_ledger: dict[str, Any],
+    decision_gate: dict[str, Any],
+) -> None:
+    with sqlite3.connect(":memory:") as conn:
+        write_forecast_decision(conn, scae_ledger, decision_gate)
+
+
 def build_canonical_machine_artifact_report() -> dict[str, Any]:
     """Build a deterministic static scan report for canonical ADS machine artifacts."""
 
@@ -425,6 +496,162 @@ def build_canonical_machine_artifact_report() -> dict[str, Any]:
             "model_provenance_trace_digest": model_trace["model_provenance_trace_digest"],
         },
         "scan_authority": "static_fixture_diagnostic",
+        "live_cutover_ready": status == "passed",
+    }
+
+
+def build_non_scae_probability_authority_report() -> dict[str, Any]:
+    """Build a static report proving non-SCAE surfaces cannot author probability."""
+
+    checks: list[dict[str, Any]] = []
+    qdt = _build_qdt()
+    evidence_packet = _fixture_evidence_packet()
+    retrieval_packet = _build_retrieval_packet(qdt, evidence_packet)
+    researcher = _build_researcher_artifacts(qdt, retrieval_packet)
+    scae_ledger = _fixture_scae_ledger()
+    synthesis = _fixture_synthesis(scae_ledger)
+    decision = build_decision_gate(
+        scae_ledger=scae_ledger,
+        synthesis_annotation=synthesis,
+        decision_request={"reason_codes": ["authority_boundary_fixture"]},
+        generated_at="2026-06-25T12:02:00+00:00",
+    )
+
+    validate_synthesis_annotation(synthesis)
+    validate_decision_gate_artifact(decision)
+
+    sidecar_with_probability = copy.deepcopy(researcher["sidecar"])
+    sidecar_with_probability["replacement_probability"] = 0.51
+    sidecar_validation = validate_researcher_sidecar_v2(sidecar_with_probability, qdt)
+    checks.append(
+        _check_result(
+            "researcher_sidecar_rejects_replacement_probability",
+            not sidecar_validation.valid
+            and any("replacement_probability" in err for err in sidecar_validation.errors),
+            sidecar_validation.errors if sidecar_validation.valid else [],
+        )
+    )
+
+    assignment_with_fair_value = copy.deepcopy(researcher["assignments"][0])
+    assignment_with_fair_value["fair_value"] = 0.54
+    assignment_validation = validate_leaf_research_assignment(assignment_with_fair_value)
+    checks.append(
+        _check_result(
+            "researcher_assignment_rejects_fair_value",
+            not assignment_validation.valid
+            and any("fair_value" in err for err in assignment_validation.errors),
+            assignment_validation.errors if assignment_validation.valid else [],
+        )
+    )
+
+    checks.append(
+        _expect_rejection(
+            "synthesis_rejects_probability_range",
+            "probability_range",
+            lambda: build_synthesis_annotation(
+                scae_ledger=scae_ledger,
+                qualitative_annotations=[{"summary": "bad", "probability_range": [0.4, 0.6]}],
+            ),
+        )
+    )
+    checks.append(
+        _expect_rejection(
+            "synthesis_rejects_replacement_probability_summary",
+            "replacement_probability",
+            lambda: build_synthesis_annotation(
+                scae_ledger=scae_ledger,
+                research_summaries={"summary": "bad", "replacement_probability": 0.7},
+            ),
+        )
+    )
+    checks.append(
+        _expect_rejection(
+            "decision_rejects_replacement_probability",
+            "replacement_probability",
+            lambda: build_decision_gate(
+                scae_ledger=scae_ledger,
+                decision_request={"replacement_probability": 0.72},
+            ),
+        )
+    )
+    checks.append(
+        _expect_rejection(
+            "decision_rejects_numeric_probability_language",
+            "numeric probability",
+            lambda: build_decision_gate(
+                scae_ledger=scae_ledger,
+                decision_request={"rationale": "I would set the probability to 61%."},
+            ),
+        )
+    )
+
+    persistence_gate = copy.deepcopy(decision)
+    persistence_gate["scae_context"]["production_forecast_prob"] = 0.72
+    checks.append(
+        _expect_rejection(
+            "persistence_rejects_decision_probability_replacement",
+            "replace SCAE production_forecast_prob",
+            lambda: _write_forecast_decision_with_replacement_context(scae_ledger, persistence_gate),
+        )
+    )
+
+    with sqlite3.connect(":memory:") as conn:
+        forecast_decision = write_forecast_decision(
+            conn,
+            scae_ledger,
+            decision,
+            metadata={"forecast_artifact_id": "forecast:authority-boundary"},
+        )
+        row = conn.execute(
+            """
+            SELECT production_forecast_prob, canonical_probability, probability_source,
+                   scoreable_forecast_output, writes_market_prediction
+            FROM forecast_decision_records
+            """
+        ).fetchone()
+    checks.append(
+        _check_result(
+            "persistence_writes_only_scae_probability_source",
+            row
+            == (
+                scae_ledger["production_forecast_prob"],
+                scae_ledger["canonical_probability"],
+                "SCAE-012.production_forecast_prob",
+                0,
+                0,
+            )
+            and forecast_decision["scoreable_forecast_output"] is False,
+        )
+    )
+
+    scanned_artifacts = {
+        "researcher_sidecar": researcher["sidecar"],
+        "leaf_research_assignments": researcher["assignments"],
+        "synthesis_annotation": synthesis,
+        "decision_gate": decision,
+        "forecast_decision_result": forecast_decision,
+    }
+    forbidden_paths = _active_forbidden_key_paths(scanned_artifacts)
+    if forbidden_paths:
+        checks.append(_check_result("clean_non_scae_active_authority_key_scan", False, forbidden_paths))
+    else:
+        checks.append(_check_result("clean_non_scae_active_authority_key_scan", True))
+
+    status = "passed" if all(check["status"] == "passed" for check in checks) else "failed"
+    return {
+        "schema_version": NON_SCAE_AUTHORITY_SCAN_SCHEMA_VERSION,
+        "blocker_id": NON_SCAE_AUTHORITY_BLOCKER_ID,
+        "status": status,
+        "check_count": len(checks),
+        "checks": checks,
+        "scan_authority": "static_fixture_diagnostic",
+        "covered_surfaces": [
+            "researcher_sidecar",
+            "leaf_research_assignment",
+            "synthesis_annotation",
+            "decision_gate",
+            "forecast_decision_records",
+        ],
         "live_cutover_ready": status == "passed",
     }
 
