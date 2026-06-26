@@ -131,6 +131,22 @@ class AdsLiveReadinessTest(unittest.TestCase):
         self.assertTrue(report["ok"], report["issues"])
         self.assertTrue(report["allow_calibration_debt_scoreable_canary"])
         self.assertEqual(report["requested_max_cases"], 1)
+        self.assertEqual(report["scoreable_readiness_mode"], "pilot_scoreable_readiness")
+
+    def test_true_live_readiness_rejects_pilot_even_with_debt_canary_allowance(self):
+        report = build_live_readiness_report(
+            self.db_path,
+            runner_mode="calibration_debt_production",
+            handler_factory="predquant.ads_production_pilot_handlers:build_stage_handlers",
+            require_scoreable_live=True,
+            scoreable_readiness_mode="true_scoreable_live_readiness",
+            allow_calibration_debt_scoreable_canary=True,
+            requested_max_cases=1,
+        )
+
+        self.assertFalse(report["ok"])
+        self.assertIn("true_scoreable_live_readiness_rejects_production_pilot_handler", report["issues"])
+        self.assertIn("true_scoreable_live_readiness_rejects_calibration_debt_canary_bypass", report["issues"])
 
     def test_scoreable_gate_blocks_overlarge_debt_canary_batch(self):
         report = build_live_readiness_report(

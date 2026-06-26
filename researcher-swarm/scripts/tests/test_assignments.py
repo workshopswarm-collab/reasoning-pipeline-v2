@@ -39,6 +39,11 @@ from researcher_swarm.retrieval import (  # noqa: E402
     build_retrieval_query_contexts,
     finalize_retrieval_packet_for_dispatch,
 )
+from researcher_swarm.subagents import (  # noqa: E402
+    build_leaf_research_barrier,
+    build_leaf_researcher_spawn_plan,
+    build_leaf_subagent_result,
+)
 
 
 def _contains_key(value: Any, target: str) -> bool:
@@ -298,6 +303,86 @@ class LeafResearchAssignmentContractTest(unittest.TestCase):
             self.assertIn("CLS-007", assignment["scope_boundaries"]["not_implemented"])
             self.assertIn("CLS-008", assignment["scope_boundaries"]["not_implemented"])
             self.assertTrue(validate_leaf_research_assignment(assignment).valid)
+
+    def test_spawn_plan_caps_parallel_leaf_launches_and_records_queue(self) -> None:
+        assignments = build_leaf_research_assignments(qdt=self.qdt, retrieval_packet=self._certifiable_packet())
+
+        plan = build_leaf_researcher_spawn_plan(assignments, max_concurrent=2)
+
+        self.assertEqual(plan["runtime_owner"], "ADS Researcher Swarm")
+        self.assertEqual(plan["launch_authority"], "control_plane_only")
+        self.assertEqual(plan["execution_policy"]["max_concurrent_leaf_researchers_per_case"], 2)
+        self.assertEqual(plan["spawn_count"], len(assignments))
+        self.assertEqual(len(plan["launch_queue"]), len(assignments))
+        self.assertEqual(
+            [row["launch_allowed"] for row in plan["launch_queue"]],
+            [True, True, False],
+        )
+        self.assertEqual(plan["queued_assignment_refs"], [assignments[2]["assignment_id"]])
+
+    def test_leaf_research_barrier_blocks_until_all_subagent_results_exist(self) -> None:
+        assignments = build_leaf_research_assignments(qdt=self.qdt, retrieval_packet=self._certifiable_packet())
+
+        barrier = build_leaf_research_barrier(assignments, true_production_mode=True)
+
+        self.assertFalse(barrier["all_leaves_terminal"])
+        self.assertFalse(barrier["proceed_to_verification_scae"])
+        self.assertEqual(barrier["blocker_reason_codes"], ["missing_leaf_subagent_result"])
+        self.assertTrue(all(row["terminal_status"] == "missing" for row in barrier["terminal_state_by_leaf"]))
+
+    def test_leaf_research_barrier_passes_terminal_gpt55_results(self) -> None:
+        assignments = build_leaf_research_assignments(qdt=self.qdt, retrieval_packet=self._certifiable_packet())
+        results = [
+            build_leaf_subagent_result(
+                assignment,
+                terminal_status="accepted_classification",
+                subagent_session_ref=f"session:{idx}",
+                sidecar_refs=[f"sidecar:{assignment['leaf_id']}"],
+                classification_refs=[f"classification:{assignment['leaf_id']}"],
+                runtime_provenance={
+                    "model_executed": True,
+                    "resolved_model_id": "gpt-5.5-high",
+                    "runtime_call_ref": f"model-runtime-call:{idx}",
+                },
+                reason_codes=["classification_accepted"],
+            )
+            for idx, assignment in enumerate(assignments)
+        ]
+
+        barrier = build_leaf_research_barrier(
+            assignments,
+            subagent_results=results,
+            true_production_mode=True,
+        )
+
+        self.assertTrue(barrier["all_leaves_terminal"])
+        self.assertTrue(barrier["proceed_to_verification_scae"])
+        self.assertEqual(barrier["blocker_reason_codes"], [])
+
+    def test_leaf_research_barrier_rejects_non_executed_or_wrong_model_result(self) -> None:
+        assignments = build_leaf_research_assignments(qdt=self.qdt, retrieval_packet=self._certifiable_packet())
+        results = [
+            build_leaf_subagent_result(
+                assignment,
+                terminal_status="accepted_classification",
+                subagent_session_ref=f"session:{idx}",
+                runtime_provenance={
+                    "model_executed": idx != 0,
+                    "resolved_model_id": "gpt-5.4-high" if idx == 1 else "gpt-5.5-high",
+                },
+            )
+            for idx, assignment in enumerate(assignments)
+        ]
+
+        barrier = build_leaf_research_barrier(
+            assignments,
+            subagent_results=results,
+            true_production_mode=True,
+        )
+
+        self.assertFalse(barrier["proceed_to_verification_scae"])
+        self.assertIn("true_production_requires_model_executed", barrier["blocker_reason_codes"])
+        self.assertIn("true_production_requires_gpt_5_5_high", barrier["blocker_reason_codes"])
 
 
 if __name__ == "__main__":

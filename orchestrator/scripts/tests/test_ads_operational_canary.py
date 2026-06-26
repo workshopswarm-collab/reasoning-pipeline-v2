@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from predquant.ads_operational_canary import OperationalCanaryConfig, run_one_case_canary, validate_preflight
 from predquant.ads_pipeline_runner import ADS_PIPELINE_STAGE_ORDER, PipelineRunnerContractError
 from predquant.ads_manifest_canary_handlers import build_stage_handlers as build_manifest_stage_handlers
+from predquant.ads_production_handlers import build_stage_handlers as build_true_production_handlers
 from predquant.ads_production_pilot_handlers import build_stage_handlers as build_production_pilot_handlers
 from predquant.ads_production_readiness_handlers import build_stage_handlers as build_production_readiness_handlers
 from predquant.ads_handoff_report import build_handoff_report
@@ -251,6 +252,87 @@ class AdsOperationalCanaryTest(unittest.TestCase):
         report = build_handoff_report(self.db_path)
         self.assertTrue(report["ok"], report["unresolved_output_manifest_refs"])
         self.assertGreaterEqual(report["manifest_counts_by_validation_status"].get("valid", 0), len(ADS_PIPELINE_STAGE_ORDER))
+
+    def test_true_production_factory_clone_canary_blocks_at_leaf_research_barrier(self):
+        config = self.config(require_scoreable_prediction=False, require_manifest_handoffs=True)
+        handlers = build_true_production_handlers(
+            db_path=config.db_path,
+            runner_mode=config.runner_mode,
+            forecast_timestamp=config.forecast_timestamp,
+            max_cases=config.max_cases,
+            metadata=config.metadata,
+        )
+
+        result = run_one_case_canary(config, handlers)
+
+        self.assertTrue(result["ok"], result["errors"])
+        self.assertEqual(result["result"]["completed_stage_count"], len(ADS_PIPELINE_STAGE_ORDER))
+        self.assertEqual(result["protected_count_deltas"]["forecast_decision_records"], 1)
+        self.assertEqual(result["protected_count_deltas"]["market_predictions"], 0)
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            qdt_row = conn.execute(
+                """
+                SELECT artifact_id, artifact_path, input_manifest_ids
+                FROM case_artifact_manifest
+                WHERE artifact_type = 'question-decomposition'
+                ORDER BY id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+            runtime_row = conn.execute(
+                """
+                SELECT artifact_id, artifact_path
+                FROM case_artifact_manifest
+                WHERE artifact_type = 'model-runtime-call'
+                ORDER BY id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+            barrier_row = conn.execute(
+                """
+                SELECT artifact_id, artifact_path
+                FROM case_artifact_manifest
+                WHERE artifact_type = 'leaf-research-barrier'
+                ORDER BY id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+            decision = conn.execute(
+                """
+                SELECT production_persistence_status, production_forecast_persisted,
+                       scoreable_forecast_output, non_scoreable_reason_code
+                FROM forecast_decision_records
+                """
+            ).fetchone()
+
+        self.assertIsNotNone(qdt_row)
+        self.assertIsNotNone(runtime_row)
+        self.assertIsNotNone(barrier_row)
+        qdt = json.loads(Path(qdt_row["artifact_path"]).read_text(encoding="utf-8"))
+        runtime = json.loads(Path(runtime_row["artifact_path"]).read_text(encoding="utf-8"))
+        barrier_payload = json.loads(Path(barrier_row["artifact_path"]).read_text(encoding="utf-8"))
+        qdt_input_manifest_ids = set(json.loads(qdt_row["input_manifest_ids"]))
+
+        leaf_ids = {leaf["leaf_id"] for leaf in qdt["required_leaf_questions"]}
+        self.assertFalse(
+            {"leaf-source-of-truth", "leaf-direct-evidence", "leaf-resolution-mechanics"} & leaf_ids
+        )
+        self.assertEqual(qdt["adapter_mode"], "decomposer_model_runtime_fixture")
+        self.assertEqual(qdt["runtime_call_ref"], runtime["runtime_call_id"])
+        self.assertIn(runtime_row["artifact_id"], qdt_input_manifest_ids)
+        self.assertEqual(runtime["resolved_model_id"], "gpt-5.5-high")
+        self.assertEqual(runtime["execution_status"], "succeeded")
+        self.assertEqual(barrier_payload["classification_status"], "blocked_leaf_research_barrier")
+        self.assertEqual(barrier_payload["reason_codes"], ["missing_leaf_subagent_result"])
+        self.assertFalse(barrier_payload["leaf_research_barrier"]["proceed_to_verification_scae"])
+        self.assertEqual(decision["production_persistence_status"], "blocked_invalid_scae_forecast")
+        self.assertEqual(decision["production_forecast_persisted"], 0)
+        self.assertEqual(decision["scoreable_forecast_output"], 0)
+        self.assertEqual(decision["non_scoreable_reason_code"], "forecast_validity_invalid_for_forecast")
+
+        report = build_handoff_report(self.db_path)
+        self.assertTrue(report["ok"], report["unresolved_output_manifest_refs"])
 
     def test_production_pilot_factory_writes_scoreable_prediction_with_manifest_handoffs(self):
         config = self.config(require_scoreable_prediction=True, require_manifest_handoffs=True)

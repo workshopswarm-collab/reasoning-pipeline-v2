@@ -11,6 +11,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from researcher_swarm.subagents import build_leaf_research_barrier, build_leaf_researcher_spawn_plan  # noqa: E402
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -22,12 +24,16 @@ def main() -> int:
         assignments = json.loads(args.assignments.read_text(encoding="utf-8"))
         if isinstance(assignments, dict):
             assignments = assignments.get("assignments", [])
+    spawn_plan = build_leaf_researcher_spawn_plan(assignments) if isinstance(assignments, list) and assignments else None
+    barrier = build_leaf_research_barrier(assignments) if isinstance(assignments, list) and assignments else None
     payload = {
         "schema_version": "researcher-swarm-run-plan/v1",
         "runtime_owner": "ADS Researcher Swarm",
         "status": "planned",
         "assignment_count": len(assignments) if isinstance(assignments, list) else 0,
         "live_spawn_authority": False,
+        "spawn_plan": spawn_plan,
+        "leaf_research_barrier": barrier,
     }
     text = json.dumps(payload, sort_keys=True) + "\n"
     if args.output:

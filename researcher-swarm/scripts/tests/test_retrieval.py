@@ -278,6 +278,51 @@ class RetrievalPacketContractTest(unittest.TestCase):
         self.assertEqual(packet["research_sufficiency_summary"]["classification_dispatch_status"], "blocked_until_certified")
         self.assertEqual(packet["browser_search_provider_diagnostics"][0]["provider_id"], "openclaw_web_fetch_browser")
 
+    def test_live_policy_overlay_raises_effective_thresholds_without_mutating_qdt(self) -> None:
+        qdt = copy.deepcopy(self.qdt)
+        packet = self._certifiable_packet(qdt=qdt)
+        overlay_packet = build_retrieval_packet(
+            qdt,
+            evidence_packet=self.evidence_packet,
+            selected_evidence=[
+                evidence
+                for result in packet["leaf_retrieval_results"]
+                for evidence in result["selected_evidence"]
+            ],
+            question_decomposition_artifact_id="artifact:qdt-1",
+            policy_context_ref="artifact:profile-1",
+            live_policy_overlay=True,
+        )
+        finalized = finalize_retrieval_packet_for_dispatch(overlay_packet)
+
+        self.assertEqual(
+            finalized["research_sufficiency_summary"]["classification_dispatch_status"],
+            "blocked_insufficient_research",
+        )
+        self.assertTrue(
+            any(
+                "admitted_evidence_count" in slice_.get("unsatisfied_breadth_dimensions", [])
+                for slice_ in finalized["retrieval_breadth_coverage_slices"]
+            )
+        )
+        for profile in finalized["retrieval_breadth_profiles"]:
+            self.assertTrue(profile["effective_policy_overlay"]["enabled"])
+            self.assertEqual(profile["effective_policy_overlay"]["policy_id"], "ads-live-retrieval-policy/v1")
+        self.assertNotIn("effective_policy_overlay", qdt["required_leaf_questions"][0])
+
+    def test_finalized_packet_builds_leaf_evidence_dockets_for_dispatch(self) -> None:
+        finalized = finalize_retrieval_packet_for_dispatch(self._certifiable_packet())
+
+        self.assertEqual(len(finalized["leaf_evidence_dockets"]), len(self.qdt["required_leaf_questions"]))
+        for docket in finalized["leaf_evidence_dockets"]:
+            self.assertEqual(docket["schema_version"], "leaf-evidence-docket/v1")
+            self.assertTrue(docket["admitted_evidence_refs"])
+            self.assertEqual(docket["research_sufficiency_status"], "certified_high_certainty")
+            self.assertTrue(docket["classification_dispatch_allowed"])
+            self.assertTrue(docket["proceed_to_classification"])
+            self.assertFalse(docket["classification_authority"])
+            self.assertFalse(docket["scae_authority"])
+
     def test_browser_and_native_attempt_records_are_refs_not_metadata_authority(self) -> None:
         context = build_retrieval_query_contexts(self.qdt, evidence_packet=self.evidence_packet)[0]
         variant = context["query_variants"][0]

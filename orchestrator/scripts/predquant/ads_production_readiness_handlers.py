@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -64,6 +65,8 @@ from researcher_swarm.retrieval import (  # noqa: E402
     dump_retrieval_packet,
     finalize_retrieval_packet_for_dispatch,
 )
+from researcher_swarm.assignments import build_leaf_research_assignments  # noqa: E402
+from researcher_swarm.subagents import build_leaf_research_barrier, build_leaf_researcher_spawn_plan  # noqa: E402
 from scae.intervals import build_pre_debt_ledger_output  # noqa: E402
 from scae.ledger import apply_research_sufficiency_guard, finalize_scae_probability_fields  # noqa: E402
 from scae.persistence import write_scae_market_prediction  # noqa: E402
@@ -76,6 +79,9 @@ VALIDATOR_VERSION = "ads-production-readiness-handler/v1"
 ARTIFACT_DIR_NAME = "production_readiness"
 PRODUCTION_PILOT_HANDLER_FACTORY_REF = "predquant.ads_production_pilot_handlers"
 PRODUCTION_PILOT_HANDLER_SCOPE = "production_pilot_structured_market_metadata"
+PILOT_QDT_ADAPTER_MODE = "pilot_fixture_decomposer_contract_adapter"
+TRUE_PRODUCTION_HANDLER_FACTORY_REF = "predquant.ads_production_handlers"
+TRUE_PRODUCTION_HANDLER_SCOPE = "true_production_specialist_runtime"
 
 STAGE_ARTIFACT_TYPES = {
     "researcher_classification": "researcher-classification-readiness-block",
@@ -401,6 +407,77 @@ def _structured_market_metadata_evidence(
     return selected
 
 
+def _live_fixture_direct_evidence(
+    *,
+    qdt: dict[str, Any],
+    case_contract: dict[str, Any],
+    source_cutoff_timestamp: str,
+) -> list[dict[str, Any]]:
+    """Build live-shaped fixture evidence without structured metadata certification."""
+
+    observed_at = _iso_before_cutoff(source_cutoff_timestamp)
+    canonical_url = _market_url(case_contract)
+    selected: list[dict[str, Any]] = []
+    for leaf in qdt.get("required_leaf_questions", []):
+        if not isinstance(leaf, dict) or not leaf.get("leaf_id"):
+            continue
+        leaf_id = str(leaf["leaf_id"])
+        parent_branch_id = str(leaf.get("parent_branch_id") or "branch-runtime")
+        purpose = str(leaf.get("purpose") or "other")
+        minimum = 2 if purpose == "resolution_mechanics" else 5
+        for idx in range(minimum):
+            if idx == 0:
+                source_class = "official_or_primary"
+                source_family_id = f"source-family:runtime-fixture-official:{leaf_id}"
+                url = canonical_url
+                method = "live_fixture_direct_official_url"
+            else:
+                source_class = "independent_secondary"
+                source_family_id = f"source-family:runtime-fixture-secondary-{idx}:{leaf_id}"
+                url = f"https://evidence-fixture.example/{leaf_id}/{idx}"
+                method = "live_fixture_independent_source"
+            item = build_retrieval_evidence_item(
+                case_id=str(qdt.get("case_id") or case_contract["case_id"]),
+                dispatch_id=str(qdt.get("dispatch_id") or case_contract["dispatch_id"]),
+                leaf_id=leaf_id,
+                parent_branch_id=parent_branch_id,
+                retrieval_transport="browser",
+                transport_attempt_ref=f"browser-fetch:runtime-fixture:{leaf_id}:{idx}",
+                requested_url=url,
+                final_url=url,
+                canonical_url=url,
+                canonical_source_id=f"source:runtime-fixture:{leaf_id}:{idx}",
+                source_family_id=source_family_id,
+                source_class=source_class,
+                independence_status="independent",
+                temporal_gate_status="pass",
+                source_published_at=observed_at,
+                source_observed_at=observed_at,
+                retrieval_score=1.0,
+                admission_status="admitted",
+                admission_reason_codes=["live_fixture_direct_evidence"],
+                claim_family_resolution_refs=[f"claim-family-resolution:runtime-fixture:{leaf_id}:{idx % 3}"],
+                content_sha256="sha256:"
+                + hashlib.sha256(
+                    canonical_json(
+                        {
+                            "leaf_id": leaf_id,
+                            "purpose": purpose,
+                            "source_index": idx,
+                            "source_class": source_class,
+                            "question_text": leaf.get("question_text"),
+                        }
+                    ).encode("utf-8")
+                ).hexdigest(),
+            )
+            item["deterministic_source_class_proof"] = True
+            item["source_class_resolution_method"] = method
+            item["source_family_resolution_method"] = method
+            item["claim_family_ids"] = [f"claim-family:runtime-fixture:{leaf_id}:{idx % 3}"]
+            selected.append(item)
+    return selected
+
+
 def _certified_reconciliation_rows(
     qdt: dict[str, Any],
     retrieval_packet: dict[str, Any],
@@ -665,6 +742,11 @@ def build_stage_handlers(
     scoreable_pilot: bool = False,
     handler_factory_ref: str | None = None,
     handler_scope: str | None = None,
+    decomposer_runtime: bool = False,
+    decomposer_runtime_mode: str = "fixture",
+    live_policy_overlay: bool = False,
+    live_fixture_retrieval: bool = False,
+    block_at_leaf_research_barrier: bool = False,
 ) -> dict[str, Callable[..., Any]]:
     resolved_factory_ref = handler_factory_ref or HANDLER_FACTORY_REF
     resolved_handler_scope = handler_scope or HANDLER_SCOPE
@@ -688,6 +770,11 @@ def build_stage_handlers(
             else "blocked_until_research_sufficiency_certified"
         ),
         "scoreable_pilot": bool(scoreable_pilot),
+        "decomposer_runtime": bool(decomposer_runtime),
+        "decomposer_runtime_mode": decomposer_runtime_mode,
+        "live_policy_overlay": bool(live_policy_overlay),
+        "live_fixture_retrieval": bool(live_fixture_retrieval),
+        "block_at_leaf_research_barrier": bool(block_at_leaf_research_barrier),
         **(metadata or {}),
     }
 
@@ -802,22 +889,65 @@ def build_stage_handlers(
             reason_codes=["decomposer_handoff_validated"],
             metadata=factory_metadata,
         )
-        candidate = build_fixture_qdt_candidate(handoff)
-        candidate["market_id"] = str(
-            handoff.get("market_context", {}).get("market_id") or lease["market_id"]
-        )
-        qdt = select_qdt_candidate([candidate])
-        qdt["adapter_mode"] = "deterministic_decomposer_contract_adapter"
-        qdt["input_manifest_ids"] = [handoff_manifest["artifact_id"]]
         qdt_path = stage_dir / "question-decomposition.json"
-        _write_json(qdt_path, json.loads(dump_question_decomposition(qdt)))
+        qdt_input_manifest_ids = [handoff_manifest["artifact_id"]]
+        runtime_manifest = None
+        if decomposer_runtime:
+            runtime_call_path = stage_dir / "model-runtime-call.json"
+            handoff_path = Path(handoff_manifest["path"])
+            command = [
+                sys.executable,
+                str(DECOMPOSER_SCRIPTS / "bin" / "run_decomposition.py"),
+                "--handoff",
+                str(handoff_path),
+                "--output",
+                str(qdt_path),
+                "--runtime-call-output",
+                str(runtime_call_path),
+                "--runtime-mode",
+                decomposer_runtime_mode,
+            ]
+            completed = subprocess.run(command, check=False, capture_output=True, text=True)
+            if completed.returncode != 0:
+                raise RuntimeError(
+                    "decomposer runtime failed: "
+                    + (completed.stderr.strip() or completed.stdout.strip() or str(completed.returncode))
+                )
+            runtime_payload = json.loads(runtime_call_path.read_text(encoding="utf-8"))
+            runtime_manifest, runtime_validation_id = _write_payload_manifest(
+                conn,
+                context=context,
+                lease=lease,
+                artifact_dir=stage_dir,
+                stage="decomposition",
+                file_name="model-runtime-call.json",
+                payload=runtime_payload,
+                artifact_type="model-runtime-call",
+                artifact_schema_version="model-runtime-call/v1",
+                forecast_timestamp=forecast_timestamp,
+                input_manifest_ids=[handoff_manifest["artifact_id"]],
+                producer="decomposer-model-runtime",
+                reason_codes=["decomposer_model_runtime_call_valid"],
+                metadata=factory_metadata,
+            )
+            qdt_input_manifest_ids.append(runtime_manifest["artifact_id"])
+            qdt = json.loads(qdt_path.read_text(encoding="utf-8"))
+        else:
+            candidate = build_fixture_qdt_candidate(handoff)
+            candidate["market_id"] = str(
+                handoff.get("market_context", {}).get("market_id") or lease["market_id"]
+            )
+            qdt = select_qdt_candidate([candidate])
+            qdt["adapter_mode"] = PILOT_QDT_ADAPTER_MODE
+            qdt["input_manifest_ids"] = [handoff_manifest["artifact_id"]]
+            _write_json(qdt_path, json.loads(dump_question_decomposition(qdt)))
         qdt_manifest = build_artifact_manifest(
             context=ArtifactManifestContext(
                 case_id=lease["case_id"],
                 case_key=lease["case_key"],
                 dispatch_id=lease["dispatch_id"],
                 stage="decomposition",
-                producer="decomposer-production-readiness-adapter",
+            producer="decomposer-model-runtime" if decomposer_runtime else "decomposer-production-readiness-adapter",
                 forecast_timestamp=_forecast_timestamp(forecast_timestamp, lease),
                 source_cutoff_timestamp=lease["selected_snapshot_observed_at"],
                 pipeline_run_id=context.pipeline_run_id,
@@ -825,36 +955,50 @@ def build_stage_handlers(
             artifact_type=QUESTION_DECOMPOSITION_ARTIFACT_TYPE.replace("_", "-"),
             artifact_schema_version=QUESTION_DECOMPOSITION_SCHEMA_VERSION,
             path=qdt_path,
-            input_manifest_ids=[handoff_manifest["artifact_id"]],
+            input_manifest_ids=qdt_input_manifest_ids,
             validation_status="valid",
             validator_version=VALIDATOR_VERSION,
             temporal_isolation_status="pass",
             metadata={
                 "handler_scope": resolved_handler_scope,
                 "handler_factory": resolved_factory_ref,
-                "adapter_mode": "deterministic_decomposer_contract_adapter",
+                "adapter_mode": qdt.get("adapter_mode") or PILOT_QDT_ADAPTER_MODE,
                 "scoreable_pilot": bool(scoreable_pilot),
+                "decomposer_runtime": bool(decomposer_runtime),
             },
         )
         qdt_validation = build_validation_result(
             artifact_id=qdt_manifest["artifact_id"],
             status="valid",
             validator_version=VALIDATOR_VERSION,
-            reason_codes=["question_decomposition_valid", "deterministic_contract_adapter"],
-            validation_messages=["QDT selected from deterministic production-readiness adapter"],
+            reason_codes=[
+                "question_decomposition_valid",
+                "decomposer_model_runtime_valid" if decomposer_runtime else "pilot_fixture_contract_adapter",
+            ],
+            validation_messages=[
+                "QDT selected from Decomposer model runtime"
+                if decomposer_runtime
+                else "QDT selected from pilot fixture production-readiness adapter"
+            ],
             metadata={"handler_scope": HANDLER_SCOPE, "stage": "decomposition"},
         )
         write_artifact_manifest(conn, qdt_manifest, validation_results=[qdt_validation])
         qdt_manifest = resolve_artifact_manifest(conn, qdt_manifest["artifact_id"])
+        validation_ids = [qdt_validation["validation_result_id"], handoff_validation_id]
+        artifact_ids = [qdt_manifest["artifact_id"], handoff_manifest["artifact_id"]]
+        if runtime_manifest is not None:
+            validation_ids.append(runtime_validation_id)
+            artifact_ids.append(runtime_manifest["artifact_id"])
         return _result(
             "decomposition",
-            [qdt_manifest["artifact_id"], handoff_manifest["artifact_id"]],
-            [qdt_validation["validation_result_id"], handoff_validation_id],
+            artifact_ids,
+            validation_ids,
             lease,
             {
                 **factory_metadata,
-                "qdt_adapter_mode": "deterministic_contract_adapter",
+                "qdt_adapter_mode": qdt.get("adapter_mode") or PILOT_QDT_ADAPTER_MODE,
                 "decomposer_handoff_ref": handoff_manifest["artifact_id"],
+                "runtime_call_ref": (runtime_manifest or {}).get("artifact_id"),
             },
         )
 
@@ -872,15 +1016,20 @@ def build_stage_handlers(
         qdt_payload = load_manifest_payload(qdt_manifest)
         case_contract = load_manifest_payload(case_manifest)
         source_cutoff = lease["selected_snapshot_observed_at"]
-        selected_evidence = (
-            _structured_market_metadata_evidence(
+        if live_fixture_retrieval:
+            selected_evidence = _live_fixture_direct_evidence(
                 qdt=qdt_payload,
                 case_contract=case_contract,
                 source_cutoff_timestamp=source_cutoff,
             )
-            if scoreable_pilot
-            else None
-        )
+        elif scoreable_pilot:
+            selected_evidence = _structured_market_metadata_evidence(
+                qdt=qdt_payload,
+                case_contract=case_contract,
+                source_cutoff_timestamp=source_cutoff,
+            )
+        else:
+            selected_evidence = None
         packet = build_retrieval_packet(
             qdt_payload,
             evidence_packet=load_manifest_payload(evidence_manifest),
@@ -897,13 +1046,15 @@ def build_stage_handlers(
                 related_manifest["artifact_id"],
             ],
             live_retrieval_allowlist=["browser", "native_gpt_research", "structured_feed"],
+            live_policy_overlay=live_policy_overlay,
         )
         packet = finalize_retrieval_packet_for_dispatch(packet)
-        packet["adapter_mode"] = (
-            "structured_market_metadata_pilot_retrieval"
-            if scoreable_pilot
-            else "query_plan_only_until_live_retrieval_transport_returns_evidence"
-        )
+        if live_fixture_retrieval:
+            packet["adapter_mode"] = "live_fixture_direct_evidence_retrieval"
+        elif scoreable_pilot:
+            packet["adapter_mode"] = "structured_market_metadata_pilot_retrieval"
+        else:
+            packet["adapter_mode"] = "query_plan_only_until_live_retrieval_transport_returns_evidence"
         packet_manifest, validation_id = _write_payload_manifest(
             conn,
             context=context,
@@ -951,41 +1102,84 @@ def build_stage_handlers(
         lease = kwargs["lease"]
         stage_outputs = kwargs["stage_outputs"]
         retrieval_manifest = resolve_stage_output_manifest(conn, stage_outputs, "retrieval")
+        qdt_manifest = resolve_stage_output_manifest(conn, stage_outputs, "decomposition")
         packet = load_manifest_payload(retrieval_manifest)
+        qdt_payload = load_manifest_payload(qdt_manifest)
         summary = packet.get("research_sufficiency_summary") or {}
-        if scoreable_pilot and summary.get("classification_dispatch_status") == "allowed":
+        if block_at_leaf_research_barrier and summary.get("classification_dispatch_status") == "allowed":
+            assignments = build_leaf_research_assignments(qdt=qdt_payload, retrieval_packet=packet)
+            spawn_plan = build_leaf_researcher_spawn_plan(assignments)
+            barrier = build_leaf_research_barrier(assignments, true_production_mode=True)
+            classification_status = "blocked_leaf_research_barrier"
+            reason_codes = barrier.get("blocker_reason_codes") or ["leaf_research_barrier_not_terminal"]
+            file_name = "leaf-research-barrier.json"
+            payload = {
+                "artifact_type": "leaf_research_barrier",
+                "schema_version": "leaf-research-barrier/v1",
+                "case_id": lease["case_id"],
+                "case_key": lease["case_key"],
+                "dispatch_id": lease["dispatch_id"],
+                "run_id": context.pipeline_run_id,
+                "forecast_timestamp": _forecast_timestamp(forecast_timestamp, lease),
+                "qdt_ref": qdt_manifest["artifact_id"],
+                "retrieval_packet_ref": retrieval_manifest["artifact_id"],
+                "classification_dispatch_status": summary.get("classification_dispatch_status"),
+                "classification_status": classification_status,
+                "reason_codes": reason_codes,
+                "assignments": assignments,
+                "spawn_plan": spawn_plan,
+                "leaf_research_barrier": barrier,
+                "researcher_probability_authority": False,
+                "writes_scae_delta": False,
+                "selected_evidence_count": sum(
+                    len(result.get("selected_evidence", []))
+                    for result in packet.get("leaf_retrieval_results", [])
+                    if isinstance(result, dict)
+                ),
+                "leaf_certificate_refs": list(summary.get("leaf_certificate_refs") or []),
+            }
+            manifest_artifact_type = "leaf-research-barrier"
+            manifest_schema_version = "leaf-research-barrier/v1"
+        elif scoreable_pilot and summary.get("classification_dispatch_status") == "allowed":
             classification_status = "structured_market_metadata_certified"
             reason_codes = ["structured_market_metadata_retrieval_certified"]
             file_name = "researcher-classification-production-pilot.json"
+            payload = None
+            manifest_artifact_type = STAGE_ARTIFACT_TYPES["researcher_classification"]
+            manifest_schema_version = STAGE_SCHEMA_VERSIONS["researcher_classification"]
         else:
             classification_status = "blocked_until_certified_retrieval"
             reason_codes = ["retrieval_sufficiency_not_certified"]
             file_name = "researcher-classification-readiness-block.json"
-        payload = {
-            "artifact_type": (
-                "researcher_classification_production_pilot"
-                if classification_status == "structured_market_metadata_certified"
-                else "researcher_classification_readiness_block"
-            ),
-            "schema_version": STAGE_SCHEMA_VERSIONS["researcher_classification"],
-            "case_id": lease["case_id"],
-            "case_key": lease["case_key"],
-            "dispatch_id": lease["dispatch_id"],
-            "run_id": context.pipeline_run_id,
-            "forecast_timestamp": _forecast_timestamp(forecast_timestamp, lease),
-            "retrieval_packet_ref": retrieval_manifest["artifact_id"],
-            "classification_dispatch_status": summary.get("classification_dispatch_status"),
-            "classification_status": classification_status,
-            "reason_codes": reason_codes,
-            "researcher_probability_authority": False,
-            "writes_scae_delta": False,
-            "selected_evidence_count": sum(
-                len(result.get("selected_evidence", []))
-                for result in packet.get("leaf_retrieval_results", [])
-                if isinstance(result, dict)
-            ),
-            "leaf_certificate_refs": list(summary.get("leaf_certificate_refs") or []),
-        }
+            payload = None
+            manifest_artifact_type = STAGE_ARTIFACT_TYPES["researcher_classification"]
+            manifest_schema_version = STAGE_SCHEMA_VERSIONS["researcher_classification"]
+        if payload is None:
+            payload = {
+                "artifact_type": (
+                    "researcher_classification_production_pilot"
+                    if classification_status == "structured_market_metadata_certified"
+                    else "researcher_classification_readiness_block"
+                ),
+                "schema_version": STAGE_SCHEMA_VERSIONS["researcher_classification"],
+                "case_id": lease["case_id"],
+                "case_key": lease["case_key"],
+                "dispatch_id": lease["dispatch_id"],
+                "run_id": context.pipeline_run_id,
+                "forecast_timestamp": _forecast_timestamp(forecast_timestamp, lease),
+                "retrieval_packet_ref": retrieval_manifest["artifact_id"],
+                "classification_dispatch_status": summary.get("classification_dispatch_status"),
+                "classification_status": classification_status,
+                "reason_codes": reason_codes,
+                "researcher_probability_authority": False,
+                "writes_scae_delta": False,
+                "selected_evidence_count": sum(
+                    len(result.get("selected_evidence", []))
+                    for result in packet.get("leaf_retrieval_results", [])
+                    if isinstance(result, dict)
+                ),
+                "leaf_certificate_refs": list(summary.get("leaf_certificate_refs") or []),
+            }
         manifest, validation_id = _write_payload_manifest(
             conn,
             context=context,
@@ -994,15 +1188,19 @@ def build_stage_handlers(
             stage="researcher_classification",
             file_name=file_name,
             payload=payload,
-            artifact_type=STAGE_ARTIFACT_TYPES["researcher_classification"],
-            artifact_schema_version=STAGE_SCHEMA_VERSIONS["researcher_classification"],
+            artifact_type=manifest_artifact_type,
+            artifact_schema_version=manifest_schema_version,
             forecast_timestamp=forecast_timestamp,
-            input_manifest_ids=[retrieval_manifest["artifact_id"]],
+            input_manifest_ids=[qdt_manifest["artifact_id"], retrieval_manifest["artifact_id"]],
             producer="researcher-swarm-production-readiness-adapter",
             reason_codes=[
-                "classification_pilot_valid"
-                if classification_status == "structured_market_metadata_certified"
-                else "classification_block_valid"
+                "leaf_research_barrier_block_valid"
+                if classification_status == "blocked_leaf_research_barrier"
+                else (
+                    "classification_pilot_valid"
+                    if classification_status == "structured_market_metadata_certified"
+                    else "classification_block_valid"
+                )
             ],
             metadata=factory_metadata,
         )

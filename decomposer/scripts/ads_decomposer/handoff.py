@@ -346,6 +346,7 @@ def resolve_decomposer_model_lane(
         "model_lane_id": DECOMPOSER_MODEL_LANE_ID,
         "provider": lane["provider"],
         "resolved_model_id": lane["default_model_id"],
+        "provider_route": f"{lane['provider']}/{lane['default_model_id']}",
         "model_policy_ref": str(policy_path),
         "model_policy_id": policy["policy_id"],
         "prompt_template_id": prompt_template_id,
@@ -353,7 +354,7 @@ def resolve_decomposer_model_lane(
         "input_manifest_ids": list(input_manifest_ids or []),
         "output_schema_version": QUESTION_DECOMPOSITION_SCHEMA_VERSION,
         "forbidden_outputs": list(lane.get("forbidden_outputs", [])),
-        "provenance_status": "prompt_template_placeholder_until_qdt_generation_phase",
+        "provenance_status": "lane_resolved_pending_model_runtime_call",
     }
 
 

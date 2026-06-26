@@ -19,6 +19,9 @@ from predquant.sqlite_store import ensure_schema, initialize_database
 LIVE_READINESS_SCHEMA_VERSION = "ads-live-readiness-report/v1"
 PRODUCTION_READINESS_HANDLER = "predquant.ads_production_readiness_handlers"
 PRODUCTION_PILOT_HANDLER = "predquant.ads_production_pilot_handlers"
+TRUE_PRODUCTION_HANDLER = "predquant.ads_production_handlers"
+PILOT_SCOREABLE_READINESS = "pilot_scoreable_readiness"
+TRUE_SCOREABLE_LIVE_READINESS = "true_scoreable_live_readiness"
 CANARY_HANDLER_MARKERS = (
     "ads_scoreable_canary_handlers",
     "ads_manifest_canary_handlers",
@@ -62,6 +65,7 @@ def build_live_readiness_report(
     handler_factory: str | None = None,
     runner_mode: str = "non_executing_canary",
     require_scoreable_live: bool = False,
+    scoreable_readiness_mode: str | None = None,
     allow_canary_handler: bool = False,
     allow_calibration_debt_scoreable_canary: bool = False,
     requested_max_cases: int | None = None,
@@ -130,12 +134,32 @@ def build_live_readiness_report(
         and any(marker in handler_factory for marker in CANARY_HANDLER_MARKERS)
     ):
         issues.append("canary_handler_factory_not_allowed")
+    resolved_scoreable_readiness_mode = scoreable_readiness_mode
+    if require_scoreable_live and not resolved_scoreable_readiness_mode:
+        resolved_scoreable_readiness_mode = (
+            PILOT_SCOREABLE_READINESS
+            if allow_calibration_debt_scoreable_canary
+            else TRUE_SCOREABLE_LIVE_READINESS
+        )
+    if resolved_scoreable_readiness_mode not in {None, PILOT_SCOREABLE_READINESS, TRUE_SCOREABLE_LIVE_READINESS}:
+        issues.append("unknown_scoreable_readiness_mode")
+
     if require_scoreable_live:
         if module_ref == PRODUCTION_READINESS_HANDLER:
             issues.append("production_readiness_handler_is_non_scoreable")
-        if not calibration.get("clears_calibration_debt") and not allow_calibration_debt_scoreable_canary:
+        if resolved_scoreable_readiness_mode == TRUE_SCOREABLE_LIVE_READINESS:
+            if module_ref == PRODUCTION_PILOT_HANDLER:
+                issues.append("true_scoreable_live_readiness_rejects_production_pilot_handler")
+            elif module_ref != TRUE_PRODUCTION_HANDLER:
+                issues.append("true_scoreable_live_readiness_requires_true_production_handler")
+            if allow_calibration_debt_scoreable_canary:
+                issues.append("true_scoreable_live_readiness_rejects_calibration_debt_canary_bypass")
+        if (
+            not calibration.get("clears_calibration_debt")
+            and not allow_calibration_debt_scoreable_canary
+        ):
             issues.append("calibration_debt_not_cleared")
-        if allow_calibration_debt_scoreable_canary:
+        if allow_calibration_debt_scoreable_canary and resolved_scoreable_readiness_mode != TRUE_SCOREABLE_LIVE_READINESS:
             if module_ref != PRODUCTION_PILOT_HANDLER:
                 issues.append("calibration_debt_scoreable_canary_requires_production_pilot_handler")
             if requested_max_cases is None:
@@ -162,6 +186,7 @@ def build_live_readiness_report(
         "runner_mode": runner_mode,
         "handler_factory": handler_factory,
         "require_scoreable_live": require_scoreable_live,
+        "scoreable_readiness_mode": resolved_scoreable_readiness_mode,
         "allow_canary_handler": allow_canary_handler,
         "allow_calibration_debt_scoreable_canary": allow_calibration_debt_scoreable_canary,
         "requested_max_cases": requested_max_cases,
@@ -177,5 +202,7 @@ def build_live_readiness_report(
 __all__ = [
     "DEFAULT_MAX_CALIBRATION_DEBT_CANARY_CASES",
     "LIVE_READINESS_SCHEMA_VERSION",
+    "PILOT_SCOREABLE_READINESS",
+    "TRUE_SCOREABLE_LIVE_READINESS",
     "build_live_readiness_report",
 ]

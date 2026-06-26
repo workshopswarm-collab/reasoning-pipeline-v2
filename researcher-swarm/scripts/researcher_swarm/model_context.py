@@ -320,12 +320,24 @@ def validate_researcher_model_execution_context(
     if not isinstance(runtime, dict):
         errors.append("runtime must be an object")
     else:
-        if runtime.get("execution_mode") != "metadata_only":
-            errors.append("runtime.execution_mode must be metadata_only")
-        if runtime.get("model_call_performed") is not False:
-            errors.append("runtime.model_call_performed must be false")
-        if runtime.get("availability_check_status") != "not_checked":
-            errors.append("runtime.availability_check_status must be not_checked")
+        execution_mode = runtime.get("execution_mode")
+        if execution_mode not in {"metadata_only", "fixture", "live"}:
+            errors.append("runtime.execution_mode must be metadata_only, fixture, or live")
+        model_call_performed = runtime.get("model_call_performed")
+        if execution_mode == "metadata_only":
+            if model_call_performed is not False:
+                errors.append("runtime.model_call_performed must be false for metadata_only")
+            if runtime.get("availability_check_status") != "not_checked":
+                errors.append("runtime.availability_check_status must be not_checked")
+        else:
+            if model_call_performed is not True:
+                errors.append("runtime.model_call_performed must be true for model-executed contexts")
+            if runtime.get("model_executed") is not True:
+                errors.append("runtime.model_executed must be true for model-executed contexts")
+            if runtime.get("execution_status") not in {"succeeded", "accepted"}:
+                errors.append("runtime.execution_status must be succeeded or accepted for model-executed contexts")
+            if not _is_non_empty_string(runtime.get("runtime_call_ref")):
+                errors.append("runtime.runtime_call_ref is required for model-executed contexts")
         if runtime.get("runtime_reason_codes") != context.get("runtime_reason_codes"):
             errors.append("runtime.runtime_reason_codes must match top-level runtime_reason_codes")
         if runtime.get("fallback_reason_codes") != context.get("fallback_reason_codes"):
@@ -336,8 +348,12 @@ def validate_researcher_model_execution_context(
         _is_non_empty_string(code) for code in runtime_reason_codes
     ):
         errors.append("runtime_reason_codes must be a non-empty string list")
-    elif "metadata_only_no_model_call" not in runtime_reason_codes:
-        errors.append("runtime_reason_codes must include metadata_only_no_model_call")
+    else:
+        runtime_mode = runtime.get("execution_mode") if isinstance(runtime, dict) else None
+        if runtime_mode == "metadata_only" and "metadata_only_no_model_call" not in runtime_reason_codes:
+            errors.append("runtime_reason_codes must include metadata_only_no_model_call")
+        if runtime_mode in {"fixture", "live"} and "model_executed" not in runtime_reason_codes:
+            errors.append("model-executed runtime_reason_codes must include model_executed")
 
     fallback_reason_codes = context.get("fallback_reason_codes")
     if not isinstance(fallback_reason_codes, list) or not all(

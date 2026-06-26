@@ -452,6 +452,48 @@ def _source_class_targets(requirements: dict[str, Any]) -> list[str]:
     return sorted(set(targets)) or ["unknown"]
 
 
+def _live_policy_thresholds_for_leaf(leaf: dict[str, Any], requirements: dict[str, Any]) -> dict[str, Any]:
+    purpose = str(leaf.get("purpose") or "other")
+    weight = _leaf_static_weight(leaf)
+    protected = bool(requirements.get("protected_primary_required") or purpose == "source_of_truth")
+    freshness_required = int(requirements.get("min_temporally_fresh_sources", 0) or 0) > 0
+    if protected or weight == "critical":
+        return {
+            "tier": "critical_source_of_truth",
+            "min_admitted_evidence_items": 5,
+            "min_independent_source_families": 3,
+            "min_independent_claim_families": 3,
+            "min_temporally_fresh_sources": max(2 if freshness_required else 0, int(requirements.get("min_temporally_fresh_sources", 0) or 0)),
+            "protected_primary_required": protected,
+        }
+    if purpose in {"direct_evidence", "catalyst"} or weight == "high":
+        return {
+            "tier": "high_direct_or_catalyst",
+            "min_admitted_evidence_items": 5,
+            "min_independent_source_families": 3,
+            "min_independent_claim_families": 3,
+            "min_temporally_fresh_sources": max(2 if freshness_required else 0, int(requirements.get("min_temporally_fresh_sources", 0) or 0)),
+            "protected_primary_required": bool(requirements.get("protected_primary_required", False)),
+        }
+    if purpose == "resolution_mechanics":
+        return {
+            "tier": "mechanics_rules_only",
+            "min_admitted_evidence_items": 2,
+            "min_independent_source_families": 1,
+            "min_independent_claim_families": 1,
+            "min_temporally_fresh_sources": int(requirements.get("min_temporally_fresh_sources", 0) or 0),
+            "protected_primary_required": bool(requirements.get("protected_primary_required", False)),
+        }
+    return {
+        "tier": "normal_medium",
+        "min_admitted_evidence_items": 3,
+        "min_independent_source_families": 2,
+        "min_independent_claim_families": 2,
+        "min_temporally_fresh_sources": max(1 if freshness_required else 0, int(requirements.get("min_temporally_fresh_sources", 0) or 0)),
+        "protected_primary_required": bool(requirements.get("protected_primary_required", False)),
+    }
+
+
 def _build_contradiction_queries(leaf: dict[str, Any], macro_question: str, market_terms: list[str]) -> list[str]:
     terms = " ".join(market_terms[:5])
     return [
@@ -474,10 +516,24 @@ def _build_negative_check_queries(leaf: dict[str, Any], checks: list[str], marke
     return variants
 
 
-def build_retrieval_breadth_profile_placeholder(leaf: dict[str, Any]) -> dict[str, Any]:
+def build_retrieval_breadth_profile_placeholder(
+    leaf: dict[str, Any],
+    *,
+    live_policy_overlay: bool = False,
+) -> dict[str, Any]:
     requirements = copy.deepcopy(leaf.get("research_sufficiency_requirements", {}))
     source_targets = _source_class_targets(requirements)
     tier, variant_count, raw_range, admitted_range, max_expansion = _volume_tier_for_leaf(leaf, requirements)
+    live_thresholds = _live_policy_thresholds_for_leaf(leaf, requirements) if live_policy_overlay else {}
+    min_claim_families = int(requirements.get("min_independent_claim_families", 0))
+    min_source_families = int(requirements.get("min_independent_source_families", 0))
+    min_fresh_sources = int(requirements.get("min_temporally_fresh_sources", 0))
+    protected_primary_required = bool(requirements.get("protected_primary_required", False))
+    if live_thresholds:
+        min_claim_families = max(min_claim_families, int(live_thresholds["min_independent_claim_families"]))
+        min_source_families = max(min_source_families, int(live_thresholds["min_independent_source_families"]))
+        min_fresh_sources = max(min_fresh_sources, int(live_thresholds["min_temporally_fresh_sources"]))
+        protected_primary_required = protected_primary_required or bool(live_thresholds["protected_primary_required"])
     profile_id = requirements.get("retrieval_breadth_profile_ref")
     if not _is_non_empty_string(profile_id):
         profile_id = "retrieval-breadth-profile:" + _sha_id("leaf", leaf.get("leaf_id", "unknown"))
@@ -488,19 +544,23 @@ def build_retrieval_breadth_profile_placeholder(leaf: dict[str, Any]) -> dict[st
         "leaf_id": leaf.get("leaf_id"),
         "source_class_requirements": {
             "required": source_targets,
-            "protected_primary_required": bool(requirements.get("protected_primary_required", False)),
+            "protected_primary_required": protected_primary_required,
         },
         "claim_family_requirements": {
-            "min_independent_claim_families": int(requirements.get("min_independent_claim_families", 0)),
+            "min_independent_claim_families": min_claim_families,
             "duplicate_same_claim_counts_once": True,
         },
         "source_family_requirements": {
-            "min_independent_source_families": int(requirements.get("min_independent_source_families", 0)),
+            "min_independent_source_families": min_source_families,
             "wire_or_api_syndication_counts_once": True,
         },
         "freshness_requirement": {
             "recency_window_seconds": int(requirements.get("recency_window_seconds", 0)),
-            "min_fresh_sources": int(requirements.get("min_temporally_fresh_sources", 0)),
+            "min_fresh_sources": min_fresh_sources,
+        },
+        "admitted_evidence_requirement": {
+            "min_admitted_evidence_items": int(live_thresholds.get("min_admitted_evidence_items", 0)),
+            "policy_source": "live_policy_overlay" if live_thresholds else "canonical_qdt_requirements",
         },
         "contradiction_search": {
             "required": bool(requirements.get("contradiction_search_required", False)),
@@ -522,6 +582,12 @@ def build_retrieval_breadth_profile_placeholder(leaf: dict[str, Any]) -> dict[st
             "status": "implemented",
             "certification_behavior": "breadth_profile_and_coverage_only",
             "research_sufficiency_certificate_status": "not_started_RET_008",
+        },
+        "effective_policy_overlay": {
+            "enabled": bool(live_policy_overlay),
+            "policy_id": "ads-live-retrieval-policy/v1" if live_policy_overlay else None,
+            "threshold_tier": live_thresholds.get("tier"),
+            "canonical_requirements_preserved": True,
         },
     }
 
@@ -2715,6 +2781,74 @@ def build_required_contradiction_and_negative_attempts(packet: dict[str, Any]) -
     return contradiction_attempts, negative_attempts
 
 
+def build_leaf_evidence_dockets(packet: dict[str, Any]) -> list[dict[str, Any]]:
+    """Build per-leaf evidence dockets before classification/sidecar dispatch."""
+
+    certificates = {
+        str(item.get("leaf_id")): item
+        for item in packet.get("leaf_research_sufficiency_certificates", [])
+        if isinstance(item, dict) and _is_non_empty_string(item.get("leaf_id"))
+    }
+    dockets: list[dict[str, Any]] = []
+    for result in packet.get("leaf_retrieval_results", []) if isinstance(packet.get("leaf_retrieval_results"), list) else []:
+        if not isinstance(result, dict) or not _is_non_empty_string(result.get("leaf_id")):
+            continue
+        leaf_id = str(result["leaf_id"])
+        selected = _selected_from_result(result)
+        omitted = [item for item in result.get("omitted_candidates", []) if isinstance(item, dict)]
+        cert = certificates.get(leaf_id, {})
+        supplemental_candidates = [
+            item
+            for item in packet.get("supplemental_evidence_candidates", [])
+            if isinstance(item, dict) and str(item.get("leaf_id") or "") == leaf_id
+        ] if isinstance(packet.get("supplemental_evidence_candidates"), list) else []
+        supplemental_admissions = [
+            item
+            for item in packet.get("supplemental_evidence_admission_results", [])
+            if isinstance(item, dict) and str(item.get("leaf_id") or "") == leaf_id
+        ] if isinstance(packet.get("supplemental_evidence_admission_results"), list) else []
+        docket_seed = {
+            "leaf_id": leaf_id,
+            "selected": [item.get("evidence_ref") for item in selected],
+            "omitted": [item.get("candidate_id") for item in omitted],
+            "certificate": cert.get("certificate_id"),
+            "supplemental": [item.get("supplemental_evidence_ref") or item.get("evidence_ref") for item in supplemental_candidates],
+        }
+        proceed = cert.get("classification_dispatch_allowed") is True and cert.get("status") == "certified_high_certainty"
+        dockets.append(
+            {
+                "artifact_type": "leaf_evidence_docket",
+                "schema_version": "leaf-evidence-docket/v1",
+                "docket_id": _sha_id("leaf-evidence-docket", docket_seed),
+                "leaf_id": leaf_id,
+                "query_context_ref": result.get("query_context_ref"),
+                "admitted_evidence_refs": [item["evidence_ref"] for item in selected if _is_non_empty_string(item.get("evidence_ref"))],
+                "rejected_or_omitted_candidate_refs": [
+                    item["candidate_id"] for item in omitted if _is_non_empty_string(item.get("candidate_id"))
+                ],
+                "supplemental_candidate_refs": [
+                    str(item.get("supplemental_evidence_ref") or item.get("evidence_ref"))
+                    for item in supplemental_candidates
+                    if _is_non_empty_string(item.get("supplemental_evidence_ref") or item.get("evidence_ref"))
+                ],
+                "supplemental_admission_result_refs": [
+                    str(item.get("admission_result_ref") or item.get("normalized_supplemental_evidence_ref"))
+                    for item in supplemental_admissions
+                    if _is_non_empty_string(item.get("admission_result_ref") or item.get("normalized_supplemental_evidence_ref"))
+                ],
+                "research_sufficiency_certificate_ref": cert.get("certificate_id"),
+                "research_sufficiency_status": cert.get("status", "not_certified"),
+                "classification_dispatch_allowed": bool(cert.get("classification_dispatch_allowed") is True),
+                "proceed_to_classification": bool(proceed),
+                "proceed_block_reason_codes": [] if proceed else list(cert.get("blocking_reason_codes", []) or ["research_sufficiency_not_certified"]),
+                "evidence_admission_authority": "deterministic_retrieval_resolvers_only",
+                "classification_authority": False,
+                "scae_authority": False,
+            }
+        )
+    return dockets
+
+
 def _fresh_source_count(selected: list[dict[str, Any]], profile: dict[str, Any], source_cutoff_timestamp: str | None) -> int:
     requirement = profile.get("freshness_requirement") if isinstance(profile.get("freshness_requirement"), dict) else {}
     window_seconds = int(requirement.get("recency_window_seconds", 0) or 0)
@@ -2796,6 +2930,9 @@ def build_retrieval_breadth_coverage_slice(
         profile.get("source_family_requirements", {}).get("min_independent_source_families", 0) or 0
     )
     min_fresh_sources = int(profile.get("freshness_requirement", {}).get("min_fresh_sources", 0) or 0)
+    min_admitted_evidence = int(
+        profile.get("admitted_evidence_requirement", {}).get("min_admitted_evidence_items", 0) or 0
+    )
     contradiction_refs = [attempt["attempt_id"] for attempt in contradiction_attempts]
     negative_refs = [attempt["attempt_id"] for attempt in negative_check_attempts]
     protected_required = bool(profile.get("source_class_requirements", {}).get("protected_primary_required"))
@@ -2841,6 +2978,8 @@ def build_retrieval_breadth_coverage_slice(
         unsatisfied.append("source_family_diversity")
     if fresh_source_count < min_fresh_sources:
         unsatisfied.append("freshness")
+    if len(selected) < min_admitted_evidence:
+        unsatisfied.append("admitted_evidence_count")
     if profile.get("contradiction_search", {}).get("required") and not contradiction_refs:
         unsatisfied.append("contradiction_search_attempt_missing")
     required_negative_checks = profile.get("negative_checks", {}).get("required_checks", [])
@@ -2892,6 +3031,7 @@ def build_retrieval_breadth_coverage_slice(
         "structural_unanswerability_proof_ref": structural_unanswerability_proof_ref,
         "raw_candidate_count": len(selected) + len(omitted),
         "admitted_ref_count": len(selected),
+        "min_admitted_evidence_items": min_admitted_evidence,
         "independent_claim_family_ids": claim_family_ids,
         "independent_source_family_ids": source_family_ids,
         "metadata_fill_diagnostic_refs": metadata_refs,
@@ -3810,6 +3950,7 @@ def finalize_retrieval_packet_for_dispatch(
             replay_command=replay_command,
         )
         packet_copy.update(stage_records)
+    packet_copy["leaf_evidence_dockets"] = build_leaf_evidence_dockets(packet_copy)
 
     result = validate_retrieval_packet(packet_copy)
     if not result.valid:
@@ -3906,6 +4047,7 @@ def build_retrieval_packet(
     source_cutoff_timestamp: str | None = None,
     pre_dispatch_input_whitelist_refs: list[str] | None = None,
     live_retrieval_allowlist: list[str] | None = None,
+    live_policy_overlay: bool = False,
 ) -> dict[str, Any]:
     _ensure_no_forbidden_keys(qdt, "qdt")
     forecast, cutoff = _timestamps_from_inputs(qdt, evidence_packet, forecast_timestamp, source_cutoff_timestamp)
@@ -3919,7 +4061,10 @@ def build_retrieval_packet(
     breadth_profiles = []
     leaves_by_id = {leaf.get("leaf_id"): leaf for leaf in qdt.get("required_leaf_questions", [])}
     for context in contexts:
-        profile = build_retrieval_breadth_profile_placeholder(leaves_by_id[context["leaf_id"]])
+        profile = build_retrieval_breadth_profile_placeholder(
+            leaves_by_id[context["leaf_id"]],
+            live_policy_overlay=live_policy_overlay,
+        )
         profile["contradiction_search"]["query_variants"] = [
             item["query_text"] for item in context["contradiction_query_variants"]
         ]

@@ -549,7 +549,7 @@ def _model_execution_context_from_handoff(handoff: dict[str, Any]) -> dict[str, 
     model_context = handoff.get("model_execution_context")
     if not isinstance(model_context, dict):
         raise QDTError("handoff missing model_execution_context")
-    return {field: copy.deepcopy(model_context.get(field)) for field in REQUIRED_MODEL_FIELDS}
+    return copy.deepcopy(model_context)
 
 
 def _related_context_usage_from_handoff(handoff: dict[str, Any]) -> dict[str, Any]:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import sys
 import tempfile
@@ -35,6 +36,11 @@ POLICY_PATH = ROOT / "orchestrator" / "plans" / "autonomous-decomposition-swarm-
 
 def _canonical_json(value: object) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+
+
+def _digest_context(context: dict) -> str:
+    digest_input = {key: value for key, value in context.items() if key != "model_context_digest"}
+    return "sha256:" + hashlib.sha256(_canonical_json(digest_input).encode("utf-8")).hexdigest()
 
 
 class ResearcherModelContextTest(unittest.TestCase):
@@ -115,6 +121,53 @@ class ResearcherModelContextTest(unittest.TestCase):
         joined = "; ".join(validation.errors)
         self.assertIn("model_call_performed", joined)
         self.assertIn("model_context_digest", joined)
+
+    def test_validation_accepts_model_executed_runtime_context_with_call_ref(self) -> None:
+        context = resolve_researcher_leaf_nli_model_context()
+        runtime_reason_codes = [
+            "model_executed",
+            "forbidden_output_scan_passed",
+            "output_schema_validated",
+        ]
+        context["runtime"] = {
+            "execution_mode": "fixture",
+            "model_call_performed": True,
+            "model_executed": True,
+            "fixture_mode": True,
+            "runtime_call_ref": "model-runtime-call:researcher-leaf-1",
+            "execution_status": "succeeded",
+            "retry_count": 0,
+            "repair_count": 0,
+            "runtime_reason_codes": runtime_reason_codes,
+            "fallback_reason_codes": ["no_fallback_required"],
+        }
+        context["runtime_reason_codes"] = runtime_reason_codes
+        context["fallback_reason_codes"] = ["no_fallback_required"]
+        context["model_context_digest"] = _digest_context(context)
+
+        validation = validate_researcher_model_execution_context(context)
+
+        self.assertTrue(validation.valid, validation.errors)
+
+    def test_validation_rejects_model_executed_context_without_call_ref(self) -> None:
+        context = resolve_researcher_leaf_nli_model_context()
+        runtime_reason_codes = ["model_executed"]
+        context["runtime"] = {
+            "execution_mode": "live",
+            "model_call_performed": True,
+            "model_executed": True,
+            "execution_status": "succeeded",
+            "runtime_reason_codes": runtime_reason_codes,
+            "fallback_reason_codes": ["no_fallback_required"],
+        }
+        context["runtime_reason_codes"] = runtime_reason_codes
+        context["fallback_reason_codes"] = ["no_fallback_required"]
+        context["model_context_digest"] = _digest_context(context)
+
+        validation = validate_researcher_model_execution_context(context)
+
+        self.assertFalse(validation.valid)
+        self.assertIn("runtime.runtime_call_ref is required", "; ".join(validation.errors))
 
 
 if __name__ == "__main__":
