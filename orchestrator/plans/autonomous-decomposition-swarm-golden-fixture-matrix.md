@@ -35,10 +35,10 @@ Status values: `not_started`, `fixture_defined`, `implemented`, `passing`, `waiv
 | FIX-010 | Cutover | 3,5 | Thin retrieval | Retrieval quality lowers leverage, widens interval, and preserves actionability warning. | not_started |
 | FIX-011 | Cutover | 3,4,5 | Protected-primary source failure | Source access failure slice persists; critical/source-of-truth leaf cannot use degraded fallback for execution authority. | not_started |
 | FIX-012 | Cutover | 4,5 | Contradictory classifications | Direction/quality verification quarantines or excludes ambiguous rows without deadlocking non-critical forecast. | not_started |
-| FIX-013 | Cutover | 3,4,5 | Duplicate same-claim evidence | Same claim across leaves contributes once through shared-claim union; no additive duplicate force. | not_started |
-| FIX-014 | Cutover | 3,5 | Ambiguous claim equivalence | Uncertain same-claim vs independent-claim defaults conservative, not independent corroboration. | not_started |
+| FIX-013 | Cutover | 3,4,5 | Duplicate same-claim evidence | Same claim across leaves contributes once through shared-claim union; no additive duplicate force. | passing |
+| FIX-014 | Cutover | 3,5 | Ambiguous claim equivalence | Uncertain same-claim vs independent-claim defaults conservative, not independent corroboration. | passing |
 | FIX-015 | Cutover | 3,5 | Same-mechanism distinct claims | Same mechanism reduces independence or widens intervals but does not merge as same claim. | not_started |
-| FIX-016 | Cutover | 3,5 | Expanded decomposition branch sub-ledger | Effective leaf budget above compact default uses sign-partitioned branch sub-ledgers, not flat summation. | not_started |
+| FIX-016 | Cutover | 3,5 | Expanded decomposition branch sub-ledger | Effective leaf budget above compact default uses sign-partitioned branch sub-ledgers, not flat summation. | passing |
 | FIX-017 | Cutover | 2,3,5 | AMRG causal cycle downgrade | Concurrent/overlapping/cyclic relation downgrades to diagnostic and cannot create prior anchor. | not_started |
 | FIX-018 | Cutover | 2,5 | AMRG adjusted upstream prior reliability | Validated upstream anchor records adjusted upstream probability, reliability context, and source timestamps. | not_started |
 | FIX-036 | Cutover | 2,3 | AMRG local vector neighbor | Local Ollama-routed `BAAI/bge-base-en-v1.5` embeds active-safe descriptors, writes an index snapshot and capped neighbor candidates, and vector-only candidates remain weak context unless later validated. | not_started |
@@ -47,7 +47,7 @@ Status values: `not_started`, `fixture_defined`, `implemented`, `passing`, `waiv
 | FIX-020 | Cutover | 5 | Structural-prior/base-rate fingerprint overlap | SCAE rejects duplicate structural prior as signed evidence unless distinct fresh not-priced proof exists. | not_started |
 | FIX-021 | Cutover | 3,5 | No-catalyst/time-expiration | Missingness and no-catalyst deltas cannot both apply without distinct absence mechanism proof. | not_started |
 | FIX-022 | Cutover | 4,5 | Correlated-quality guard | Raw quality multiplier is floored/grouped and final multiplier is recorded before evidence delta. | not_started |
-| FIX-023 | Cutover | 5 | Direct-cutover cap stack | Per-update, per-cluster, per-branch, and total caps apply; debt-mode caps are stricter. | not_started |
+| FIX-023 | Cutover | 5 | Direct-cutover cap stack | Per-update, per-cluster, per-branch, and total caps apply; debt-mode caps are stricter. | passing |
 | FIX-024 | Calibration debt | 5,6 | Calibration-debt hard gates | First-100 trace completeness alone cannot clear debt; resolved/tail/regime/pointer-stability gates are required. | not_started |
 | FIX-025 | Cutover | 2,5 | Near-resolution market shrinkage | Near-resolution prior handling distinguishes source-grade contradiction from ordinary uncertainty. | not_started |
 | FIX-026 | Cutover | 2,5 | Effective tuning profile selection | Unknown/underpowered domains use global baseline plus conservative overlays; sports/crypto tags remain excluded from initial active profiles. | not_started |
