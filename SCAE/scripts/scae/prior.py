@@ -187,7 +187,7 @@ def compute_prior_reliability(
     )
     floor_applied = False
     ceiling_applied = False
-    if fresh_liquid and not contradiction_signal and not spoofing_signal:
+    if fresh_liquid and not stale_thin and not contradiction_signal and not spoofing_signal:
         reliability = max(reliability, prior_policy["fresh_liquid_reliability_floor"])
         floor_applied = True
         flags.append("fresh_liquid_floor_applied")
@@ -201,10 +201,10 @@ def compute_prior_reliability(
     if spoofing_signal:
         flags.append("spoofing_signal_present")
 
-    if floor_applied:
-        reliability_class = "fresh_liquid"
-    elif ceiling_applied:
+    if ceiling_applied:
         reliability_class = "stale_thin"
+    elif floor_applied:
+        reliability_class = "fresh_liquid"
     elif reliability >= 0.65:
         reliability_class = "usable_market"
     else:

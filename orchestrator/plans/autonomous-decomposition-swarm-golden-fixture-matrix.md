@@ -49,7 +49,7 @@ Status values: `not_started`, `fixture_defined`, `implemented`, `passing`, `waiv
 | FIX-022 | Cutover | 4,5 | Correlated-quality guard | Raw quality multiplier is floored/grouped and final multiplier is recorded before evidence delta. | passing |
 | FIX-023 | Cutover | 5 | Direct-cutover cap stack | Per-update, per-cluster, per-branch, and total caps apply; debt-mode caps are stricter. | passing |
 | FIX-024 | Calibration debt | 5,6 | Calibration-debt hard gates | First-100 trace completeness alone cannot clear debt; resolved/tail/regime/pointer-stability gates are required. | passing |
-| FIX-025 | Cutover | 2,5 | Near-resolution market shrinkage | Near-resolution prior handling distinguishes source-grade contradiction from ordinary uncertainty. | not_started |
+| FIX-025 | Cutover | 2,5 | Near-resolution market shrinkage | Near-resolution prior handling distinguishes source-grade contradiction from ordinary uncertainty. | passing |
 | FIX-026 | Cutover | 2,5 | Effective tuning profile selection | Unknown/underpowered domains use global baseline plus conservative overlays; sports/crypto tags remain excluded from initial active profiles. | passing |
 | FIX-027 | Maturity | 6 | Profile canary/rollback | Candidate profile runs in deterministic canary bucket and can roll back by lane-local pointer. | not_started |
 | FIX-028 | Maturity | 3,6 | Decomposer-miss learning | Post-resolution decomposer-miss labels feed promoted QDT scoring overlay without leaking same-case outcomes into active dispatch. | not_started |

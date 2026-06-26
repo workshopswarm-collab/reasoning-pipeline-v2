@@ -102,11 +102,21 @@ class TuningProfileTest(unittest.TestCase):
         )
         return int(cursor.lastrowid)
 
-    def build_packet(self, *, category="politics", title=None, source_status="unknown", quotes=None):
+    def build_packet(
+        self,
+        *,
+        category="politics",
+        title=None,
+        source_status="unknown",
+        quotes=None,
+        closes_at="2026-06-25T00:00:00+00:00",
+    ):
+        market_index = self.conn.execute("SELECT COUNT(*) FROM markets").fetchone()[0]
         market_id = self.insert_market(
             category=category,
             title=title or "Will the election fixture pass?",
-            external_market_id=f"poly-{category}-{len(category)}",
+            external_market_id=f"poly-{category}-{len(category)}-{market_index}",
+            closes_at=closes_at,
         )
         snapshot_id = self.insert_snapshot(market_id)
         contract_result = materialize_ads_case_contract(
@@ -239,6 +249,55 @@ class TuningProfileTest(unittest.TestCase):
 
         self.assertEqual(without_pointer["conservative_overlay_ids"], [])
         self.assertIn("conservative_thin_liquidity_overlay", with_pointer["conservative_overlay_ids"])
+
+    def test_near_resolution_overlay_requires_near_resolution_tag_and_active_pointer(self):
+        near_packet, near_contract = self.build_packet(
+            category="politics",
+            source_status="clear",
+            closes_at="2026-06-25T00:00:00+00:00",
+        )
+        without_pointer = resolve_tuning_profile_context(
+            evidence_packet=near_packet,
+            evidence_packet_ref=near_contract["artifact_id"],
+        )
+        with_pointer = resolve_tuning_profile_context(
+            evidence_packet=near_packet,
+            evidence_packet_ref=near_contract["artifact_id"],
+            active_overlay_pointers={
+                "conservative_close_to_resolution_overlay": self.active_pointer("ptr-near"),
+            },
+        )
+
+        self.assertEqual(
+            with_pointer["market_regime_tags"]["tags"]["resolution_proximity"],
+            "near_resolution",
+        )
+        self.assertEqual(without_pointer["conservative_overlay_ids"], [])
+        self.assertIn(
+            "conservative_close_to_resolution_overlay",
+            with_pointer["conservative_overlay_ids"],
+        )
+
+        open_packet, open_contract = self.build_packet(
+            category="politics",
+            source_status="clear",
+            closes_at="2026-06-28T00:00:00+00:00",
+        )
+        open_context = resolve_tuning_profile_context(
+            evidence_packet=open_packet,
+            evidence_packet_ref=open_contract["artifact_id"],
+            active_overlay_pointers={
+                "conservative_close_to_resolution_overlay": self.active_pointer("ptr-near"),
+            },
+        )
+        self.assertEqual(
+            open_context["market_regime_tags"]["tags"]["resolution_proximity"],
+            "open_window",
+        )
+        self.assertNotIn(
+            "conservative_close_to_resolution_overlay",
+            open_context["conservative_overlay_ids"],
+        )
 
     def test_unpromoted_overlay_cannot_apply_live_even_with_pointer(self):
         packet, contract_result = self.build_packet(

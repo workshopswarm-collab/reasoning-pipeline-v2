@@ -79,6 +79,41 @@ class ScaePriorTest(unittest.TestCase):
         )
         self.assertIn("fresh_liquid_floor_applied", context["reliability_flags"])
 
+    def test_source_grade_contradiction_blocks_fresh_liquid_floor(self):
+        context = build_prior_context(
+            market_prior={"source": "market_live_probability", "probability": 0.70, "valid": True},
+            structural_prior=None,
+            prior_reliability_inputs=self.prior_inputs(spread=0.18, depth=1200.0, volume=2000.0),
+            policy=self.policy,
+            contradiction_signal=True,
+        )
+
+        self.assertNotEqual(context["prior_reliability_class"], "fresh_liquid")
+        self.assertLess(
+            context["prior_reliability_score"],
+            self.policy["prior_reliability"]["fresh_liquid_reliability_floor"],
+        )
+        self.assertIn("contradiction_signal_present", context["reliability_flags"])
+        self.assertNotIn("fresh_liquid_floor_applied", context["reliability_flags"])
+
+    def test_ordinary_spread_warning_is_not_source_grade_contradiction(self):
+        inputs = self.prior_inputs(freshness="fresh", spread=0.30, depth=1200.0, volume=2000.0)
+        inputs["reason_code_candidates"].append({"code": "instant_spread_spike_warning_candidate"})
+        context = build_prior_context(
+            market_prior={"source": "market_live_probability", "probability": 0.70, "valid": True},
+            structural_prior=None,
+            prior_reliability_inputs=inputs,
+            policy=self.policy,
+        )
+
+        self.assertEqual(context["prior_reliability_class"], "stale_thin")
+        self.assertLessEqual(
+            context["prior_reliability_score"],
+            self.policy["prior_reliability"]["stale_thin_reliability_ceiling"],
+        )
+        self.assertIn("stale_thin_ceiling_applied", context["reliability_flags"])
+        self.assertNotIn("contradiction_signal_present", context["reliability_flags"])
+
     def test_stale_thin_market_prior_gets_reliability_ceiling(self):
         context = build_prior_context(
             market_prior={"source": "market_live_probability", "probability": 0.70, "valid": True},
