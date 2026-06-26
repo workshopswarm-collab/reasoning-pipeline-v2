@@ -18,6 +18,7 @@ from predquant.ads_operational_canary import (  # noqa: E402
     build_operational_case_selection_policy,
     load_handler_factory,
 )
+from predquant.ads_live_readiness import build_live_readiness_report  # noqa: E402
 from predquant.ads_pipeline_control import set_pipeline_enabled  # noqa: E402
 from predquant.ads_pipeline_runner import (  # noqa: E402
     RUNNER_MODES,
@@ -57,6 +58,21 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--enable-for-run", action="store_true", help="Enable pipeline control before running.")
     parser.add_argument("--disable-after-run", action="store_true", help="Disable pipeline control after running.")
+    parser.add_argument(
+        "--require-live-readiness",
+        action="store_true",
+        help="Refuse to run unless the ADS live-readiness gate passes.",
+    )
+    parser.add_argument(
+        "--require-scoreable-live",
+        action="store_true",
+        help="Require calibration-debt clearance and a scoreable-capable handler in the live-readiness gate.",
+    )
+    parser.add_argument(
+        "--allow-canary-handler",
+        action="store_true",
+        help="Allow scoreable/manifest canary handlers to pass the live-readiness handler policy check.",
+    )
     parser.add_argument("--updated-by", default="ads-operational-scheduler")
     parser.add_argument("--reason", default="bounded ADS operational scheduler run")
     parser.add_argument("--metadata-json", type=parse_metadata)
@@ -100,6 +116,23 @@ def main() -> int:
     conn = sqlite3.connect(db_path, isolation_level=None)
     conn.row_factory = sqlite3.Row
     try:
+        readiness = None
+        if args.require_live_readiness:
+            readiness = build_live_readiness_report(
+                db_path,
+                handler_factory=args.handler_factory,
+                runner_mode=args.runner_mode,
+                require_scoreable_live=args.require_scoreable_live,
+                allow_canary_handler=args.allow_canary_handler,
+            )
+            if not readiness["ok"]:
+                record = {
+                    "ok": False,
+                    "status": "live_readiness_blocked",
+                    "live_readiness_report": readiness,
+                }
+                print(json.dumps(record, indent=2 if args.pretty else None, sort_keys=True))
+                return 2
         if args.enable_for_run:
             set_pipeline_enabled(
                 conn,
@@ -126,6 +159,8 @@ def main() -> int:
             case_selection_policy=build_operational_case_selection_policy(config),
         )
         record = result.to_record()
+        if readiness is not None:
+            record["live_readiness_report"] = readiness
         if args.disable_after_run:
             record["control_after_disable"] = set_pipeline_enabled(
                 conn,

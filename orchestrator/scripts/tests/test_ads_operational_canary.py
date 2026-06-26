@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from predquant.ads_operational_canary import OperationalCanaryConfig, run_one_case_canary, validate_preflight
 from predquant.ads_pipeline_runner import ADS_PIPELINE_STAGE_ORDER, PipelineRunnerContractError
 from predquant.ads_manifest_canary_handlers import build_stage_handlers as build_manifest_stage_handlers
+from predquant.ads_production_readiness_handlers import build_stage_handlers as build_production_readiness_handlers
 from predquant.ads_handoff_report import build_handoff_report
 from predquant.ads_scoreable_canary_handlers import build_stage_handlers
 from predquant.sqlite_store import SCHEMA
@@ -216,6 +217,39 @@ class AdsOperationalCanaryTest(unittest.TestCase):
             {stage["stage"] for stage in report["stages"]},
             set(ADS_PIPELINE_STAGE_ORDER),
         )
+
+    def test_production_readiness_factory_blocks_prediction_until_research_sufficiency(self):
+        config = self.config(require_scoreable_prediction=False, require_manifest_handoffs=True)
+        handlers = build_production_readiness_handlers(
+            db_path=config.db_path,
+            runner_mode=config.runner_mode,
+            forecast_timestamp=config.forecast_timestamp,
+            max_cases=config.max_cases,
+            metadata=config.metadata,
+        )
+
+        result = run_one_case_canary(config, handlers)
+
+        self.assertTrue(result["ok"], result["errors"])
+        self.assertEqual(result["result"]["completed_stage_count"], len(ADS_PIPELINE_STAGE_ORDER))
+        self.assertEqual(result["protected_count_deltas"]["forecast_decision_records"], 1)
+        self.assertEqual(result["protected_count_deltas"]["market_predictions"], 0)
+        with sqlite3.connect(self.db_path) as conn:
+            decision = conn.execute(
+                """
+                SELECT production_persistence_status, production_forecast_persisted,
+                       scoreable_forecast_output, non_scoreable_reason_code
+                FROM forecast_decision_records
+                """
+            ).fetchone()
+            self.assertEqual(decision[0], "blocked_invalid_scae_forecast")
+            self.assertEqual(decision[1], 0)
+            self.assertEqual(decision[2], 0)
+            self.assertEqual(decision[3], "forecast_validity_invalid_for_forecast")
+
+        report = build_handoff_report(self.db_path)
+        self.assertTrue(report["ok"], report["unresolved_output_manifest_refs"])
+        self.assertGreaterEqual(report["manifest_counts_by_validation_status"].get("valid", 0), len(ADS_PIPELINE_STAGE_ORDER))
 
 
 if __name__ == "__main__":

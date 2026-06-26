@@ -62,6 +62,16 @@ def scalar(conn: sqlite3.Connection, sql: str, params=()):
     return row[0] if row else None
 
 
+def table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    return (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1",
+            (table,),
+        ).fetchone()
+        is not None
+    )
+
+
 def age_seconds(timestamp: Optional[str]) -> Optional[float]:
     parsed = parse_market_time(timestamp)
     if parsed is None:
@@ -102,9 +112,26 @@ def build_report(db_path: Path, args: argparse.Namespace) -> dict:
             conn,
             "SELECT MAX(updated_at) FROM market_predictions WHERE prediction_brier IS NOT NULL",
         )
-        latest_resolution_checked_at = scalar(
+        latest_market_resolution_checked_at = scalar(
             conn,
             "SELECT MAX(resolution_checked_at) FROM markets WHERE resolution_checked_at IS NOT NULL",
+        )
+        latest_resolution_sync_heartbeat_at = None
+        if table_exists(conn, "polymarket_resolution_sync_heartbeats"):
+            latest_resolution_sync_heartbeat_at = scalar(
+                conn,
+                "SELECT MAX(checked_at) FROM polymarket_resolution_sync_heartbeats WHERE dry_run = 0",
+            )
+        latest_resolution_checked_at = max(
+            [
+                item
+                for item in (
+                    latest_market_resolution_checked_at,
+                    latest_resolution_sync_heartbeat_at,
+                )
+                if item
+            ],
+            default=None,
         )
         snapshot_age = age_seconds(latest_snapshot_at)
         brier_age = age_seconds(latest_scored_at)
@@ -135,6 +162,7 @@ def build_report(db_path: Path, args: argparse.Namespace) -> dict:
             "latest_brier_age_seconds": brier_age,
             "latest_resolution_checked_at": latest_resolution_checked_at,
             "latest_resolution_age_seconds": resolution_age,
+            "latest_resolution_sync_heartbeat_at": latest_resolution_sync_heartbeat_at,
             "updated_at": utc_now(),
         }
     finally:

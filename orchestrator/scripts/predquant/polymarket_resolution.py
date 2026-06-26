@@ -20,6 +20,25 @@ from predquant.sqlite_store import (
 
 
 DEFAULT_TERMINAL_TOLERANCE = 0.001
+RESOLUTION_SYNC_HEARTBEAT_TABLE = "polymarket_resolution_sync_heartbeats"
+
+
+def ensure_resolution_sync_heartbeat_schema(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {RESOLUTION_SYNC_HEARTBEAT_TABLE} (
+          heartbeat_id TEXT PRIMARY KEY,
+          checked_at TEXT NOT NULL,
+          candidate_count INTEGER NOT NULL,
+          resolved_count INTEGER NOT NULL,
+          unresolved_count INTEGER NOT NULL,
+          error_count INTEGER NOT NULL,
+          dry_run INTEGER NOT NULL DEFAULT 0,
+          metadata TEXT NOT NULL DEFAULT '{{}}',
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
 
 
 def parse_json_list(value, default=None):
@@ -196,6 +215,7 @@ def sync_polymarket_resolutions(
     try:
         conn.execute("PRAGMA foreign_keys = ON")
         ensure_schema(conn)
+        ensure_resolution_sync_heartbeat_schema(conn)
         candidates = candidate_markets_for_resolution(conn, limit)
 
         for market in candidates:
@@ -259,6 +279,34 @@ def sync_polymarket_resolutions(
                         "external_market_id": external_market_id,
                         "error": str(exc),
                     }
+                )
+
+        if not dry_run:
+            checked_at = datetime.now(timezone.utc).isoformat()
+            metadata = {
+                "schema_version": "polymarket-resolution-sync-heartbeat/v1",
+                "limit": limit,
+                "terminal_tolerance": terminal_tolerance,
+            }
+            with conn:
+                conn.execute(
+                    f"""
+                    INSERT OR REPLACE INTO {RESOLUTION_SYNC_HEARTBEAT_TABLE} (
+                      heartbeat_id, checked_at, candidate_count, resolved_count,
+                      unresolved_count, error_count, dry_run, metadata
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "polymarket-resolution-sync-current",
+                        checked_at,
+                        len(candidates),
+                        len(resolved),
+                        len(unresolved),
+                        len(errors),
+                        0,
+                        to_json_text(metadata),
+                    ),
                 )
 
         return {
