@@ -489,6 +489,27 @@ class AdsPipelineRunnerTest(unittest.TestCase):
         self.assertIsNone(second_loop["case_lease_id"])
         self.assertTrue(second_loop["metadata"]["empty_queue"])
 
+    def test_auto003_strict_manifest_handoffs_rejects_synthetic_refs(self):
+        self.initialize_intake_case()
+        self.enable_fixture_pipeline()
+
+        result = run_ads_pipeline_loop(
+            self.conn,
+            self.auto003_policy(require_manifest_handoffs=True),
+            downstream_stage_handlers=self.stage_handlers(),
+            case_selection_policy=self.case_selection_policy(),
+        )
+
+        self.assertEqual(result.terminal_status, TERMINAL_REASON_AUTO003_FAILED)
+        self.assertEqual(result.completed_stage_count, 1)
+        self.assertEqual(
+            self.conn.execute(
+                f"SELECT COUNT(*) FROM {PIPELINE_ERROR_EVENT_TABLE} WHERE stage = ?",
+                ("evidence_packet",),
+            ).fetchone()[0],
+            1,
+        )
+
     def test_auto004_stop_before_next_case_exits_without_acquiring_lease(self):
         self.initialize_intake_case()
         self.enable_fixture_pipeline()

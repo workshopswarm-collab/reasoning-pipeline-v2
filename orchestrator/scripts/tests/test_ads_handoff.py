@@ -19,6 +19,11 @@ from predquant.ads_handoff import (
     write_artifact_manifest,
     write_validation_result,
 )
+from predquant.ads_handoff_resolver import (
+    ManifestRequirement,
+    load_manifest_payload,
+    resolve_artifact_manifest,
+)
 from predquant.foundation_schema import ensure_foundation_schema
 
 
@@ -142,6 +147,36 @@ class AdsHandoffTest(unittest.TestCase):
                 self.assertEqual(manifest_row[1], "valid")
                 self.assertEqual(json.loads(manifest_row[2]), [validation["validation_result_id"]])
                 self.assertEqual(validation_row, (validation["validation_result_id"], artifact_id, "valid"))
+            finally:
+                conn.close()
+
+    def test_resolver_loads_and_validates_persisted_manifest_payload(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            path = self.artifact_path(tempdir).resolve()
+            manifest = build_artifact_manifest(
+                context=self.context(),
+                artifact_type="retrieval-packet",
+                artifact_schema_version="retrieval-packet/v1",
+                path=path,
+                validation_status="valid",
+                validator_version="ads-handoff-test/v1",
+                temporal_isolation_status="pass",
+            )
+            conn = sqlite3.connect(":memory:")
+            try:
+                artifact_id = write_artifact_manifest(conn, manifest)
+                resolved = resolve_artifact_manifest(
+                    conn,
+                    artifact_id,
+                    ManifestRequirement(
+                        role="retrieval",
+                        artifact_type="retrieval-packet",
+                        artifact_schema_version="retrieval-packet/v1",
+                        stage="retrieval",
+                    ),
+                )
+                self.assertEqual(resolved["artifact_id"], artifact_id)
+                self.assertEqual(load_manifest_payload(resolved)["schema_version"], "retrieval-packet/v1")
             finally:
                 conn.close()
 

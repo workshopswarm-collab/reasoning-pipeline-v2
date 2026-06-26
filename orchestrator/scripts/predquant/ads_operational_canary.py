@@ -43,6 +43,8 @@ class OperationalCanaryConfig:
     updated_by: str = "manual"
     reason: str = "one-case ADS operational canary"
     require_scoreable_prediction: bool = True
+    require_manifest_handoffs: bool = False
+    skip_existing_ads_predictions: bool = False
     protected_tables: tuple[str, ...] = DEFAULT_PROTECTED_TABLES
     metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -112,6 +114,7 @@ def validate_preflight(
         allow_downstream_execution=True,
         allow_forecast_persistence=True,
         retry_backoff_seconds=config.retry_backoff_seconds,
+        require_manifest_handoffs=config.require_manifest_handoffs,
     )
     if config.max_cases == 1:
         validate_auto003_policy(policy, handlers)
@@ -123,7 +126,7 @@ def validate_preflight(
         errors.append("active ADS pipeline runs exist")
     if active["active_leases"]:
         errors.append("active ADS case leases exist")
-    case_policy = _case_selection_policy(config)
+    case_policy = build_operational_case_selection_policy(config)
     eligible_case = select_eligible_case(conn, case_policy)
     if eligible_case is None:
         errors.append("no eligible ADS case available for canary forecast timestamp and snapshot-age policy")
@@ -147,16 +150,22 @@ def validate_preflight(
     }
 
 
-def _case_selection_policy(config: OperationalCanaryConfig) -> CaseSelectionPolicy:
+def build_operational_case_selection_policy(config: OperationalCanaryConfig) -> CaseSelectionPolicy:
     return CaseSelectionPolicy(
         forecast_timestamp=config.forecast_timestamp,
         lease_duration_seconds=config.lease_duration_seconds,
+        skip_existing_ads_predictions=config.skip_existing_ads_predictions,
         metadata={
             "purpose": "ads_operational_canary",
             "max_cases": config.max_cases,
+            "skip_existing_ads_predictions": config.skip_existing_ads_predictions,
             **config.metadata,
         },
     )
+
+
+def _case_selection_policy(config: OperationalCanaryConfig) -> CaseSelectionPolicy:
+    return build_operational_case_selection_policy(config)
 
 
 def _eligible_case_summary(candidate: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -204,6 +213,7 @@ def run_one_case_canary(
             allow_downstream_execution=True,
             allow_forecast_persistence=True,
             retry_backoff_seconds=config.retry_backoff_seconds,
+            require_manifest_handoffs=config.require_manifest_handoffs,
         )
         result = run_ads_pipeline_loop(
             conn,

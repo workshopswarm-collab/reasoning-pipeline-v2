@@ -209,6 +209,40 @@ class AdsCaseSelectorTest(unittest.TestCase):
         self.assertIsNone(second)
         self.assertEqual(self.conn.execute(f"SELECT COUNT(*) FROM {CASE_LEASE_TABLE}").fetchone()[0], 1)
 
+    def test_policy_can_skip_markets_with_existing_ads_scoreable_predictions(self):
+        first_market_id = self.insert_market(external_market_id="poly-1", slug="first-fixture-market")
+        second_market_id = self.insert_market(external_market_id="poly-2", slug="second-fixture-market")
+        self.insert_snapshot(first_market_id, "2026-06-24T17:55:00+00:00")
+        self.insert_snapshot(second_market_id, "2026-06-24T17:54:00+00:00")
+        self.conn.execute(
+            """
+            INSERT INTO market_predictions (
+              market_id, predicted_at, predicted_probability,
+              prediction_source, prediction_label
+            )
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                first_market_id,
+                "2026-06-24T17:56:00+00:00",
+                0.51,
+                "ads_pipeline",
+                "v2_scae",
+            ),
+        )
+
+        candidate = select_eligible_case(
+            self.conn,
+            CaseSelectionPolicy(
+                forecast_timestamp="2026-06-24T18:00:00+00:00",
+                skip_existing_ads_predictions=True,
+            ),
+        )
+
+        self.assertIsNotNone(candidate)
+        self.assertEqual(candidate["market_id"], second_market_id)
+        self.assertEqual(candidate["case_key"], "polymarket:poly-2")
+
     def test_explicit_acquire_is_idempotent_for_same_case_market_snapshot(self):
         market_id = self.insert_market()
         self.insert_snapshot(market_id, "2026-06-24T17:55:00+00:00")

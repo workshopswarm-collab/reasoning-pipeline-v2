@@ -34,6 +34,8 @@ CASE_SELECTION_CANDIDATE_SCHEMA_VERSION = "ads-case-selection-candidate/v1"
 CASE_SELECTION_POLICY_REF = "ads-case-selection/v1"
 CASE_LEASE_STATUSES = ("leased", "released", "expired", "quarantined")
 DEFAULT_LEASE_DURATION_SECONDS = 3600
+ADS_SCOREABLE_PREDICTION_SOURCE = "ads_pipeline"
+ADS_SCOREABLE_PREDICTION_LABEL = "v2_scae"
 
 
 class CaseSelectorError(ValueError):
@@ -55,6 +57,7 @@ class CaseSelectionPolicy:
     lease_duration_seconds: int = DEFAULT_LEASE_DURATION_SECONDS
     selection_policy_ref: str = CASE_SELECTION_POLICY_REF
     lease_owner: str = "orchestrator"
+    skip_existing_ads_predictions: bool = False
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -75,6 +78,8 @@ def validate_selection_policy(policy: CaseSelectionPolicy) -> None:
         raise CaseSelectorError("max_snapshot_age_seconds must be non-negative")
     if not isinstance(policy.lease_duration_seconds, int) or policy.lease_duration_seconds <= 0:
         raise CaseSelectorError("lease_duration_seconds must be a positive integer")
+    if not isinstance(policy.skip_existing_ads_predictions, bool):
+        raise CaseSelectorError("skip_existing_ads_predictions must be a boolean")
     _require_non_empty("selection_policy_ref", policy.selection_policy_ref)
     _require_non_empty("lease_owner", policy.lease_owner)
     ensure_safe_metadata(policy.metadata)
@@ -132,6 +137,33 @@ def _active_case_lease_exists(conn: sqlite3.Connection, *, market_id: int, case_
         LIMIT 1
         """,
         (market_id, case_key),
+    ).fetchone()
+    return row is not None
+
+
+def _table_has_columns(conn: sqlite3.Connection, table: str, required_columns: tuple[str, ...]) -> bool:
+    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    columns = {row[1] for row in rows}
+    return all(column in columns for column in required_columns)
+
+
+def _existing_ads_prediction_for_market(conn: sqlite3.Connection, market_id: int) -> bool:
+    if not _table_has_columns(
+        conn,
+        "market_predictions",
+        ("market_id", "prediction_source", "prediction_label"),
+    ):
+        return False
+    row = conn.execute(
+        """
+        SELECT 1
+        FROM market_predictions
+        WHERE market_id = ?
+          AND prediction_source = ?
+          AND prediction_label = ?
+        LIMIT 1
+        """,
+        (market_id, ADS_SCOREABLE_PREDICTION_SOURCE, ADS_SCOREABLE_PREDICTION_LABEL),
     ).fetchone()
     return row is not None
 
@@ -319,6 +351,8 @@ def select_eligible_case(conn: sqlite3.Connection, policy: CaseSelectionPolicy |
 
     for market_row in eligible_market_rows(conn):
         market = row_to_dict(market_row)
+        if policy.skip_existing_ads_predictions and _existing_ads_prediction_for_market(conn, market["id"]):
+            continue
         try:
             snapshot_row, snapshot_age = select_snapshot_for_forecast(
                 conn,

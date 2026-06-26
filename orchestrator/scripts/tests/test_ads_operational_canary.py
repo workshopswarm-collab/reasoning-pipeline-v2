@@ -10,6 +10,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from predquant.ads_operational_canary import OperationalCanaryConfig, run_one_case_canary, validate_preflight
 from predquant.ads_pipeline_runner import ADS_PIPELINE_STAGE_ORDER, PipelineRunnerContractError
+from predquant.ads_manifest_canary_handlers import build_stage_handlers as build_manifest_stage_handlers
+from predquant.ads_handoff_report import build_handoff_report
 from predquant.ads_scoreable_canary_handlers import build_stage_handlers
 from predquant.sqlite_store import SCHEMA
 
@@ -82,7 +84,7 @@ class AdsOperationalCanaryTest(unittest.TestCase):
             ),
         )
 
-    def config(self, *, require_scoreable_prediction=False, max_cases=1):
+    def config(self, *, require_scoreable_prediction=False, max_cases=1, require_manifest_handoffs=False):
         return OperationalCanaryConfig(
             db_path=self.db_path,
             runner_mode="fixture",
@@ -91,6 +93,7 @@ class AdsOperationalCanaryTest(unittest.TestCase):
             updated_by="unit-test",
             reason="unit-test one-case canary",
             require_scoreable_prediction=require_scoreable_prediction,
+            require_manifest_handoffs=require_manifest_handoffs,
             metadata={"test_scope": "operational_canary"},
         )
 
@@ -184,6 +187,35 @@ class AdsOperationalCanaryTest(unittest.TestCase):
         self.assertEqual(result["result"]["terminal_status"], "auto005_max_cases_complete")
         self.assertEqual(result["protected_count_deltas"]["market_predictions"], 2)
         self.assertEqual(result["protected_count_deltas"]["forecast_decision_records"], 2)
+
+    def test_manifest_canary_factory_satisfies_strict_handoff_mode(self):
+        config = self.config(require_scoreable_prediction=True, require_manifest_handoffs=True)
+        handlers = build_manifest_stage_handlers(
+            db_path=config.db_path,
+            runner_mode=config.runner_mode,
+            forecast_timestamp=config.forecast_timestamp,
+            max_cases=config.max_cases,
+            metadata=config.metadata,
+        )
+
+        result = run_one_case_canary(config, handlers)
+
+        self.assertTrue(result["ok"], result["errors"])
+        self.assertEqual(result["protected_count_deltas"]["market_predictions"], 1)
+        with sqlite3.connect(self.db_path) as conn:
+            manifest_count = conn.execute("SELECT COUNT(*) FROM case_artifact_manifest").fetchone()[0]
+        self.assertGreaterEqual(manifest_count, len(ADS_PIPELINE_STAGE_ORDER))
+
+        report = build_handoff_report(self.db_path)
+        self.assertTrue(report["ok"], report["unresolved_output_manifest_refs"])
+        self.assertEqual(
+            report["manifest_counts_by_validation_status"],
+            {"valid": len(ADS_PIPELINE_STAGE_ORDER) - 1},
+        )
+        self.assertEqual(
+            {stage["stage"] for stage in report["stages"]},
+            set(ADS_PIPELINE_STAGE_ORDER),
+        )
 
 
 if __name__ == "__main__":

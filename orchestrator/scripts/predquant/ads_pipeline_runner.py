@@ -22,6 +22,7 @@ from predquant.ads_stage_logging import (
     write_stage_execution_event,
     write_stage_status_snapshot,
 )
+from predquant.ads_handoff_resolver import resolve_artifact_manifest
 
 PIPELINE_CONTROL_STATE_TABLE = "ads_pipeline_control_state"
 PIPELINE_RUN_TABLE = "ads_pipeline_runs"
@@ -185,6 +186,7 @@ class PipelineRunnerPolicy:
     allow_downstream_execution: bool = False
     allow_forecast_persistence: bool = False
     retry_backoff_seconds: int = 60
+    require_manifest_handoffs: bool = False
 
 
 @dataclass(frozen=True)
@@ -492,6 +494,8 @@ def validate_pipeline_runner_policy(policy: PipelineRunnerPolicy) -> None:
         raise PipelineRunnerContractError("max_cases must be a non-negative integer")
     if not isinstance(policy.retry_backoff_seconds, int) or policy.retry_backoff_seconds < 0:
         raise PipelineRunnerContractError("retry_backoff_seconds must be a non-negative integer")
+    if not isinstance(policy.require_manifest_handoffs, bool):
+        raise PipelineRunnerContractError("require_manifest_handoffs must be boolean")
     policy.idle_policy.to_record()
     if policy.allow_forecast_persistence and not policy.allow_downstream_execution:
         raise PipelineRunnerContractError("forecast persistence requires downstream stage execution")
@@ -535,6 +539,7 @@ def validate_auto005_policy(
             allow_downstream_execution=policy.allow_downstream_execution,
             allow_forecast_persistence=policy.allow_forecast_persistence,
             retry_backoff_seconds=policy.retry_backoff_seconds,
+            require_manifest_handoffs=policy.require_manifest_handoffs,
         ),
         downstream_stage_handlers,
     )
@@ -1687,6 +1692,29 @@ def _call_stage_handler(
     )
 
 
+def _validate_stage_manifest_handoffs(
+    conn: sqlite3.Connection,
+    *,
+    stage: str,
+    result: dict[str, Any],
+    require_manifest_handoffs: bool,
+) -> None:
+    if not require_manifest_handoffs:
+        return
+    refs = result.get("output_artifact_refs") or ()
+    if not refs:
+        raise PipelineRunnerContractError(f"{stage} must return at least one artifact manifest ref")
+    for artifact_id in refs:
+        try:
+            manifest = resolve_artifact_manifest(conn, artifact_id)
+        except Exception as exc:
+            raise PipelineRunnerContractError(
+                f"{stage} output_artifact_refs must be persisted artifact manifests: {artifact_id}"
+            ) from exc
+        if manifest["case_id"] != result.get("safe_metadata", {}).get("case_id", manifest["case_id"]):
+            raise PipelineRunnerContractError(f"{stage} artifact manifest case_id mismatch")
+
+
 def _run_auto003_single_case(
     conn: sqlite3.Connection,
     policy: PipelineRunnerPolicy,
@@ -1827,6 +1855,12 @@ def _run_auto003_single_case(
                     context=context,
                     lease=lease,
                     stage_outputs=stage_outputs,
+                )
+                _validate_stage_manifest_handoffs(
+                    conn,
+                    stage=stage,
+                    result=result,
+                    require_manifest_handoffs=policy.require_manifest_handoffs,
                 )
                 record_id = result.get("forecast_decision_record_id")
                 if record_id:
@@ -2336,6 +2370,12 @@ def _run_auto005_continuous_fixture(
                         context=context,
                         lease=lease,
                         stage_outputs=stage_outputs,
+                    )
+                    _validate_stage_manifest_handoffs(
+                        conn,
+                        stage=stage,
+                        result=result,
+                        require_manifest_handoffs=policy.require_manifest_handoffs,
                     )
                     record_id = result.get("forecast_decision_record_id")
                     if record_id:

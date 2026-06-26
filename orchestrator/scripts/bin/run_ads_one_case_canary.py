@@ -68,6 +68,16 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Do not require exactly one forecast_decision_records row and one market_predictions row.",
     )
+    parser.add_argument(
+        "--require-manifest-handoffs",
+        action="store_true",
+        help="Require every downstream stage output ref to resolve to a persisted artifact manifest.",
+    )
+    parser.add_argument(
+        "--skip-existing-ads-predictions",
+        action="store_true",
+        help="Skip markets that already have ads_pipeline/v2_scae market_predictions rows.",
+    )
     parser.add_argument("--metadata-json", type=parse_metadata)
     parser.add_argument("--preflight-only", action="store_true", help="Validate handler coverage and active-work state only.")
     parser.add_argument("--apply", action="store_true", help="Actually enable and run the one-case canary.")
@@ -87,6 +97,8 @@ def main() -> int:
         updated_by=args.updated_by,
         reason=args.reason,
         require_scoreable_prediction=not args.allow_non_scoreable,
+        require_manifest_handoffs=args.require_manifest_handoffs,
+        skip_existing_ads_predictions=args.skip_existing_ads_predictions,
         metadata=args.metadata_json or {},
     )
     if not args.handler_factory:
