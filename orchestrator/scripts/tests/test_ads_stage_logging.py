@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import json
 import sqlite3
 import sys
 import tempfile
@@ -24,6 +25,8 @@ from predquant.ads_stage_logging import (
     validate_stage,
     validate_transition,
     write_pipeline_error_event,
+    write_stage_execution_event,
+    write_stage_status_snapshot,
 )
 
 
@@ -214,6 +217,125 @@ class AdsStageLoggingTest(unittest.TestCase):
 
         self.assertEqual(event_count, 1)
         self.assertEqual(group_count, 1)
+
+    def test_negative_stage_fixture_writes_status_events_errors_and_replay(self):
+        conn = sqlite3.connect(":memory:")
+        context = self.context("retrieval")
+        command = "python3 wake_researcher_swarm.py --case-id case-1 --dispatch-id dispatch-1"
+        event_specs = [
+            ("stage_started", "info", "running", None, None),
+            ("stage_blocked", "warning", "blocked", "dependency_not_ready", "blocked"),
+            ("retry_scheduled", "warning", "blocked", "dependency_not_ready", "retryable"),
+            ("artifact_validation_failed", "error", "failed", "schema_validation_failed", "terminal"),
+            ("stage_failed", "error", "failed", "missing_required_artifact", "terminal"),
+        ]
+        try:
+            for event_type, event_status, stage_status, failure_class, retryability in event_specs:
+                event_id = f"stage-exec:{event_type}"
+                error_event_id = f"pipeline-error:{event_type}" if failure_class else None
+                uses_bounded_log = event_type in {"artifact_validation_failed", "stage_failed"}
+                event = build_stage_execution_event(
+                    execution_event_id=event_id,
+                    context=context,
+                    event_type=event_type,
+                    event_status=event_status,
+                    attempt_number=1,
+                    max_attempts=3,
+                    runner_ref="ads-runner:fixture",
+                    agent_or_component_ref="orchestrator",
+                    script_path="/Users/agent2/.openclaw/orchestrator/scripts/bin/wake_researcher_swarm.py",
+                    command_sha256_value=command_sha256(command),
+                    input_artifact_refs=["artifact:retrieval-packet"],
+                    validation_result_refs=["artifact-validation:retrieval-packet"]
+                    if event_type == "artifact_validation_failed"
+                    else [],
+                    error_event_id=error_event_id,
+                    failure_class=failure_class,
+                    safe_exception_class="StageContractError" if failure_class else None,
+                    safe_exception_message=f"{event_type} fixture" if failure_class else None,
+                    bounded_log_artifact_ref=f"artifact:bounded-log:{event_type}" if uses_bounded_log else None,
+                    no_log_reason=None if uses_bounded_log else f"{event_type}_has_no_raw_log",
+                    redaction_status="redacted" if uses_bounded_log else "not_needed",
+                    retry_policy_ref="retry-policy:fixture" if event_type == "retry_scheduled" else None,
+                    next_retry_at="2026-06-24T18:05:00+00:00" if event_type == "retry_scheduled" else None,
+                    replay_command=command,
+                    safe_metadata={"fixture_id": "FIX-030", "event_type": event_type},
+                )
+                write_stage_execution_event(conn, event)
+                error_refs = []
+                if error_event_id:
+                    error = build_pipeline_error_event(
+                        error_event_id=error_event_id,
+                        execution_event_id=event_id,
+                        context=context,
+                        failure_class=failure_class,
+                        failure_grouping_key=f"retrieval:{failure_class}:fixture",
+                        retryability=retryability or "terminal",
+                        safe_message=f"{event_type} fixture failure",
+                        safe_metadata={"fixture_id": "FIX-030", "event_type": event_type},
+                        replay_command=command,
+                        bounded_log_artifact_refs=[f"artifact:bounded-log:{event_type}"] if uses_bounded_log else [],
+                    )
+                    write_pipeline_error_event(conn, error)
+                    error_refs = [error_event_id]
+                status = build_stage_status_snapshot(
+                    context=context,
+                    status=stage_status,
+                    input_artifacts=["artifact:retrieval-packet"],
+                    output_artifacts=[],
+                    blocking_feature_ids=["RET-008"] if stage_status == "blocked" else [],
+                    reason_codes=[f"fixture_{event_type}"],
+                    latest_execution_event_ids=[event_id],
+                    error_event_ids=error_refs,
+                    replay_command=command,
+                    metadata={"fixture_id": "FIX-030", "event_type": event_type},
+                )
+                write_stage_status_snapshot(conn, status)
+
+            event_types = {
+                row[0]
+                for row in conn.execute(f"SELECT event_type FROM {STAGE_EXECUTION_EVENT_TABLE}").fetchall()
+            }
+            statuses = {
+                row[0]
+                for row in conn.execute(f"SELECT status FROM {STAGE_STATUS_TABLE}").fetchall()
+            }
+            event_rows = conn.execute(
+                f"""
+                SELECT replay_command, bounded_log_artifact_ref, no_log_reason, safe_metadata
+                FROM {STAGE_EXECUTION_EVENT_TABLE}
+                """
+            ).fetchall()
+            error_rows = conn.execute(
+                f"""
+                SELECT failure_grouping_key, replay_command, safe_metadata
+                FROM {PIPELINE_ERROR_EVENT_TABLE}
+                """
+            ).fetchall()
+            group_count = conn.execute(
+                f"SELECT COUNT(*) FROM {FAILURE_PATTERN_GROUP_TABLE}"
+            ).fetchone()[0]
+            dependency_group_count = conn.execute(
+                f"""
+                SELECT event_count FROM {FAILURE_PATTERN_GROUP_TABLE}
+                WHERE failure_grouping_key = 'retrieval:dependency_not_ready:fixture'
+                """
+            ).fetchone()[0]
+        finally:
+            conn.close()
+
+        self.assertEqual(event_types, {spec[0] for spec in event_specs})
+        self.assertTrue({"running", "blocked", "failed"}.issubset(statuses))
+        self.assertEqual(len(error_rows), 4)
+        self.assertEqual(group_count, 3)
+        self.assertEqual(dependency_group_count, 2)
+        self.assertTrue(all(row[0] == command for row in event_rows))
+        self.assertTrue(all(row[1] or row[2] for row in event_rows))
+        self.assertTrue(all(row[1] == command for row in error_rows))
+        self.assertTrue(all(row[0].startswith("retrieval:") for row in error_rows))
+        self.assertTrue(
+            all(json.loads(row[2])["fixture_id"] == "FIX-030" for row in error_rows)
+        )
 
 
 if __name__ == "__main__":
