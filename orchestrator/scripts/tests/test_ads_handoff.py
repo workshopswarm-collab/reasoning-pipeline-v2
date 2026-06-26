@@ -322,6 +322,51 @@ class AdsHandoffTest(unittest.TestCase):
         self.assertIn("artifact_id", result_columns)
         self.assertIn("validation_result_id", result_columns)
 
+    def test_foundation_migration_upgrades_compact_legacy_manifest_table(self):
+        conn = sqlite3.connect(":memory:")
+        try:
+            conn.executescript(
+                """
+                CREATE TABLE case_artifact_manifest (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  case_id TEXT,
+                  case_key TEXT,
+                  market_id TEXT,
+                  dispatch_id TEXT NOT NULL,
+                  feature_id TEXT,
+                  artifact_type TEXT NOT NULL,
+                  schema_version TEXT,
+                  schema_id TEXT,
+                  producer_stage TEXT NOT NULL,
+                  artifact_path TEXT NOT NULL,
+                  sha256 TEXT,
+                  artifact_sha256 TEXT,
+                  replay_command TEXT,
+                  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                """
+            )
+
+            ensure_foundation_schema(conn)
+
+            manifest_columns = {
+                row[1]
+                for row in conn.execute("PRAGMA table_info(case_artifact_manifest)").fetchall()
+            }
+            indexes = {
+                row[1]
+                for row in conn.execute("PRAGMA index_list(case_artifact_manifest)").fetchall()
+            }
+        finally:
+            conn.close()
+
+        self.assertIn("stage", manifest_columns)
+        self.assertIn("artifact_id", manifest_columns)
+        self.assertIn("artifact_schema_version", manifest_columns)
+        self.assertIn("validation_status", manifest_columns)
+        self.assertIn("idx_case_artifact_manifest_case_dispatch", indexes)
+        self.assertIn("idx_case_artifact_manifest_type_schema", indexes)
+
 
 if __name__ == "__main__":
     unittest.main()

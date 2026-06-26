@@ -372,6 +372,65 @@ class AdsCaseContractTest(unittest.TestCase):
         finally:
             conn.close()
 
+    def test_sqlite_store_bootstrap_upgrades_compact_training_trace_surfaces(self):
+        conn = sqlite3.connect(":memory:")
+        try:
+            conn.executescript(
+                """
+                CREATE TABLE training_trace_minimal_pointers (
+                  trace_pointer_id TEXT PRIMARY KEY,
+                  case_id TEXT NOT NULL,
+                  market_id TEXT,
+                  run_id TEXT NOT NULL,
+                  pointer_artifact_id TEXT NOT NULL,
+                  stage_status_snapshot_ids TEXT NOT NULL DEFAULT '[]',
+                  forecast_authority TEXT NOT NULL,
+                  materialization_status TEXT NOT NULL,
+                  created_at TEXT NOT NULL,
+                  metadata TEXT NOT NULL DEFAULT '{}'
+                );
+
+                CREATE TABLE training_trace_full_materializations (
+                  trace_materialization_id TEXT PRIMARY KEY,
+                  run_id TEXT NOT NULL,
+                  case_id TEXT NOT NULL,
+                  status TEXT NOT NULL,
+                  artifact_id TEXT NOT NULL,
+                  queue_reason TEXT,
+                  created_at TEXT NOT NULL,
+                  metadata TEXT NOT NULL DEFAULT '{}'
+                );
+                """
+            )
+
+            ensure_sqlite_store_schema(conn)
+
+            minimal_columns = {
+                row[1]
+                for row in conn.execute("PRAGMA table_info(training_trace_minimal_pointers)").fetchall()
+            }
+            full_columns = {
+                row[1]
+                for row in conn.execute("PRAGMA table_info(training_trace_full_materializations)").fetchall()
+            }
+            minimal_indexes = {
+                row[1]
+                for row in conn.execute("PRAGMA index_list(training_trace_minimal_pointers)").fetchall()
+            }
+            full_indexes = {
+                row[1]
+                for row in conn.execute("PRAGMA index_list(training_trace_full_materializations)").fetchall()
+            }
+        finally:
+            conn.close()
+
+        self.assertIn("trace_status", minimal_columns)
+        self.assertIn("dispatch_id", minimal_columns)
+        self.assertIn("trace_id", full_columns)
+        self.assertIn("materialization_status", full_columns)
+        self.assertIn("idx_training_trace_minimal_status", minimal_indexes)
+        self.assertIn("idx_training_trace_full_trace", full_indexes)
+
 
 if __name__ == "__main__":
     unittest.main()

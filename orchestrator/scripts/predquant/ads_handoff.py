@@ -142,7 +142,6 @@ def ensure_artifact_manifest_schema(conn: sqlite3.Connection) -> None:
     conn.execute("PRAGMA foreign_keys = ON")
     if not table_exists(conn, ARTIFACT_MANIFEST_TABLE):
         conn.executescript(ARTIFACT_MANIFEST_MIGRATION.read_text(encoding="utf-8"))
-        return
 
     existing = table_columns(conn, ARTIFACT_MANIFEST_TABLE)
     for column, definition in ARTIFACT_MANIFEST_COMPAT_COLUMNS.items():

@@ -1011,6 +1011,25 @@ SESSION6_COMPAT_COLUMN_MIGRATIONS = {
     },
 }
 
+PRE_OPERATIONAL_COMPAT_COLUMN_MIGRATIONS = {
+    "training_trace_minimal_pointers": {
+        "trace_id": "TEXT",
+        "schema_version": "TEXT",
+        "case_key": "TEXT",
+        "dispatch_id": "TEXT",
+        "forecast_timestamp": "TEXT",
+        "artifact_manifest_ids": "TEXT NOT NULL DEFAULT '[]'",
+        "artifact_hashes": "TEXT NOT NULL DEFAULT '{}'",
+        "trace_status": "TEXT",
+        "live_authority": "TEXT",
+        "live_forecast_authority": "INTEGER NOT NULL DEFAULT 0",
+        "updated_at": "TEXT",
+    },
+    "training_trace_full_materializations": SESSION6_COMPAT_COLUMN_MIGRATIONS[
+        "training_trace_full_materializations"
+    ],
+}
+
 
 OPERATIONAL_SCHEMA = """
 CREATE TABLE IF NOT EXISTS resource_ceiling_records (
@@ -1327,6 +1346,16 @@ def ensure_columns(conn: sqlite3.Connection, table: str, columns: dict) -> None:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
 
 
+def table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    return (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1",
+            (table,),
+        ).fetchone()
+        is not None
+    )
+
+
 def ensure_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
     ensure_columns(conn, "markets", MARKET_COLUMN_MIGRATIONS)
@@ -1335,6 +1364,9 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     ensure_foundation_schema(conn)
     for table, columns in FOUNDATION_COMPAT_COLUMN_MIGRATIONS.items():
         ensure_columns(conn, table, columns)
+    for table, columns in PRE_OPERATIONAL_COMPAT_COLUMN_MIGRATIONS.items():
+        if table_exists(conn, table):
+            ensure_columns(conn, table, columns)
     conn.executescript(OPERATIONAL_SCHEMA)
     conn.executescript(FIRST_WAVE_SCHEMA)
     for table, columns in SESSION6_COMPAT_COLUMN_MIGRATIONS.items():
