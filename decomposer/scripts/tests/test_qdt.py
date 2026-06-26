@@ -34,6 +34,7 @@ from ads_decomposer.qdt import (  # noqa: E402
     select_qdt_candidate,
     validate_anchor_dependency_contract,
     validate_question_decomposition,
+    validate_question_decomposition_against_amrg_context,
 )
 from ads_decomposer.sufficiency_requirements import (  # noqa: E402
     RESEARCH_SUFFICIENCY_REQUIREMENTS_SCHEMA_VERSION,
@@ -78,6 +79,22 @@ class QDTContractTest(unittest.TestCase):
             condition_scope=leaf["leaf_condition_scope"],
             required_value_fields=leaf["required_evidence_fields"],
         )
+
+    def _condition_scoped_qdt_with_anchor_contract(self, *, edge_id: str, edge_status: str) -> dict:
+        selected = select_qdt_candidate([build_fixture_qdt_candidate(self.handoff)])
+        scoped = copy.deepcopy(selected)
+        scoped["required_leaf_questions"][1]["leaf_condition_scope"] = "target_given_upstream"
+        self._refresh_leaf_sufficiency(scoped["required_leaf_questions"][1])
+        scoped["branches"][0]["anchor_mode"] = "anchor_required"
+        scoped["amrg_anchor_dependency_contracts"] = [
+            build_anchor_dependency_contract(
+                {"edge_id": edge_id, "status": edge_status},
+                scoped["branches"][0],
+                leaves=scoped["required_leaf_questions"],
+                related_market_ref="artifact:amrg-1",
+            )
+        ]
+        return scoped
 
     def test_selects_valid_candidate_and_records_rejection_audit(self):
         invalid = build_fixture_qdt_candidate(self.handoff, candidate_id="qdt-candidate-bad")
@@ -268,6 +285,74 @@ class QDTContractTest(unittest.TestCase):
         )
         self.assertFalse(forced_result.valid)
         self.assertIn("cannot use weak", "; ".join(forced_result.errors))
+
+    def test_amrg_usage_refs_must_match_actual_amrg_context(self):
+        selected = select_qdt_candidate([build_fixture_qdt_candidate(self.handoff)])
+        scoped = copy.deepcopy(selected)
+        scoped["branches"][0]["amrg_usage_refs"] = ["edge-missing"]
+
+        result = validate_question_decomposition_against_amrg_context(
+            scoped,
+            {
+                "artifact_type": "related_live_market_context",
+                "relationship_edges": [{"edge_id": "edge-present"}],
+                "amrg_decomposer_context": {"hints": [{"hint_ref": "edge-present"}]},
+            },
+        )
+
+        self.assertFalse(result.valid)
+        self.assertIn("unknown AMRG hints", "; ".join(result.errors))
+
+    def test_anchor_contract_cross_checks_actual_amrg_context_status(self):
+        scoped = self._condition_scoped_qdt_with_anchor_contract(
+            edge_id="edge-anchor-actual",
+            edge_status="validated_strict_precedence_anchor",
+        )
+        self.assertTrue(validate_question_decomposition(scoped).valid)
+
+        result = validate_question_decomposition_against_amrg_context(
+            scoped,
+            {
+                "artifact_type": "related_live_market_context",
+                "relationship_edges": [
+                    {
+                        "edge_id": "edge-anchor-actual",
+                        "relationship_status": "weak_context_only",
+                        "allowed_effects": ["decomposition_context_hint"],
+                    }
+                ],
+                "amrg_decomposer_context": {"hints": [{"hint_ref": "edge-anchor-actual"}]},
+            },
+        )
+
+        self.assertFalse(result.valid)
+        self.assertIn("not a strict-precedence AMRG edge", "; ".join(result.errors))
+
+    def test_anchor_contract_accepts_actual_strict_amrg_context_edge(self):
+        scoped = self._condition_scoped_qdt_with_anchor_contract(
+            edge_id="edge-anchor-actual",
+            edge_status="validated_strict_precedence_anchor",
+        )
+
+        result = validate_question_decomposition_against_amrg_context(
+            scoped,
+            {
+                "artifact_type": "related_live_market_context",
+                "relationship_edges": [
+                    {
+                        "edge_id": "edge-anchor-actual",
+                        "relationship_status": "validated_strict_precedence_anchor",
+                        "allowed_effects": [
+                            "decomposition_context_hint",
+                            "qdt_anchor_dependency_hint",
+                        ],
+                    }
+                ],
+                "amrg_decomposer_context": {"hints": [{"hint_ref": "edge-anchor-actual"}]},
+            },
+        )
+
+        self.assertTrue(result.valid, result.errors)
 
     def test_strict_precedence_candidate_creates_anchor_optional_contract(self):
         selected = select_qdt_candidate([build_fixture_qdt_candidate(self.handoff)])

@@ -23,6 +23,7 @@ from .qdt import (
     validate_anchor_dependency_contract,
     validate_qdt_structure,
     validate_question_decomposition,
+    validate_question_decomposition_against_amrg_context,
 )
 from .persistence import (
     QDTPersistenceError,
@@ -60,6 +61,7 @@ __all__ = [
     "validate_decomposer_handoff",
     "validate_qdt_structure",
     "validate_question_decomposition",
+    "validate_question_decomposition_against_amrg_context",
     "write_decomposition_run",
     "write_qdt_research_sufficiency_requirements",
 ]

@@ -1352,6 +1352,91 @@ def validate_question_decomposition(
     return QDTValidationResult(not errors, tuple(errors), tuple(warnings))
 
 
+def _amrg_context_edges_by_id(related_market_context: Any) -> dict[str, dict[str, Any]]:
+    if not isinstance(related_market_context, dict):
+        return {}
+    edges = related_market_context.get("relationship_edges")
+    if not isinstance(edges, list):
+        return {}
+    return {
+        str(edge["edge_id"]): edge
+        for edge in edges
+        if isinstance(edge, dict) and _is_non_empty_string(edge.get("edge_id"))
+    }
+
+
+def _amrg_context_hint_refs(related_market_context: Any) -> set[str]:
+    refs: set[str] = set(_amrg_context_edges_by_id(related_market_context))
+    if isinstance(related_market_context, dict):
+        section = related_market_context.get("amrg_decomposer_context")
+        hints = section.get("hints") if isinstance(section, dict) else None
+        if isinstance(hints, list):
+            for hint in hints:
+                if isinstance(hint, dict) and _is_non_empty_string(hint.get("hint_ref")):
+                    refs.add(str(hint["hint_ref"]))
+    return refs
+
+
+def _artifact_amrg_usage_refs(artifact: dict[str, Any]) -> set[str]:
+    refs: set[str] = set()
+    usage = artifact.get("related_market_context_usage")
+    if isinstance(usage, dict) and isinstance(usage.get("amrg_usage_refs"), list):
+        refs.update(str(ref) for ref in usage["amrg_usage_refs"] if _is_non_empty_string(ref))
+    for branch in artifact.get("branches") or []:
+        if isinstance(branch, dict) and isinstance(branch.get("amrg_usage_refs"), list):
+            refs.update(str(ref) for ref in branch["amrg_usage_refs"] if _is_non_empty_string(ref))
+    for leaf in artifact.get("required_leaf_questions") or []:
+        if isinstance(leaf, dict) and isinstance(leaf.get("amrg_usage_refs"), list):
+            refs.update(str(ref) for ref in leaf["amrg_usage_refs"] if _is_non_empty_string(ref))
+    return refs
+
+
+def validate_question_decomposition_against_amrg_context(
+    artifact: dict[str, Any],
+    related_market_context: dict[str, Any] | None,
+) -> QDTValidationResult:
+    """Validate QDT AMRG refs against the actual related-market context."""
+
+    base = validate_question_decomposition(artifact)
+    errors = list(base.errors)
+    if related_market_context is None:
+        return QDTValidationResult(not errors, tuple(errors), base.warnings)
+
+    hint_refs = _amrg_context_hint_refs(related_market_context)
+    usage_refs = _artifact_amrg_usage_refs(artifact)
+    unknown_usage_refs = sorted(ref for ref in usage_refs if ref not in hint_refs)
+    if unknown_usage_refs:
+        errors.append("amrg_usage_refs reference unknown AMRG hints: " + ", ".join(unknown_usage_refs))
+
+    context_type = related_market_context.get("artifact_type") if isinstance(related_market_context, dict) else None
+    contracts = artifact.get("amrg_anchor_dependency_contracts")
+    if contracts and context_type == "no_related_context_waiver":
+        errors.append("amrg_anchor_dependency_contracts cannot be used with no-related-context waiver")
+    edges_by_id = _amrg_context_edges_by_id(related_market_context)
+    if isinstance(contracts, list):
+        for idx, contract in enumerate(contracts):
+            if not isinstance(contract, dict):
+                continue
+            anchor_mode = contract.get("anchor_mode")
+            if anchor_mode not in ANCHOR_MODES_SATISFYING_CONDITION_SCOPE:
+                continue
+            edge_id = str(contract.get("edge_id") or "")
+            edge = edges_by_id.get(edge_id)
+            path = f"amrg_anchor_dependency_contracts[{idx}]"
+            if edge is None:
+                errors.append(f"{path}.edge_id references unknown AMRG context edge")
+                continue
+            actual_status = edge.get("relationship_status") or edge.get("status")
+            if actual_status not in STRICT_PRECEDENCE_ANCHOR_EDGE_STATUSES:
+                errors.append(f"{path}.edge_id is not a strict-precedence AMRG edge")
+            if contract.get("edge_status") != actual_status:
+                errors.append(f"{path}.edge_status does not match AMRG context edge status")
+            allowed_effects = edge.get("allowed_effects")
+            if isinstance(allowed_effects, list) and "qdt_anchor_dependency_hint" not in allowed_effects:
+                errors.append(f"{path}.edge_id is not allowed as a QDT anchor dependency hint")
+    return QDTValidationResult(not errors, tuple(errors), base.warnings)
+
+
 def validate_qdt_structure(
     artifact: dict[str, Any],
     evidence_packet: dict[str, Any] | None = None,

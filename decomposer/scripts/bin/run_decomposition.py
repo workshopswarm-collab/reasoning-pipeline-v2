@@ -17,6 +17,10 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(REPO_ROOT / "orchestrator" / "scripts"))
 
 from predquant.ads_handoff import canonical_json  # noqa: E402
+from predquant.amrg import (  # noqa: E402
+    build_amrg_decomposer_context,
+    validate_amrg_decomposer_context,
+)
 from ads_decomposer.handoff import validate_decomposer_handoff  # noqa: E402
 from ads_decomposer.model_runtime import (  # noqa: E402
     MODEL_RUNTIME_TRANSPORT_RESPONSE_SCHEMA_VERSION,
@@ -33,6 +37,7 @@ from ads_decomposer.qdt import (  # noqa: E402
     build_qdt_candidate,
     dump_question_decomposition,
     select_qdt_candidate,
+    validate_question_decomposition_against_amrg_context,
     validate_question_decomposition,
 )
 
@@ -68,6 +73,18 @@ def _load_manifest_payloads(handoff: dict[str, Any]) -> dict[str, dict[str, Any]
         "effective_profile_context": _load_manifest_payload(refs.get("effective_profile_context", {})),
         "related_market_context": _load_manifest_payload(refs.get("related_market_context", {})),
     }
+
+
+def _amrg_decomposer_context_from_payload(amrg_payload: dict[str, Any]) -> dict[str, Any] | None:
+    if not amrg_payload:
+        return None
+    section = amrg_payload.get("amrg_decomposer_context")
+    if isinstance(section, dict):
+        validate_amrg_decomposer_context(section)
+        return section
+    if amrg_payload.get("artifact_type") in {"related_live_market_context", "no_related_context_waiver"}:
+        return build_amrg_decomposer_context(amrg_payload)
+    return None
 
 
 def _slug(value: str, *, fallback: str) -> str:
@@ -241,6 +258,12 @@ def _candidate_from_model_payload(
         branches=model_payload["branches"],
         required_leaf_questions=model_payload["required_leaf_questions"],
         market_complexity_score=float(model_payload.get("market_complexity_score", 0.62)),
+        related_market_context_usage=model_payload.get("related_market_context_usage")
+        if isinstance(model_payload.get("related_market_context_usage"), dict)
+        else None,
+        amrg_anchor_dependency_contracts=model_payload.get("amrg_anchor_dependency_contracts")
+        if isinstance(model_payload.get("amrg_anchor_dependency_contracts"), list)
+        else None,
         selection_strategy=f"model_runtime_{runtime_mode}",
     )
     market_id = str(
@@ -263,6 +286,43 @@ def _candidate_from_model_payload(
         }.intersection({str(leaf.get("leaf_id")) for leaf in selected.get("required_leaf_questions", [])}),
     }
     return selected
+
+
+def _amrg_operator_metadata(
+    selected: dict[str, Any],
+    amrg_decomposer_context: dict[str, Any] | None,
+) -> dict[str, Any]:
+    hints = amrg_decomposer_context.get("hints", []) if isinstance(amrg_decomposer_context, dict) else []
+    hint_refs = {str(hint.get("hint_ref")) for hint in hints if isinstance(hint, dict) and hint.get("hint_ref")}
+    leaf_refs: dict[str, list[str]] = {}
+    branch_refs: dict[str, list[str]] = {}
+    for branch in selected.get("branches", []):
+        if isinstance(branch, dict) and isinstance(branch.get("amrg_usage_refs"), list):
+            refs = sorted({str(ref) for ref in branch["amrg_usage_refs"] if str(ref) in hint_refs})
+            if refs:
+                branch_refs[str(branch.get("branch_id"))] = refs
+    for leaf in selected.get("required_leaf_questions", []):
+        if isinstance(leaf, dict) and isinstance(leaf.get("amrg_usage_refs"), list):
+            refs = sorted({str(ref) for ref in leaf["amrg_usage_refs"] if str(ref) in hint_refs})
+            if refs:
+                leaf_refs[str(leaf.get("leaf_id"))] = refs
+    return {
+        "schema_version": "qdt-amrg-operator-metadata/v1",
+        "amrg_decomposer_context_ref": amrg_decomposer_context.get("context_ref")
+        if isinstance(amrg_decomposer_context, dict)
+        else None,
+        "hint_refs_considered": sorted(hint_refs),
+        "branch_hint_refs": branch_refs,
+        "leaf_hint_refs": leaf_refs,
+        "anchor_contract_edge_refs": sorted(
+            {
+                str(contract.get("edge_id"))
+                for contract in selected.get("amrg_anchor_dependency_contracts", [])
+                if isinstance(contract, dict) and contract.get("edge_id")
+            }
+        ),
+        "authority": "operator_audit_only_no_forecast_authority",
+    }
 
 
 def _response_validator_for_handoff(
@@ -309,6 +369,7 @@ def build_decomposition_prompt_payload(
     evidence_payload = payloads.get("evidence_packet", {})
     profile_payload = payloads.get("effective_profile_context", {})
     amrg_payload = payloads.get("related_market_context", {})
+    amrg_decomposer_context = _amrg_decomposer_context_from_payload(amrg_payload)
     market_identity = case_payload.get("market_identity") or evidence_payload.get("market_identity", {})
     market_constraints = evidence_payload.get("market_reality_constraints", {})
     return {
@@ -358,6 +419,7 @@ def build_decomposition_prompt_payload(
             else 0,
             "waiver_reason_codes": amrg_payload.get("waiver_reason_codes", []),
         },
+        "amrg_decomposer_context": amrg_decomposer_context,
         "instructions": {
             "output": "depth_2_question_decomposition_branches_and_leaves",
             "depth": "exactly branches at depth 1 and required_leaf_questions at depth 2",
@@ -368,6 +430,19 @@ def build_decomposition_prompt_payload(
                 "static_information_weight",
                 "leaf_condition_scope",
                 "required_evidence_fields",
+            ],
+            "amrg_allowed_uses": [
+                "context_leaf",
+                "retrieval_hint",
+                "conditional_anchor_dependency_request",
+            ],
+            "amrg_forbidden_uses": [
+                "qdt_selection",
+                "qdt_repair",
+                "prior_anchor",
+                "probability_authority",
+                "scae_delta",
+                "production_forecast_write",
             ],
             "forbidden": [
                 "probability",
@@ -396,6 +471,8 @@ def build_question_decomposition_from_handoff(
     if runtime_mode == "live" and transport is None:
         transport = _configured_live_transport()
     evidence_packet = payloads.get("evidence_packet") or None
+    related_market_context = payloads.get("related_market_context") or None
+    amrg_decomposer_context = request_payload.get("amrg_decomposer_context")
     runtime_result = execute_model_runtime_call(
         model_lane_id=base_context["model_lane_id"],
         provider=base_context.get("provider", "openai"),
@@ -429,9 +506,16 @@ def build_question_decomposition_from_handoff(
         runtime_context=runtime_context,
     )
     selected["runtime_call_ref"] = runtime_result.runtime_call["runtime_call_id"]
+    selected["amrg_operator_metadata"] = _amrg_operator_metadata(selected, amrg_decomposer_context)
     validation = validate_question_decomposition(selected, evidence_packet=evidence_packet)
     if not validation.valid:
         raise QDTError("; ".join(validation.errors))
+    amrg_validation = validate_question_decomposition_against_amrg_context(
+        selected,
+        related_market_context,
+    )
+    if not amrg_validation.valid:
+        raise QDTError("; ".join(amrg_validation.errors))
     return selected, runtime_result.runtime_call
 
 

@@ -34,6 +34,7 @@ AMRG_CANDIDATE_SCHEMA_VERSION = "amrg-candidate/v1"
 AMRG_WEAK_EDGE_SCHEMA_VERSION = "amrg-weak-context-edge/v1"
 RELATED_LIVE_MARKET_CONTEXT_SCHEMA_VERSION = "related-live-market-context/v1"
 NO_RELATED_CONTEXT_WAIVER_SCHEMA_VERSION = "no-related-context-waiver/v1"
+AMRG_DECOMPOSER_CONTEXT_SCHEMA_VERSION = "amrg-decomposer-context/v1"
 RELATED_LIVE_MARKET_CONTEXT_ARTIFACT_TYPE = "related-live-market-context"
 NO_RELATED_CONTEXT_WAIVER_ARTIFACT_TYPE = "no-related-context-waiver"
 AMRG_VECTOR_LANE_ID = "amrg_vector_embedding"
@@ -53,6 +54,10 @@ AMRG_CONTEXT_MIGRATION = Path(__file__).resolve().parents[1] / "migrations" / "0
 AMRG_STAGE = "amrg"
 AMRG_PRODUCER = "session-02-amrg"
 DEFAULT_AMRG_CANDIDATE_CAP = 8
+AMRG_DECOMPOSER_CONTEXT_MAX_HINTS = 12
+AMRG_DECOMPOSER_DETERMINISTIC_HINT_CAP = 5
+AMRG_DECOMPOSER_VECTOR_HINT_CAP = 5
+AMRG_DECOMPOSER_ANCHOR_HINT_CAP = 2
 WEAK_CONTEXT_ONLY = "weak_context_only"
 RELATIONSHIP_TYPES = {
     "causal_upstream",
@@ -146,6 +151,19 @@ AMRG_SHARED_CACHE_FORBIDDEN_EFFECTS = sorted(
         + [
             "classification_authority",
             "researcher_verdict_authority",
+            "production_forecast_write",
+        ]
+    )
+)
+AMRG_DECOMPOSER_CONTEXT_FORBIDDEN_USES = sorted(
+    set(
+        AMRG_FORBIDDEN_EFFECTS
+        + [
+            "qdt_selection",
+            "qdt_repair",
+            "prior_anchor",
+            "probability_authority",
+            "scae_delta",
             "production_forecast_write",
         ]
     )
@@ -1785,7 +1803,7 @@ def build_related_live_market_context_or_waiver(
             **common,
         }
         validate_no_related_context_waiver(waiver)
-        return waiver
+        return attach_amrg_decomposer_context(waiver)
     context = {
         "artifact_type": "related_live_market_context",
         "schema_version": RELATED_LIVE_MARKET_CONTEXT_SCHEMA_VERSION,
@@ -1796,7 +1814,7 @@ def build_related_live_market_context_or_waiver(
         **common,
     }
     validate_related_live_market_context(context)
-    return context
+    return attach_amrg_decomposer_context(context)
 
 
 def validate_common_amrg_artifact(artifact: dict[str, Any], *, schema_version: str) -> None:
@@ -1880,6 +1898,237 @@ def validate_no_related_context_waiver(waiver: dict[str, Any]) -> None:
         raise AMRGError("no-related-context waiver must not include candidates or edges")
     if not str(waiver.get("waiver_id", "")).startswith("amrg-waiver:"):
         raise AMRGError("waiver_id must use amrg-waiver prefix")
+
+
+def _candidate_lookup(context: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {
+        candidate["candidate_id"]: candidate
+        for candidate in context.get("candidates", [])
+        if isinstance(candidate, dict) and candidate.get("candidate_id")
+    }
+
+
+def _edge_relation_types(edge: dict[str, Any]) -> list[str]:
+    if isinstance(edge.get("relationship_types"), list) and edge["relationship_types"]:
+        return validate_relationship_type_list(edge["relationship_types"])
+    label = edge.get("relationship_label")
+    if label == "weak_context_untyped_phase6":
+        return ["generic_theme"]
+    return ["generic_theme"]
+
+
+def _refresh_status_for_hint(edge: dict[str, Any]) -> str:
+    lifecycle = edge.get("refresh_lifecycle_state")
+    if isinstance(lifecycle, dict) and lifecycle.get("refresh_status"):
+        return str(lifecycle["refresh_status"])
+    status = edge.get("relationship_status")
+    if status in {"deterministic_context_candidate", "strict_precedence_anchor_candidate", "validated_strict_precedence_anchor"}:
+        return "fresh_no_refresh_needed"
+    return "not_requested_no_promoted_effect"
+
+
+def _hint_category(edge: dict[str, Any], candidate: dict[str, Any]) -> str | None:
+    status = edge.get("relationship_status")
+    relationship_types = set(_edge_relation_types(edge))
+    candidate_sources = set(candidate.get("candidate_sources") or [])
+    if status in STRICT_PRECEDENCE_ANCHOR_STATUSES:
+        return "strict_precedence_anchor_hint"
+    if status == "deterministic_context_candidate":
+        return "deterministic_relationship_hint"
+    if (
+        candidate.get("vector_only")
+        or candidate.get("candidate_source") == AMRG_VECTOR_CANDIDATE_SOURCE
+        or AMRG_VECTOR_CANDIDATE_SOURCE in candidate_sources
+        or "vector_similarity_neighbor" in relationship_types
+    ):
+        return "vector_neighbor_weak_context_hint"
+    if status in {WEAK_CONTEXT_ONLY, "timing_mismatch_weak_context_only", "model_assisted_weak_context_only"}:
+        return "weak_context_hint"
+    return None
+
+
+def _candidate_leaf_relevance(edge: dict[str, Any], candidate: dict[str, Any], category: str) -> dict[str, Any]:
+    allowed_leaf_uses = ["context_leaf"]
+    if "retrieval_query_hint" in edge.get("allowed_effects", []):
+        allowed_leaf_uses.append("retrieval_hint")
+    if "qdt_anchor_dependency_hint" in edge.get("allowed_effects", []):
+        allowed_leaf_uses.append("conditional_anchor_dependency_request")
+    return {
+        "allowed_leaf_uses": sorted(set(allowed_leaf_uses)),
+        "suggested_purposes": (
+            ["structural", "resolution_mechanics"]
+            if category == "strict_precedence_anchor_hint"
+            else ["other"]
+            if category in {"weak_context_hint", "vector_neighbor_weak_context_hint"}
+            else ["direct_evidence", "catalyst", "other"]
+        ),
+        "reason_codes": sorted(set(candidate.get("reason_codes", [])))[:6],
+    }
+
+
+def _amrg_decomposer_hint(edge: dict[str, Any], candidate: dict[str, Any], category: str) -> dict[str, Any]:
+    relation_types = _edge_relation_types(edge)
+    hint = {
+        "hint_ref": edge["edge_id"],
+        "candidate_ref": edge["candidate_id"],
+        "hint_category": category,
+        "source_market_ref": {
+            "market_id": str(candidate.get("market_id")),
+            "external_market_id": candidate.get("external_market_id"),
+            "candidate_id": candidate["candidate_id"],
+        },
+        "relation_type": relation_types[0],
+        "relation_types": relation_types,
+        "effect_status": edge["relationship_status"],
+        "allowed_use": list(edge.get("allowed_effects", [])),
+        "prohibited_use": list(edge.get("forbidden_effects", [])),
+        "freshness_status": {
+            "timing_alignment_status": edge.get("timing_alignment_status"),
+            "refresh_status": _refresh_status_for_hint(edge),
+            "selected_market_snapshot_as_of": edge.get("selected_market_snapshot_as_of"),
+            "related_market_snapshot_as_of": edge.get("related_market_snapshot_as_of"),
+        },
+        "candidate_leaf_relevance": _candidate_leaf_relevance(edge, candidate, category),
+        "authority": "context_hint_only_no_forecast_authority",
+    }
+    ensure_no_raw_amrg_fields(hint, "amrg_decomposer_hint")
+    return hint
+
+
+def _sort_hint_key(hint: dict[str, Any]) -> tuple[int, str]:
+    priority = {
+        "strict_precedence_anchor_hint": 0,
+        "deterministic_relationship_hint": 1,
+        "vector_neighbor_weak_context_hint": 2,
+        "weak_context_hint": 3,
+    }
+    return priority.get(str(hint.get("hint_category")), 9), str(hint.get("hint_ref"))
+
+
+def _capped_hint_groups(hints: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    groups = {
+        "deterministic_relationship_hint": AMRG_DECOMPOSER_DETERMINISTIC_HINT_CAP,
+        "vector_neighbor_weak_context_hint": AMRG_DECOMPOSER_VECTOR_HINT_CAP,
+        "strict_precedence_anchor_hint": AMRG_DECOMPOSER_ANCHOR_HINT_CAP,
+    }
+    selected: list[dict[str, Any]] = []
+    for category, cap in groups.items():
+        rows = [hint for hint in hints if hint["hint_category"] == category]
+        selected.extend(sorted(rows, key=_sort_hint_key)[:cap])
+    if not selected:
+        weak_rows = [hint for hint in hints if hint["hint_category"] == "weak_context_hint"]
+        selected.extend(sorted(weak_rows, key=_sort_hint_key)[:AMRG_DECOMPOSER_CONTEXT_MAX_HINTS])
+    return sorted(selected, key=_sort_hint_key)[:AMRG_DECOMPOSER_CONTEXT_MAX_HINTS]
+
+
+def build_amrg_decomposer_context(context: dict[str, Any]) -> dict[str, Any]:
+    """Build the bounded, non-authoritative AMRG prompt section for Decomposer."""
+
+    if context.get("artifact_type") == "no_related_context_waiver":
+        validate_no_related_context_waiver(context)
+        hints: list[dict[str, Any]] = []
+    else:
+        validate_related_live_market_context(context)
+        candidates_by_id = _candidate_lookup(context)
+        raw_hints: list[dict[str, Any]] = []
+        for edge in context.get("relationship_edges", []):
+            candidate = candidates_by_id.get(edge.get("candidate_id"))
+            if candidate is None:
+                continue
+            category = _hint_category(edge, candidate)
+            if category is None:
+                continue
+            raw_hints.append(_amrg_decomposer_hint(edge, candidate, category))
+        hints = _capped_hint_groups(raw_hints)
+
+    section = {
+        "schema_version": AMRG_DECOMPOSER_CONTEXT_SCHEMA_VERSION,
+        "context_ref": context.get("candidate_set_id"),
+        "source_artifact_type": context.get("artifact_type"),
+        "source_schema_version": context.get("schema_version"),
+        "hint_cap": AMRG_DECOMPOSER_CONTEXT_MAX_HINTS,
+        "hint_caps": {
+            "deterministic_relationship_hint": AMRG_DECOMPOSER_DETERMINISTIC_HINT_CAP,
+            "vector_neighbor_weak_context_hint": AMRG_DECOMPOSER_VECTOR_HINT_CAP,
+            "strict_precedence_anchor_hint": AMRG_DECOMPOSER_ANCHOR_HINT_CAP,
+        },
+        "hints": hints,
+        "operator_metadata": {
+            "hint_refs_considered": [hint["hint_ref"] for hint in hints],
+            "hint_count_by_category": dict(Counter(hint["hint_category"] for hint in hints)),
+            "allowed_qdt_uses": ["context_leaf", "retrieval_hint", "conditional_anchor_dependency_request"],
+            "forbidden_qdt_uses": AMRG_DECOMPOSER_CONTEXT_FORBIDDEN_USES,
+            "qdt_leaf_reference_field": "branches[].amrg_usage_refs or related_market_context_usage.amrg_usage_refs",
+        },
+        "authority": "context_hints_only_no_forecast_or_selection_authority",
+    }
+    validate_amrg_decomposer_context(section)
+    return section
+
+
+def validate_amrg_decomposer_context(section: dict[str, Any]) -> None:
+    if section.get("schema_version") != AMRG_DECOMPOSER_CONTEXT_SCHEMA_VERSION:
+        raise AMRGError(f"amrg decomposer context schema_version must be {AMRG_DECOMPOSER_CONTEXT_SCHEMA_VERSION}")
+    if section.get("authority") != "context_hints_only_no_forecast_or_selection_authority":
+        raise AMRGError("amrg decomposer context authority is invalid")
+    hints = section.get("hints")
+    if not isinstance(hints, list):
+        raise AMRGError("amrg decomposer context hints must be a list")
+    if len(hints) > AMRG_DECOMPOSER_CONTEXT_MAX_HINTS:
+        raise AMRGError("amrg decomposer context hint cap exceeded")
+    counts = Counter(hint.get("hint_category") for hint in hints if isinstance(hint, dict))
+    if counts["deterministic_relationship_hint"] > AMRG_DECOMPOSER_DETERMINISTIC_HINT_CAP:
+        raise AMRGError("deterministic AMRG hint cap exceeded")
+    if counts["vector_neighbor_weak_context_hint"] > AMRG_DECOMPOSER_VECTOR_HINT_CAP:
+        raise AMRGError("vector AMRG hint cap exceeded")
+    if counts["strict_precedence_anchor_hint"] > AMRG_DECOMPOSER_ANCHOR_HINT_CAP:
+        raise AMRGError("strict-precedence AMRG hint cap exceeded")
+    for idx, hint in enumerate(hints):
+        path = f"amrg_decomposer_context.hints[{idx}]"
+        for field in (
+            "hint_ref",
+            "source_market_ref",
+            "relation_type",
+            "effect_status",
+            "allowed_use",
+            "prohibited_use",
+            "freshness_status",
+            "candidate_leaf_relevance",
+        ):
+            if field not in hint:
+                raise AMRGError(f"{path}.{field} is required")
+        if "qdt_selection" not in hint["prohibited_use"]:
+            raise AMRGError(f"{path} must prohibit qdt_selection")
+        if "qdt_repair" not in hint["prohibited_use"]:
+            raise AMRGError(f"{path} must prohibit qdt_repair")
+        if "probability_authority" not in hint["prohibited_use"]:
+            raise AMRGError(f"{path} must prohibit probability_authority")
+        if "scae_delta" not in hint["prohibited_use"]:
+            raise AMRGError(f"{path} must prohibit scae_delta")
+        if hint.get("hint_category") in {"weak_context_hint", "vector_neighbor_weak_context_hint"}:
+            if set(hint["allowed_use"]) != {"decomposition_context_hint"}:
+                raise AMRGError(f"{path} weak hints may only allow decomposition context use")
+        if hint.get("hint_category") == "strict_precedence_anchor_hint":
+            if "qdt_anchor_dependency_hint" not in hint["allowed_use"]:
+                raise AMRGError(f"{path} strict-precedence hints must allow qdt anchor dependency hints")
+        ensure_no_raw_amrg_fields(hint, path)
+    metadata = section.get("operator_metadata")
+    if not isinstance(metadata, dict):
+        raise AMRGError("amrg decomposer context operator_metadata is required")
+    for forbidden in ("probability_authority", "qdt_selection", "qdt_repair", "scae_delta"):
+        if forbidden not in metadata.get("forbidden_qdt_uses", []):
+            raise AMRGError(f"amrg decomposer operator metadata must forbid {forbidden}")
+    ensure_no_raw_amrg_fields(section, "amrg_decomposer_context")
+
+
+def attach_amrg_decomposer_context(context: dict[str, Any]) -> dict[str, Any]:
+    section = build_amrg_decomposer_context(context)
+    attached = {**context, "amrg_decomposer_context": section}
+    if attached.get("artifact_type") == "no_related_context_waiver":
+        validate_no_related_context_waiver(attached)
+    else:
+        validate_related_live_market_context(attached)
+    return attached
 
 
 def validate_relationship_type_list(types: list[str]) -> list[str]:
@@ -2402,7 +2651,9 @@ def apply_strict_precedence_anchor_validation(
         return dict(context)
     edge_ids = context_edges_requiring_anchor_validation(context, qdt_anchor_contracts)
     if not edge_ids:
-        return {**context, "prior_anchor_slices": list(context.get("prior_anchor_slices", []))}
+        return attach_amrg_decomposer_context(
+            {**context, "prior_anchor_slices": list(context.get("prior_anchor_slices", []))}
+        )
 
     validated_edges: list[dict[str, Any]] = []
     prior_anchor_slices: list[dict[str, Any]] = []
@@ -2433,7 +2684,7 @@ def apply_strict_precedence_anchor_validation(
         "prior_anchor_slices": prior_anchor_slices,
     }
     validate_related_live_market_context(validated_context)
-    return validated_context
+    return attach_amrg_decomposer_context(validated_context)
 
 
 def normalize_refresh_policy(context: dict[str, Any], refresh_policy: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -3021,7 +3272,7 @@ def enrich_related_live_market_context(
         consuming_dispatch=consuming_dispatch,
     )
     validate_related_live_market_context(enriched)
-    return enriched
+    return attach_amrg_decomposer_context(enriched)
 
 
 def model_assist_prompt_descriptor() -> str:
@@ -3263,6 +3514,21 @@ def build_manifest_for_related_live_market_artifact(artifact: dict[str, Any], pa
                 for diagnostic in artifact.get("vector_source_diagnostics", [])
                 if diagnostic.get("reason_code")
             ],
+            "amrg_decomposer_context_schema_version": (
+                artifact.get("amrg_decomposer_context", {}).get("schema_version")
+            ),
+            "amrg_decomposer_hint_count": len(
+                artifact.get("amrg_decomposer_context", {}).get("hints", [])
+                if isinstance(artifact.get("amrg_decomposer_context"), dict)
+                else []
+            ),
+            "amrg_decomposer_hint_refs": (
+                artifact.get("amrg_decomposer_context", {})
+                .get("operator_metadata", {})
+                .get("hint_refs_considered", [])
+                if isinstance(artifact.get("amrg_decomposer_context"), dict)
+                else []
+            ),
         },
     )
     validate_artifact_manifest(manifest, expected_artifact_schema_version=schema_version)
@@ -3292,6 +3558,12 @@ def materialize_related_live_market_context(
         profile_context_ref=profile_context_ref,
         candidate_cap=candidate_cap,
     )
+    if artifact["artifact_type"] == "related_live_market_context":
+        artifact = enrich_related_live_market_context(
+            artifact,
+            evidence_packet=evidence_packet,
+            active_market_index=active_market_index,
+        )
     path = write_related_live_market_artifact(related_live_market_artifact_path(artifact_dir, artifact), artifact)
     manifest = build_manifest_for_related_live_market_artifact(artifact, path)
     artifact_id = write_artifact_manifest(conn, manifest)

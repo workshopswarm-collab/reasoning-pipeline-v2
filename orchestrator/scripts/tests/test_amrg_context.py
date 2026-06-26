@@ -8,6 +8,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from predquant.amrg import (
+    AMRG_DECOMPOSER_CONTEXT_SCHEMA_VERSION,
     AMRG_VECTOR_CANDIDATE_SOURCE,
     AMRG_MODEL_ASSIST_OUTPUT_SCHEMA_VERSION,
     AMRG_REFRESH_LIFECYCLE_SCHEMA_VERSION,
@@ -17,6 +18,7 @@ from predquant.amrg import (
     RELATED_LIVE_MARKET_CONTEXT_SCHEMA_VERSION,
     WEAK_CONTEXT_ONLY,
     apply_shared_cache_reuse_eligibility,
+    build_amrg_decomposer_context,
     build_amrg_model_assist_packet,
     build_related_live_market_context_or_waiver,
     build_unavailable_vector_source_diagnostic,
@@ -26,6 +28,7 @@ from predquant.amrg import (
     ensure_amrg_context_schema,
     materialize_related_live_market_context,
     model_assist_downgrade_for_missing_manifest,
+    validate_amrg_decomposer_context,
     validate_amrg_model_assist_output,
     write_related_market_context,
 )
@@ -240,7 +243,7 @@ class AMRGContextTest(unittest.TestCase):
 
             manifest_row = conn.execute(
                 """
-                SELECT artifact_type, artifact_schema_version, stage, validation_status
+                SELECT artifact_type, artifact_schema_version, stage, validation_status, metadata
                 FROM case_artifact_manifest
                 WHERE artifact_id = ?
                 """,
@@ -250,6 +253,12 @@ class AMRGContextTest(unittest.TestCase):
             self.assertEqual(manifest_row["artifact_schema_version"], NO_RELATED_CONTEXT_WAIVER_SCHEMA_VERSION)
             self.assertEqual(manifest_row["stage"], "amrg")
             self.assertEqual(manifest_row["validation_status"], "valid")
+            metadata = json.loads(manifest_row["metadata"])
+            self.assertEqual(
+                metadata["amrg_decomposer_context_schema_version"],
+                AMRG_DECOMPOSER_CONTEXT_SCHEMA_VERSION,
+            )
+            self.assertEqual(metadata["amrg_decomposer_hint_count"], 0)
         finally:
             conn.close()
 
@@ -265,6 +274,10 @@ class AMRGContextTest(unittest.TestCase):
         second = self.build_artifact(list(reversed(markets)), candidate_cap=2)
 
         self.assertEqual(first["schema_version"], RELATED_LIVE_MARKET_CONTEXT_SCHEMA_VERSION)
+        self.assertEqual(
+            first["amrg_decomposer_context"]["schema_version"],
+            AMRG_DECOMPOSER_CONTEXT_SCHEMA_VERSION,
+        )
         self.assertEqual(len(first["candidates"]), 2)
         self.assertEqual([candidate["market_id"] for candidate in first["candidates"]], [2, 3])
         self.assertEqual(first["candidate_set_id"], second["candidate_set_id"])
@@ -310,6 +323,18 @@ class AMRGContextTest(unittest.TestCase):
         for edge in artifact["relationship_edges"]:
             self.assertEqual(edge["relationship_status"], WEAK_CONTEXT_ONLY)
             self.assertIn("probability_authority", edge["forbidden_effects"])
+
+        prompt_context = build_amrg_decomposer_context(artifact)
+        self.assertEqual(prompt_context["schema_version"], AMRG_DECOMPOSER_CONTEXT_SCHEMA_VERSION)
+        self.assertEqual(prompt_context["operator_metadata"]["hint_count_by_category"], {"weak_context_hint": 1})
+        hint = prompt_context["hints"][0]
+        self.assertEqual(hint["allowed_use"], ["decomposition_context_hint"])
+        self.assertIn("qdt_selection", hint["prohibited_use"])
+        self.assertIn("qdt_repair", hint["prohibited_use"])
+        self.assertIn("probability_authority", hint["prohibited_use"])
+        self.assertIn("scae_delta", hint["prohibited_use"])
+        self.assertIn("context_leaf", hint["candidate_leaf_relevance"]["allowed_leaf_uses"])
+        validate_amrg_decomposer_context(prompt_context)
 
     def test_vector_unavailable_is_non_blocking_with_deterministic_candidate(self):
         diagnostic = build_unavailable_vector_source_diagnostic(
@@ -383,6 +408,90 @@ class AMRGContextTest(unittest.TestCase):
         self.assertEqual(artifact["candidates"][0]["candidate_source"], AMRG_VECTOR_CANDIDATE_SOURCE)
         self.assertEqual(artifact["candidates"][0]["relationship_status"], WEAK_CONTEXT_ONLY)
         self.assertTrue(artifact["candidates"][0]["vector_only"])
+
+    def test_amrg_decomposer_context_caps_relationship_vector_and_anchor_hints(self):
+        deterministic_artifact = enrich_related_live_market_context(
+            self.build_artifact([self.market(market_id) for market_id in range(2, 12)], candidate_cap=10),
+            evidence_packet=self.evidence_packet(),
+        )
+        deterministic_context = build_amrg_decomposer_context(deterministic_artifact)
+        self.assertEqual(
+            deterministic_context["operator_metadata"]["hint_count_by_category"],
+            {"deterministic_relationship_hint": 5},
+        )
+
+        vector_candidates = [
+            {
+                "schema_version": AMRG_VECTOR_NEIGHBOR_CANDIDATE_SCHEMA_VERSION,
+                "candidate_source": AMRG_VECTOR_CANDIDATE_SOURCE,
+                "relationship_status": WEAK_CONTEXT_ONLY,
+                "vector_only": True,
+                "market_id": market_id,
+                "external_market_id": f"poly-{market_id}",
+                "similarity_score": 0.95 - (market_id / 100),
+                "similarity_metric": "cosine",
+                "query_descriptor_sha256": "sha256:query",
+                "candidate_descriptor_sha256": f"sha256:candidate-{market_id}",
+                "index_snapshot_id": "amrg-vector-index:fixture",
+                "embedding_lane_id": "amrg_vector_embedding",
+                "resolved_model_id": "BAAI/bge-base-en-v1.5",
+                "route_id": "ollama/local",
+            }
+            for market_id in range(20, 28)
+        ]
+        vector_artifact = build_related_live_market_context_or_waiver(
+            evidence_packet=self.evidence_packet(
+                market_identity={
+                    **self.evidence_packet()["market_identity"],
+                    "title": "Will an unrelated weather event happen?",
+                    "category": "weather",
+                    "source_of_truth_kind": "weather",
+                    "source_url": "https://example.test/weather",
+                },
+                regime_seed_fields={
+                    **self.evidence_packet()["regime_seed_fields"],
+                    "category": "weather",
+                },
+            ),
+            evidence_packet_ref="artifact:evidence-packet",
+            active_market_index=[
+                self.market(
+                    market_id,
+                    title=f"Will sports event {market_id} happen?",
+                    normalized_entities=[],
+                    contract_terms=[],
+                    category="sports",
+                    source_of_truth_kind="sports",
+                    source_url="https://example.test/sports",
+                )
+                for market_id in range(20, 28)
+            ],
+            vector_candidates=vector_candidates,
+            candidate_cap=8,
+        )
+        vector_context = build_amrg_decomposer_context(vector_artifact)
+        self.assertEqual(
+            vector_context["operator_metadata"]["hint_count_by_category"],
+            {"vector_neighbor_weak_context_hint": 5},
+        )
+        for hint in vector_context["hints"]:
+            self.assertEqual(hint["allowed_use"], ["decomposition_context_hint"])
+
+        anchor_artifact = enrich_related_live_market_context(
+            self.build_artifact([self.market(market_id) for market_id in range(30, 34)], candidate_cap=4),
+            evidence_packet=self.evidence_packet(),
+        )
+        for edge in anchor_artifact["relationship_edges"]:
+            edge["relationship_status"] = "strict_precedence_anchor_candidate"
+            edge["relationship_types"] = ["causal_upstream"]
+            edge["allowed_effects"] = ["decomposition_context_hint", "qdt_anchor_dependency_hint"]
+        anchor_context = build_amrg_decomposer_context(anchor_artifact)
+        self.assertEqual(
+            anchor_context["operator_metadata"]["hint_count_by_category"],
+            {"strict_precedence_anchor_hint": 2},
+        )
+        for hint in anchor_context["hints"]:
+            self.assertIn("qdt_anchor_dependency_hint", hint["allowed_use"])
 
     def test_relationship_typing_and_timing_alignment_can_add_safe_context_status(self):
         packet = self.evidence_packet()
