@@ -44,9 +44,9 @@ Status values: `not_started`, `fixture_defined`, `implemented`, `passing`, `waiv
 | FIX-036 | Cutover | 2,3 | AMRG local vector neighbor | Local Ollama-routed `BAAI/bge-base-en-v1.5` embeds active-safe descriptors, writes an index snapshot and capped neighbor candidates, and vector-only candidates remain weak context unless later validated. | not_started |
 | FIX-038 | Cutover | 1,2,5 | SCAE forecast benchmark provenance | SCAE `production_forecast_prob` creates an idempotent `market_predictions` row tied to the case contract prediction-time snapshot; resolution scoring records prediction Brier, market Brier, Brier edge, scoring version, and resolution payload hash. | passing |
 | FIX-019 | Maturity | 2,3,4 | AMRG shared reuse temporal rejection | Cached retrieval/classification reuse is rejected when consuming dispatch temporal provenance is unsafe. | not_started |
-| FIX-020 | Cutover | 5 | Structural-prior/base-rate fingerprint overlap | SCAE rejects duplicate structural prior as signed evidence unless distinct fresh not-priced proof exists. | not_started |
-| FIX-021 | Cutover | 3,5 | No-catalyst/time-expiration | Missingness and no-catalyst deltas cannot both apply without distinct absence mechanism proof. | not_started |
-| FIX-022 | Cutover | 4,5 | Correlated-quality guard | Raw quality multiplier is floored/grouped and final multiplier is recorded before evidence delta. | not_started |
+| FIX-020 | Cutover | 5 | Structural-prior/base-rate fingerprint overlap | SCAE rejects duplicate structural prior as signed evidence unless distinct fresh not-priced proof exists. | passing |
+| FIX-021 | Cutover | 3,5 | No-catalyst/time-expiration | Missingness and no-catalyst deltas cannot both apply without distinct absence mechanism proof. | passing |
+| FIX-022 | Cutover | 4,5 | Correlated-quality guard | Raw quality multiplier is floored/grouped and final multiplier is recorded before evidence delta. | passing |
 | FIX-023 | Cutover | 5 | Direct-cutover cap stack | Per-update, per-cluster, per-branch, and total caps apply; debt-mode caps are stricter. | passing |
 | FIX-024 | Calibration debt | 5,6 | Calibration-debt hard gates | First-100 trace completeness alone cannot clear debt; resolved/tail/regime/pointer-stability gates are required. | not_started |
 | FIX-025 | Cutover | 2,5 | Near-resolution market shrinkage | Near-resolution prior handling distinguishes source-grade contradiction from ordinary uncertainty. | not_started |
