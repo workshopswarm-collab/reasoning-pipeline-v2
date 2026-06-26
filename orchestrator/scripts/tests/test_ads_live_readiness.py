@@ -148,6 +148,36 @@ class AdsLiveReadinessTest(unittest.TestCase):
         self.assertIn("true_scoreable_live_readiness_rejects_production_pilot_handler", report["issues"])
         self.assertIn("true_scoreable_live_readiness_rejects_calibration_debt_canary_bypass", report["issues"])
 
+    def test_true_live_readiness_rejects_reported_pilot_only_runtime_signals(self):
+        report = build_live_readiness_report(
+            self.db_path,
+            runner_mode="calibration_debt_production",
+            handler_factory="predquant.ads_production_handlers:build_stage_handlers",
+            require_scoreable_live=True,
+            scoreable_readiness_mode="true_scoreable_live_readiness",
+            qdt_adapter_mode="pilot_fixture_decomposer_contract_adapter",
+            researcher_runtime_mode="metadata_only",
+            research_input_mode="structured_market_metadata_certified",
+            first100_trace_complete=True,
+            trace_manifest_count=100,
+        )
+
+        self.assertFalse(report["ok"])
+        self.assertIn("true_scoreable_live_readiness_rejects_pilot_qdt_adapter_mode", report["issues"])
+        self.assertIn("true_scoreable_live_readiness_rejects_metadata_only_researcher_context", report["issues"])
+        self.assertIn(
+            "true_scoreable_live_readiness_rejects_structured_market_metadata_only_research_input",
+            report["issues"],
+        )
+        self.assertEqual(
+            report["reported_runtime_signals"],
+            {
+                "qdt_adapter_mode": "pilot_fixture_decomposer_contract_adapter",
+                "researcher_runtime_mode": "metadata_only",
+                "research_input_mode": "structured_market_metadata_certified",
+            },
+        )
+
     def test_scoreable_gate_blocks_overlarge_debt_canary_batch(self):
         report = build_live_readiness_report(
             self.db_path,

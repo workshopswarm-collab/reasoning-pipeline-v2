@@ -26,6 +26,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--runner-mode", choices=RUNNER_MODES, default="non_executing_canary")
     parser.add_argument("--handler-factory")
     parser.add_argument("--require-scoreable-live", action="store_true")
+    parser.add_argument(
+        "--scoreable-readiness-mode",
+        choices=("pilot_scoreable_readiness", "true_scoreable_live_readiness"),
+    )
+    parser.add_argument("--qdt-adapter-mode")
+    parser.add_argument("--researcher-runtime-mode")
+    parser.add_argument("--research-input-mode")
     parser.add_argument("--allow-canary-handler", action="store_true")
     parser.add_argument("--allow-calibration-debt-scoreable-canary", action="store_true")
     parser.add_argument("--requested-max-cases", type=int)
@@ -51,6 +58,10 @@ def main() -> int:
         handler_factory=args.handler_factory,
         runner_mode=args.runner_mode,
         require_scoreable_live=args.require_scoreable_live,
+        scoreable_readiness_mode=args.scoreable_readiness_mode,
+        qdt_adapter_mode=args.qdt_adapter_mode,
+        researcher_runtime_mode=args.researcher_runtime_mode,
+        research_input_mode=args.research_input_mode,
         allow_canary_handler=args.allow_canary_handler,
         allow_calibration_debt_scoreable_canary=args.allow_calibration_debt_scoreable_canary,
         requested_max_cases=args.requested_max_cases,

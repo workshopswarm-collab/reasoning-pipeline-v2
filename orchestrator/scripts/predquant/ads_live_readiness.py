@@ -22,6 +22,15 @@ PRODUCTION_PILOT_HANDLER = "predquant.ads_production_pilot_handlers"
 TRUE_PRODUCTION_HANDLER = "predquant.ads_production_handlers"
 PILOT_SCOREABLE_READINESS = "pilot_scoreable_readiness"
 TRUE_SCOREABLE_LIVE_READINESS = "true_scoreable_live_readiness"
+PILOT_QDT_ADAPTER_MODES = {
+    "deterministic_decomposer_contract_adapter",
+    "pilot_fixture_decomposer_contract_adapter",
+}
+PILOT_RESEARCH_INPUT_MODES = {
+    "structured_market_metadata_certified",
+    "structured_market_metadata_pilot_retrieval",
+    "structured_market_metadata_pilot_only",
+}
 CANARY_HANDLER_MARKERS = (
     "ads_scoreable_canary_handlers",
     "ads_manifest_canary_handlers",
@@ -66,6 +75,9 @@ def build_live_readiness_report(
     runner_mode: str = "non_executing_canary",
     require_scoreable_live: bool = False,
     scoreable_readiness_mode: str | None = None,
+    qdt_adapter_mode: str | None = None,
+    researcher_runtime_mode: str | None = None,
+    research_input_mode: str | None = None,
     allow_canary_handler: bool = False,
     allow_calibration_debt_scoreable_canary: bool = False,
     requested_max_cases: int | None = None,
@@ -154,6 +166,12 @@ def build_live_readiness_report(
                 issues.append("true_scoreable_live_readiness_requires_true_production_handler")
             if allow_calibration_debt_scoreable_canary:
                 issues.append("true_scoreable_live_readiness_rejects_calibration_debt_canary_bypass")
+            if qdt_adapter_mode in PILOT_QDT_ADAPTER_MODES:
+                issues.append("true_scoreable_live_readiness_rejects_pilot_qdt_adapter_mode")
+            if researcher_runtime_mode == "metadata_only":
+                issues.append("true_scoreable_live_readiness_rejects_metadata_only_researcher_context")
+            if research_input_mode in PILOT_RESEARCH_INPUT_MODES:
+                issues.append("true_scoreable_live_readiness_rejects_structured_market_metadata_only_research_input")
         if (
             not calibration.get("clears_calibration_debt")
             and not allow_calibration_debt_scoreable_canary
@@ -187,6 +205,11 @@ def build_live_readiness_report(
         "handler_factory": handler_factory,
         "require_scoreable_live": require_scoreable_live,
         "scoreable_readiness_mode": resolved_scoreable_readiness_mode,
+        "reported_runtime_signals": {
+            "qdt_adapter_mode": qdt_adapter_mode,
+            "researcher_runtime_mode": researcher_runtime_mode,
+            "research_input_mode": research_input_mode,
+        },
         "allow_canary_handler": allow_canary_handler,
         "allow_calibration_debt_scoreable_canary": allow_calibration_debt_scoreable_canary,
         "requested_max_cases": requested_max_cases,
@@ -202,6 +225,8 @@ def build_live_readiness_report(
 __all__ = [
     "DEFAULT_MAX_CALIBRATION_DEBT_CANARY_CASES",
     "LIVE_READINESS_SCHEMA_VERSION",
+    "PILOT_QDT_ADAPTER_MODES",
+    "PILOT_RESEARCH_INPUT_MODES",
     "PILOT_SCOREABLE_READINESS",
     "TRUE_SCOREABLE_LIVE_READINESS",
     "build_live_readiness_report",
