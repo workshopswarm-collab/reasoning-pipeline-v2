@@ -53,7 +53,7 @@ Status values: `not_started`, `fixture_defined`, `implemented`, `passing`, `waiv
 | FIX-026 | Cutover | 2,5 | Effective tuning profile selection | Unknown/underpowered domains use global baseline plus conservative overlays; sports/crypto tags remain excluded from initial active profiles. | not_started |
 | FIX-027 | Maturity | 6 | Profile canary/rollback | Candidate profile runs in deterministic canary bucket and can roll back by lane-local pointer. | not_started |
 | FIX-028 | Maturity | 3,6 | Decomposer-miss learning | Post-resolution decomposer-miss labels feed promoted QDT scoring overlay without leaking same-case outcomes into active dispatch. | not_started |
-| FIX-029 | Cutover | 1 | Exact Section 10 operational schema names | Schema name map has no unresolved runtime surface used by live components. | not_started |
+| FIX-029 | Cutover | 1 | Exact Section 10 operational schema names | Schema name map has no unresolved runtime surface used by live components. | passing |
 | FIX-030 | Cutover | 1 | Structured execution log, error, and replay command | Every failed, blocked, retried, or artifact-validation-failed stage writes `v2_stage_execution_events`, status, safe bounded log refs or explicit no-log reason, error grouping key, replay command, and safe metadata. | not_started |
 | FIX-034 | Cutover | 3,4,5 | Insufficient research cannot become clean forecast | Leaf remains uncertified after expansion; SCAE marks forecast invalid or policy watch-only with structural unanswerability proof, never normal high-confidence evidence. | not_started |
 

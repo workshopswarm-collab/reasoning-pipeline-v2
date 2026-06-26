@@ -15,6 +15,7 @@ from pathlib import Path
 PLANS_ROOT = Path(__file__).resolve().parents[1]
 INVENTORY_PATH = PLANS_ROOT / "autonomous-decomposition-swarm-feature-inventory.yaml"
 INVENTORY_MD_PATH = PLANS_ROOT / "autonomous-decomposition-swarm-feature-inventory.md"
+SCHEMA_NAME_MAP_PATH = PLANS_ROOT / "autonomous-decomposition-swarm-schema-name-map.md"
 PHASE_REPORT_README = PLANS_ROOT / "phase-reports" / "README.md"
 GATE_PATH = PLANS_ROOT / "check_dependency_gates.py"
 
@@ -53,6 +54,29 @@ def markdown_feature_rows() -> dict[str, dict]:
             "dependencies": dependencies,
             "status": cells[7],
         }
+    return rows
+
+
+def markdown_schema_rows() -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    for line in SCHEMA_NAME_MAP_PATH.read_text(encoding="utf-8").splitlines():
+        if not line.startswith("|"):
+            continue
+        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+        if len(cells) != 8:
+            continue
+        if cells[0] in {"Logical Surface", "---"}:
+            continue
+        rows.append(
+            {
+                "logical_surface": cells[0],
+                "spec_name": cells[1],
+                "canonical_name": cells[3],
+                "owner": cells[4],
+                "migration_group": cells[5],
+                "status": cells[6],
+            }
+        )
     return rows
 
 
@@ -209,6 +233,19 @@ class DependencyGateTests(unittest.TestCase):
             "effective_tuning_profile_context.json",
             contracts["groups"]["MIG-011"]["write_path_destinations"]["promote_policy_pointer"],
         )
+
+    def test_schema_name_map_has_no_unresolved_runtime_surface(self) -> None:
+        rows = markdown_schema_rows()
+        self.assertTrue(rows)
+        unresolved = [row for row in rows if row["status"] == "unresolved"]
+        self.assertEqual(unresolved, [])
+
+        needs_migration = [row for row in rows if row["status"] == "needs_new_migration"]
+        self.assertTrue(needs_migration)
+        for row in needs_migration:
+            with self.subTest(surface=row["logical_surface"]):
+                self.assertEqual(row["migration_group"], "`MIG-011`")
+                self.assertEqual(row["owner"], "Session 6")
 
     def test_missing_migration_write_path_destination_is_rejected(self) -> None:
         inv = load_inventory()
