@@ -8,13 +8,16 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from predquant.training_trace import (
+    TRAINING_TRACE_FULL_TABLE,
     TRAINING_TRACE_MINIMAL_TABLE,
     TrainingTraceContext,
     TrainingTraceContractError,
+    build_full_training_trace_materialization,
     build_minimal_training_trace,
     build_session5_minimal_training_trace,
     ensure_training_trace_schema,
     validate_minimal_training_trace,
+    write_full_training_trace_materialization,
     write_minimal_training_trace,
     write_session5_minimal_training_trace,
 )
@@ -45,18 +48,21 @@ class TrainingTraceTest(unittest.TestCase):
                 "sha256": "sha256:" + "c" * 64,
                 "stage": "researcher_classification",
                 "artifact_type": "researcher-sidecar",
+                "source_cutoff_timestamp": "2026-06-24T11:59:00+00:00",
             },
             {
                 "artifact_id": "artifact:scae",
                 "sha256": "sha256:" + "d" * 64,
                 "stage": "scae",
                 "artifact_type": "scae-ledger",
+                "source_cutoff_timestamp": "2026-06-24T11:59:00+00:00",
             },
             {
                 "artifact_id": "artifact:decision",
                 "sha256": "sha256:" + "e" * 64,
                 "stage": "decision",
                 "artifact_type": "decision-context",
+                "source_cutoff_timestamp": "2026-06-24T11:59:00+00:00",
             },
         ]
 
@@ -193,6 +199,59 @@ class TrainingTraceTest(unittest.TestCase):
         self.assertEqual(json.loads(row[5]), trace["artifact_manifest_ids"])
         self.assertEqual(json.loads(row[6]), trace["artifact_hashes"])
         self.assertEqual(row[7:], ("minimal_pointer_written", "none", 0, "not_materialized"))
+
+    def test_full_trace_materialization_rejects_hash_or_temporal_leaks(self):
+        trace = build_session5_minimal_training_trace(
+            context=self.context,
+            artifact_manifests=self.session5_manifests(),
+            created_at="2026-06-24T12:00:01+00:00",
+        )
+        broken_hashes = self.session5_manifests()
+        broken_hashes[0]["sha256"] = "sha256:" + "f" * 64
+        with self.assertRaisesRegex(TrainingTraceContractError, "hashes must match"):
+            build_full_training_trace_materialization(
+                trace_pointer=trace,
+                artifact_manifests=broken_hashes,
+            )
+
+        future_artifact = self.session5_manifests()
+        future_artifact[0]["source_cutoff_timestamp"] = "2026-06-24T12:01:00+00:00"
+        with self.assertRaisesRegex(TrainingTraceContractError, "temporal isolation"):
+            build_full_training_trace_materialization(
+                trace_pointer=trace,
+                artifact_manifests=future_artifact,
+            )
+
+    def test_full_trace_materialization_is_non_authoritative_and_persisted(self):
+        trace = build_session5_minimal_training_trace(
+            context=self.context,
+            artifact_manifests=self.session5_manifests(),
+            created_at="2026-06-24T12:00:01+00:00",
+        )
+        materialization = build_full_training_trace_materialization(
+            trace_pointer=trace,
+            artifact_manifests=self.session5_manifests(),
+            replay_manifest_refs=["replay-manifest:1"],
+            created_at="2026-06-24T12:03:00+00:00",
+            metadata={"requested_by": "TRACE-002"},
+        )
+        materialization_id = write_full_training_trace_materialization(self.conn, materialization)
+        write_full_training_trace_materialization(self.conn, materialization)
+
+        self.assertEqual(materialization_id, materialization["trace_materialization_id"])
+        row = self.conn.execute(
+            f"""
+            SELECT trace_materialization_id, trace_id, materialization_status,
+                   temporal_leak_check_status, live_authority, live_forecast_authority,
+                   artifact_manifest_ids, replay_manifest_refs
+            FROM {TRAINING_TRACE_FULL_TABLE}
+            WHERE trace_materialization_id = ?
+            """,
+            (materialization_id,),
+        ).fetchone()
+        self.assertEqual(row[:6], (materialization_id, trace["trace_id"], "full_materialized", "passed", "none", 0))
+        self.assertEqual(json.loads(row[6]), trace["artifact_manifest_ids"])
+        self.assertEqual(json.loads(row[7]), ["replay-manifest:1"])
 
 
 if __name__ == "__main__":

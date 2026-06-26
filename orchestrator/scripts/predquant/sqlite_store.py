@@ -976,6 +976,41 @@ FOUNDATION_COMPAT_COLUMN_MIGRATIONS = {
     },
 }
 
+SESSION6_COMPAT_COLUMN_MIGRATIONS = {
+    "training_trace_full_materializations": {
+        "schema_version": "TEXT",
+        "trace_id": "TEXT",
+        "case_key": "TEXT",
+        "dispatch_id": "TEXT",
+        "forecast_timestamp": "TEXT",
+        "artifact_manifest_ids": "TEXT NOT NULL DEFAULT '[]'",
+        "artifact_hashes": "TEXT NOT NULL DEFAULT '{}'",
+        "replay_manifest_refs": "TEXT NOT NULL DEFAULT '[]'",
+        "materialization_status": "TEXT",
+        "temporal_leak_check_status": "TEXT",
+        "live_authority": "TEXT",
+        "live_forecast_authority": "INTEGER NOT NULL DEFAULT 0",
+        "updated_at": "TEXT",
+    },
+    "calibration_candidate_records": {
+        "schema_version": "TEXT",
+        "owner_session": "TEXT",
+        "changed_parameters": "TEXT NOT NULL DEFAULT '[]'",
+        "source_replay_cohort_ids": "TEXT NOT NULL DEFAULT '[]'",
+        "source_scorecard_refs": "TEXT NOT NULL DEFAULT '[]'",
+        "source_trace_materialization_refs": "TEXT NOT NULL DEFAULT '[]'",
+        "component_diagnostics_ref": "TEXT",
+        "bounds_check_status": "TEXT",
+        "protected_slice_non_degradation_status": "TEXT",
+        "holdout_status": "TEXT",
+        "canary_status": "TEXT",
+        "promotion_status": "TEXT",
+        "rollback_pointer_ref": "TEXT",
+        "live_forecast_authority": "INTEGER NOT NULL DEFAULT 0",
+        "updated_at": "TEXT",
+    },
+}
+
 
 OPERATIONAL_SCHEMA = """
 CREATE TABLE IF NOT EXISTS resource_ceiling_records (
@@ -1054,17 +1089,32 @@ CREATE INDEX IF NOT EXISTS idx_training_trace_minimal_status
 
 CREATE TABLE IF NOT EXISTS training_trace_full_materializations (
   trace_materialization_id TEXT PRIMARY KEY,
+  schema_version TEXT NOT NULL,
+  trace_id TEXT NOT NULL,
   run_id TEXT NOT NULL,
   case_id TEXT NOT NULL,
+  case_key TEXT,
+  dispatch_id TEXT NOT NULL,
+  forecast_timestamp TEXT NOT NULL,
+  artifact_manifest_ids TEXT NOT NULL DEFAULT '[]',
+  artifact_hashes TEXT NOT NULL DEFAULT '{}',
+  replay_manifest_refs TEXT NOT NULL DEFAULT '[]',
+  materialization_status TEXT NOT NULL,
+  temporal_leak_check_status TEXT NOT NULL,
+  live_authority TEXT NOT NULL,
+  live_forecast_authority INTEGER NOT NULL DEFAULT 0,
   status TEXT NOT NULL,
   artifact_id TEXT NOT NULL,
   queue_reason TEXT,
   created_at TEXT NOT NULL,
-  metadata TEXT NOT NULL DEFAULT '{}'
+  metadata TEXT NOT NULL DEFAULT '{}',
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE INDEX IF NOT EXISTS idx_training_trace_full_case
   ON training_trace_full_materializations(case_id, run_id);
+CREATE INDEX IF NOT EXISTS idx_training_trace_full_trace
+  ON training_trace_full_materializations(trace_id, materialization_status);
 
 CREATE TABLE IF NOT EXISTS case_annotation_outputs (
   annotation_id TEXT PRIMARY KEY,
@@ -1106,20 +1156,164 @@ CREATE INDEX IF NOT EXISTS idx_evaluator_scorecards_cluster
 
 CREATE TABLE IF NOT EXISTS calibration_candidate_records (
   candidate_id TEXT PRIMARY KEY,
+  schema_version TEXT NOT NULL,
   lane_id TEXT NOT NULL,
+  owner_session TEXT NOT NULL,
   candidate_status TEXT NOT NULL,
   baseline_policy_sha256 TEXT,
   candidate_policy_sha256 TEXT,
+  changed_parameters TEXT NOT NULL DEFAULT '[]',
+  source_replay_cohort_ids TEXT NOT NULL DEFAULT '[]',
   scorecard_refs TEXT NOT NULL DEFAULT '[]',
+  source_scorecard_refs TEXT NOT NULL DEFAULT '[]',
+  source_trace_materialization_refs TEXT NOT NULL DEFAULT '[]',
+  component_diagnostics_ref TEXT,
+  bounds_check_status TEXT NOT NULL,
+  protected_slice_non_degradation_status TEXT NOT NULL,
+  holdout_status TEXT NOT NULL,
+  canary_status TEXT NOT NULL,
+  promotion_status TEXT NOT NULL,
   promotion_decision TEXT NOT NULL,
   canary_bucket TEXT NOT NULL,
+  rollback_pointer_ref TEXT,
   rollback_status TEXT NOT NULL,
+  live_forecast_authority INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL,
-  metadata TEXT NOT NULL DEFAULT '{}'
+  metadata TEXT NOT NULL DEFAULT '{}',
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE INDEX IF NOT EXISTS idx_calibration_candidate_records_lane
   ON calibration_candidate_records(lane_id, created_at);
+
+CREATE TABLE IF NOT EXISTS calibration_component_diagnostic_records (
+  diagnostic_id TEXT PRIMARY KEY,
+  schema_version TEXT NOT NULL,
+  candidate_id TEXT NOT NULL,
+  lane_id TEXT NOT NULL,
+  replay_cohort_id TEXT NOT NULL,
+  headline_status TEXT NOT NULL,
+  protected_slice_non_degradation_status TEXT NOT NULL,
+  metrics_json TEXT NOT NULL DEFAULT '{}',
+  protected_slice_diagnostics TEXT NOT NULL DEFAULT '{}',
+  live_forecast_authority INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  metadata TEXT NOT NULL DEFAULT '{}'
+);
+
+CREATE TABLE IF NOT EXISTS calibration_lane_health_records (
+  health_id TEXT PRIMARY KEY,
+  schema_version TEXT NOT NULL,
+  lane_id TEXT NOT NULL,
+  health_status TEXT NOT NULL,
+  active_pointer_id TEXT,
+  reason_codes TEXT NOT NULL DEFAULT '[]',
+  created_at TEXT NOT NULL,
+  metadata TEXT NOT NULL DEFAULT '{}'
+);
+
+CREATE TABLE IF NOT EXISTS calibration_canary_state_records (
+  canary_id TEXT PRIMARY KEY,
+  schema_version TEXT NOT NULL,
+  candidate_id TEXT NOT NULL,
+  lane_id TEXT NOT NULL,
+  canary_status TEXT NOT NULL,
+  canary_bucket TEXT NOT NULL,
+  started_at TEXT,
+  completed_at TEXT,
+  live_forecast_authority INTEGER NOT NULL DEFAULT 0,
+  metadata TEXT NOT NULL DEFAULT '{}'
+);
+
+CREATE TABLE IF NOT EXISTS calibration_lane_pointer_records (
+  pointer_id TEXT PRIMARY KEY,
+  schema_version TEXT NOT NULL,
+  lane_id TEXT NOT NULL,
+  pointer_status TEXT NOT NULL,
+  active_policy_snapshot_ref TEXT NOT NULL,
+  candidate_id TEXT NOT NULL,
+  rollback_pointer_ref TEXT,
+  canary_status TEXT NOT NULL,
+  promoted_at TEXT NOT NULL,
+  promoted_by TEXT NOT NULL,
+  live_forecast_authority INTEGER NOT NULL DEFAULT 0,
+  metadata TEXT NOT NULL DEFAULT '{}'
+);
+
+CREATE INDEX IF NOT EXISTS idx_calibration_lane_pointers_lane
+  ON calibration_lane_pointer_records(lane_id, pointer_status);
+
+CREATE TABLE IF NOT EXISTS policy_rollback_events (
+  rollback_event_id TEXT PRIMARY KEY,
+  schema_version TEXT NOT NULL,
+  lane_id TEXT NOT NULL,
+  candidate_id TEXT NOT NULL,
+  pointer_id TEXT,
+  rollback_pointer_ref TEXT,
+  reason TEXT NOT NULL,
+  actor TEXT NOT NULL,
+  health_evidence_refs TEXT NOT NULL DEFAULT '[]',
+  live_forecast_authority INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  metadata TEXT NOT NULL DEFAULT '{}'
+);
+
+CREATE TABLE IF NOT EXISTS retrieval_policy_snapshot_records (
+  snapshot_id TEXT PRIMARY KEY,
+  schema_version TEXT NOT NULL,
+  candidate_id TEXT NOT NULL,
+  lane_id TEXT NOT NULL,
+  replay_feature_summary TEXT NOT NULL DEFAULT '{}',
+  protected_primary_diagnostics TEXT NOT NULL DEFAULT '{}',
+  live_forecast_authority INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  metadata TEXT NOT NULL DEFAULT '{}'
+);
+
+CREATE TABLE IF NOT EXISTS decomposer_profile_candidate_records (
+  profile_candidate_id TEXT PRIMARY KEY,
+  schema_version TEXT NOT NULL,
+  candidate_id TEXT NOT NULL,
+  qdt_shape_summary TEXT NOT NULL DEFAULT '{}',
+  decomposer_miss_labels TEXT NOT NULL DEFAULT '[]',
+  live_forecast_authority INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  metadata TEXT NOT NULL DEFAULT '{}'
+);
+
+CREATE TABLE IF NOT EXISTS decision_actionability_candidate_records (
+  actionability_candidate_id TEXT PRIMARY KEY,
+  schema_version TEXT NOT NULL,
+  candidate_id TEXT NOT NULL,
+  route_diagnostics TEXT NOT NULL DEFAULT '{}',
+  live_forecast_authority INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  metadata TEXT NOT NULL DEFAULT '{}'
+);
+
+CREATE TABLE IF NOT EXISTS emergency_conservative_overlay_records (
+  overlay_id TEXT PRIMARY KEY,
+  schema_version TEXT NOT NULL,
+  lane_id TEXT NOT NULL,
+  trigger_kind TEXT NOT NULL,
+  reason_codes TEXT NOT NULL DEFAULT '[]',
+  effects TEXT NOT NULL DEFAULT '[]',
+  expires_at TEXT NOT NULL,
+  rollback_semantics TEXT NOT NULL,
+  live_forecast_authority INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  metadata TEXT NOT NULL DEFAULT '{}'
+);
+
+CREATE TABLE IF NOT EXISTS optimization_maturity_results (
+  maturity_result_id TEXT PRIMARY KEY,
+  schema_version TEXT NOT NULL,
+  status TEXT NOT NULL,
+  checks_json TEXT NOT NULL DEFAULT '{}',
+  live_forecast_authority INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  metadata TEXT NOT NULL DEFAULT '{}'
+);
 """
 
 
@@ -1143,6 +1337,8 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         ensure_columns(conn, table, columns)
     conn.executescript(OPERATIONAL_SCHEMA)
     conn.executescript(FIRST_WAVE_SCHEMA)
+    for table, columns in SESSION6_COMPAT_COLUMN_MIGRATIONS.items():
+        ensure_columns(conn, table, columns)
 
 
 def initialize_database(db_path: Path) -> None:

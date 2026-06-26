@@ -70,16 +70,16 @@ This file verifies that the individual session plans cover every row in `plans/a
 
 ## Coverage Audit Checklist
 
-- [ ] Every inventory feature ID appears in exactly one session plan.
-- [ ] Every migration group `MIG-001` to `MIG-013` appears in exactly one primary owner session plan; `MIG-009` records the Session 6 `TRACE-002` contribution explicitly.
-- [ ] Every session plan references the master plan and shared inventory.
-- [ ] Every session plan references the machine-readable inventory and dependency gate when it owns runtime-gated work.
-- [ ] Every session plan includes ownership rules.
-- [ ] Every session plan includes dependency gates.
-- [ ] Every session plan includes phase-by-phase implementation instructions.
-- [ ] Every phase includes pseudocode.
-- [ ] Every phase includes a testing suite.
-- [ ] Every phase includes a completion checklist.
-- [ ] Maturity-only work is separated from v2 live-cutover work.
-- [ ] The live forecast authority boundary remains SCAE-only.
-- [ ] Session 6 maturity records cannot write production forecasts or base policy files.
+- [x] Every inventory feature ID appears in exactly one session plan.
+- [x] Every migration group `MIG-001` to `MIG-013` appears in exactly one primary owner session plan; `MIG-009` records the Session 6 `TRACE-002` contribution explicitly.
+- [x] Every session plan references the master plan and shared inventory.
+- [x] Every session plan references the machine-readable inventory and dependency gate when it owns runtime-gated work.
+- [x] Every session plan includes ownership rules.
+- [x] Every session plan includes dependency gates.
+- [x] Every session plan includes phase-by-phase implementation instructions.
+- [x] Every phase includes pseudocode.
+- [x] Every phase includes a testing suite.
+- [x] Every phase includes a completion checklist.
+- [x] Maturity-only work is separated from v2 live-cutover work.
+- [x] The live forecast authority boundary remains SCAE-only.
+- [x] Session 6 maturity records cannot write production forecasts or base policy files.

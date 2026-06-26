@@ -80,3 +80,33 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_v2_replay_results_replay_result_id
 
 CREATE INDEX IF NOT EXISTS idx_v2_replay_results_cohort_status
   ON v2_replay_result_records(replay_cohort_id, result_status);
+
+CREATE TABLE IF NOT EXISTS training_trace_full_materializations (
+  trace_materialization_id TEXT PRIMARY KEY,
+  schema_version TEXT NOT NULL,
+  trace_id TEXT NOT NULL,
+  run_id TEXT NOT NULL,
+  case_id TEXT NOT NULL,
+  case_key TEXT,
+  dispatch_id TEXT NOT NULL,
+  forecast_timestamp TEXT NOT NULL,
+  artifact_manifest_ids TEXT NOT NULL DEFAULT '[]',
+  artifact_hashes TEXT NOT NULL DEFAULT '{}',
+  replay_manifest_refs TEXT NOT NULL DEFAULT '[]',
+  materialization_status TEXT NOT NULL,
+  temporal_leak_check_status TEXT NOT NULL,
+  live_authority TEXT NOT NULL,
+  live_forecast_authority INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL,
+  artifact_id TEXT NOT NULL,
+  queue_reason TEXT,
+  metadata TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_training_trace_full_case
+  ON training_trace_full_materializations(case_id, run_id);
+
+CREATE INDEX IF NOT EXISTS idx_training_trace_full_trace
+  ON training_trace_full_materializations(trace_id, materialization_status);

@@ -43,7 +43,7 @@ Status values: `not_started`, `fixture_defined`, `implemented`, `passing`, `waiv
 | FIX-018 | Cutover | 2,5 | AMRG adjusted upstream prior reliability | Validated upstream anchor records adjusted upstream probability, reliability context, and source timestamps. | passing |
 | FIX-036 | Cutover | 2,3 | AMRG local vector neighbor | Local Ollama-routed `BAAI/bge-base-en-v1.5` embeds active-safe descriptors, writes an index snapshot and capped neighbor candidates, and vector-only candidates remain weak context unless later validated. | passing |
 | FIX-038 | Cutover | 1,2,5 | SCAE forecast benchmark provenance | SCAE `production_forecast_prob` creates an idempotent `market_predictions` row tied to the case contract prediction-time snapshot; resolution scoring records prediction Brier, market Brier, Brier edge, scoring version, and resolution payload hash. | passing |
-| FIX-019 | Maturity | 2,3,4 | AMRG shared reuse temporal rejection | Cached retrieval/classification reuse is rejected when consuming dispatch temporal provenance is unsafe. | not_started |
+| FIX-019 | Maturity | 2,3,4 | AMRG shared reuse temporal rejection | Cached retrieval/classification reuse is rejected when consuming dispatch temporal provenance is unsafe. | passing |
 | FIX-020 | Cutover | 5 | Structural-prior/base-rate fingerprint overlap | SCAE rejects duplicate structural prior as signed evidence unless distinct fresh not-priced proof exists. | passing |
 | FIX-021 | Cutover | 3,5 | No-catalyst/time-expiration | Missingness and no-catalyst deltas cannot both apply without distinct absence mechanism proof. | passing |
 | FIX-022 | Cutover | 4,5 | Correlated-quality guard | Raw quality multiplier is floored/grouped and final multiplier is recorded before evidence delta. | passing |
@@ -51,8 +51,8 @@ Status values: `not_started`, `fixture_defined`, `implemented`, `passing`, `waiv
 | FIX-024 | Calibration debt | 5,6 | Calibration-debt hard gates | First-100 trace completeness alone cannot clear debt; resolved/tail/regime/pointer-stability gates are required. | passing |
 | FIX-025 | Cutover | 2,5 | Near-resolution market shrinkage | Near-resolution prior handling distinguishes source-grade contradiction from ordinary uncertainty. | passing |
 | FIX-026 | Cutover | 2,5 | Effective tuning profile selection | Unknown/underpowered domains use global baseline plus conservative overlays; sports/crypto tags remain excluded from initial active profiles. | passing |
-| FIX-027 | Maturity | 6 | Profile canary/rollback | Candidate profile runs in deterministic canary bucket and can roll back by lane-local pointer. | not_started |
-| FIX-028 | Maturity | 3,6 | Decomposer-miss learning | Post-resolution decomposer-miss labels feed promoted QDT scoring overlay without leaking same-case outcomes into active dispatch. | not_started |
+| FIX-027 | Maturity | 6 | Profile canary/rollback | Candidate profile runs in deterministic canary bucket and can roll back by lane-local pointer. | passing |
+| FIX-028 | Maturity | 3,6 | Decomposer-miss learning | Post-resolution decomposer-miss labels feed promoted QDT scoring overlay without leaking same-case outcomes into active dispatch. | passing |
 | FIX-029 | Cutover | 1 | Exact Section 10 operational schema names | Schema name map has no unresolved runtime surface used by live components. | passing |
 | FIX-030 | Cutover | 1 | Structured execution log, error, and replay command | Every failed, blocked, retried, or artifact-validation-failed stage writes `v2_stage_execution_events`, status, safe bounded log refs or explicit no-log reason, error grouping key, replay command, and safe metadata. | passing |
 | FIX-034 | Cutover | 3,4,5 | Insufficient research cannot become clean forecast | Leaf remains uncertified after expansion; SCAE marks forecast invalid or policy watch-only with structural unanswerability proof, never normal high-confidence evidence. | passing |
@@ -67,6 +67,6 @@ Status values: `not_started`, `fixture_defined`, `implemented`, `passing`, `waiv
 ## Completion Checklist
 
 - [x] Fixture registry contains every `FIX-*` row.
-- [ ] Each fixture has expected artifacts, expected status transitions, and expected failure modes.
+- [x] Each fixture has expected artifacts, expected status transitions, and expected failure modes.
 - [x] Each fixture maps to at least one live-cutover blocker or maturity gate.
 - [x] Fixture results persist through `golden_fixture_case_results`.

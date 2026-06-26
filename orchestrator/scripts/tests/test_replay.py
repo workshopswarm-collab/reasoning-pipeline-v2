@@ -207,7 +207,21 @@ class ReplayContractTest(unittest.TestCase):
             "calibration_lane_pointer_records",
         )
         for table in protected_tables:
-            self.conn.execute(f"CREATE TABLE {table} (id TEXT PRIMARY KEY, marker TEXT NOT NULL)")
+            if table == "training_trace_full_materializations":
+                self.conn.execute(
+                    f"""
+                    CREATE TABLE {table} (
+                      id TEXT PRIMARY KEY,
+                      marker TEXT NOT NULL,
+                      case_id TEXT,
+                      run_id TEXT,
+                      trace_id TEXT,
+                      materialization_status TEXT
+                    )
+                    """
+                )
+            else:
+                self.conn.execute(f"CREATE TABLE {table} (id TEXT PRIMARY KEY, marker TEXT NOT NULL)")
             self.conn.execute(f"INSERT INTO {table} (id, marker) VALUES (?, ?)", (f"{table}:1", "unchanged"))
         before = {
             table: self.conn.execute(f"SELECT COUNT(*), MIN(marker), MAX(marker) FROM {table}").fetchone()

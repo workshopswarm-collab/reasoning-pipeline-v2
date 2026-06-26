@@ -241,11 +241,7 @@ class DependencyGateTests(unittest.TestCase):
         self.assertEqual(unresolved, [])
 
         needs_migration = [row for row in rows if row["status"] == "needs_new_migration"]
-        self.assertTrue(needs_migration)
-        for row in needs_migration:
-            with self.subTest(surface=row["logical_surface"]):
-                self.assertEqual(row["migration_group"], "`MIG-011`")
-                self.assertEqual(row["owner"], "Session 6")
+        self.assertEqual(needs_migration, [])
 
     def test_missing_migration_write_path_destination_is_rejected(self) -> None:
         inv = load_inventory()
