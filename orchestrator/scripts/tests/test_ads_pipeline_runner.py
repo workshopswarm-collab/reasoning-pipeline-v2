@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
+import hashlib
 import json
 import sqlite3
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "SCAE" / "scripts"))
 
 from predquant.ads_pipeline_runner import (
     ADS_PIPELINE_STAGE_ORDER,
@@ -47,6 +50,7 @@ from predquant.ads_stage_logging import (
     STAGE_STATUS_TABLE,
 )
 from predquant.sqlite_store import SCHEMA
+from scae.persistence import FORECAST_DECISION_TABLE, write_scae_market_prediction
 
 
 class AdsPipelineRunnerTest(unittest.TestCase):
@@ -136,6 +140,108 @@ class AdsPipelineRunnerTest(unittest.TestCase):
             lease_duration_seconds=900,
             metadata={"test_scope": "AUTO-003"},
         )
+
+    def sha256_ref(self, *parts) -> str:
+        return "sha256:" + hashlib.sha256(":".join(str(part) for part in parts).encode()).hexdigest()
+
+    def scae_fixture_ledger(self, lease, *, probability: float, ordinal: int) -> dict:
+        return {
+            "case_id": lease["case_id"],
+            "case_key": lease["case_key"],
+            "dispatch_id": lease["dispatch_id"],
+            "run_id": lease["pipeline_run_id"],
+            "forecast_timestamp": "2026-06-24T18:00:00+00:00",
+            "forecast_validity_status": "valid_for_forecast",
+            "execution_authority_status": "normal_execution_allowed",
+            "final_probability_fields_status": "final_probability_fields_ready",
+            "production_forecast_prob": probability,
+            "canonical_probability": probability,
+            "writes_persistence": False,
+            "writes_production_forecast": False,
+            "final_probability_ledger_id": f"scae-final-probability-ledger:auto005:{ordinal}:{lease['case_id']}",
+            "final_probability_ledger_digest": self.sha256_ref("auto005-ledger", ordinal, lease["case_id"]),
+        }
+
+    def decision_gate_for_ledger(self, ledger: dict, *, ordinal: int) -> dict:
+        return {
+            "artifact_type": "decision_execution_gate",
+            "feature_id": "DEC-001",
+            "decision_gate_id": f"decision-gate:auto005:{ordinal}:{ledger['case_id']}",
+            "decision_gate_digest": self.sha256_ref("auto005-decision-gate", ordinal, ledger["case_id"]),
+            "probability_authority": False,
+            "replacement_probability_authority": False,
+            "synthesis_upgrade_authority": False,
+            "persistence_authority": False,
+            "market_prediction_authority": False,
+            "scoring_authority": False,
+            "calibration_debt_clearance_authority": False,
+            "writes_production_forecast": False,
+            "writes_persistence": False,
+            "writes_market_prediction": False,
+            "scoreable_forecast_output": False,
+            "clears_calibration_debt": False,
+            "forecast_validity_status": ledger["forecast_validity_status"],
+            "execution_authority_status": ledger["execution_authority_status"],
+            "actionability_status": "actionable",
+            "scae_context": {
+                "scae_ledger_ref": ledger["final_probability_ledger_id"],
+                "scae_ledger_digest": ledger["final_probability_ledger_digest"],
+                "case_id": ledger["case_id"],
+                "case_key": ledger["case_key"],
+                "dispatch_id": ledger["dispatch_id"],
+                "run_id": ledger["run_id"],
+                "forecast_timestamp": ledger["forecast_timestamp"],
+                "forecast_validity_status": ledger["forecast_validity_status"],
+                "execution_authority_status": ledger["execution_authority_status"],
+                "production_forecast_prob": ledger["production_forecast_prob"],
+                "canonical_probability": ledger["canonical_probability"],
+                "probability_source": "SCAE-012_final_probability_fields",
+            },
+            "synthesis_context": {
+                "synthesis_annotation_ref": f"synthesis-annotation:auto005:{ordinal}",
+                "synthesis_annotation_digest": self.sha256_ref("auto005-synthesis", ordinal, ledger["case_id"]),
+            },
+        }
+
+    def ads_case_contract_for_lease(self, lease, *, ordinal: int) -> dict:
+        market = self.conn.execute(
+            "SELECT platform, external_market_id, title FROM markets WHERE id = ?",
+            (lease["market_id"],),
+        ).fetchone()
+        snapshot = self.conn.execute(
+            "SELECT observed_at, best_bid, best_ask FROM market_snapshots WHERE id = ?",
+            (lease["selected_snapshot_id"],),
+        ).fetchone()
+        return {
+            "artifact_type": "ads_case_contract",
+            "schema_version": "ads-case-contract/v1",
+            "case_key": lease["case_key"],
+            "case_id": lease["case_id"],
+            "dispatch_id": lease["dispatch_id"],
+            "prediction_run_id": f"prediction-run:auto005:{ordinal}:{lease['case_id']}",
+            "forecast_artifact_id": f"forecast-artifact:auto005:{ordinal}:{lease['case_id']}",
+            "forecast_timestamp": "2026-06-24T18:00:00+00:00",
+            "intake_source": {
+                "market_row_id": lease["market_id"],
+                "market_snapshot_id": lease["selected_snapshot_id"],
+                "snapshot_observed_at": snapshot["observed_at"],
+                "source_payload_hash": self.sha256_ref("auto005-source-payload", ordinal, lease["case_id"]),
+            },
+            "market_identity": {
+                "platform": market["platform"],
+                "internal_market_id": lease["market_id"],
+                "external_market_id": market["external_market_id"],
+                "title": market["title"],
+            },
+            "prediction_time_market_baseline": {
+                "market_snapshot_id": lease["selected_snapshot_id"],
+                "source_fetched_at": snapshot["observed_at"],
+                "snapshot_age_seconds_at_dispatch": 300,
+                "max_snapshot_age_seconds": 3600,
+                "market_probability": (float(snapshot["best_bid"]) + float(snapshot["best_ask"])) / 2,
+                "market_probability_method": "bid_ask_midpoint",
+            },
+        }
 
     def stage_handlers(
         self,
@@ -654,6 +760,132 @@ class AdsPipelineRunnerTest(unittest.TestCase):
         self.assertEqual(signal["signal_status"], "acknowledged")
         self.assertEqual(signal["acknowledged_by_run_id"], result.pipeline_run_id)
         self.assertEqual(signal["stop_policy"], "stop_after_current_case")
+
+    def test_auto005_continuous_fixture_persists_two_scoreable_scae_market_predictions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.conn.close()
+            db_path = Path(tmp) / "auto005-scoreable.sqlite3"
+            self.conn = sqlite3.connect(db_path, isolation_level=None)
+            self.conn.row_factory = sqlite3.Row
+
+            self.initialize_intake_case("poly-auto005-scoreable-a")
+            self.initialize_intake_case("poly-auto005-scoreable-b")
+            self.enable_fixture_pipeline()
+            decision_record_ids = []
+            forecast_artifact_ids = []
+            market_prediction_ids = []
+
+            def make_handler(stage):
+                def handler(**kwargs):
+                    lease = kwargs["lease"]
+                    result = {
+                        "output_artifact_refs": [f"artifact:{stage}:{lease['case_id']}"],
+                        "validation_result_refs": [f"validation:{stage}:{lease['case_id']}"],
+                        "safe_metadata": {"stage": stage, "handler_scope": "AUTO-005"},
+                    }
+                    if stage == "decision":
+                        ordinal = len(decision_record_ids) + 1
+                        ledger = self.scae_fixture_ledger(
+                            lease,
+                            probability=round(0.55 + (ordinal * 0.04), 2),
+                            ordinal=ordinal,
+                        )
+                        gate = self.decision_gate_for_ledger(ledger, ordinal=ordinal)
+                        contract = self.ads_case_contract_for_lease(lease, ordinal=ordinal)
+                        metadata = {
+                            "forecast_decision_artifact_path": f"artifacts/auto005/{ordinal}/forecast-decision.json",
+                            "test_scope": "FIX-040",
+                        }
+                        persisted = write_scae_market_prediction(db_path, ledger, gate, contract, metadata=metadata)
+                        duplicate = write_scae_market_prediction(db_path, ledger, gate, contract, metadata=metadata)
+
+                        self.assertTrue(persisted["market_prediction_written"])
+                        self.assertTrue(persisted["scoreable_forecast_output"])
+                        self.assertTrue(duplicate["idempotent"])
+                        self.assertEqual(duplicate["prediction_id"], persisted["prediction_id"])
+
+                        decision_record_ids.append(persisted["forecast_decision_id"])
+                        forecast_artifact_ids.append(persisted["forecast_artifact_id"])
+                        market_prediction_ids.append(str(persisted["prediction_id"]))
+                        result["forecast_decision_record_id"] = persisted["forecast_decision_id"]
+                        result["forecast_artifact_id"] = persisted["forecast_artifact_id"]
+                        result["market_prediction_id"] = str(persisted["prediction_id"])
+                        if len(decision_record_ids) == 2:
+                            request_pipeline_stop(
+                                kwargs["conn"],
+                                stop_policy="stop_after_current_case",
+                                reason="FIX-040 scoreable two-case loop complete",
+                                requested_by="fixture",
+                                pipeline_run_id=kwargs["context"].pipeline_run_id,
+                                metadata={"scope": "FIX-040", "market_prediction_count": 2},
+                            )
+                    return result
+
+                return handler
+
+            handlers = {stage: make_handler(stage) for stage in ADS_PIPELINE_STAGE_ORDER[1:]}
+
+            result = run_ads_pipeline_loop(
+                self.conn,
+                self.auto003_policy(max_cases=2),
+                downstream_stage_handlers=handlers,
+                case_selection_policy=CaseSelectionPolicy(
+                    forecast_timestamp="2026-06-24T18:00:00+00:00",
+                    lease_duration_seconds=900,
+                    metadata={"test_scope": "FIX-040"},
+                ),
+            )
+
+            self.assertEqual(result.terminal_status, TERMINAL_REASON_STOP_AFTER_CURRENT)
+            self.assertEqual(len(decision_record_ids), 2)
+            self.assertEqual(len(set(decision_record_ids)), 2)
+            self.assertEqual(len(set(forecast_artifact_ids)), 2)
+            self.assertEqual(len(set(market_prediction_ids)), 2)
+
+            run = read_pipeline_run(self.conn, result.pipeline_run_id)
+            self.assertEqual(run["metadata"]["forecast_decision_record_ids"], decision_record_ids)
+            self.assertEqual(run["metadata"]["forecast_artifact_ids"], forecast_artifact_ids)
+            self.assertEqual(run["metadata"]["market_prediction_ids"], market_prediction_ids)
+
+            prediction_rows = self.conn.execute(
+                """
+                SELECT id, prediction_run_id, forecast_artifact_id, case_id, dispatch_id,
+                       predicted_probability, prediction_source, prediction_label,
+                       scoring_version, metadata
+                FROM market_predictions
+                ORDER BY id
+                """
+            ).fetchall()
+            self.assertEqual(len(prediction_rows), 2)
+            self.assertEqual([str(row["id"]) for row in prediction_rows], market_prediction_ids)
+            self.assertEqual([row["forecast_artifact_id"] for row in prediction_rows], forecast_artifact_ids)
+            self.assertEqual({row["prediction_source"] for row in prediction_rows}, {"ads_pipeline"})
+            self.assertEqual({row["prediction_label"] for row in prediction_rows}, {"v2_scae"})
+            self.assertEqual({row["scoring_version"] for row in prediction_rows}, {None})
+            self.assertEqual([row["predicted_probability"] for row in prediction_rows], [0.59, 0.63])
+            for row in prediction_rows:
+                metadata = json.loads(row["metadata"])
+                self.assertEqual(metadata["scoreable_prediction_source"], "scae.production_forecast_prob")
+                self.assertFalse(metadata["fresh_snapshot_payload_recorded"])
+
+            self.assertEqual(
+                self.conn.execute(f"SELECT COUNT(*) FROM {FORECAST_DECISION_TABLE}").fetchone()[0],
+                2,
+            )
+            loop_rows = self.conn.execute(
+                f"""
+                SELECT iteration_number, forecast_decision_record_id,
+                       forecast_artifact_id, market_prediction_id
+                FROM {PIPELINE_LOOP_ITERATION_TABLE}
+                WHERE pipeline_run_id = ?
+                ORDER BY iteration_number
+                """,
+                (result.pipeline_run_id,),
+            ).fetchall()
+            self.assertEqual([row["iteration_number"] for row in loop_rows], [1, 2])
+            self.assertEqual([row["forecast_decision_record_id"] for row in loop_rows], decision_record_ids)
+            self.assertEqual([row["forecast_artifact_id"] for row in loop_rows], forecast_artifact_ids)
+            self.assertEqual([row["market_prediction_id"] for row in loop_rows], market_prediction_ids)
 
     def test_auto003_quarantines_lease_and_logs_structured_failure(self):
         self.initialize_intake_case()

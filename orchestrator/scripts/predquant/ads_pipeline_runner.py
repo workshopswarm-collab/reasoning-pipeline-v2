@@ -197,6 +197,8 @@ class StageHandlerResult:
     agent_or_component_ref: str | None = None
     forecast_decision_record_id: str | None = None
     forecast_decision_record_ref: str | None = None
+    forecast_artifact_id: str | None = None
+    market_prediction_id: str | None = None
 
     def to_record(self, stage: str) -> dict[str, Any]:
         output_refs = require_string_tuple("output_artifact_refs", self.output_artifact_refs)
@@ -206,6 +208,10 @@ class StageHandlerResult:
             require_non_empty("forecast_decision_record_id", self.forecast_decision_record_id)
         if self.forecast_decision_record_ref is not None:
             require_non_empty("forecast_decision_record_ref", self.forecast_decision_record_ref)
+        if self.forecast_artifact_id is not None:
+            require_non_empty("forecast_artifact_id", self.forecast_artifact_id)
+        if self.market_prediction_id is not None:
+            require_non_empty("market_prediction_id", self.market_prediction_id)
         return {
             "output_artifact_refs": output_refs,
             "validation_result_refs": validation_refs,
@@ -215,6 +221,8 @@ class StageHandlerResult:
             "agent_or_component_ref": self.agent_or_component_ref or STAGE_COMPONENT_REFS[stage],
             "forecast_decision_record_id": self.forecast_decision_record_id,
             "forecast_decision_record_ref": self.forecast_decision_record_ref,
+            "forecast_artifact_id": self.forecast_artifact_id,
+            "market_prediction_id": self.market_prediction_id,
         }
 
 
@@ -1259,6 +1267,8 @@ def _write_pipeline_loop_iteration(
     loop_iteration_id: str | None = None,
     completed_stage_count: int = 0,
     forecast_decision_record_id: str | None = None,
+    forecast_artifact_id: str | None = None,
+    market_prediction_id: str | None = None,
     error_event_refs: tuple[str, ...] = (),
     retry_summary: dict[str, Any] | None = None,
     metadata: dict[str, Any] | None = None,
@@ -1275,6 +1285,8 @@ def _write_pipeline_loop_iteration(
         terminal_status=terminal_status,
         completed_stage_count=completed_stage_count,
         forecast_decision_record_id=forecast_decision_record_id,
+        forecast_artifact_id=forecast_artifact_id,
+        market_prediction_id=market_prediction_id,
         error_event_refs=error_event_refs,
         retry_summary=retry_summary,
         started_at=run_record["started_at"],
@@ -1360,6 +1372,10 @@ def _record_stage_completed(
     metadata = dict(result["safe_metadata"])
     if result.get("forecast_decision_record_id"):
         metadata["forecast_decision_record_id"] = result["forecast_decision_record_id"]
+    if result.get("forecast_artifact_id"):
+        metadata["forecast_artifact_id"] = result["forecast_artifact_id"]
+    if result.get("market_prediction_id"):
+        metadata["market_prediction_id"] = result["market_prediction_id"]
     event = build_stage_execution_event(
         execution_event_id=event_id,
         context=context,
@@ -1646,6 +1662,8 @@ def _coerce_stage_result(stage: str, value: Any) -> dict[str, Any]:
         agent_or_component_ref=value.get("agent_or_component_ref"),
         forecast_decision_record_id=value.get("forecast_decision_record_id"),
         forecast_decision_record_ref=value.get("forecast_decision_record_ref"),
+        forecast_artifact_id=value.get("forecast_artifact_id"),
+        market_prediction_id=value.get("market_prediction_id"),
     )
     return result.to_record(stage)
 
@@ -1779,6 +1797,8 @@ def _run_auto003_single_case(
 
     stage_outputs: dict[str, dict[str, Any]] = {}
     forecast_decision_record_id: str | None = None
+    forecast_artifact_id: str | None = None
+    market_prediction_id: str | None = None
     completed_stage_count = 0
     error_event_refs: tuple[str, ...] = ()
     stop_after_current_requested = policy.stop_policy == "stop_after_current_case"
@@ -1817,6 +1837,8 @@ def _run_auto003_single_case(
                     if forecast_decision_record_id is not None:
                         raise PipelineRunnerContractError("duplicate forecast decision persistence for leased case")
                     forecast_decision_record_id = record_id
+                    forecast_artifact_id = result.get("forecast_artifact_id")
+                    market_prediction_id = result.get("market_prediction_id")
                 _record_stage_completed(conn, context, started_event_id=started_event_id, result=result)
                 stage_outputs[stage] = result
                 completed_stage_count += 1
@@ -1857,6 +1879,8 @@ def _run_auto003_single_case(
                             loop_iteration_id=loop_iteration_id,
                             completed_stage_count=completed_stage_count,
                             forecast_decision_record_id=forecast_decision_record_id,
+                            forecast_artifact_id=forecast_artifact_id,
+                            market_prediction_id=market_prediction_id,
                             metadata={"safe_drained_after_stage": stage},
                         )
                         return PipelineRunnerResult(
@@ -1976,6 +2000,8 @@ def _run_auto003_single_case(
             loop_iteration_id=loop_iteration_id,
             completed_stage_count=completed_stage_count,
             forecast_decision_record_id=forecast_decision_record_id,
+            forecast_artifact_id=forecast_artifact_id,
+            market_prediction_id=market_prediction_id,
             metadata={"stop_after_current_requested": stop_after_current_requested},
         )
         return PipelineRunnerResult(
@@ -2151,6 +2177,8 @@ def _run_auto005_continuous_fixture(
     completed_case_lease_ids: list[str] = []
     completed_case_keys: list[str] = []
     forecast_decision_record_ids: list[str] = []
+    forecast_artifact_ids: list[str] = []
+    market_prediction_ids: list[str] = []
     latest_case_lease_id: str | None = None
     latest_forecast_decision_record_id: str | None = None
     latest_completed_stage_count = 0
@@ -2180,6 +2208,8 @@ def _run_auto005_continuous_fixture(
                     "completed_case_lease_ids": completed_case_lease_ids,
                     "completed_case_keys": completed_case_keys,
                     "forecast_decision_record_ids": forecast_decision_record_ids,
+                    "forecast_artifact_ids": forecast_artifact_ids,
+                    "market_prediction_ids": market_prediction_ids,
                     "stop_signal": signal,
                     "stopped_before_next_case": True,
                 },
@@ -2228,6 +2258,8 @@ def _run_auto005_continuous_fixture(
                     "completed_case_lease_ids": completed_case_lease_ids,
                     "completed_case_keys": completed_case_keys,
                     "forecast_decision_record_ids": forecast_decision_record_ids,
+                    "forecast_artifact_ids": forecast_artifact_ids,
+                    "market_prediction_ids": market_prediction_ids,
                 },
             )
             run_record = _write_pipeline_loop_iteration(
@@ -2273,6 +2305,8 @@ def _run_auto005_continuous_fixture(
 
         stage_outputs: dict[str, dict[str, Any]] = {}
         forecast_decision_record_id: str | None = None
+        forecast_artifact_id: str | None = None
+        market_prediction_id: str | None = None
         completed_stage_count = 0
         error_event_refs: tuple[str, ...] = ()
         stop_after_current_requested = policy.stop_policy == "stop_after_current_case"
@@ -2314,6 +2348,12 @@ def _run_auto005_continuous_fixture(
                         if record_id in forecast_decision_record_ids:
                             raise PipelineRunnerContractError("duplicate forecast decision persistence across AUTO-005 cases")
                         forecast_decision_record_id = record_id
+                        forecast_artifact_id = result.get("forecast_artifact_id")
+                        market_prediction_id = result.get("market_prediction_id")
+                        if forecast_artifact_id and forecast_artifact_id in forecast_artifact_ids:
+                            raise PipelineRunnerContractError("duplicate forecast artifact persistence across AUTO-005 cases")
+                        if market_prediction_id and market_prediction_id in market_prediction_ids:
+                            raise PipelineRunnerContractError("duplicate market prediction persistence across AUTO-005 cases")
                     _record_stage_completed(conn, context, started_event_id=started_event_id, result=result)
                     stage_outputs[stage] = result
                     completed_stage_count += 1
@@ -2341,6 +2381,8 @@ def _run_auto005_continuous_fixture(
                                     "completed_case_lease_ids": completed_case_lease_ids,
                                     "completed_case_keys": completed_case_keys,
                                     "forecast_decision_record_ids": forecast_decision_record_ids,
+                                    "forecast_artifact_ids": forecast_artifact_ids,
+                                    "market_prediction_ids": market_prediction_ids,
                                     "stop_signal": signal,
                                     "safe_drained_after_stage": stage,
                                 },
@@ -2359,6 +2401,8 @@ def _run_auto005_continuous_fixture(
                                 loop_iteration_id=loop_iteration_id,
                                 completed_stage_count=completed_stage_count,
                                 forecast_decision_record_id=forecast_decision_record_id,
+                                forecast_artifact_id=forecast_artifact_id,
+                                market_prediction_id=market_prediction_id,
                                 metadata={"feature_id": "AUTO-005", "safe_drained_after_stage": stage},
                             )
                             return PipelineRunnerResult(
@@ -2399,6 +2443,8 @@ def _run_auto005_continuous_fixture(
                             "completed_case_lease_ids": completed_case_lease_ids,
                             "completed_case_keys": completed_case_keys,
                             "forecast_decision_record_ids": forecast_decision_record_ids,
+                            "forecast_artifact_ids": forecast_artifact_ids,
+                            "market_prediction_ids": market_prediction_ids,
                             "retry_stage": stage,
                             "next_retry_at": retry["next_retry_at"],
                             "retry_policy_ref": retry["retry_policy_ref"],
@@ -2463,6 +2509,10 @@ def _run_auto005_continuous_fixture(
             completed_case_lease_ids.append(lease["case_lease_id"])
             completed_case_keys.append(lease["case_key"])
             forecast_decision_record_ids.append(forecast_decision_record_id)
+            if forecast_artifact_id:
+                forecast_artifact_ids.append(forecast_artifact_id)
+            if market_prediction_id:
+                market_prediction_ids.append(market_prediction_id)
             processed_case_count += 1
             latest_case_lease_id = lease["case_lease_id"]
             latest_forecast_decision_record_id = forecast_decision_record_id
@@ -2481,7 +2531,11 @@ def _run_auto005_continuous_fixture(
                     "completed_case_lease_ids": completed_case_lease_ids,
                     "completed_case_keys": completed_case_keys,
                     "forecast_decision_record_ids": forecast_decision_record_ids,
+                    "forecast_artifact_ids": forecast_artifact_ids,
+                    "market_prediction_ids": market_prediction_ids,
                     "forecast_decision_record_id": forecast_decision_record_id,
+                    "forecast_artifact_id": forecast_artifact_id,
+                    "market_prediction_id": market_prediction_id,
                     "stop_after_current_requested": stop_after_current_requested,
                 },
             )
@@ -2500,6 +2554,8 @@ def _run_auto005_continuous_fixture(
                 loop_iteration_id=loop_iteration_id,
                 completed_stage_count=completed_stage_count,
                 forecast_decision_record_id=forecast_decision_record_id,
+                forecast_artifact_id=forecast_artifact_id,
+                market_prediction_id=market_prediction_id,
                 metadata={
                     "feature_id": "AUTO-005",
                     "processed_case_count": processed_case_count,
@@ -2540,6 +2596,8 @@ def _run_auto005_continuous_fixture(
                     "completed_case_lease_ids": completed_case_lease_ids,
                     "completed_case_keys": completed_case_keys,
                     "forecast_decision_record_ids": forecast_decision_record_ids,
+                    "forecast_artifact_ids": forecast_artifact_ids,
+                    "market_prediction_ids": market_prediction_ids,
                     "non_retryable_failure": True,
                 },
             )
@@ -2587,6 +2645,8 @@ def _run_auto005_continuous_fixture(
                     "completed_case_lease_ids": completed_case_lease_ids,
                     "completed_case_keys": completed_case_keys,
                     "forecast_decision_record_ids": forecast_decision_record_ids,
+                    "forecast_artifact_ids": forecast_artifact_ids,
+                    "market_prediction_ids": market_prediction_ids,
                 },
             )
             _write_pipeline_loop_iteration(
@@ -2626,6 +2686,8 @@ def _run_auto005_continuous_fixture(
             "completed_case_lease_ids": completed_case_lease_ids,
             "completed_case_keys": completed_case_keys,
             "forecast_decision_record_ids": forecast_decision_record_ids,
+            "forecast_artifact_ids": forecast_artifact_ids,
+            "market_prediction_ids": market_prediction_ids,
         },
     )
     return PipelineRunnerResult(
