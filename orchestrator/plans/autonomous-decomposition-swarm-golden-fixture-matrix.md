@@ -30,8 +30,8 @@ Status values: `not_started`, `fixture_defined`, `implemented`, `passing`, `waiv
 | FIX-039 | Wave B | 1,3,4,5 | Runtime script placement static scan | Planned script paths resolve to the owning runtime workspace: QDT under Decomposer, retrieval/research/verification under Researcher Swarm, ledger under SCAE, and Orchestrator-only for intake/context/wakeup/handoff/post-SCAE routing. | passing |
 | FIX-040 | Wave B | 1,2,5 | Continuous automation two-case loop | Runner leases a unique eligible case from existing intake rows, completes the vertical slice to scoreable SCAE forecast persistence, releases the lease, selects a second unique case, then honors stop-after-current without duplicate leases or duplicate prediction rows. | passing |
 | FIX-041 | Wave B | 1 | Manual pipeline enable switch | `pipeline_enabled=false` blocks runner start and new lease acquisition; enabling permits the next lease; disabling during an active case writes the configured stop-after-current or safe-drain signal and acknowledgement. | passing |
-| FIX-008 | Cutover | 2,5 | Stale/illiquid prior | Market prior reliability shrinks toward validated structural/base-rate anchor when present; no instant-snapshot-only shrink. | not_started |
-| FIX-009 | Cutover | 2,5 | Fresh/liquid strong prior | Public old evidence receives assimilation discount and does not double count priced information. | not_started |
+| FIX-008 | Cutover | 2,5 | Stale/illiquid prior | Market prior reliability shrinks toward validated structural/base-rate anchor when present; no instant-snapshot-only shrink. | passing |
+| FIX-009 | Cutover | 2,5 | Fresh/liquid strong prior | Public old evidence receives assimilation discount and does not double count priced information. | passing |
 | FIX-010 | Cutover | 3,5 | Thin retrieval | Retrieval quality lowers leverage, widens interval, and preserves actionability warning. | not_started |
 | FIX-011 | Cutover | 3,4,5 | Protected-primary source failure | Source access failure slice persists; critical/source-of-truth leaf cannot use degraded fallback for execution authority. | not_started |
 | FIX-012 | Cutover | 4,5 | Contradictory classifications | Direction/quality verification quarantines or excludes ambiguous rows without deadlocking non-critical forecast. | not_started |
@@ -48,7 +48,7 @@ Status values: `not_started`, `fixture_defined`, `implemented`, `passing`, `waiv
 | FIX-021 | Cutover | 3,5 | No-catalyst/time-expiration | Missingness and no-catalyst deltas cannot both apply without distinct absence mechanism proof. | passing |
 | FIX-022 | Cutover | 4,5 | Correlated-quality guard | Raw quality multiplier is floored/grouped and final multiplier is recorded before evidence delta. | passing |
 | FIX-023 | Cutover | 5 | Direct-cutover cap stack | Per-update, per-cluster, per-branch, and total caps apply; debt-mode caps are stricter. | passing |
-| FIX-024 | Calibration debt | 5,6 | Calibration-debt hard gates | First-100 trace completeness alone cannot clear debt; resolved/tail/regime/pointer-stability gates are required. | not_started |
+| FIX-024 | Calibration debt | 5,6 | Calibration-debt hard gates | First-100 trace completeness alone cannot clear debt; resolved/tail/regime/pointer-stability gates are required. | passing |
 | FIX-025 | Cutover | 2,5 | Near-resolution market shrinkage | Near-resolution prior handling distinguishes source-grade contradiction from ordinary uncertainty. | not_started |
 | FIX-026 | Cutover | 2,5 | Effective tuning profile selection | Unknown/underpowered domains use global baseline plus conservative overlays; sports/crypto tags remain excluded from initial active profiles. | passing |
 | FIX-027 | Maturity | 6 | Profile canary/rollback | Candidate profile runs in deterministic canary bucket and can roll back by lane-local pointer. | not_started |
