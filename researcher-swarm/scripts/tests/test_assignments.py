@@ -43,6 +43,10 @@ from researcher_swarm.subagents import (  # noqa: E402
     build_leaf_research_barrier,
     build_leaf_researcher_spawn_plan,
     build_leaf_subagent_result,
+    compute_leaf_subagent_result_digest,
+    validate_leaf_research_barrier,
+    validate_leaf_researcher_spawn_plan,
+    validate_leaf_subagent_result,
 )
 
 
@@ -319,6 +323,19 @@ class LeafResearchAssignmentContractTest(unittest.TestCase):
             [True, True, False],
         )
         self.assertEqual(plan["queued_assignment_refs"], [assignments[2]["assignment_id"]])
+        validation = validate_leaf_researcher_spawn_plan(plan, assignments)
+        self.assertTrue(validation.valid, validation.errors)
+
+    def test_spawn_plan_validator_rejects_ready_launch_without_launch_allowed(self) -> None:
+        assignments = build_leaf_research_assignments(qdt=self.qdt, retrieval_packet=self._certifiable_packet())
+        plan = build_leaf_researcher_spawn_plan(assignments, max_concurrent=2)
+        broken = copy.deepcopy(plan)
+        broken["launch_queue"][0]["launch_allowed"] = False
+
+        validation = validate_leaf_researcher_spawn_plan(broken, assignments)
+
+        self.assertFalse(validation.valid)
+        self.assertIn("launch_allowed must reflect the concurrency cap", "; ".join(validation.errors))
 
     def test_leaf_research_barrier_blocks_until_all_subagent_results_exist(self) -> None:
         assignments = build_leaf_research_assignments(qdt=self.qdt, retrieval_packet=self._certifiable_packet())
@@ -329,6 +346,8 @@ class LeafResearchAssignmentContractTest(unittest.TestCase):
         self.assertFalse(barrier["proceed_to_verification_scae"])
         self.assertEqual(barrier["blocker_reason_codes"], ["missing_leaf_subagent_result"])
         self.assertTrue(all(row["terminal_status"] == "missing" for row in barrier["terminal_state_by_leaf"]))
+        validation = validate_leaf_research_barrier(barrier, assignments=assignments, true_production_mode=True)
+        self.assertTrue(validation.valid, validation.errors)
 
     def test_leaf_research_barrier_passes_terminal_gpt55_results(self) -> None:
         assignments = build_leaf_research_assignments(qdt=self.qdt, retrieval_packet=self._certifiable_packet())
@@ -348,6 +367,13 @@ class LeafResearchAssignmentContractTest(unittest.TestCase):
             )
             for idx, assignment in enumerate(assignments)
         ]
+        for result, assignment in zip(results, assignments):
+            validation = validate_leaf_subagent_result(
+                result,
+                assignment=assignment,
+                true_production_mode=True,
+            )
+            self.assertTrue(validation.valid, validation.errors)
 
         barrier = build_leaf_research_barrier(
             assignments,
@@ -358,6 +384,8 @@ class LeafResearchAssignmentContractTest(unittest.TestCase):
         self.assertTrue(barrier["all_leaves_terminal"])
         self.assertTrue(barrier["proceed_to_verification_scae"])
         self.assertEqual(barrier["blocker_reason_codes"], [])
+        validation = validate_leaf_research_barrier(barrier, assignments=assignments, true_production_mode=True)
+        self.assertTrue(validation.valid, validation.errors)
 
     def test_leaf_research_barrier_rejects_non_executed_or_wrong_model_result(self) -> None:
         assignments = build_leaf_research_assignments(qdt=self.qdt, retrieval_packet=self._certifiable_packet())
@@ -383,6 +411,99 @@ class LeafResearchAssignmentContractTest(unittest.TestCase):
         self.assertFalse(barrier["proceed_to_verification_scae"])
         self.assertIn("true_production_requires_model_executed", barrier["blocker_reason_codes"])
         self.assertIn("true_production_requires_gpt_5_5_high", barrier["blocker_reason_codes"])
+
+    def test_leaf_subagent_result_validator_requires_session_sidecar_and_digest(self) -> None:
+        assignment = build_leaf_research_assignments(qdt=self.qdt, retrieval_packet=self._certifiable_packet())[0]
+        result = build_leaf_subagent_result(
+            assignment,
+            terminal_status="accepted_classification",
+            subagent_session_ref="session:leaf-1",
+            sidecar_refs=["sidecar:leaf-1"],
+            classification_refs=["classification:leaf-1"],
+            runtime_provenance={"model_executed": True, "resolved_model_id": "gpt-5.5-high"},
+        )
+        self.assertTrue(validate_leaf_subagent_result(result, assignment=assignment, true_production_mode=True).valid)
+
+        broken = copy.deepcopy(result)
+        broken["sidecar_refs"] = []
+        broken["result_digest"] = compute_leaf_subagent_result_digest(broken)
+
+        validation = validate_leaf_subagent_result(broken, assignment=assignment, true_production_mode=True)
+
+        self.assertFalse(validation.valid)
+        self.assertIn("accepted_classification requires sidecar_refs", validation.errors)
+
+    def test_leaf_research_barrier_blocks_contaminated_result(self) -> None:
+        assignments = build_leaf_research_assignments(qdt=self.qdt, retrieval_packet=self._certifiable_packet())
+        results = []
+        for idx, assignment in enumerate(assignments):
+            if idx == 0:
+                results.append(
+                    build_leaf_subagent_result(
+                        assignment,
+                        terminal_status="contaminated",
+                        subagent_session_ref=f"session:{idx}",
+                        runtime_provenance={"model_executed": True, "resolved_model_id": "gpt-5.5-high"},
+                        reason_codes=["isolation_contaminated"],
+                    )
+                )
+            else:
+                results.append(
+                    build_leaf_subagent_result(
+                        assignment,
+                        terminal_status="accepted_classification",
+                        subagent_session_ref=f"session:{idx}",
+                        sidecar_refs=[f"sidecar:{assignment['leaf_id']}"],
+                        classification_refs=[f"classification:{assignment['leaf_id']}"],
+                        runtime_provenance={"model_executed": True, "resolved_model_id": "gpt-5.5-high"},
+                    )
+                )
+
+        barrier = build_leaf_research_barrier(
+            assignments,
+            subagent_results=results,
+            true_production_mode=True,
+        )
+
+        self.assertFalse(barrier["proceed_to_verification_scae"])
+        self.assertIn("leaf_status_contaminated", barrier["blocker_reason_codes"])
+        self.assertFalse(barrier["terminal_state_by_leaf"][0]["retry_state"]["retry_eligible"])
+        self.assertIn(
+            "never_retry_status_contaminated",
+            barrier["terminal_state_by_leaf"][0]["retry_state"]["retry_blocked_reason_codes"],
+        )
+        validation = validate_leaf_research_barrier(barrier, assignments=assignments, true_production_mode=True)
+        self.assertTrue(validation.valid, validation.errors)
+
+    def test_leaf_research_barrier_blocks_unknown_duplicate_and_malformed_results(self) -> None:
+        assignments = build_leaf_research_assignments(qdt=self.qdt, retrieval_packet=self._certifiable_packet())
+        results = [
+            build_leaf_subagent_result(
+                assignment,
+                terminal_status="accepted_classification",
+                subagent_session_ref=f"session:{idx}",
+                sidecar_refs=[f"sidecar:{assignment['leaf_id']}"],
+                classification_refs=[f"classification:{assignment['leaf_id']}"],
+                runtime_provenance={"model_executed": True, "resolved_model_id": "gpt-5.5-high"},
+            )
+            for idx, assignment in enumerate(assignments)
+        ]
+        unknown = copy.deepcopy(results[0])
+        unknown["assignment_ref"] = "leaf-assignment:unknown"
+
+        barrier = build_leaf_research_barrier(
+            assignments,
+            subagent_results=[*results, copy.deepcopy(results[0]), unknown, "not-a-result"],  # type: ignore[list-item]
+            true_production_mode=True,
+        )
+
+        self.assertFalse(barrier["proceed_to_verification_scae"])
+        self.assertIn("duplicate_leaf_subagent_result", barrier["blocker_reason_codes"])
+        self.assertIn("unknown_leaf_subagent_result", barrier["blocker_reason_codes"])
+        self.assertIn("invalid_leaf_subagent_result", barrier["blocker_reason_codes"])
+        self.assertEqual(len(barrier["result_validation_errors"]), 3)
+        validation = validate_leaf_research_barrier(barrier, assignments=assignments, true_production_mode=True)
+        self.assertTrue(validation.valid, validation.errors)
 
 
 if __name__ == "__main__":

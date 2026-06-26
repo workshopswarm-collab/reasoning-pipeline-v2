@@ -11,7 +11,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from researcher_swarm.subagents import build_leaf_research_barrier, build_leaf_researcher_spawn_plan  # noqa: E402
+from researcher_swarm.subagents import (  # noqa: E402
+    build_leaf_research_barrier,
+    build_leaf_researcher_spawn_plan,
+    validate_leaf_research_barrier,
+    validate_leaf_researcher_spawn_plan,
+)
 
 
 def main() -> int:
@@ -26,6 +31,16 @@ def main() -> int:
             assignments = assignments.get("assignments", [])
     spawn_plan = build_leaf_researcher_spawn_plan(assignments) if isinstance(assignments, list) and assignments else None
     barrier = build_leaf_research_barrier(assignments) if isinstance(assignments, list) and assignments else None
+    spawn_plan_validation = (
+        validate_leaf_researcher_spawn_plan(spawn_plan, assignments).to_dict()
+        if spawn_plan is not None and isinstance(assignments, list)
+        else None
+    )
+    barrier_validation = (
+        validate_leaf_research_barrier(barrier, assignments=assignments).to_dict()
+        if barrier is not None and isinstance(assignments, list)
+        else None
+    )
     payload = {
         "schema_version": "researcher-swarm-run-plan/v1",
         "runtime_owner": "ADS Researcher Swarm",
@@ -33,7 +48,9 @@ def main() -> int:
         "assignment_count": len(assignments) if isinstance(assignments, list) else 0,
         "live_spawn_authority": False,
         "spawn_plan": spawn_plan,
+        "spawn_plan_validation": spawn_plan_validation,
         "leaf_research_barrier": barrier,
+        "leaf_research_barrier_validation": barrier_validation,
     }
     text = json.dumps(payload, sort_keys=True) + "\n"
     if args.output:

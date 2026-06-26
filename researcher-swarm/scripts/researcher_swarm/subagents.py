@@ -9,14 +9,17 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+from dataclasses import dataclass
 from typing import Any
 
 from .assignments import validate_leaf_research_assignment
+from .model_context import RESEARCHER_MODEL_ID
 
 LEAF_SUBAGENT_EXECUTION_POLICY_SCHEMA_VERSION = "leaf-subagent-execution-policy/v1"
 LEAF_SUBAGENT_RESULT_SCHEMA_VERSION = "leaf-subagent-result/v1"
 LEAF_RESEARCH_BARRIER_SCHEMA_VERSION = "leaf-research-barrier/v1"
 LEAF_SUBAGENT_POLICY_ID = "ads-leaf-subagent-execution-policy/v1"
+LEAF_SUBAGENT_CONTRACT_VALIDATOR_VERSION = "ads-phase-2-leaf-subagent-contract/v1"
 
 TERMINAL_RESULT_STATUSES = {
     "accepted_classification",
@@ -34,6 +37,30 @@ BLOCKING_RESULT_STATUSES = {
     "invalid_runtime_provenance",
     "launch_blocked",
 }
+TRANSIENT_RETRY_STATUSES = {"missing", "active", "timed_out", "cancelled", "launch_blocked"}
+NEVER_RETRY_STATUSES = {
+    "contaminated",
+    "forbidden_output",
+    "invalid_sidecar",
+    "invalid_runtime_provenance",
+}
+ALLOWED_TIMEOUT_STATUSES = {"not_timed_out", "timed_out"}
+ALLOWED_CANCEL_STATUSES = {"not_cancelled", "cancelled"}
+
+
+@dataclass(frozen=True)
+class LeafSubagentContractValidationResult:
+    valid: bool
+    errors: tuple[str, ...]
+    warnings: tuple[str, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "valid": self.valid,
+            "errors": list(self.errors),
+            "warnings": list(self.warnings),
+            "validator_version": LEAF_SUBAGENT_CONTRACT_VALIDATOR_VERSION,
+        }
 
 
 def _canonical_json(value: Any) -> str:
@@ -48,6 +75,63 @@ def _is_non_empty_string(value: Any) -> bool:
     return isinstance(value, str) and bool(value.strip())
 
 
+def _is_sha256_ref(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and value.startswith("sha256:")
+        and len(value) == 71
+        and all(char in "0123456789abcdef" for char in value[7:])
+    )
+
+
+def _string_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item) for item in value if _is_non_empty_string(item)]
+
+
+def _validate_string_list(value: Any, field: str, errors: list[str]) -> list[str]:
+    if not isinstance(value, list) or not all(_is_non_empty_string(item) for item in value):
+        errors.append(f"{field} must be a string list")
+        return []
+    return [str(item) for item in value]
+
+
+def _result_digest_payload(result: dict[str, Any]) -> dict[str, Any]:
+    payload = copy.deepcopy(result)
+    payload.pop("result_digest", None)
+    return payload
+
+
+def compute_leaf_subagent_result_digest(result: dict[str, Any]) -> str:
+    return "sha256:" + hashlib.sha256(_canonical_json(_result_digest_payload(result)).encode("utf-8")).hexdigest()
+
+
+def _barrier_digest_payload(barrier: dict[str, Any]) -> dict[str, Any]:
+    payload = copy.deepcopy(barrier)
+    payload.pop("barrier_digest", None)
+    return payload
+
+
+def compute_leaf_research_barrier_digest(barrier: dict[str, Any]) -> str:
+    return "sha256:" + hashlib.sha256(_canonical_json(_barrier_digest_payload(barrier)).encode("utf-8")).hexdigest()
+
+
+def _retry_state_for_status(status: str, *, attempt_index: int = 0, max_retries: int = 1) -> dict[str, Any]:
+    retry_eligible = status in TRANSIENT_RETRY_STATUSES and attempt_index < max_retries
+    retry_blockers: list[str] = []
+    if status in NEVER_RETRY_STATUSES:
+        retry_blockers.append(f"never_retry_status_{status}")
+    if attempt_index >= max_retries and status in TRANSIENT_RETRY_STATUSES:
+        retry_blockers.append("transient_retry_budget_exhausted")
+    return {
+        "attempt_index": attempt_index,
+        "max_retries": max_retries,
+        "retry_eligible": retry_eligible,
+        "retry_blocked_reason_codes": retry_blockers,
+    }
+
+
 def build_leaf_subagent_execution_policy(*, max_concurrent: int = 5) -> dict[str, Any]:
     if max_concurrent < 1 or max_concurrent > 5:
         raise ValueError("max_concurrent must be between 1 and 5")
@@ -59,14 +143,36 @@ def build_leaf_subagent_execution_policy(*, max_concurrent: int = 5) -> dict[str
         "max_wall_time_seconds_per_leaf": 1200,
         "heartbeat_poll_interval_seconds": 60,
         "transient_launch_retry_budget": 1,
-        "never_retry_statuses": [
-            "contaminated",
-            "forbidden_output",
-            "invalid_sidecar",
-            "invalid_runtime_provenance",
-        ],
+        "never_retry_statuses": sorted(NEVER_RETRY_STATUSES),
         "launch_authority": "control_plane_only",
     }
+
+
+def validate_leaf_subagent_execution_policy(policy: Any) -> LeafSubagentContractValidationResult:
+    errors: list[str] = []
+    if not isinstance(policy, dict):
+        return LeafSubagentContractValidationResult(False, ("policy must be an object",))
+    expected_values = {
+        "artifact_type": "leaf_subagent_execution_policy",
+        "schema_version": LEAF_SUBAGENT_EXECUTION_POLICY_SCHEMA_VERSION,
+        "policy_id": LEAF_SUBAGENT_POLICY_ID,
+        "launch_authority": "control_plane_only",
+    }
+    for field, expected in expected_values.items():
+        if policy.get(field) != expected:
+            errors.append(f"{field} must be {expected}")
+    max_concurrent = policy.get("max_concurrent_leaf_researchers_per_case")
+    if not isinstance(max_concurrent, int) or isinstance(max_concurrent, bool) or not 1 <= max_concurrent <= 5:
+        errors.append("max_concurrent_leaf_researchers_per_case must be an integer between 1 and 5")
+    if policy.get("max_wall_time_seconds_per_leaf") != 1200:
+        errors.append("max_wall_time_seconds_per_leaf must be 1200")
+    if policy.get("heartbeat_poll_interval_seconds") != 60:
+        errors.append("heartbeat_poll_interval_seconds must be 60")
+    if policy.get("transient_launch_retry_budget") != 1:
+        errors.append("transient_launch_retry_budget must be 1")
+    if policy.get("never_retry_statuses") != sorted(NEVER_RETRY_STATUSES):
+        errors.append("never_retry_statuses does not match Phase 2 policy")
+    return LeafSubagentContractValidationResult(not errors, tuple(errors))
 
 
 def build_leaf_researcher_spawn_plan(assignments: list[dict[str, Any]], *, max_concurrent: int = 5) -> dict[str, Any]:
@@ -80,11 +186,12 @@ def build_leaf_researcher_spawn_plan(assignments: list[dict[str, Any]], *, max_c
         assignment_refs.append(str(assignment["assignment_id"]))
     running_refs = assignment_refs[:max_concurrent]
     queued_refs = assignment_refs[max_concurrent:]
-    return {
+    policy = build_leaf_subagent_execution_policy(max_concurrent=max_concurrent)
+    plan = {
         "schema_version": "leaf-researcher-spawn-plan/v1",
         "runtime_owner": "ADS Researcher Swarm",
         "launch_authority": "control_plane_only",
-        "execution_policy": build_leaf_subagent_execution_policy(max_concurrent=max_concurrent),
+        "execution_policy": policy,
         "max_concurrent": max_concurrent,
         "assignment_refs": assignment_refs,
         "launch_queue": [
@@ -93,12 +200,119 @@ def build_leaf_researcher_spawn_plan(assignments: list[dict[str, Any]], *, max_c
                 "queue_position": idx,
                 "launch_allowed": assignment_ref in running_refs,
                 "queue_status": "ready_to_launch" if assignment_ref in running_refs else "queued_waiting_for_capacity",
+                "launch_block_reason_codes": [] if assignment_ref in running_refs else ["queued_waiting_for_capacity"],
+                "subagent_session_ref": None,
+                "timeout_state": {
+                    "max_wall_time_seconds": policy["max_wall_time_seconds_per_leaf"],
+                    "heartbeat_poll_interval_seconds": policy["heartbeat_poll_interval_seconds"],
+                },
+                "retry_state": _retry_state_for_status(
+                    "launch_blocked" if assignment_ref in queued_refs else "active",
+                    attempt_index=0,
+                    max_retries=policy["transient_launch_retry_budget"],
+                ),
             }
             for idx, assignment_ref in enumerate(assignment_refs)
         ],
         "queued_assignment_refs": queued_refs,
         "spawn_count": len(assignment_refs),
     }
+    return plan
+
+
+def validate_leaf_researcher_spawn_plan(
+    plan: Any,
+    assignments: list[dict[str, Any]] | None = None,
+) -> LeafSubagentContractValidationResult:
+    errors: list[str] = []
+    if not isinstance(plan, dict):
+        return LeafSubagentContractValidationResult(False, ("spawn plan must be an object",))
+    if plan.get("schema_version") != "leaf-researcher-spawn-plan/v1":
+        errors.append("schema_version must be leaf-researcher-spawn-plan/v1")
+    if plan.get("runtime_owner") != "ADS Researcher Swarm":
+        errors.append("runtime_owner must be ADS Researcher Swarm")
+    if plan.get("launch_authority") != "control_plane_only":
+        errors.append("launch_authority must be control_plane_only")
+    policy = plan.get("execution_policy")
+    policy_validation = validate_leaf_subagent_execution_policy(policy)
+    if not policy_validation.valid:
+        errors.extend(f"execution_policy.{error}" for error in policy_validation.errors)
+    max_concurrent = plan.get("max_concurrent")
+    if not isinstance(max_concurrent, int) or isinstance(max_concurrent, bool) or not 1 <= max_concurrent <= 5:
+        errors.append("max_concurrent must be an integer between 1 and 5")
+        max_concurrent = 0
+    assignment_refs = _validate_string_list(plan.get("assignment_refs"), "assignment_refs", errors)
+    if assignments is not None:
+        expected_refs: list[str] = []
+        for assignment in assignments:
+            validation = validate_leaf_research_assignment(assignment)
+            if not validation.valid:
+                errors.extend(f"assignment.{error}" for error in validation.errors)
+            elif _is_non_empty_string(assignment.get("assignment_id")):
+                expected_refs.append(str(assignment["assignment_id"]))
+        if assignment_refs != expected_refs:
+            errors.append("assignment_refs must match validated assignments")
+    if len(set(assignment_refs)) != len(assignment_refs):
+        errors.append("assignment_refs must be unique")
+    if plan.get("spawn_count") != len(assignment_refs):
+        errors.append("spawn_count must match assignment_refs")
+    queued_assignment_refs = _validate_string_list(plan.get("queued_assignment_refs"), "queued_assignment_refs", errors)
+    expected_queued_refs = assignment_refs[max_concurrent:] if max_concurrent else []
+    if queued_assignment_refs != expected_queued_refs:
+        errors.append("queued_assignment_refs must match assignments over the concurrency cap")
+
+    launch_queue = plan.get("launch_queue")
+    if not isinstance(launch_queue, list):
+        errors.append("launch_queue must be a list")
+        launch_queue = []
+    if len(launch_queue) != len(assignment_refs):
+        errors.append("launch_queue must have one row per assignment")
+    for idx, row in enumerate(launch_queue):
+        if not isinstance(row, dict):
+            errors.append(f"launch_queue[{idx}] must be an object")
+            continue
+        expected_ref = assignment_refs[idx] if idx < len(assignment_refs) else None
+        if row.get("assignment_ref") != expected_ref:
+            errors.append(f"launch_queue[{idx}].assignment_ref must match assignment_refs order")
+        if row.get("queue_position") != idx:
+            errors.append(f"launch_queue[{idx}].queue_position must be {idx}")
+        launch_allowed = row.get("launch_allowed")
+        expected_launch_allowed = idx < max_concurrent
+        if launch_allowed is not True and launch_allowed is not False:
+            errors.append(f"launch_queue[{idx}].launch_allowed must be a boolean")
+        elif launch_allowed != expected_launch_allowed:
+            errors.append(f"launch_queue[{idx}].launch_allowed must reflect the concurrency cap")
+        expected_status = "ready_to_launch" if expected_launch_allowed else "queued_waiting_for_capacity"
+        if row.get("queue_status") != expected_status:
+            errors.append(f"launch_queue[{idx}].queue_status must be {expected_status}")
+        reason_codes = _validate_string_list(
+            row.get("launch_block_reason_codes"),
+            f"launch_queue[{idx}].launch_block_reason_codes",
+            errors,
+        )
+        if launch_allowed is True and reason_codes:
+            errors.append(f"launch_queue[{idx}] cannot launch with launch_block_reason_codes")
+        if launch_allowed is False and not reason_codes:
+            errors.append(f"launch_queue[{idx}] must explain why launch is blocked")
+        if row.get("subagent_session_ref") is not None:
+            errors.append(f"launch_queue[{idx}].subagent_session_ref must be null before control-plane launch")
+        timeout_state = row.get("timeout_state")
+        if not isinstance(timeout_state, dict):
+            errors.append(f"launch_queue[{idx}].timeout_state must be an object")
+        else:
+            if timeout_state.get("max_wall_time_seconds") != 1200:
+                errors.append(f"launch_queue[{idx}].timeout_state.max_wall_time_seconds must be 1200")
+            if timeout_state.get("heartbeat_poll_interval_seconds") != 60:
+                errors.append(f"launch_queue[{idx}].timeout_state.heartbeat_poll_interval_seconds must be 60")
+        retry_state = row.get("retry_state")
+        if not isinstance(retry_state, dict):
+            errors.append(f"launch_queue[{idx}].retry_state must be an object")
+        else:
+            if retry_state.get("max_retries") != 1:
+                errors.append(f"launch_queue[{idx}].retry_state.max_retries must be 1")
+            if not isinstance(retry_state.get("retry_eligible"), bool):
+                errors.append(f"launch_queue[{idx}].retry_state.retry_eligible must be a boolean")
+    return LeafSubagentContractValidationResult(not errors, tuple(errors))
 
 
 def build_leaf_subagent_result(
@@ -113,6 +327,8 @@ def build_leaf_subagent_result(
     runtime_provenance: dict[str, Any] | None = None,
     timeout_status: str = "not_timed_out",
     cancel_status: str = "not_cancelled",
+    attempt_index: int = 0,
+    tool_use_summary: dict[str, Any] | None = None,
     reason_codes: list[str] | None = None,
 ) -> dict[str, Any]:
     validation = validate_leaf_research_assignment(assignment)
@@ -120,6 +336,14 @@ def build_leaf_subagent_result(
         raise ValueError("; ".join(validation.errors))
     if terminal_status not in TERMINAL_RESULT_STATUSES | BLOCKING_RESULT_STATUSES:
         raise ValueError("terminal_status is invalid")
+    if not _is_non_empty_string(subagent_session_ref):
+        raise ValueError("subagent_session_ref is required for leaf subagent results")
+    if timeout_status not in ALLOWED_TIMEOUT_STATUSES:
+        raise ValueError("timeout_status is invalid")
+    if cancel_status not in ALLOWED_CANCEL_STATUSES:
+        raise ValueError("cancel_status is invalid")
+    if attempt_index < 0:
+        raise ValueError("attempt_index must be non-negative")
     runtime = runtime_provenance or {}
     model_executed = bool(
         runtime.get("model_executed") is True
@@ -128,6 +352,12 @@ def build_leaf_subagent_result(
     resolved_model = runtime.get("resolved_model_id") or (
         runtime.get("runtime", {}).get("resolved_model_id") if isinstance(runtime.get("runtime"), dict) else None
     )
+    summary = copy.deepcopy(tool_use_summary or {})
+    summary.setdefault("leaf_scoped_only", True)
+    summary.setdefault("approved_transports_only", True)
+    summary.setdefault("candidate_supplemental_evidence_requires_resolver_admission", True)
+    summary.setdefault("summary_available", False)
+    policy = build_leaf_subagent_execution_policy()
     result = {
         "artifact_type": "leaf_subagent_result",
         "schema_version": LEAF_SUBAGENT_RESULT_SCHEMA_VERSION,
@@ -147,17 +377,132 @@ def build_leaf_subagent_result(
         "sidecar_refs": list(sidecar_refs or []),
         "classification_refs": list(classification_refs or []),
         "proposed_supplemental_evidence_refs": list(supplemental_evidence_refs or []),
-        "tool_use_summary": {"leaf_scoped_only": True, "summary_available": False},
+        "tool_use_summary": summary,
         "timeout_status": timeout_status,
         "cancel_status": cancel_status,
         "isolation_audit_ref": isolation_audit_ref or assignment["context_isolation"]["isolation_audit_ref"],
         "runtime_provenance": copy.deepcopy(runtime),
         "model_executed": model_executed,
         "resolved_model_id": resolved_model,
+        "retry_state": _retry_state_for_status(
+            terminal_status,
+            attempt_index=attempt_index,
+            max_retries=policy["transient_launch_retry_budget"],
+        ),
         "reason_codes": list(reason_codes or []),
     }
-    result["result_digest"] = "sha256:" + hashlib.sha256(_canonical_json(result).encode("utf-8")).hexdigest()
+    result["result_digest"] = compute_leaf_subagent_result_digest(result)
     return result
+
+
+def validate_leaf_subagent_result(
+    result: Any,
+    *,
+    assignment: dict[str, Any] | None = None,
+    true_production_mode: bool = False,
+) -> LeafSubagentContractValidationResult:
+    errors: list[str] = []
+    if not isinstance(result, dict):
+        return LeafSubagentContractValidationResult(False, ("result must be an object",))
+    expected_values = {
+        "artifact_type": "leaf_subagent_result",
+        "schema_version": LEAF_SUBAGENT_RESULT_SCHEMA_VERSION,
+    }
+    for field, expected in expected_values.items():
+        if result.get(field) != expected:
+            errors.append(f"{field} must be {expected}")
+    for field in ("result_id", "assignment_ref", "leaf_id", "subagent_session_ref", "isolation_audit_ref"):
+        if not _is_non_empty_string(result.get(field)):
+            errors.append(f"{field} is required")
+    status = result.get("terminal_status")
+    if status not in TERMINAL_RESULT_STATUSES | BLOCKING_RESULT_STATUSES:
+        errors.append("terminal_status is invalid")
+        status = "invalid_sidecar"
+    sidecar_refs = _validate_string_list(result.get("sidecar_refs"), "sidecar_refs", errors)
+    classification_refs = _validate_string_list(result.get("classification_refs"), "classification_refs", errors)
+    _validate_string_list(
+        result.get("proposed_supplemental_evidence_refs"),
+        "proposed_supplemental_evidence_refs",
+        errors,
+    )
+    reason_codes = _validate_string_list(result.get("reason_codes"), "reason_codes", errors)
+    if len(set(reason_codes)) != len(reason_codes):
+        errors.append("reason_codes must be unique")
+    if result.get("timeout_status") not in ALLOWED_TIMEOUT_STATUSES:
+        errors.append("timeout_status is invalid")
+    if result.get("cancel_status") not in ALLOWED_CANCEL_STATUSES:
+        errors.append("cancel_status is invalid")
+    if status == "timed_out" and result.get("timeout_status") != "timed_out":
+        errors.append("timed_out terminal_status requires timeout_status=timed_out")
+    if status == "cancelled" and result.get("cancel_status") != "cancelled":
+        errors.append("cancelled terminal_status requires cancel_status=cancelled")
+    if status == "accepted_classification":
+        if not sidecar_refs:
+            errors.append("accepted_classification requires sidecar_refs")
+        if not classification_refs:
+            errors.append("accepted_classification requires classification_refs")
+        if result.get("timeout_status") != "not_timed_out":
+            errors.append("accepted_classification cannot be timed out")
+        if result.get("cancel_status") != "not_cancelled":
+            errors.append("accepted_classification cannot be cancelled")
+    tool_use_summary = result.get("tool_use_summary")
+    if not isinstance(tool_use_summary, dict):
+        errors.append("tool_use_summary must be an object")
+    else:
+        if tool_use_summary.get("leaf_scoped_only") is not True:
+            errors.append("tool_use_summary.leaf_scoped_only must be true")
+        if tool_use_summary.get("approved_transports_only") is not True:
+            errors.append("tool_use_summary.approved_transports_only must be true")
+        if tool_use_summary.get("candidate_supplemental_evidence_requires_resolver_admission") is not True:
+            errors.append(
+                "tool_use_summary.candidate_supplemental_evidence_requires_resolver_admission must be true"
+            )
+    if not isinstance(result.get("runtime_provenance"), dict):
+        errors.append("runtime_provenance must be an object")
+    if result.get("model_executed") is not True and result.get("model_executed") is not False:
+        errors.append("model_executed must be a boolean")
+    if result.get("resolved_model_id") is not None and not _is_non_empty_string(result.get("resolved_model_id")):
+        errors.append("resolved_model_id must be a non-empty string or null")
+    if true_production_mode:
+        if result.get("model_executed") is not True:
+            errors.append("true production requires model_executed=true")
+        if result.get("resolved_model_id") != RESEARCHER_MODEL_ID:
+            errors.append(f"true production requires resolved_model_id={RESEARCHER_MODEL_ID}")
+    retry_state = result.get("retry_state")
+    if not isinstance(retry_state, dict):
+        errors.append("retry_state must be an object")
+    else:
+        if not isinstance(retry_state.get("attempt_index"), int) or isinstance(retry_state.get("attempt_index"), bool):
+            errors.append("retry_state.attempt_index must be an integer")
+        if retry_state.get("max_retries") != 1:
+            errors.append("retry_state.max_retries must be 1")
+        if not isinstance(retry_state.get("retry_eligible"), bool):
+            errors.append("retry_state.retry_eligible must be a boolean")
+        _validate_string_list(
+            retry_state.get("retry_blocked_reason_codes"),
+            "retry_state.retry_blocked_reason_codes",
+            errors,
+        )
+    digest = result.get("result_digest")
+    if not _is_sha256_ref(digest):
+        errors.append("result_digest must be a sha256 ref")
+    elif digest != compute_leaf_subagent_result_digest(result):
+        errors.append("result_digest does not match result payload")
+    if assignment is not None:
+        if not isinstance(assignment, dict):
+            errors.append("assignment must be an object when provided")
+        else:
+            assignment_validation = validate_leaf_research_assignment(assignment)
+            if not assignment_validation.valid:
+                errors.extend(f"assignment.{error}" for error in assignment_validation.errors)
+            if result.get("assignment_ref") != assignment.get("assignment_id"):
+                errors.append("assignment_ref must match assignment")
+            if result.get("leaf_id") != assignment.get("leaf_id"):
+                errors.append("leaf_id must match assignment")
+            expected_audit_ref = assignment.get("context_isolation", {}).get("isolation_audit_ref")
+            if result.get("isolation_audit_ref") != expected_audit_ref:
+                errors.append("isolation_audit_ref must match assignment")
+    return LeafSubagentContractValidationResult(not errors, tuple(errors))
 
 
 def build_leaf_research_barrier(
@@ -166,19 +511,60 @@ def build_leaf_research_barrier(
     subagent_results: list[dict[str, Any]] | None = None,
     true_production_mode: bool = False,
 ) -> dict[str, Any]:
-    results_by_assignment = {
-        str(item.get("assignment_ref")): item
-        for item in subagent_results or []
-        if isinstance(item, dict) and _is_non_empty_string(item.get("assignment_ref"))
-    }
-    terminal_rows: list[dict[str, Any]] = []
-    proceed = True
+    assignment_by_ref: dict[str, dict[str, Any]] = {}
     for assignment in assignments:
         validation = validate_leaf_research_assignment(assignment)
         if not validation.valid:
             raise ValueError("; ".join(validation.errors))
+        assignment_by_ref[str(assignment["assignment_id"])] = assignment
+    policy = build_leaf_subagent_execution_policy()
+    results_by_assignment: dict[str, dict[str, Any]] = {}
+    global_reason_codes: list[str] = []
+    result_validation_errors: list[dict[str, Any]] = []
+    for idx, item in enumerate(subagent_results or []):
+        if not isinstance(item, dict):
+            global_reason_codes.append("invalid_leaf_subagent_result")
+            result_validation_errors.append({"result_index": idx, "errors": ["result must be an object"]})
+            continue
+        assignment_ref = item.get("assignment_ref")
+        if not _is_non_empty_string(assignment_ref):
+            global_reason_codes.append("invalid_leaf_subagent_result")
+            result_validation_errors.append({"result_index": idx, "errors": ["assignment_ref is required"]})
+            continue
+        assignment_ref = str(assignment_ref)
+        if assignment_ref not in assignment_by_ref:
+            global_reason_codes.append("unknown_leaf_subagent_result")
+            result_validation_errors.append({"result_index": idx, "assignment_ref": assignment_ref, "errors": ["unknown assignment_ref"]})
+            continue
+        if assignment_ref in results_by_assignment:
+            global_reason_codes.append("duplicate_leaf_subagent_result")
+            result_validation_errors.append({"result_index": idx, "assignment_ref": assignment_ref, "errors": ["duplicate assignment_ref"]})
+            continue
+        validation = validate_leaf_subagent_result(
+            item,
+            assignment=assignment_by_ref[assignment_ref],
+            true_production_mode=true_production_mode,
+        )
+        if not validation.valid:
+            global_reason_codes.append("invalid_leaf_subagent_result")
+            result_validation_errors.append(
+                {
+                    "result_index": idx,
+                    "assignment_ref": assignment_ref,
+                    "errors": list(validation.errors),
+                }
+            )
+        results_by_assignment[assignment_ref] = item
+    terminal_rows: list[dict[str, Any]] = []
+    proceed = not global_reason_codes
+    for assignment in assignments:
         result = results_by_assignment.get(str(assignment["assignment_id"]))
         if not result:
+            retry_state = _retry_state_for_status(
+                "missing",
+                attempt_index=0,
+                max_retries=policy["transient_launch_retry_budget"],
+            )
             row = {
                 "assignment_ref": assignment["assignment_id"],
                 "leaf_id": assignment["leaf_id"],
@@ -187,6 +573,9 @@ def build_leaf_research_barrier(
                 "reason_codes": ["missing_leaf_subagent_result"],
                 "subagent_session_ref": None,
                 "isolation_audit_ref": assignment["context_isolation"]["isolation_audit_ref"],
+                "timeout_status": "not_timed_out",
+                "cancel_status": "not_cancelled",
+                "retry_state": retry_state,
             }
             proceed = False
         else:
@@ -200,9 +589,17 @@ def build_leaf_research_barrier(
                 if result.get("model_executed") is not True:
                     row_proceed = False
                     reasons.append("true_production_requires_model_executed")
-                if result.get("resolved_model_id") != "gpt-5.5-high":
+                if result.get("resolved_model_id") != RESEARCHER_MODEL_ID:
                     row_proceed = False
                     reasons.append("true_production_requires_gpt_5_5_high")
+            result_validation = validate_leaf_subagent_result(
+                result,
+                assignment=assignment,
+                true_production_mode=true_production_mode,
+            )
+            if not result_validation.valid:
+                row_proceed = False
+                reasons.append("invalid_leaf_subagent_result")
             row = {
                 "assignment_ref": assignment["assignment_id"],
                 "leaf_id": assignment["leaf_id"],
@@ -213,6 +610,9 @@ def build_leaf_research_barrier(
                 "isolation_audit_ref": result.get("isolation_audit_ref"),
                 "sidecar_refs": list(result.get("sidecar_refs") or []),
                 "proposed_supplemental_evidence_refs": list(result.get("proposed_supplemental_evidence_refs") or []),
+                "timeout_status": result.get("timeout_status"),
+                "cancel_status": result.get("cancel_status"),
+                "retry_state": result.get("retry_state"),
             }
             proceed = proceed and row_proceed
         terminal_rows.append(row)
@@ -221,7 +621,7 @@ def build_leaf_research_barrier(
         "terminal_rows": terminal_rows,
         "true_production_mode": true_production_mode,
     }
-    return {
+    barrier = {
         "artifact_type": "leaf_research_barrier",
         "schema_version": LEAF_RESEARCH_BARRIER_SCHEMA_VERSION,
         "barrier_id": _sha_id("leaf-research-barrier", seed),
@@ -232,22 +632,130 @@ def build_leaf_research_barrier(
         "blocker_reason_codes": sorted(
             {
                 reason
+                for reason in global_reason_codes
+            }
+            | {
+                reason
                 for row in terminal_rows
                 if not row["proceed"]
                 for reason in row.get("reason_codes", [])
             }
         ),
+        "result_validation_errors": result_validation_errors,
         "true_production_mode": bool(true_production_mode),
-        "barrier_policy": build_leaf_subagent_execution_policy(),
+        "barrier_policy": policy,
     }
+    barrier["barrier_digest"] = compute_leaf_research_barrier_digest(barrier)
+    return barrier
+
+
+def validate_leaf_research_barrier(
+    barrier: Any,
+    *,
+    assignments: list[dict[str, Any]] | None = None,
+    true_production_mode: bool | None = None,
+) -> LeafSubagentContractValidationResult:
+    errors: list[str] = []
+    if not isinstance(barrier, dict):
+        return LeafSubagentContractValidationResult(False, ("barrier must be an object",))
+    if barrier.get("artifact_type") != "leaf_research_barrier":
+        errors.append("artifact_type must be leaf_research_barrier")
+    if barrier.get("schema_version") != LEAF_RESEARCH_BARRIER_SCHEMA_VERSION:
+        errors.append(f"schema_version must be {LEAF_RESEARCH_BARRIER_SCHEMA_VERSION}")
+    if not _is_non_empty_string(barrier.get("barrier_id")):
+        errors.append("barrier_id is required")
+    assignment_refs = _validate_string_list(barrier.get("assignment_refs"), "assignment_refs", errors)
+    if len(set(assignment_refs)) != len(assignment_refs):
+        errors.append("assignment_refs must be unique")
+    if assignments is not None:
+        expected_refs: list[str] = []
+        for assignment in assignments:
+            validation = validate_leaf_research_assignment(assignment)
+            if not validation.valid:
+                errors.extend(f"assignment.{error}" for error in validation.errors)
+            elif _is_non_empty_string(assignment.get("assignment_id")):
+                expected_refs.append(str(assignment["assignment_id"]))
+        if assignment_refs != expected_refs:
+            errors.append("assignment_refs must match validated assignments")
+    policy_validation = validate_leaf_subagent_execution_policy(barrier.get("barrier_policy"))
+    if not policy_validation.valid:
+        errors.extend(f"barrier_policy.{error}" for error in policy_validation.errors)
+    terminal_rows = barrier.get("terminal_state_by_leaf")
+    if not isinstance(terminal_rows, list):
+        errors.append("terminal_state_by_leaf must be a list")
+        terminal_rows = []
+    if len(terminal_rows) != len(assignment_refs):
+        errors.append("terminal_state_by_leaf must have one row per assignment")
+    row_proceed_values: list[bool] = []
+    row_terminal_values: list[bool] = []
+    for idx, row in enumerate(terminal_rows):
+        if not isinstance(row, dict):
+            errors.append(f"terminal_state_by_leaf[{idx}] must be an object")
+            row_proceed_values.append(False)
+            row_terminal_values.append(False)
+            continue
+        expected_ref = assignment_refs[idx] if idx < len(assignment_refs) else None
+        if row.get("assignment_ref") != expected_ref:
+            errors.append(f"terminal_state_by_leaf[{idx}].assignment_ref must match assignment_refs order")
+        if not _is_non_empty_string(row.get("leaf_id")):
+            errors.append(f"terminal_state_by_leaf[{idx}].leaf_id is required")
+        status = row.get("terminal_status")
+        if status not in TERMINAL_RESULT_STATUSES | BLOCKING_RESULT_STATUSES | {"missing"}:
+            errors.append(f"terminal_state_by_leaf[{idx}].terminal_status is invalid")
+            status = "invalid_sidecar"
+        if row.get("proceed") is not True and row.get("proceed") is not False:
+            errors.append(f"terminal_state_by_leaf[{idx}].proceed must be a boolean")
+            row_proceed = False
+        else:
+            row_proceed = bool(row.get("proceed"))
+        row_proceed_values.append(row_proceed)
+        row_terminal_values.append(status in TERMINAL_RESULT_STATUSES)
+        _validate_string_list(row.get("reason_codes"), f"terminal_state_by_leaf[{idx}].reason_codes", errors)
+        if status in BLOCKING_RESULT_STATUSES | {"missing"} and row_proceed:
+            errors.append(f"terminal_state_by_leaf[{idx}] cannot proceed with blocking status")
+        if row_proceed and status not in TERMINAL_RESULT_STATUSES:
+            errors.append(f"terminal_state_by_leaf[{idx}] cannot proceed without terminal status")
+        if row.get("subagent_session_ref") is not None and not _is_non_empty_string(row.get("subagent_session_ref")):
+            errors.append(f"terminal_state_by_leaf[{idx}].subagent_session_ref must be a string or null")
+        if not _is_non_empty_string(row.get("isolation_audit_ref")):
+            errors.append(f"terminal_state_by_leaf[{idx}].isolation_audit_ref is required")
+        if row.get("timeout_status") not in ALLOWED_TIMEOUT_STATUSES:
+            errors.append(f"terminal_state_by_leaf[{idx}].timeout_status is invalid")
+        if row.get("cancel_status") not in ALLOWED_CANCEL_STATUSES:
+            errors.append(f"terminal_state_by_leaf[{idx}].cancel_status is invalid")
+        if not isinstance(row.get("retry_state"), dict):
+            errors.append(f"terminal_state_by_leaf[{idx}].retry_state must be an object")
+    expected_all_terminal = bool(terminal_rows) and all(row_terminal_values)
+    if barrier.get("all_leaves_terminal") != expected_all_terminal:
+        errors.append("all_leaves_terminal does not match terminal rows")
+    blocker_reason_codes = _validate_string_list(barrier.get("blocker_reason_codes"), "blocker_reason_codes", errors)
+    expected_proceed = bool(terminal_rows) and all(row_proceed_values) and not blocker_reason_codes
+    if barrier.get("proceed_to_verification_scae") != expected_proceed:
+        errors.append("proceed_to_verification_scae does not match terminal rows and blockers")
+    if true_production_mode is not None and barrier.get("true_production_mode") is not bool(true_production_mode):
+        errors.append("true_production_mode does not match expected mode")
+    if not isinstance(barrier.get("result_validation_errors"), list):
+        errors.append("result_validation_errors must be a list")
+    digest = barrier.get("barrier_digest")
+    if not _is_sha256_ref(digest):
+        errors.append("barrier_digest must be a sha256 ref")
+    elif digest != compute_leaf_research_barrier_digest(barrier):
+        errors.append("barrier_digest does not match barrier payload")
+    return LeafSubagentContractValidationResult(not errors, tuple(errors))
 
 
 __all__ = [
     "LEAF_RESEARCH_BARRIER_SCHEMA_VERSION",
     "LEAF_SUBAGENT_EXECUTION_POLICY_SCHEMA_VERSION",
     "LEAF_SUBAGENT_RESULT_SCHEMA_VERSION",
+    "compute_leaf_research_barrier_digest",
+    "compute_leaf_subagent_result_digest",
     "build_leaf_research_barrier",
     "build_leaf_researcher_spawn_plan",
     "build_leaf_subagent_execution_policy",
     "build_leaf_subagent_result",
+    "validate_leaf_research_barrier",
+    "validate_leaf_researcher_spawn_plan",
+    "validate_leaf_subagent_execution_policy",
+    "validate_leaf_subagent_result",
 ]
