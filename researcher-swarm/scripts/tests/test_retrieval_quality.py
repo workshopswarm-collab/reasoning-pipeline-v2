@@ -174,6 +174,11 @@ class RetrievalQualityScoringTest(unittest.TestCase):
         self.assertIn("stale_selected_sources", quality_slice["diagnostic_codes"])
         self.assertIn("unknown_metadata_signals", quality_slice["diagnostic_codes"])
         self.assertIn("protected_primary_access_failed", quality_slice["diagnostic_codes"])
+        diagnostics_by_code = {
+            diagnostic["code"]: diagnostic
+            for diagnostic in quality_slice["diagnostics"]
+        }
+        self.assertEqual(diagnostics_by_code["thin_retrieval"]["severity"], "warning")
         self.assertEqual(quality_slice["quality_status"], "blocked")
         self.assertGreaterEqual(quality_slice["dimensions"]["unknown_metadata_signal_count"], 3)
 

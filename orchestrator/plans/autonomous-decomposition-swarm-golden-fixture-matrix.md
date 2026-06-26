@@ -32,12 +32,12 @@ Status values: `not_started`, `fixture_defined`, `implemented`, `passing`, `waiv
 | FIX-041 | Wave B | 1 | Manual pipeline enable switch | `pipeline_enabled=false` blocks runner start and new lease acquisition; enabling permits the next lease; disabling during an active case writes the configured stop-after-current or safe-drain signal and acknowledgement. | passing |
 | FIX-008 | Cutover | 2,5 | Stale/illiquid prior | Market prior reliability shrinks toward validated structural/base-rate anchor when present; no instant-snapshot-only shrink. | passing |
 | FIX-009 | Cutover | 2,5 | Fresh/liquid strong prior | Public old evidence receives assimilation discount and does not double count priced information. | passing |
-| FIX-010 | Cutover | 3,5 | Thin retrieval | Retrieval quality lowers leverage, widens interval, and preserves actionability warning. | not_started |
+| FIX-010 | Cutover | 3,5 | Thin retrieval | Retrieval quality lowers leverage, widens interval, and preserves actionability warning. | passing |
 | FIX-011 | Cutover | 3,4,5 | Protected-primary source failure | Source access failure slice persists; critical/source-of-truth leaf cannot use degraded fallback for execution authority. | passing |
-| FIX-012 | Cutover | 4,5 | Contradictory classifications | Direction/quality verification quarantines or excludes ambiguous rows without deadlocking non-critical forecast. | not_started |
+| FIX-012 | Cutover | 4,5 | Contradictory classifications | Direction/quality verification quarantines or excludes ambiguous rows without deadlocking non-critical forecast. | passing |
 | FIX-013 | Cutover | 3,4,5 | Duplicate same-claim evidence | Same claim across leaves contributes once through shared-claim union; no additive duplicate force. | passing |
 | FIX-014 | Cutover | 3,5 | Ambiguous claim equivalence | Uncertain same-claim vs independent-claim defaults conservative, not independent corroboration. | passing |
-| FIX-015 | Cutover | 3,5 | Same-mechanism distinct claims | Same mechanism reduces independence or widens intervals but does not merge as same claim. | not_started |
+| FIX-015 | Cutover | 3,5 | Same-mechanism distinct claims | Same mechanism reduces independence or widens intervals but does not merge as same claim. | passing |
 | FIX-016 | Cutover | 3,5 | Expanded decomposition branch sub-ledger | Effective leaf budget above compact default uses sign-partitioned branch sub-ledgers, not flat summation. | passing |
 | FIX-017 | Cutover | 2,3,5 | AMRG causal cycle downgrade | Concurrent/overlapping/cyclic relation downgrades to diagnostic and cannot create prior anchor. | passing |
 | FIX-018 | Cutover | 2,5 | AMRG adjusted upstream prior reliability | Validated upstream anchor records adjusted upstream probability, reliability context, and source timestamps. | passing |
