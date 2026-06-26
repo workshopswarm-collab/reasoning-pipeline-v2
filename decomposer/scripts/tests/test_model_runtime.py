@@ -13,8 +13,14 @@ sys.path.insert(0, str(ROOT / "decomposer" / "scripts"))
 
 from ads_decomposer.model_runtime import (  # noqa: E402
     MODEL_RUNTIME_CALL_SCHEMA_VERSION,
+    MODEL_RUNTIME_TIMEOUTS,
+    MODEL_RUNTIME_TRANSPORT_REQUEST_SCHEMA_VERSION,
+    MODEL_RUNTIME_TRANSPORT_RESPONSE_SCHEMA_VERSION,
     ModelRuntimeError,
     execute_model_runtime_call,
+    execute_model_runtime_call_for_lane,
+    model_execution_context_from_runtime_call,
+    resolve_model_runtime_lane,
 )
 
 
@@ -43,6 +49,22 @@ class ModelRuntimeContractTest(unittest.TestCase):
         args.update(overrides)
         return execute_model_runtime_call(**args)
 
+    def test_resolves_phase1_openai_gpt55_lanes_from_policy(self) -> None:
+        for lane_id in (
+            "decomposer_qdt_generation",
+            "researcher_leaf_nli_classification",
+            "native_research_candidate_discovery",
+        ):
+            with self.subTest(lane_id=lane_id):
+                lane = resolve_model_runtime_lane(lane_id)
+
+                self.assertEqual(lane["model_lane_id"], lane_id)
+                self.assertEqual(lane["provider"], "openai")
+                self.assertEqual(lane["resolved_model_id"], "gpt-5.5-high")
+                self.assertEqual(lane["provider_route"], "openai/gpt-5.5-high")
+                self.assertEqual(lane["timeout_seconds"], MODEL_RUNTIME_TIMEOUTS[lane_id])
+                self.assertIn("resolved_model_id", lane["required_artifact_fields"])
+
     def test_fixture_mode_records_runtime_provenance_and_schema_validation(self) -> None:
         result = self._call()
         runtime = result.runtime_call
@@ -62,8 +84,12 @@ class ModelRuntimeContractTest(unittest.TestCase):
     def test_live_transport_retries_once_then_succeeds(self) -> None:
         attempts = {"count": 0}
 
-        def transport(_payload: dict[str, Any]) -> dict[str, Any]:
+        def transport(payload: dict[str, Any]) -> dict[str, Any]:
             attempts["count"] += 1
+            self.assertEqual(payload["schema_version"], MODEL_RUNTIME_TRANSPORT_REQUEST_SCHEMA_VERSION)
+            self.assertEqual(payload["provider_route"], "openai/gpt-5.5-high")
+            self.assertEqual(payload["timeout_seconds"], 180)
+            self.assertEqual(payload["request_payload"], {"question": "Will example happen?"})
             if attempts["count"] == 1:
                 raise TimeoutError("transient")
             return {"ok": True}
@@ -74,6 +100,39 @@ class ModelRuntimeContractTest(unittest.TestCase):
         self.assertEqual(result.runtime_call["retry_count"], 1)
         self.assertEqual(result.runtime_call["execution_status"], "succeeded")
         self.assertIn("transport_retry", result.runtime_call["runtime_reason_codes"])
+
+    def test_live_transport_response_records_token_usage_and_provider_status(self) -> None:
+        lane = resolve_model_runtime_lane("decomposer_qdt_generation")
+
+        def transport(payload: dict[str, Any]) -> dict[str, Any]:
+            self.assertEqual(payload["schema_version"], MODEL_RUNTIME_TRANSPORT_REQUEST_SCHEMA_VERSION)
+            return {
+                "schema_version": MODEL_RUNTIME_TRANSPORT_RESPONSE_SCHEMA_VERSION,
+                "response_payload": {"ok": True},
+                "token_usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+                "provider_status": {"finish_reason": "stop"},
+            }
+
+        result = execute_model_runtime_call_for_lane(
+            lane=lane,
+            prompt_template_id="decomposer-qdt/v1",
+            prompt_template_sha256="sha256:" + "1" * 64,
+            input_manifest_refs=["artifact:case"],
+            output_schema_version="question-decomposition/v1",
+            request_payload={"question": "Will example happen?"},
+            mode="live",
+            transport=transport,
+            output_validator=_validator,
+        )
+        context = model_execution_context_from_runtime_call(
+            {"fallback_reason_codes": ["no_fallback_required"]},
+            result.runtime_call,
+        )
+
+        self.assertEqual(result.response_payload, {"ok": True})
+        self.assertEqual(result.runtime_call["token_usage"]["total_tokens"], 15)
+        self.assertEqual(result.runtime_call["provider_status"]["finish_reason"], "stop")
+        self.assertEqual(context["token_usage"]["total_tokens"], 15)
 
     def test_forbidden_output_fails_closed_before_schema_use(self) -> None:
         with self.assertRaises(ModelRuntimeError) as raised:

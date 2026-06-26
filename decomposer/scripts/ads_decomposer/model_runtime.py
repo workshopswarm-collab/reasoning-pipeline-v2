@@ -12,6 +12,7 @@ import hashlib
 import json
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable
 
 
@@ -27,6 +28,14 @@ MODEL_RUNTIME_TIMEOUTS = {
 DEFAULT_TIMEOUT_SECONDS = 180
 DEFAULT_MAX_TRANSPORT_RETRIES = 1
 DEFAULT_MAX_SCHEMA_REPAIRS = 1
+MODEL_RUNTIME_TRANSPORT_REQUEST_SCHEMA_VERSION = "model-runtime-transport-request/v1"
+MODEL_RUNTIME_TRANSPORT_RESPONSE_SCHEMA_VERSION = "model-runtime-transport-response/v1"
+DEFAULT_MODEL_LANE_POLICY_PATH = (
+    Path(__file__).resolve().parents[3]
+    / "orchestrator"
+    / "plans"
+    / "autonomous-decomposition-swarm-model-lane-policy.json"
+)
 
 FORBIDDEN_OUTPUT_KEY_FRAGMENTS = (
     "probability",
@@ -93,6 +102,87 @@ def stable_id(prefix: str, value: Any, length: int = 24) -> str:
     return f"{prefix}-" + hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()[:length]
 
 
+def _is_non_empty_string(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _string_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item) for item in value if _is_non_empty_string(item)]
+
+
+def _load_model_lane_policy(path: Path | str = DEFAULT_MODEL_LANE_POLICY_PATH) -> dict[str, Any]:
+    try:
+        policy = json.loads(Path(path).read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ModelRuntimeError(f"{path} is not valid JSON") from exc
+    if not isinstance(policy, dict):
+        raise ModelRuntimeError("model lane policy must be an object")
+    if policy.get("artifact_type") != "model_lane_policy":
+        raise ModelRuntimeError("model lane policy artifact_type must be model_lane_policy")
+    if policy.get("schema_version") != "model-lane-policy/v1":
+        raise ModelRuntimeError("model lane policy schema_version must be model-lane-policy/v1")
+    authority = policy.get("authority_boundary")
+    if not isinstance(authority, dict):
+        raise ModelRuntimeError("model lane policy authority_boundary must be an object")
+    for field in (
+        "scae_numeric_aggregation_uses_model",
+        "model_outputs_may_author_probability",
+        "model_outputs_may_override_scae",
+    ):
+        if authority.get(field) is not False:
+            raise ModelRuntimeError(f"authority_boundary.{field} must be false")
+    return policy
+
+
+def resolve_model_runtime_lane(
+    lane_id: str,
+    *,
+    model_lane_policy: dict[str, Any] | None = None,
+    model_lane_policy_path: Path | str = DEFAULT_MODEL_LANE_POLICY_PATH,
+    requested_model_id: str | None = None,
+) -> dict[str, Any]:
+    """Resolve a model-lane policy row into runtime transport metadata."""
+
+    if not _is_non_empty_string(lane_id):
+        raise ModelRuntimeError("lane_id is required")
+    policy = model_lane_policy or _load_model_lane_policy(model_lane_policy_path)
+    lanes = policy.get("lanes")
+    lane = lanes.get(lane_id) if isinstance(lanes, dict) else None
+    if not isinstance(lane, dict):
+        raise ModelRuntimeError(f"missing model lane {lane_id}")
+    provider = str(lane.get("provider") or policy.get("default_provider") or "")
+    if provider != "openai":
+        raise ModelRuntimeError(f"{lane_id} provider must be openai for Phase 1 runtime")
+    default_model_id = str(lane.get("default_model_id") or "")
+    allowed_model_ids = _string_list(lane.get("allowed_model_ids"))
+    if not default_model_id:
+        raise ModelRuntimeError(f"{lane_id} default_model_id is required")
+    if default_model_id not in allowed_model_ids:
+        raise ModelRuntimeError(f"{lane_id} default model must be in allowed_model_ids")
+    requested = requested_model_id.strip() if isinstance(requested_model_id, str) else None
+    if requested and requested not in allowed_model_ids:
+        raise ModelRuntimeError(f"{lane_id} requested model is not allowed")
+    resolved_model_id = requested or default_model_id
+    if lane_id in MODEL_RUNTIME_TIMEOUTS and resolved_model_id != "gpt-5.5-high":
+        raise ModelRuntimeError(f"{lane_id} must resolve to gpt-5.5-high")
+    return {
+        "schema_version": "model-runtime-lane-resolution/v1",
+        "model_lane_id": lane_id,
+        "provider": provider,
+        "resolved_model_id": resolved_model_id,
+        "provider_route": f"{provider}/{resolved_model_id}",
+        "model_policy_ref": str(Path(model_lane_policy_path)),
+        "model_policy_id": policy.get("policy_id"),
+        "default_model_id": default_model_id,
+        "allowed_model_ids": allowed_model_ids,
+        "required_artifact_fields": _string_list(lane.get("required_artifact_fields")),
+        "forbidden_outputs": _string_list(lane.get("forbidden_outputs")),
+        "timeout_seconds": MODEL_RUNTIME_TIMEOUTS.get(lane_id, DEFAULT_TIMEOUT_SECONDS),
+    }
+
+
 def _normalized_field_name(value: Any) -> str:
     normalized = "".join(ch.lower() if ch.isalnum() else "_" for ch in str(value))
     while "__" in normalized:
@@ -131,6 +221,36 @@ def _json_payload(value: Any) -> Any:
     if isinstance(value, str):
         return json.loads(value)
     return copy.deepcopy(value)
+
+
+def _transport_request(runtime_call: dict[str, Any], request_payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "schema_version": MODEL_RUNTIME_TRANSPORT_REQUEST_SCHEMA_VERSION,
+        "runtime_call_id": runtime_call["runtime_call_id"],
+        "model_lane_id": runtime_call["model_lane_id"],
+        "provider": runtime_call["provider"],
+        "resolved_model_id": runtime_call["resolved_model_id"],
+        "provider_route": runtime_call["provider_route"],
+        "prompt_template_id": runtime_call["prompt_template_id"],
+        "prompt_template_sha256": runtime_call["prompt_template_sha256"],
+        "output_schema_version": runtime_call["output_schema_version"],
+        "timeout_seconds": runtime_call["timeout_seconds"],
+        "request_payload": copy.deepcopy(request_payload),
+    }
+
+
+def _unwrap_transport_response(raw: Any) -> tuple[Any, Any, Any]:
+    if (
+        isinstance(raw, dict)
+        and raw.get("schema_version") == MODEL_RUNTIME_TRANSPORT_RESPONSE_SCHEMA_VERSION
+        and "response_payload" in raw
+    ):
+        return (
+            raw.get("response_payload"),
+            copy.deepcopy(raw.get("token_usage")),
+            copy.deepcopy(raw.get("provider_status")),
+        )
+    return raw, None, None
 
 
 def _base_runtime_call(
@@ -256,7 +376,12 @@ def execute_model_runtime_call(
                 runtime_call["runtime_reason_codes"].append("fixture_response_used")
             else:
                 assert transport is not None
-                response = transport(copy.deepcopy(request_payload))
+                raw_response = transport(_transport_request(runtime_call, request_payload))
+                response, token_usage, provider_status = _unwrap_transport_response(raw_response)
+                if token_usage is not None:
+                    runtime_call["token_usage"] = token_usage
+                if provider_status is not None:
+                    runtime_call["provider_status"] = provider_status
                 runtime_call["runtime_reason_codes"].append("live_transport_called")
             response = _json_payload(response)
             break
@@ -311,6 +436,50 @@ def execute_model_runtime_call(
     return ModelRuntimeResult(response_payload=response, runtime_call=runtime_call)
 
 
+def execute_model_runtime_call_for_lane(
+    *,
+    lane: dict[str, Any],
+    prompt_template_id: str,
+    prompt_template_sha256: str,
+    input_manifest_refs: list[str],
+    output_schema_version: str,
+    request_payload: dict[str, Any],
+    mode: str,
+    fixture_response: Any | None = None,
+    transport: Transport | None = None,
+    output_validator: OutputValidator | None = None,
+    repairer: Repairer | None = None,
+    timeout_seconds: int | None = None,
+    max_transport_retries: int = DEFAULT_MAX_TRANSPORT_RETRIES,
+    max_schema_repairs: int = DEFAULT_MAX_SCHEMA_REPAIRS,
+) -> ModelRuntimeResult:
+    """Execute a runtime call from a resolved model-lane policy row."""
+
+    required = ("model_lane_id", "provider", "resolved_model_id", "provider_route")
+    missing = [field for field in required if not _is_non_empty_string(lane.get(field))]
+    if missing:
+        raise ModelRuntimeError("resolved lane missing " + ", ".join(missing))
+    return execute_model_runtime_call(
+        model_lane_id=str(lane["model_lane_id"]),
+        provider=str(lane["provider"]),
+        resolved_model_id=str(lane["resolved_model_id"]),
+        provider_route=str(lane["provider_route"]),
+        prompt_template_id=prompt_template_id,
+        prompt_template_sha256=prompt_template_sha256,
+        input_manifest_refs=input_manifest_refs,
+        output_schema_version=output_schema_version,
+        request_payload=request_payload,
+        mode=mode,
+        fixture_response=fixture_response,
+        transport=transport,
+        output_validator=output_validator,
+        repairer=repairer,
+        timeout_seconds=timeout_seconds if timeout_seconds is not None else int(lane.get("timeout_seconds", DEFAULT_TIMEOUT_SECONDS)),
+        max_transport_retries=max_transport_retries,
+        max_schema_repairs=max_schema_repairs,
+    )
+
+
 def model_execution_context_from_runtime_call(
     base_context: dict[str, Any],
     runtime_call: dict[str, Any],
@@ -335,6 +504,7 @@ def model_execution_context_from_runtime_call(
             "execution_status": runtime_call.get("execution_status"),
             "runtime_reason_codes": list(runtime_call.get("runtime_reason_codes", [])),
             "latency_ms": runtime_call.get("latency_ms"),
+            "token_usage": copy.deepcopy(runtime_call.get("token_usage")),
         }
     )
     context["runtime"] = {
@@ -359,7 +529,9 @@ __all__ = [
     "ModelRuntimeError",
     "ModelRuntimeResult",
     "execute_model_runtime_call",
+    "execute_model_runtime_call_for_lane",
     "model_execution_context_from_runtime_call",
     "prefixed_sha256",
+    "resolve_model_runtime_lane",
     "scan_forbidden_model_outputs",
 ]
