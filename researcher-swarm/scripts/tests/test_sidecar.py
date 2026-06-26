@@ -19,6 +19,7 @@ from researcher_swarm.classification import (  # noqa: E402
     build_researcher_sidecar_v2,
     compute_classification_matrix_digest,
     compute_researcher_sidecar_digest,
+    validate_researcher_sidecar_against_retrieval_packet,
     validate_researcher_sidecar_v2,
 )
 from researcher_swarm.model_context import resolve_researcher_leaf_nli_model_context  # noqa: E402
@@ -206,6 +207,69 @@ class ResearcherSidecarV2Test(unittest.TestCase):
 
         self.assertFalse(result.valid)
         self.assertIn("classification_coverage_missing: leaf-2", "; ".join(result.errors))
+
+    def test_retrieval_aware_validation_rejects_unadmitted_evidence_refs(self) -> None:
+        sidecar = self._sidecar()
+        sidecar["required_question_classifications"][0]["evidence_ref"] = "retrieval-evidence:leaf-1:unadmitted"
+        sidecar["coverage_proofs"][0]["evidence_refs_reviewed"] = ["retrieval-evidence:leaf-1:unadmitted"]
+        self._refresh_digests(sidecar)
+        retrieval_packet = {
+            "leaf_evidence_dockets": [
+                {
+                    "leaf_id": "leaf-1",
+                    "admitted_evidence_refs": [self._evidence_ref("leaf-1")],
+                },
+                {
+                    "leaf_id": "leaf-2",
+                    "admitted_evidence_refs": [self._evidence_ref("leaf-2")],
+                },
+            ],
+            "supplemental_evidence_admission_results": [],
+        }
+
+        base = validate_researcher_sidecar_v2(sidecar, self.qdt)
+        retrieval_aware = validate_researcher_sidecar_against_retrieval_packet(
+            sidecar,
+            self.qdt,
+            retrieval_packet,
+        )
+
+        self.assertTrue(base.valid, base.errors)
+        self.assertFalse(retrieval_aware.valid)
+        self.assertIn("not admitted by retrieval docket", "; ".join(retrieval_aware.errors))
+
+    def test_retrieval_aware_validation_rejects_unadmitted_supplemental_refs(self) -> None:
+        sidecar = self._sidecar()
+        supplemental_ref = "supplemental:leaf-1:proposal"
+        sidecar["required_question_classifications"][0].pop("evidence_ref")
+        sidecar["required_question_classifications"][0]["supplemental_evidence_ref"] = supplemental_ref
+        sidecar["coverage_proofs"][0]["evidence_refs_reviewed"] = [supplemental_ref]
+        sidecar["coverage_proofs"][0]["supplemental_evidence_refs_reviewed"] = [supplemental_ref]
+        self._refresh_digests(sidecar)
+        retrieval_packet = {
+            "leaf_evidence_dockets": [
+                {
+                    "leaf_id": "leaf-1",
+                    "admitted_evidence_refs": [self._evidence_ref("leaf-1")],
+                },
+                {
+                    "leaf_id": "leaf-2",
+                    "admitted_evidence_refs": [self._evidence_ref("leaf-2")],
+                },
+            ],
+            "supplemental_evidence_admission_results": [],
+        }
+
+        base = validate_researcher_sidecar_v2(sidecar, self.qdt)
+        retrieval_aware = validate_researcher_sidecar_against_retrieval_packet(
+            sidecar,
+            self.qdt,
+            retrieval_packet,
+        )
+
+        self.assertTrue(base.valid, base.errors)
+        self.assertFalse(retrieval_aware.valid)
+        self.assertIn("not admitted by retrieval docket", "; ".join(retrieval_aware.errors))
 
     def test_missing_coverage_proof_is_rejected(self) -> None:
         sidecar = self._sidecar()

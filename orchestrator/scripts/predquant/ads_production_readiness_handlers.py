@@ -60,6 +60,7 @@ from ads_decomposer.qdt import (  # noqa: E402
 from researcher_swarm.retrieval import (  # noqa: E402
     RETRIEVAL_PACKET_MANIFEST_ARTIFACT_TYPE,
     RETRIEVAL_PACKET_SCHEMA_VERSION,
+    build_live_retrieval_packet_from_candidates,
     build_retrieval_evidence_item,
     build_retrieval_packet,
     dump_retrieval_packet,
@@ -407,17 +408,17 @@ def _structured_market_metadata_evidence(
     return selected
 
 
-def _live_fixture_direct_evidence(
+def _live_fixture_direct_candidates(
     *,
     qdt: dict[str, Any],
     case_contract: dict[str, Any],
     source_cutoff_timestamp: str,
 ) -> list[dict[str, Any]]:
-    """Build live-shaped fixture evidence without structured metadata certification."""
+    """Build live-shaped browser candidate records for the Phase 3 retrieval executor."""
 
     observed_at = _iso_before_cutoff(source_cutoff_timestamp)
     canonical_url = _market_url(case_contract)
-    selected: list[dict[str, Any]] = []
+    candidates: list[dict[str, Any]] = []
     for leaf in qdt.get("required_leaf_questions", []):
         if not isinstance(leaf, dict) or not leaf.get("leaf_id"):
             continue
@@ -431,35 +432,39 @@ def _live_fixture_direct_evidence(
                 source_family_id = f"source-family:runtime-fixture-official:{leaf_id}"
                 url = canonical_url
                 method = "live_fixture_direct_official_url"
+                navigation_mode = "direct_url"
             else:
                 source_class = "independent_secondary"
                 source_family_id = f"source-family:runtime-fixture-secondary-{idx}:{leaf_id}"
                 url = f"https://evidence-fixture.example/{leaf_id}/{idx}"
                 method = "live_fixture_independent_source"
-            item = build_retrieval_evidence_item(
-                case_id=str(qdt.get("case_id") or case_contract["case_id"]),
-                dispatch_id=str(qdt.get("dispatch_id") or case_contract["dispatch_id"]),
-                leaf_id=leaf_id,
-                parent_branch_id=parent_branch_id,
-                retrieval_transport="browser",
-                transport_attempt_ref=f"browser-fetch:runtime-fixture:{leaf_id}:{idx}",
-                requested_url=url,
-                final_url=url,
-                canonical_url=url,
-                canonical_source_id=f"source:runtime-fixture:{leaf_id}:{idx}",
-                source_family_id=source_family_id,
-                source_class=source_class,
-                independence_status="independent",
-                temporal_gate_status="pass",
-                source_published_at=observed_at,
-                source_observed_at=observed_at,
-                retrieval_score=1.0,
-                admission_status="admitted",
-                admission_reason_codes=["live_fixture_direct_evidence"],
-                claim_family_resolution_refs=[f"claim-family-resolution:runtime-fixture:{leaf_id}:{idx % 3}"],
-                content_sha256="sha256:"
-                + hashlib.sha256(
-                    canonical_json(
+                navigation_mode = "web_search"
+            candidates.append(
+                {
+                    "leaf_id": leaf_id,
+                    "parent_branch_id": parent_branch_id,
+                    "retrieval_transport": "browser",
+                    "navigation_mode": navigation_mode,
+                    "requested_url": url,
+                    "final_url": url,
+                    "canonical_url": url,
+                    "source_family_id": source_family_id,
+                    "source_class": source_class,
+                    "independence_status": "independent",
+                    "temporal_gate_status": "pass",
+                    "source_published_at": observed_at,
+                    "source_observed_at": observed_at,
+                    "captured_at": observed_at,
+                    "retrieval_score": 1.0,
+                    "admission_status": "admitted",
+                    "admission_reason_code": "live_fixture_direct_evidence",
+                    "claim_family_id": f"claim-family:runtime-fixture:{leaf_id}:{idx % 3}",
+                    "deterministic_source_class_proof": True,
+                    "source_class_resolution_method": method,
+                    "source_family_resolution_method": method,
+                    "result_rank": idx + 1,
+                    "direct_url_source_ref": "case_contract.market_url" if idx == 0 else None,
+                    "content": canonical_json(
                         {
                             "leaf_id": leaf_id,
                             "purpose": purpose,
@@ -467,15 +472,10 @@ def _live_fixture_direct_evidence(
                             "source_class": source_class,
                             "question_text": leaf.get("question_text"),
                         }
-                    ).encode("utf-8")
-                ).hexdigest(),
+                    ),
+                }
             )
-            item["deterministic_source_class_proof"] = True
-            item["source_class_resolution_method"] = method
-            item["source_family_resolution_method"] = method
-            item["claim_family_ids"] = [f"claim-family:runtime-fixture:{leaf_id}:{idx % 3}"]
-            selected.append(item)
-    return selected
+    return candidates
 
 
 def _certified_reconciliation_rows(
@@ -1017,10 +1017,28 @@ def build_stage_handlers(
         case_contract = load_manifest_payload(case_manifest)
         source_cutoff = lease["selected_snapshot_observed_at"]
         if live_fixture_retrieval:
-            selected_evidence = _live_fixture_direct_evidence(
+            fetched_candidates = _live_fixture_direct_candidates(
                 qdt=qdt_payload,
                 case_contract=case_contract,
                 source_cutoff_timestamp=source_cutoff,
+            )
+            packet = build_live_retrieval_packet_from_candidates(
+                qdt_payload,
+                evidence_packet=load_manifest_payload(evidence_manifest),
+                amrg_context=load_manifest_payload(related_manifest),
+                fetched_candidates=fetched_candidates,
+                question_decomposition_artifact_id=qdt_manifest["artifact_id"],
+                policy_context_ref=profile_manifest["artifact_id"],
+                forecast_timestamp=_forecast_timestamp(forecast_timestamp, lease),
+                source_cutoff_timestamp=source_cutoff,
+                pre_dispatch_input_whitelist_refs=[
+                    qdt_manifest["artifact_id"],
+                    evidence_manifest["artifact_id"],
+                    profile_manifest["artifact_id"],
+                    related_manifest["artifact_id"],
+                ],
+                live_retrieval_allowlist=["browser", "native_gpt_research", "structured_feed"],
+                live_policy_overlay=live_policy_overlay,
             )
         elif scoreable_pilot:
             selected_evidence = _structured_market_metadata_evidence(
@@ -1028,29 +1046,47 @@ def build_stage_handlers(
                 case_contract=case_contract,
                 source_cutoff_timestamp=source_cutoff,
             )
+            packet = build_retrieval_packet(
+                qdt_payload,
+                evidence_packet=load_manifest_payload(evidence_manifest),
+                amrg_context=load_manifest_payload(related_manifest),
+                question_decomposition_artifact_id=qdt_manifest["artifact_id"],
+                policy_context_ref=profile_manifest["artifact_id"],
+                selected_evidence=selected_evidence,
+                forecast_timestamp=_forecast_timestamp(forecast_timestamp, lease),
+                source_cutoff_timestamp=source_cutoff,
+                pre_dispatch_input_whitelist_refs=[
+                    qdt_manifest["artifact_id"],
+                    evidence_manifest["artifact_id"],
+                    profile_manifest["artifact_id"],
+                    related_manifest["artifact_id"],
+                ],
+                live_retrieval_allowlist=["browser", "native_gpt_research", "structured_feed"],
+                live_policy_overlay=live_policy_overlay,
+            )
+            packet = finalize_retrieval_packet_for_dispatch(packet)
         else:
-            selected_evidence = None
-        packet = build_retrieval_packet(
-            qdt_payload,
-            evidence_packet=load_manifest_payload(evidence_manifest),
-            amrg_context=load_manifest_payload(related_manifest),
-            question_decomposition_artifact_id=qdt_manifest["artifact_id"],
-            policy_context_ref=profile_manifest["artifact_id"],
-            selected_evidence=selected_evidence,
-            forecast_timestamp=_forecast_timestamp(forecast_timestamp, lease),
-            source_cutoff_timestamp=source_cutoff,
-            pre_dispatch_input_whitelist_refs=[
-                qdt_manifest["artifact_id"],
-                evidence_manifest["artifact_id"],
-                profile_manifest["artifact_id"],
-                related_manifest["artifact_id"],
-            ],
-            live_retrieval_allowlist=["browser", "native_gpt_research", "structured_feed"],
-            live_policy_overlay=live_policy_overlay,
-        )
-        packet = finalize_retrieval_packet_for_dispatch(packet)
+            packet = build_retrieval_packet(
+                qdt_payload,
+                evidence_packet=load_manifest_payload(evidence_manifest),
+                amrg_context=load_manifest_payload(related_manifest),
+                question_decomposition_artifact_id=qdt_manifest["artifact_id"],
+                policy_context_ref=profile_manifest["artifact_id"],
+                selected_evidence=None,
+                forecast_timestamp=_forecast_timestamp(forecast_timestamp, lease),
+                source_cutoff_timestamp=source_cutoff,
+                pre_dispatch_input_whitelist_refs=[
+                    qdt_manifest["artifact_id"],
+                    evidence_manifest["artifact_id"],
+                    profile_manifest["artifact_id"],
+                    related_manifest["artifact_id"],
+                ],
+                live_retrieval_allowlist=["browser", "native_gpt_research", "structured_feed"],
+                live_policy_overlay=live_policy_overlay,
+            )
+            packet = finalize_retrieval_packet_for_dispatch(packet)
         if live_fixture_retrieval:
-            packet["adapter_mode"] = "live_fixture_direct_evidence_retrieval"
+            packet["adapter_mode"] = "live_candidate_fixture_retrieval_runtime"
         elif scoreable_pilot:
             packet["adapter_mode"] = "structured_market_metadata_pilot_retrieval"
         else:
@@ -1076,6 +1112,9 @@ def build_stage_handlers(
             reason_codes=[
                 "retrieval_packet_valid",
                 (
+                    "live_candidate_fixture_retrieval_certified"
+                    if live_fixture_retrieval
+                    else
                     "structured_market_metadata_pilot_certified"
                     if scoreable_pilot
                     else "classification_dispatch_blocked_until_certified"

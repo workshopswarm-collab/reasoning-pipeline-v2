@@ -322,6 +322,11 @@ def _iso_or_none(value: Any) -> str | None:
     return parsed.isoformat().replace("+00:00", "Z")
 
 
+def _iso_before_cutoff(value: Any) -> str:
+    parsed = _parse_timestamp(value) or datetime(1970, 1, 1, tzinfo=timezone.utc)
+    return (parsed - timedelta(seconds=1)).isoformat().replace("+00:00", "Z")
+
+
 def _first_non_empty(*values: Any) -> str:
     for value in values:
         if _is_non_empty_string(value):
@@ -3956,6 +3961,377 @@ def finalize_retrieval_packet_for_dispatch(
     if not result.valid:
         raise RetrievalPacketError("; ".join(result.errors))
     return packet_copy
+
+
+def _candidate_navigation_sort_key(candidate: dict[str, Any]) -> tuple[int, int, str]:
+    mode = str(candidate.get("navigation_mode") or "")
+    status = str(candidate.get("candidate_role") or "")
+    priority = 0 if mode == "direct_url" or status == "direct_url" else 1
+    rank = int(candidate.get("result_rank", 0) or 0)
+    return (priority, rank, str(candidate.get("canonical_url") or candidate.get("url") or ""))
+
+
+def _candidate_query_variant(context: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
+    requested = str(candidate.get("query_variant_id") or "")
+    variants = context.get("query_variants") if isinstance(context.get("query_variants"), list) else []
+    for variant in variants:
+        if isinstance(variant, dict) and variant.get("query_variant_id") == requested:
+            return variant
+    if variants:
+        return variants[0]
+    raise RetrievalPacketError(f"leaf {context.get('leaf_id')} has no query variants")
+
+
+def _candidate_text(candidate: dict[str, Any]) -> str:
+    return _bounded_excerpt(
+        candidate.get("content")
+        or candidate.get("extracted_text")
+        or candidate.get("rendered_text")
+        or candidate.get("snippet")
+        or candidate.get("title")
+        or candidate.get("canonical_url")
+        or candidate.get("url")
+        or "",
+        max_chars=1200,
+    )
+
+
+def _materialize_candidate_evidence(
+    *,
+    qdt: dict[str, Any],
+    context: dict[str, Any],
+    candidate: dict[str, Any],
+    attempt: dict[str, Any],
+    source_cutoff_timestamp: str,
+    evidence_source: str,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    leaf_id = str(context["leaf_id"])
+    text = _candidate_text(candidate)
+    content_artifact_ref = candidate.get("content_artifact_ref") or _sha_id(
+        "browser-content",
+        {
+            "leaf_id": leaf_id,
+            "attempt_id": attempt["attempt_id"],
+            "canonical_url": attempt.get("canonical_url"),
+            "text": text,
+        },
+    )
+    source_class = str(candidate.get("source_class") or "unknown")
+    if source_class not in ALLOWED_SOURCE_CLASSES:
+        source_class = "unknown"
+    source_family_id = str(candidate.get("source_family_id") or f"source-family:{_registrable_domain(attempt.get('canonical_url', '')) or leaf_id}")
+    claim_family_id = str(
+        candidate.get("claim_family_id")
+        or candidate.get("claim_family_resolution_ref")
+        or f"claim-family:{leaf_id}:{_hash_suffix(attempt.get('canonical_url') or attempt['attempt_id'], 16)}"
+    )
+    evidence = build_retrieval_evidence_item(
+        case_id=str(qdt.get("case_id") or context.get("case_id")),
+        dispatch_id=str(qdt.get("dispatch_id") or context.get("dispatch_id")),
+        leaf_id=leaf_id,
+        parent_branch_id=str(context.get("parent_branch_id") or candidate.get("parent_branch_id") or "branch-runtime"),
+        retrieval_transport=str(candidate.get("retrieval_transport") or "browser"),
+        transport_attempt_ref=str(candidate.get("transport_attempt_ref") or attempt["attempt_id"]),
+        requested_url=str(attempt.get("requested_url") or candidate.get("requested_url") or candidate.get("url") or ""),
+        final_url=str(attempt.get("final_url") or candidate.get("final_url") or candidate.get("url") or ""),
+        canonical_url=str(attempt.get("canonical_url") or candidate.get("canonical_url") or candidate.get("url") or ""),
+        canonical_source_id=str(candidate.get("canonical_source_id") or f"source:{source_family_id}"),
+        source_family_id=source_family_id,
+        source_class=source_class,
+        independence_status=str(candidate.get("independence_status") or "independent"),
+        temporal_gate_status=str(candidate.get("temporal_gate_status") or "pass"),
+        source_published_at=str(candidate.get("source_published_at") or candidate.get("published_at") or _iso_before_cutoff(source_cutoff_timestamp)),
+        source_updated_at=candidate.get("source_updated_at"),
+        source_observed_at=candidate.get("source_observed_at") or candidate.get("captured_at"),
+        captured_at=candidate.get("captured_at") or _iso_before_cutoff(source_cutoff_timestamp),
+        artifact_generated_at=candidate.get("artifact_generated_at") or _iso_before_cutoff(source_cutoff_timestamp),
+        retrieval_capture_for_dispatch=True,
+        content_sha256=candidate.get("content_sha256"),
+        retrieval_score=float(candidate.get("retrieval_score", 1.0) or 1.0),
+        admission_reason_codes=[
+            str(candidate.get("admission_reason_code") or evidence_source),
+            "deterministic_retrieval_admission",
+        ],
+        claim_family_resolution_refs=[claim_family_id],
+    )
+    evidence["deterministic_source_class_proof"] = bool(candidate.get("deterministic_source_class_proof", True))
+    evidence["source_class_resolution_method"] = str(
+        candidate.get("source_class_resolution_method") or "deterministic_live_retrieval_fixture"
+    )
+    evidence["source_family_resolution_method"] = str(
+        candidate.get("source_family_resolution_method") or "deterministic_live_retrieval_fixture"
+    )
+    evidence["claim_family_ids"] = [claim_family_id]
+    chunk = build_evidence_chunk(
+        evidence_ref=evidence["evidence_ref"],
+        content_artifact_ref=str(content_artifact_ref),
+        chunk_index=0,
+        char_start=0,
+        char_end=len(text),
+        text=text,
+    )
+    span = build_evidence_span(
+        chunk_ref=chunk["chunk_ref"],
+        char_start=0,
+        char_end=min(len(text), max(1, len(text))),
+        text=text,
+    )
+    evidence["chunk_refs"] = [chunk["chunk_ref"]]
+    return evidence, chunk, span
+
+
+def _compact_supplemental_admission_result(record: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "artifact_type": "supplemental_evidence_admission_result",
+        "schema_version": "supplemental-evidence-admission-result/v1",
+        "admission_result_ref": record.get("normalization_id"),
+        "normalized_supplemental_evidence_ref": record.get("normalization_id"),
+        "supplemental_evidence_ref": record.get("supplemental_evidence_ref"),
+        "case_id": record.get("case_id"),
+        "dispatch_id": record.get("dispatch_id"),
+        "leaf_id": record.get("leaf_id"),
+        "normalization_status": record.get("normalization_status"),
+        "admission_status": record.get("admission_status"),
+        "source_access_status": record.get("source_access_status"),
+        "canonical_url": record.get("canonical_url"),
+        "source_class": record.get("source_class"),
+        "source_family_id": record.get("source_family_id"),
+        "claim_family_id": record.get("claim_family_id"),
+        "temporal_gate_status": record.get("temporal_gate_status"),
+        "independence_status": record.get("independence_status"),
+        "counts_toward_breadth": bool(record.get("counts_toward_breadth")),
+        "blockers": list(record.get("blockers") or []),
+        "rejection_reason_codes": list(record.get("rejection_reason_codes") or []),
+        "admission_authority": "deterministic_supplemental_evidence_normalizer",
+    }
+
+
+def build_live_retrieval_packet_from_candidates(
+    qdt: dict[str, Any],
+    *,
+    evidence_packet: dict[str, Any] | None = None,
+    amrg_context: dict[str, Any] | None = None,
+    fetched_candidates: list[dict[str, Any]] | None = None,
+    supplemental_candidates: list[dict[str, Any]] | None = None,
+    question_decomposition_artifact_id: str | None = None,
+    policy_context_ref: str | None = None,
+    forecast_timestamp: str | None = None,
+    source_cutoff_timestamp: str | None = None,
+    pre_dispatch_input_whitelist_refs: list[str] | None = None,
+    live_retrieval_allowlist: list[str] | None = None,
+    live_policy_overlay: bool = True,
+    finalize_for_dispatch: bool = True,
+) -> dict[str, Any]:
+    """Materialize live-shaped browser/supplemental candidates through deterministic retrieval validators."""
+
+    _ensure_no_forbidden_keys(qdt, "qdt")
+    forecast, cutoff = _timestamps_from_inputs(qdt, evidence_packet, forecast_timestamp, source_cutoff_timestamp)
+    contexts = build_retrieval_query_contexts(
+        qdt,
+        evidence_packet=evidence_packet,
+        amrg_context=amrg_context,
+        forecast_timestamp=forecast,
+        source_cutoff_timestamp=cutoff,
+    )
+    contexts_by_leaf = {str(context["leaf_id"]): context for context in contexts}
+    selected: list[dict[str, Any]] = []
+    omitted: list[dict[str, Any]] = []
+    browser_attempts: list[dict[str, Any]] = []
+    chunks: list[dict[str, Any]] = []
+    spans: list[dict[str, Any]] = []
+    attempt_refs_by_leaf: dict[str, list[str]] = {leaf_id: [] for leaf_id in contexts_by_leaf}
+
+    for candidate in sorted(fetched_candidates or [], key=_candidate_navigation_sort_key):
+        if not isinstance(candidate, dict):
+            raise RetrievalPacketError("fetched_candidates must contain objects")
+        leaf_id = str(candidate.get("leaf_id") or "")
+        context = contexts_by_leaf.get(leaf_id)
+        if not context:
+            raise RetrievalPacketError(f"candidate leaf_id is not dispatchable: {leaf_id}")
+        variant = _candidate_query_variant(context, candidate)
+        requested_url = str(candidate.get("requested_url") or candidate.get("url") or candidate.get("canonical_url") or "")
+        final_url = str(candidate.get("final_url") or requested_url)
+        canonical_url = canonicalize_source_url(candidate.get("canonical_url"), final_url, requested_url)
+        navigation_mode = str(candidate.get("navigation_mode") or ("direct_url" if candidate.get("direct_url") else "web_search"))
+        extraction_status = str(candidate.get("extraction_status") or "accepted")
+        attempt = build_browser_retrieval_attempt(
+            context,
+            variant,
+            navigation_mode=navigation_mode,
+            requested_url=requested_url,
+            final_url=final_url,
+            canonical_url=canonical_url,
+            captured_at=candidate.get("captured_at") or _iso_before_cutoff(cutoff),
+            extraction_status=extraction_status,
+            result_rank=int(candidate.get("result_rank", len(attempt_refs_by_leaf[leaf_id]) + 1) or 0),
+        )
+        attempt["provider_availability_status"] = "available"
+        attempt["normalized_domain"] = _registrable_domain(canonical_url)
+        attempt["direct_url_source_ref"] = candidate.get("direct_url_source_ref")
+        browser_attempts.append(attempt)
+        attempt_refs_by_leaf[leaf_id].append(attempt["attempt_id"])
+        if extraction_status == "accepted" and candidate.get("admission_status", "admitted") == "admitted":
+            evidence, chunk, span = _materialize_candidate_evidence(
+                qdt=qdt,
+                context=context,
+                candidate={**candidate, "canonical_url": canonical_url},
+                attempt=attempt,
+                source_cutoff_timestamp=cutoff,
+                evidence_source="live_retrieval_candidate_admitted",
+            )
+            selected.append(evidence)
+            chunks.append(chunk)
+            spans.append(span)
+        else:
+            omitted.append(
+                build_retrieval_candidate_record(
+                    leaf_id=leaf_id,
+                    query_context_ref=str(context["query_context_ref"]),
+                    query_variant_id=str(variant["query_variant_id"]),
+                    retrieval_transport=str(candidate.get("retrieval_transport") or "browser"),
+                    transport_attempt_ref=attempt["attempt_id"],
+                    candidate_status=str(candidate.get("candidate_status") or "rejected"),
+                    requested_url=requested_url,
+                    canonical_url=canonical_url,
+                    omission_reason_codes=list(candidate.get("omission_reason_codes") or [f"extraction_{extraction_status}"]),
+                    temporal_gate_status=str(candidate.get("temporal_gate_status") or "unknown_not_counted"),
+                )
+            )
+
+    supplemental_records: list[dict[str, Any]] = []
+    if supplemental_candidates:
+        from .supplemental import normalize_supplemental_evidence, validate_normalized_supplemental_evidence
+
+        seen_source_family_ids = {
+            str(item.get("source_family_id"))
+            for item in selected
+            if _is_non_empty_string(item.get("source_family_id")) and item.get("source_family_id") != "source-family-unknown"
+        }
+        seen_claim_family_ids = {
+            str(claim_id)
+            for item in selected
+            for claim_id in item.get("claim_family_ids", [])
+            if _is_non_empty_string(claim_id)
+        }
+        dispatch_context = {
+            "case_id": qdt.get("case_id"),
+            "dispatch_id": qdt.get("dispatch_id"),
+            "forecast_timestamp": forecast,
+            "source_cutoff_timestamp": cutoff,
+            "live_retrieval_allowlist": list(live_retrieval_allowlist or sorted(DEFAULT_LIVE_RETRIEVAL_TRANSPORT_ALLOWLIST)),
+            "pre_dispatch_input_whitelist_refs": list(pre_dispatch_input_whitelist_refs or []),
+        }
+        for raw in supplemental_candidates:
+            if not isinstance(raw, dict):
+                raise RetrievalPacketError("supplemental_candidates must contain objects")
+            leaf_id = str(raw.get("leaf_id") or "")
+            context = contexts_by_leaf.get(leaf_id)
+            if not context:
+                raise RetrievalPacketError(f"supplemental candidate leaf_id is not dispatchable: {leaf_id}")
+            enriched = {
+                **raw,
+                "case_id": raw.get("case_id") or qdt.get("case_id"),
+                "dispatch_id": raw.get("dispatch_id") or qdt.get("dispatch_id"),
+                "parent_branch_id": raw.get("parent_branch_id") or context.get("parent_branch_id"),
+            }
+            record = normalize_supplemental_evidence(
+                enriched,
+                dispatch_context,
+                seen_source_family_ids=seen_source_family_ids,
+                seen_claim_family_ids=seen_claim_family_ids,
+            )
+            validation = validate_normalized_supplemental_evidence(record)
+            if not validation.valid:
+                raise RetrievalPacketError("; ".join(validation.errors))
+            supplemental_records.append(_compact_supplemental_admission_result(record))
+            if record.get("normalization_status") == "normalized":
+                if _is_non_empty_string(record.get("source_family_id")):
+                    seen_source_family_ids.add(str(record["source_family_id"]))
+                if _is_non_empty_string(record.get("claim_family_id")):
+                    seen_claim_family_ids.add(str(record["claim_family_id"]))
+                evidence, chunk, span = _materialize_candidate_evidence(
+                    qdt=qdt,
+                    context=context,
+                    candidate={
+                        **record,
+                        "url": record.get("canonical_url"),
+                        "source_published_at": record.get("source_published_at"),
+                        "admission_reason_code": "supplemental_evidence_admitted_after_validation",
+                        "source_class_resolution_method": record.get("source_class_resolution_method"),
+                        "source_family_resolution_method": record.get("source_family_resolution_method"),
+                    },
+                    attempt={
+                        "attempt_id": str(record["supplemental_evidence_ref"]),
+                        "requested_url": record.get("requested_url"),
+                        "final_url": record.get("final_url"),
+                        "canonical_url": record.get("canonical_url"),
+                    },
+                    source_cutoff_timestamp=cutoff,
+                    evidence_source="supplemental_evidence_admitted_after_validation",
+                )
+                selected.append(evidence)
+                chunks.append(chunk)
+                spans.append(span)
+
+    packet = build_retrieval_packet(
+        qdt,
+        evidence_packet=evidence_packet,
+        amrg_context=amrg_context,
+        question_decomposition_artifact_id=question_decomposition_artifact_id,
+        policy_context_ref=policy_context_ref,
+        selected_evidence=selected,
+        omitted_candidates=omitted,
+        forecast_timestamp=forecast,
+        source_cutoff_timestamp=cutoff,
+        pre_dispatch_input_whitelist_refs=pre_dispatch_input_whitelist_refs,
+        live_retrieval_allowlist=live_retrieval_allowlist,
+        live_policy_overlay=live_policy_overlay,
+    )
+    packet["browser_retrieval_attempts"] = browser_attempts
+    packet["browser_search_provider_diagnostics"] = [
+        build_browser_search_provider_diagnostic(
+            availability_status="available" if browser_attempts else "unavailable",
+            checked_at=forecast,
+            unavailable_reason=None if browser_attempts else "no_browser_candidates_supplied",
+        )
+    ]
+    packet["evidence_chunks"] = chunks
+    packet["evidence_spans"] = spans
+    packet["supplemental_evidence_candidates"] = copy.deepcopy(supplemental_candidates or [])
+    packet["supplemental_evidence_admission_results"] = supplemental_records
+    packet["retrieval_runtime_summary"] = {
+        "schema_version": "retrieval-runtime-summary/v1",
+        "runtime_mode": "live_candidate_fixture",
+        "direct_url_attempt_count": sum(1 for item in browser_attempts if item.get("navigation_mode") == "direct_url"),
+        "web_search_attempt_count": sum(1 for item in browser_attempts if item.get("navigation_mode") == "web_search"),
+        "admitted_initial_evidence_count": len(selected) - sum(
+            1 for item in supplemental_records if item.get("normalization_status") == "normalized"
+        ),
+        "admitted_supplemental_evidence_count": sum(
+            1 for item in supplemental_records if item.get("normalization_status") == "normalized"
+        ),
+        "omitted_or_rejected_candidate_count": len(omitted),
+        "web_fetch_is_url_fetch_not_search": True,
+        "deterministic_admission_authority": "retrieval_source_claim_temporal_breadth_validators",
+    }
+    packet.setdefault("schema_feature_gates", {})["RET-001"] = "implemented"
+    packet.setdefault("schema_feature_gates", {})["RET-004"] = "implemented"
+    packet.setdefault("schema_feature_gates", {})["RET-008"] = "pending"
+    packet.setdefault("validation_summary", {}).setdefault("reason_codes", []).append(
+        "phase_3_live_retrieval_runtime_candidates_materialized"
+    )
+    for result in packet["leaf_retrieval_results"]:
+        result["browser_retrieval_attempt_refs"] = attempt_refs_by_leaf.get(str(result.get("leaf_id")), [])
+        result["evidence_chunk_refs"] = [
+            chunk for item in result.get("selected_evidence", []) for chunk in item.get("chunk_refs", [])
+        ]
+        result["result_status"] = "live_retrieval_runtime_materialized"
+    if not finalize_for_dispatch:
+        validation = validate_retrieval_packet(packet)
+        if not validation.valid:
+            raise RetrievalPacketError("; ".join(validation.errors))
+        return packet
+    return finalize_retrieval_packet_for_dispatch(packet)
 
 
 def attach_native_research_transport_diagnostics(

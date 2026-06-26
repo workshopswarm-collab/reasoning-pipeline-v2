@@ -289,9 +289,18 @@ class AdsOperationalCanaryTest(unittest.TestCase):
                 LIMIT 1
                 """
             ).fetchone()
+            retrieval_row = conn.execute(
+                """
+                SELECT artifact_id, artifact_path, input_manifest_ids
+                FROM case_artifact_manifest
+                WHERE artifact_type = 'retrieval-packet'
+                ORDER BY id DESC
+                LIMIT 1
+                """
+            ).fetchone()
             barrier_row = conn.execute(
                 """
-                SELECT artifact_id, artifact_path
+                SELECT artifact_id, artifact_path, input_manifest_ids
                 FROM case_artifact_manifest
                 WHERE artifact_type = 'leaf-research-barrier'
                 ORDER BY id DESC
@@ -308,11 +317,14 @@ class AdsOperationalCanaryTest(unittest.TestCase):
 
         self.assertIsNotNone(qdt_row)
         self.assertIsNotNone(runtime_row)
+        self.assertIsNotNone(retrieval_row)
         self.assertIsNotNone(barrier_row)
         qdt = json.loads(Path(qdt_row["artifact_path"]).read_text(encoding="utf-8"))
         runtime = json.loads(Path(runtime_row["artifact_path"]).read_text(encoding="utf-8"))
+        retrieval = json.loads(Path(retrieval_row["artifact_path"]).read_text(encoding="utf-8"))
         barrier_payload = json.loads(Path(barrier_row["artifact_path"]).read_text(encoding="utf-8"))
         qdt_input_manifest_ids = set(json.loads(qdt_row["input_manifest_ids"]))
+        barrier_input_manifest_ids = set(json.loads(barrier_row["input_manifest_ids"]))
 
         leaf_ids = {leaf["leaf_id"] for leaf in qdt["required_leaf_questions"]}
         self.assertFalse(
@@ -323,6 +335,12 @@ class AdsOperationalCanaryTest(unittest.TestCase):
         self.assertIn(runtime_row["artifact_id"], qdt_input_manifest_ids)
         self.assertEqual(runtime["resolved_model_id"], "gpt-5.5-high")
         self.assertEqual(runtime["execution_status"], "succeeded")
+        self.assertEqual(retrieval["adapter_mode"], "live_candidate_fixture_retrieval_runtime")
+        self.assertEqual(retrieval["retrieval_runtime_summary"]["runtime_mode"], "live_candidate_fixture")
+        self.assertTrue(retrieval["leaf_evidence_dockets"])
+        self.assertTrue(retrieval["browser_retrieval_attempts"])
+        self.assertTrue(all(docket["admitted_evidence_refs"] for docket in retrieval["leaf_evidence_dockets"]))
+        self.assertIn(retrieval_row["artifact_id"], barrier_input_manifest_ids)
         self.assertEqual(barrier_payload["classification_status"], "blocked_leaf_research_barrier")
         self.assertEqual(barrier_payload["reason_codes"], ["missing_leaf_subagent_result"])
         self.assertFalse(barrier_payload["leaf_research_barrier"]["proceed_to_verification_scae"])

@@ -40,6 +40,7 @@ from researcher_swarm.retrieval import (  # noqa: E402
     build_compact_source_candidate_packet,
     build_evidence_chunk,
     build_evidence_span,
+    build_live_retrieval_packet_from_candidates,
     build_native_research_attempt,
     build_retrieval_candidate_record,
     build_retrieval_evidence_item,
@@ -164,6 +165,43 @@ class RetrievalPacketContractTest(unittest.TestCase):
             question_decomposition_artifact_id="artifact:qdt-1",
             policy_context_ref="artifact:profile-1",
         )
+
+    def _live_candidate(self, context: dict, index: int, *, direct: bool = False, official: bool = False) -> dict:
+        leaf_id = context["leaf_id"]
+        source_class = "official_or_primary" if official else "independent_secondary"
+        url = (
+            f"https://example.com/official/{leaf_id}"
+            if direct
+            else f"https://independent{index}.example/{leaf_id}"
+        )
+        return {
+            "leaf_id": leaf_id,
+            "parent_branch_id": context["parent_branch_id"],
+            "navigation_mode": "direct_url" if direct else "web_search",
+            "requested_url": url,
+            "final_url": url,
+            "canonical_url": url,
+            "source_class": source_class,
+            "source_family_id": f"source-family-live-{leaf_id}-{index}",
+            "claim_family_id": f"claim-family-live-{leaf_id}-{index % 3}",
+            "source_published_at": "2026-06-24T11:30:00+00:00",
+            "captured_at": "2026-06-24T11:59:00+00:00",
+            "deterministic_source_class_proof": official,
+            "source_class_resolution_method": "manual_fixture" if official else "deterministic_url_registry",
+            "source_family_resolution_method": "deterministic_url_registry",
+            "result_rank": index + 1,
+            "content": f"Live-shaped candidate {index} for {leaf_id}",
+        }
+
+    def _live_candidates_for_context(self, context: dict, *, include_direct: bool = True, count: int = 5) -> list[dict]:
+        candidates = []
+        start = 0
+        if include_direct:
+            candidates.append(self._live_candidate(context, 0, direct=True, official=True))
+            start = 1
+        for index in range(start, count):
+            candidates.append(self._live_candidate(context, index))
+        return candidates
 
     def test_query_contexts_cover_every_leaf_with_sufficiency_and_breadth_targets(self) -> None:
         contexts = build_retrieval_query_contexts(self.qdt, evidence_packet=self.evidence_packet)
@@ -1254,6 +1292,106 @@ class RetrievalPacketContractTest(unittest.TestCase):
         self.assertEqual(finalized["research_sufficiency_summary"]["classification_dispatch_status"], "allowed")
         self.assertEqual(len(assignments), len(self.qdt["required_leaf_questions"]))
         self.assertTrue(all(assignment["assigned_evidence_refs"] for assignment in assignments))
+
+    def test_phase3_live_fixture_without_direct_sources_blocks_before_classification(self) -> None:
+        qdt = copy.deepcopy(self.qdt)
+        qdt["required_leaf_questions"] = [qdt["required_leaf_questions"][0]]
+        context = build_retrieval_query_contexts(qdt, evidence_packet=self.evidence_packet)[0]
+        candidates = self._live_candidates_for_context(context, include_direct=False, count=5)
+
+        packet = build_live_retrieval_packet_from_candidates(
+            qdt,
+            evidence_packet=self.evidence_packet,
+            fetched_candidates=candidates,
+            question_decomposition_artifact_id="artifact:qdt-1",
+            policy_context_ref="artifact:profile-1",
+        )
+
+        self.assertEqual(
+            packet["research_sufficiency_summary"]["classification_dispatch_status"],
+            "blocked_insufficient_research",
+        )
+        self.assertFalse(packet["leaf_evidence_dockets"][0]["proceed_to_classification"])
+        self.assertIn(
+            "protected_primary_missing",
+            packet["leaf_research_sufficiency_certificates"][0]["unsatisfied_requirement_codes"],
+        )
+
+    def test_phase3_live_fixture_with_sufficient_direct_evidence_dispatches_admitted_refs(self) -> None:
+        contexts = build_retrieval_query_contexts(self.qdt, evidence_packet=self.evidence_packet)
+        candidates = [
+            candidate
+            for context in contexts
+            for candidate in self._live_candidates_for_context(context, include_direct=True, count=5)
+        ]
+
+        packet = build_live_retrieval_packet_from_candidates(
+            self.qdt,
+            evidence_packet=self.evidence_packet,
+            fetched_candidates=candidates,
+            question_decomposition_artifact_id="artifact:qdt-1",
+            policy_context_ref="artifact:profile-1",
+        )
+        assignments = build_leaf_research_assignments(qdt=self.qdt, retrieval_packet=packet)
+
+        self.assertEqual(packet["retrieval_runtime_summary"]["runtime_mode"], "live_candidate_fixture")
+        self.assertGreater(packet["retrieval_runtime_summary"]["direct_url_attempt_count"], 0)
+        self.assertEqual(packet["research_sufficiency_summary"]["classification_dispatch_status"], "allowed")
+        self.assertTrue(packet["leaf_evidence_dockets"])
+        self.assertTrue(all(docket["admitted_evidence_refs"] for docket in packet["leaf_evidence_dockets"]))
+        self.assertTrue(all(result["browser_retrieval_attempt_refs"] for result in packet["leaf_retrieval_results"]))
+        self.assertTrue(all(result["evidence_chunk_refs"] for result in packet["leaf_retrieval_results"]))
+        self.assertEqual(len(assignments), len(self.qdt["required_leaf_questions"]))
+        self.assertTrue(all(assignment["assigned_evidence_refs"] for assignment in assignments))
+
+    def test_phase3_supplemental_source_counts_only_after_deterministic_admission(self) -> None:
+        qdt = copy.deepcopy(self.qdt)
+        qdt["required_leaf_questions"] = [qdt["required_leaf_questions"][0]]
+        context = build_retrieval_query_contexts(qdt, evidence_packet=self.evidence_packet)[0]
+        initial = self._live_candidates_for_context(context, include_direct=False, count=4)
+        supplemental_ref = f"supplemental:{context['leaf_id']}:official"
+        supplemental = {
+            "supplemental_evidence_ref": supplemental_ref,
+            "leaf_id": context["leaf_id"],
+            "parent_branch_id": context["parent_branch_id"],
+            "retrieval_transport": "browser",
+            "fetch_status": "metadata_fixture",
+            "url": "https://example.com/official/supplemental",
+            "canonical_url": "https://example.com/official/supplemental",
+            "source_class": "official_or_primary",
+            "source_class_resolution_method": "manual_fixture",
+            "deterministic_source_class_proof": True,
+            "source_family_id": "source-family-live-supplemental-official",
+            "source_family_resolution_method": "deterministic_url_registry",
+            "claim_family_id": "claim-family-live-supplemental-official",
+            "source_published_at": "2026-06-24T11:45:00+00:00",
+            "content": "Supplemental official source admitted after deterministic validation",
+        }
+
+        packet = build_live_retrieval_packet_from_candidates(
+            qdt,
+            evidence_packet=self.evidence_packet,
+            fetched_candidates=initial,
+            supplemental_candidates=[supplemental],
+            question_decomposition_artifact_id="artifact:qdt-1",
+            policy_context_ref="artifact:profile-1",
+        )
+
+        self.assertEqual(
+            packet["research_sufficiency_summary"]["classification_dispatch_status"],
+            "allowed",
+        )
+        self.assertEqual(packet["supplemental_evidence_admission_results"][0]["normalization_status"], "normalized")
+        self.assertEqual(packet["supplemental_evidence_admission_results"][0]["admission_status"], "admitted")
+        self.assertEqual(packet["leaf_evidence_dockets"][0]["supplemental_candidate_refs"], [supplemental_ref])
+        self.assertTrue(packet["leaf_evidence_dockets"][0]["supplemental_admission_result_refs"])
+        admitted_reasons = [
+            reason
+            for result in packet["leaf_retrieval_results"]
+            for evidence in result["selected_evidence"]
+            for reason in evidence["admission_reason_codes"]
+        ]
+        self.assertIn("supplemental_evidence_admitted_after_validation", admitted_reasons)
 
     def test_ret_008_missing_certificate_rejects_allowed_dispatch_status(self) -> None:
         packet = self._certifiable_packet()

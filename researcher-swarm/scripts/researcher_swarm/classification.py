@@ -1175,3 +1175,64 @@ def validate_sidecar_v2(sidecar: Any, qdt: Any) -> ResearcherSidecarValidationRe
     """Compatibility alias matching the Session 4 plan pseudocode."""
 
     return validate_researcher_sidecar_v2(sidecar, qdt)
+
+
+def validate_researcher_sidecar_against_retrieval_packet(
+    sidecar: Any,
+    qdt: Any,
+    retrieval_packet: Any,
+) -> ResearcherSidecarValidationResult:
+    """Validate that sidecar classifications cite only retrieval-admitted evidence."""
+
+    base = validate_researcher_sidecar_v2(sidecar, qdt)
+    errors = list(base.errors)
+    if not isinstance(sidecar, dict):
+        return ResearcherSidecarValidationResult(False, tuple(errors or ["sidecar must be an object"]))
+    if not isinstance(retrieval_packet, dict):
+        errors.append("retrieval_packet must be an object")
+        return ResearcherSidecarValidationResult(False, tuple(errors))
+
+    admitted_by_leaf: dict[str, set[str]] = {}
+    for docket in retrieval_packet.get("leaf_evidence_dockets", []):
+        if not isinstance(docket, dict) or not _is_non_empty_string(docket.get("leaf_id")):
+            continue
+        refs = _string_refs_from(docket, "admitted_evidence_refs")
+        admitted_by_leaf.setdefault(str(docket["leaf_id"]), set()).update(refs)
+
+    admitted_supplemental_by_leaf: dict[str, set[str]] = {}
+    for record in retrieval_packet.get("supplemental_evidence_admission_results", []):
+        if not isinstance(record, dict) or record.get("normalization_status") != "normalized":
+            continue
+        leaf_id = str(record.get("leaf_id") or "")
+        if not leaf_id:
+            continue
+        ref = record.get("supplemental_evidence_ref")
+        if _is_non_empty_string(ref):
+            admitted_supplemental_by_leaf.setdefault(leaf_id, set()).add(str(ref))
+
+    for idx, classification in enumerate(sidecar.get("required_question_classifications", [])):
+        if not isinstance(classification, dict):
+            continue
+        leaf_id = str(classification.get("leaf_id") or "")
+        admitted_refs = admitted_by_leaf.get(leaf_id, set())
+        admitted_supplemental_refs = admitted_supplemental_by_leaf.get(leaf_id, set())
+        proposed_supplemental_refs = set(
+            _string_refs_from(
+                classification,
+                "proposed_supplemental_evidence_refs",
+                "candidate_supplemental_evidence_refs",
+            )
+        )
+        for ref in _classification_evidence_refs(classification):
+            if ref in admitted_refs or ref in admitted_supplemental_refs:
+                continue
+            if ref in proposed_supplemental_refs:
+                errors.append(
+                    f"required_question_classifications[{idx}] cites proposed supplemental evidence before admission: {ref}"
+                )
+            else:
+                errors.append(
+                    f"required_question_classifications[{idx}] cites evidence not admitted by retrieval docket: {ref}"
+                )
+
+    return ResearcherSidecarValidationResult(not errors, tuple(errors), base.warnings)
