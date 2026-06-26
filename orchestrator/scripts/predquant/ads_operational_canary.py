@@ -1,4 +1,4 @@
-"""Bounded ADS one-case operational canary harness."""
+"""Bounded ADS operational canary harness."""
 
 from __future__ import annotations
 
@@ -9,18 +9,20 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from predquant.ads_case_selector import CASE_LEASE_TABLE, CaseSelectionPolicy
+from predquant.ads_case_selector import CASE_LEASE_TABLE, CaseSelectionPolicy, select_eligible_case
 from predquant.ads_pipeline_control import set_pipeline_enabled
 from predquant.ads_pipeline_runner import (
     ADS_PIPELINE_STAGE_ORDER,
     PIPELINE_RUN_TABLE,
     RUNNER_MODES,
+    TERMINAL_REASON_AUTO005_MAX_CASES,
     TERMINAL_REASON_STOP_AFTER_CURRENT,
     PipelineRunnerContractError,
     PipelineRunnerPolicy,
     ensure_pipeline_runner_schema,
     run_ads_pipeline_loop,
     validate_auto003_policy,
+    validate_auto005_policy,
 )
 
 DEFAULT_PROTECTED_TABLES = (
@@ -35,6 +37,7 @@ class OperationalCanaryConfig:
     db_path: Path
     runner_mode: str = "fixture"
     forecast_timestamp: str | None = None
+    max_cases: int = 1
     lease_duration_seconds: int = 900
     retry_backoff_seconds: int = 60
     updated_by: str = "manual"
@@ -98,22 +101,32 @@ def validate_preflight(
 ) -> dict[str, Any]:
     if config.runner_mode not in RUNNER_MODES:
         raise PipelineRunnerContractError("runner_mode is invalid")
+    if not isinstance(config.max_cases, int) or config.max_cases < 1:
+        raise PipelineRunnerContractError("max_cases must be a positive integer")
+    stop_policy = "stop_after_current_case" if config.max_cases == 1 else "none"
     policy = PipelineRunnerPolicy(
         runner_mode=config.runner_mode,
-        stop_policy="stop_after_current_case",
-        max_cases=1,
+        stop_policy=stop_policy,
+        max_cases=config.max_cases,
         dependency_gate_mode="calibration_debt_clearance",
         allow_downstream_execution=True,
         allow_forecast_persistence=True,
         retry_backoff_seconds=config.retry_backoff_seconds,
     )
-    validate_auto003_policy(policy, handlers)
+    if config.max_cases == 1:
+        validate_auto003_policy(policy, handlers)
+    else:
+        validate_auto005_policy(policy, handlers)
     active = active_work_counts(conn)
     errors: list[str] = []
     if active["active_runs"]:
         errors.append("active ADS pipeline runs exist")
     if active["active_leases"]:
         errors.append("active ADS case leases exist")
+    case_policy = _case_selection_policy(config)
+    eligible_case = select_eligible_case(conn, case_policy)
+    if eligible_case is None:
+        errors.append("no eligible ADS case available for canary forecast timestamp and snapshot-age policy")
     control = set_pipeline_enabled(
         conn,
         pipeline_enabled=False,
@@ -127,8 +140,35 @@ def validate_preflight(
         "ok": not errors,
         "errors": errors,
         "active": active,
+        "eligible_case_available": eligible_case is not None,
+        "eligible_case": _eligible_case_summary(eligible_case),
         "control": control,
         "protected_counts": protected_counts(conn, config.protected_tables),
+    }
+
+
+def _case_selection_policy(config: OperationalCanaryConfig) -> CaseSelectionPolicy:
+    return CaseSelectionPolicy(
+        forecast_timestamp=config.forecast_timestamp,
+        lease_duration_seconds=config.lease_duration_seconds,
+        metadata={
+            "purpose": "ads_operational_canary",
+            "max_cases": config.max_cases,
+            **config.metadata,
+        },
+    )
+
+
+def _eligible_case_summary(candidate: dict[str, Any] | None) -> dict[str, Any] | None:
+    if candidate is None:
+        return None
+    return {
+        "market_id": candidate["market_id"],
+        "case_key": candidate["case_key"],
+        "case_id": candidate["case_id"],
+        "selected_snapshot_id": candidate["selected_snapshot_id"],
+        "selected_snapshot_observed_at": candidate["selected_snapshot_observed_at"],
+        "snapshot_age_seconds": candidate["snapshot_age_seconds"],
     }
 
 
@@ -153,12 +193,13 @@ def run_one_case_canary(
             updated_by=config.updated_by,
             reason=config.reason,
             default_disable_action="stop_after_current_case",
-            metadata={"purpose": "one_case_operational_canary", **config.metadata},
+            metadata={"purpose": "ads_operational_canary", "max_cases": config.max_cases, **config.metadata},
         )
+        stop_policy = "stop_after_current_case" if config.max_cases == 1 else "none"
         policy = PipelineRunnerPolicy(
             runner_mode=config.runner_mode,
-            stop_policy="stop_after_current_case",
-            max_cases=1,
+            stop_policy=stop_policy,
+            max_cases=config.max_cases,
             dependency_gate_mode="calibration_debt_clearance",
             allow_downstream_execution=True,
             allow_forecast_persistence=True,
@@ -168,11 +209,7 @@ def run_one_case_canary(
             conn,
             policy,
             downstream_stage_handlers=handlers,
-            case_selection_policy=CaseSelectionPolicy(
-                forecast_timestamp=config.forecast_timestamp,
-                lease_duration_seconds=config.lease_duration_seconds,
-                metadata={"purpose": "one_case_operational_canary", **config.metadata},
-            ),
+            case_selection_policy=_case_selection_policy(config),
         )
         result_record = result.to_record()
     finally:
@@ -206,7 +243,10 @@ def run_one_case_canary(
     if result_record is None:
         errors.append("runner did not produce a result")
     else:
-        if result_record["terminal_status"] != TERMINAL_REASON_STOP_AFTER_CURRENT:
+        expected_terminal_status = (
+            TERMINAL_REASON_STOP_AFTER_CURRENT if config.max_cases == 1 else TERMINAL_REASON_AUTO005_MAX_CASES
+        )
+        if result_record["terminal_status"] != expected_terminal_status:
             errors.append(f"terminal_status was {result_record['terminal_status']!r}")
         if result_record["case_lease_id"] is None:
             errors.append("no case lease was processed")
@@ -217,10 +257,10 @@ def run_one_case_canary(
     if active_after["active_leases"]:
         errors.append("active ADS case leases remain after canary")
     deltas = count_deltas(before, after)
-    if config.require_scoreable_prediction and deltas.get("market_predictions", 0) != 1:
-        errors.append("scoreable canary expected exactly one market_predictions row")
-    if config.require_scoreable_prediction and deltas.get("forecast_decision_records", 0) != 1:
-        errors.append("scoreable canary expected exactly one forecast_decision_records row")
+    if config.require_scoreable_prediction and deltas.get("market_predictions", 0) != config.max_cases:
+        errors.append(f"scoreable canary expected exactly {config.max_cases} market_predictions row(s)")
+    if config.require_scoreable_prediction and deltas.get("forecast_decision_records", 0) != config.max_cases:
+        errors.append(f"scoreable canary expected exactly {config.max_cases} forecast_decision_records row(s)")
     if control_after["pipeline_enabled"]:
         errors.append("pipeline control state remains enabled after canary")
     if disable_error:
@@ -267,6 +307,7 @@ def build_handlers_from_factory(
         db_path=config.db_path,
         runner_mode=config.runner_mode,
         forecast_timestamp=config.forecast_timestamp,
+        max_cases=config.max_cases,
         metadata=dict(config.metadata),
     )
     if not isinstance(handlers, dict):

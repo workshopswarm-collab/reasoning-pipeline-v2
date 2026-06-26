@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run a bounded one-case ADS operational canary."""
+"""Run a bounded ADS operational canary."""
 
 from __future__ import annotations
 
@@ -49,6 +49,12 @@ def parse_args() -> argparse.Namespace:
         help="Runner mode to store in control state. Use calibration_debt_production only for an explicit live canary.",
     )
     parser.add_argument("--forecast-timestamp", help="Optional forecast timestamp for deterministic case selection.")
+    parser.add_argument(
+        "--max-cases",
+        type=int,
+        default=1,
+        help="Bounded case count. Use 1 for the stop-after-current canary, 2+ for a small batch canary.",
+    )
     parser.add_argument("--lease-duration-seconds", type=int, default=900)
     parser.add_argument("--retry-backoff-seconds", type=int, default=60)
     parser.add_argument("--updated-by", default="manual")
@@ -75,6 +81,7 @@ def main() -> int:
         db_path=Path(args.db_path),
         runner_mode=args.runner_mode,
         forecast_timestamp=args.forecast_timestamp,
+        max_cases=args.max_cases,
         lease_duration_seconds=args.lease_duration_seconds,
         retry_backoff_seconds=args.retry_backoff_seconds,
         updated_by=args.updated_by,

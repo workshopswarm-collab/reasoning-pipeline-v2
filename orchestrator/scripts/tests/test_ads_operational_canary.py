@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from predquant.ads_operational_canary import OperationalCanaryConfig, run_one_case_canary, validate_preflight
 from predquant.ads_pipeline_runner import ADS_PIPELINE_STAGE_ORDER, PipelineRunnerContractError
+from predquant.ads_scoreable_canary_handlers import build_stage_handlers
 from predquant.sqlite_store import SCHEMA
 
 
@@ -27,7 +28,15 @@ class AdsOperationalCanaryTest(unittest.TestCase):
         self.conn.close()
         self.tempdir.cleanup()
 
-    def _seed_market(self):
+    def _seed_market(
+        self,
+        *,
+        external_market_id="operational-canary",
+        slug="operational-canary",
+        title="Will the operational canary complete?",
+        best_bid=0.49,
+        best_ask=0.53,
+    ):
         market_id = self.conn.execute(
             """
             INSERT INTO markets (
@@ -38,9 +47,9 @@ class AdsOperationalCanaryTest(unittest.TestCase):
             """,
             (
                 "polymarket",
-                "operational-canary",
-                "operational-canary",
-                "Will the operational canary complete?",
+                external_market_id,
+                slug,
+                title,
                 "Synthetic canary market",
                 "test",
                 "open",
@@ -63,8 +72,8 @@ class AdsOperationalCanaryTest(unittest.TestCase):
                 market_id,
                 "2099-12-31T23:55:00+00:00",
                 None,
-                0.49,
-                0.53,
+                best_bid,
+                best_ask,
                 None,
                 None,
                 100.0,
@@ -73,11 +82,12 @@ class AdsOperationalCanaryTest(unittest.TestCase):
             ),
         )
 
-    def config(self, *, require_scoreable_prediction=False):
+    def config(self, *, require_scoreable_prediction=False, max_cases=1):
         return OperationalCanaryConfig(
             db_path=self.db_path,
             runner_mode="fixture",
             forecast_timestamp="2100-01-01T00:00:00+00:00",
+            max_cases=max_cases,
             updated_by="unit-test",
             reason="unit-test one-case canary",
             require_scoreable_prediction=require_scoreable_prediction,
@@ -108,6 +118,8 @@ class AdsOperationalCanaryTest(unittest.TestCase):
             validate_preflight(self.conn, self.config(), handlers)
 
     def test_one_case_canary_runs_once_and_disables_pipeline(self):
+        self.assertTrue(validate_preflight(self.conn, self.config(), self.stage_handlers())["eligible_case_available"])
+
         result = run_one_case_canary(self.config(), self.stage_handlers())
 
         self.assertTrue(result["ok"], result["errors"])
@@ -127,7 +139,51 @@ class AdsOperationalCanaryTest(unittest.TestCase):
         result = run_one_case_canary(self.config(require_scoreable_prediction=True), self.stage_handlers())
 
         self.assertFalse(result["ok"])
-        self.assertIn("scoreable canary expected exactly one market_predictions row", result["errors"])
+        self.assertIn("scoreable canary expected exactly 1 market_predictions row(s)", result["errors"])
+
+    def test_scoreable_canary_factory_writes_one_prediction(self):
+        config = self.config(require_scoreable_prediction=True)
+        handlers = build_stage_handlers(
+            db_path=config.db_path,
+            runner_mode=config.runner_mode,
+            forecast_timestamp=config.forecast_timestamp,
+            max_cases=config.max_cases,
+            metadata=config.metadata,
+        )
+
+        result = run_one_case_canary(config, handlers)
+
+        self.assertTrue(result["ok"], result["errors"])
+        self.assertEqual(result["protected_count_deltas"]["market_predictions"], 1)
+        self.assertEqual(result["protected_count_deltas"]["forecast_decision_records"], 1)
+        with sqlite3.connect(self.db_path) as conn:
+            prediction_source = conn.execute("SELECT prediction_source FROM market_predictions").fetchone()[0]
+        self.assertEqual(prediction_source, "ads_pipeline")
+
+    def test_scoreable_canary_factory_runs_bounded_batch(self):
+        self._seed_market(
+            external_market_id="operational-canary-b",
+            slug="operational-canary-b",
+            title="Will the second operational canary complete?",
+            best_bid=0.58,
+            best_ask=0.62,
+        )
+        self.conn.commit()
+        config = self.config(require_scoreable_prediction=True, max_cases=2)
+        handlers = build_stage_handlers(
+            db_path=config.db_path,
+            runner_mode=config.runner_mode,
+            forecast_timestamp=config.forecast_timestamp,
+            max_cases=config.max_cases,
+            metadata=config.metadata,
+        )
+
+        result = run_one_case_canary(config, handlers)
+
+        self.assertTrue(result["ok"], result["errors"])
+        self.assertEqual(result["result"]["terminal_status"], "auto005_max_cases_complete")
+        self.assertEqual(result["protected_count_deltas"]["market_predictions"], 2)
+        self.assertEqual(result["protected_count_deltas"]["forecast_decision_records"], 2)
 
 
 if __name__ == "__main__":
