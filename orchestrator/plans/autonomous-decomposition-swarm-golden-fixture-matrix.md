@@ -8,13 +8,13 @@ Status values: `not_started`, `fixture_defined`, `implemented`, `passing`, `waiv
 
 | Fixture ID | Stage Gate | Owner Sessions | Scenario | Required Assertions | Status |
 | --- | --- | --- | --- | --- | --- |
-| FIX-001 | Wave B | 1-5 | Minimal standalone binary market | Full fixture path reaches decision context; no live execution; trace pointer written. | implemented |
-| FIX-002 | Wave B | 1,2,5 | Family-aware binary child | Selected child remains binary; family context persists; sibling prices never become evidence deltas. | implemented |
-| FIX-003 | Wave B | 1,2,3 | AMRG no-related-context waiver | Empty active-safe candidate pool writes explicit waiver and decomposition proceeds. | implemented |
-| FIX-004 | Wave B | 1,2,3 | AMRG weak-context artifact | Weak semantic/shared-driver edge can inform decomposition/retrieval hints but cannot promote effects. | implemented |
-| FIX-005 | Wave B | 1,2,3,5 | Conditional-anchor negative | Strict-precedence candidate fails validation; QDT fallback/repair/exhaustion policy is followed. | implemented |
-| FIX-006 | Wave B | 1,4,5 | Researcher probability-authoring attempt | Sidecar/schema rejects probability, fair value, interval, reassembly, and decision recommendation fields. | implemented |
-| FIX-007 | Wave B | 1,5 | Decision override attempt | Decision cannot replace probability or upgrade SCAE validity. | implemented |
+| FIX-001 | Wave B | 1-5 | Minimal standalone binary market | Full fixture path reaches decision context; no live execution; trace pointer written. | passing |
+| FIX-002 | Wave B | 1,2,5 | Family-aware binary child | Selected child remains binary; family context persists; sibling prices never become evidence deltas. | passing |
+| FIX-003 | Wave B | 1,2,3 | AMRG no-related-context waiver | Empty active-safe candidate pool writes explicit waiver and decomposition proceeds. | passing |
+| FIX-004 | Wave B | 1,2,3 | AMRG weak-context artifact | Weak semantic/shared-driver edge can inform decomposition/retrieval hints but cannot promote effects. | passing |
+| FIX-005 | Wave B | 1,2,3,5 | Conditional-anchor negative | Strict-precedence candidate fails validation; QDT fallback/repair/exhaustion policy is followed. | passing |
+| FIX-006 | Wave B | 1,4,5 | Researcher probability-authoring attempt | Sidecar/schema rejects probability, fair value, interval, reassembly, and decision recommendation fields. | passing |
+| FIX-007 | Wave B | 1,5 | Decision override attempt | Decision cannot replace probability or upgrade SCAE validity. | passing |
 | FIX-031 | Wave B | 1,3,4,5 | Canonical machine-template enforcement | QDT and researcher outputs must be schema-bound machine artifacts with prompt hashes, schema versions, stable IDs, and no prose-only substitutes. | passing |
 | FIX-032 | Wave B | 1,3,4 | Thin leaf retrieval expands before research | Initial retrieval misses required source/value/negative-check coverage; targeted expansion runs until a high-certainty sufficiency certificate is produced before researcher dispatch. | passing |
 | FIX-042 | Wave B | 1,4 | Compact leaf research assignment | `leaf-research-assignment/v1` contains stable refs, hashes, requirement IDs, evidence refs, prompt/model metadata, output refs, and budget caps; it rejects embedded evidence bodies, duplicated full QDT leaves, narrative research reports, and probability-bearing fields. | passing |

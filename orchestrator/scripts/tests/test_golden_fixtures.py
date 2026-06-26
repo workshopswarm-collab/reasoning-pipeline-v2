@@ -53,6 +53,24 @@ class GoldenFixturesTest(unittest.TestCase):
         self.assertEqual(set(STARTER_FIXTURE_IDS), {fixture_id for fixture_id, spec in registry.items() if spec.starter_implemented})
         self.assertGreater(len(registry["FIX-001"].expected_stages), 8)
 
+    def test_all_starter_wave_b_fixtures_pass_harness(self):
+        expected_failure_classes = {
+            "FIX-005": "amrg_anchor_required_unrepairable",
+            "FIX-006": "forbidden_probability_field",
+            "FIX-007": "decision_probability_override_attempt",
+        }
+
+        for fixture_id in sorted(STARTER_FIXTURE_IDS):
+            with self.subTest(fixture_id=fixture_id):
+                result = self.run_fixture(fixture_id)
+
+                self.assertEqual(result.status, "passed")
+                self.assertEqual(result.failure_class, expected_failure_classes.get(fixture_id))
+                if fixture_id in expected_failure_classes:
+                    self.assertTrue(result.error_event_ids)
+                else:
+                    self.assertFalse(result.error_event_ids)
+
     def test_minimal_fixture_reaches_stub_terminal_state(self):
         result = self.run_fixture("FIX-001")
 
