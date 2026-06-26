@@ -203,6 +203,59 @@ class RetrievalPacketContractTest(unittest.TestCase):
                 amrg_context={"candidate_refs": ["amrg:1"], "probability": 0.9},
             )
 
+    def test_active_retrieval_rejects_replay_outcome_and_scoring_surface_inputs(self) -> None:
+        forbidden_amrg_inputs = [
+            {"candidate_refs": ["amrg:1"], "replay_result_ref": "replay-result:case-1"},
+            {"candidate_refs": ["amrg:1"], "outcome_scoring_ref": "outcome-scoring:market-1"},
+            {"candidate_refs": ["amrg:1"], "market_prediction_ref": "market-prediction:case-1"},
+            {"candidate_refs": ["amrg:1"], "raw_forecast_result_payload": {"probability": 0.7}},
+        ]
+
+        for amrg_context in forbidden_amrg_inputs:
+            with self.subTest(amrg_context=amrg_context):
+                with self.assertRaises(RetrievalPacketError):
+                    build_retrieval_query_contexts(
+                        self.qdt,
+                        evidence_packet=self.evidence_packet,
+                        amrg_context=amrg_context,
+                    )
+
+    def test_compact_candidate_packet_rejects_replay_outcome_and_scoring_surface_refs(self) -> None:
+        context = build_retrieval_query_contexts(self.qdt, evidence_packet=self.evidence_packet)[0]
+        variant = context["query_variants"][0]
+        candidate = build_retrieval_candidate_record(
+            leaf_id=context["leaf_id"],
+            query_context_ref=context["query_context_ref"],
+            query_variant_id=variant["query_variant_id"],
+            retrieval_transport="browser",
+            transport_attempt_ref="browser-attempt:1",
+            candidate_status="selected",
+            requested_url="https://example.com/source",
+            canonical_url="https://example.com/source",
+            temporal_gate_status="pass",
+        )
+        candidate["scorecard_artifact_ref"] = "artifact:scorecard-1"
+
+        with self.assertRaises(RetrievalPacketError):
+            build_compact_source_candidate_packet(candidate)
+
+    def test_packet_validation_rejects_replay_outcome_and_scoring_surface_refs(self) -> None:
+        context = build_retrieval_query_contexts(self.qdt, evidence_packet=self.evidence_packet)[0]
+        evidence = self._evidence(
+            context,
+            attempt_ref="browser-attempt:1",
+            canonical_url="https://example.com/source",
+        )
+        packet = build_retrieval_packet(self.qdt, evidence_packet=self.evidence_packet, selected_evidence=[evidence])
+        packet["leaf_retrieval_results"][0]["selected_evidence"][0][
+            "resolution_outcome_ref"
+        ] = "outcome-scoring:market-1"
+
+        result = validate_retrieval_packet(packet)
+
+        self.assertFalse(result.valid)
+        self.assertIn("resolution_outcome_ref is forbidden", "; ".join(result.errors))
+
     def test_packet_schema_contains_feature_gated_placeholders_without_marking_later_rows_ready(self) -> None:
         packet = build_retrieval_packet(
             self.qdt,

@@ -228,6 +228,18 @@ FORBIDDEN_RETRIEVAL_KEY_FRAGMENTS = (
     "log_odds",
     "synthesis_conclusion",
     "decision_instruction",
+    "replay_result",
+    "replay_manifest",
+    "replay_artifact",
+    "outcome_scoring",
+    "outcome_score",
+    "resolved_outcome",
+    "resolution_outcome",
+    "market_prediction",
+    "forecast_result",
+    "raw_forecast_result",
+    "prediction_result",
+    "scorecard",
 )
 MAX_QUERY_VARIANTS = 7
 MAX_QUERY_TEXT_CHARS = 360
