@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from predquant.ads_operational_canary import OperationalCanaryConfig, run_one_case_canary, validate_preflight
 from predquant.ads_pipeline_runner import ADS_PIPELINE_STAGE_ORDER, PipelineRunnerContractError
 from predquant.ads_manifest_canary_handlers import build_stage_handlers as build_manifest_stage_handlers
+from predquant.ads_production_pilot_handlers import build_stage_handlers as build_production_pilot_handlers
 from predquant.ads_production_readiness_handlers import build_stage_handlers as build_production_readiness_handlers
 from predquant.ads_handoff_report import build_handoff_report
 from predquant.ads_scoreable_canary_handlers import build_stage_handlers
@@ -250,6 +251,76 @@ class AdsOperationalCanaryTest(unittest.TestCase):
         report = build_handoff_report(self.db_path)
         self.assertTrue(report["ok"], report["unresolved_output_manifest_refs"])
         self.assertGreaterEqual(report["manifest_counts_by_validation_status"].get("valid", 0), len(ADS_PIPELINE_STAGE_ORDER))
+
+    def test_production_pilot_factory_writes_scoreable_prediction_with_manifest_handoffs(self):
+        config = self.config(require_scoreable_prediction=True, require_manifest_handoffs=True)
+        handlers = build_production_pilot_handlers(
+            db_path=config.db_path,
+            runner_mode=config.runner_mode,
+            forecast_timestamp=config.forecast_timestamp,
+            max_cases=config.max_cases,
+            metadata=config.metadata,
+        )
+
+        result = run_one_case_canary(config, handlers)
+
+        self.assertTrue(result["ok"], result["errors"])
+        self.assertEqual(result["result"]["completed_stage_count"], len(ADS_PIPELINE_STAGE_ORDER))
+        self.assertEqual(result["protected_count_deltas"]["forecast_decision_records"], 1)
+        self.assertEqual(result["protected_count_deltas"]["market_predictions"], 1)
+        with sqlite3.connect(self.db_path) as conn:
+            decision = conn.execute(
+                """
+                SELECT production_persistence_status, production_forecast_persisted,
+                       production_forecast_prob, non_scoreable_reason_code
+                FROM forecast_decision_records
+                """
+            ).fetchone()
+            prediction = conn.execute(
+                """
+                SELECT prediction_source, prediction_label, predicted_probability
+                FROM market_predictions
+                """
+            ).fetchone()
+            self.assertEqual(decision[0], "production_forecast_persisted_from_scae")
+            self.assertEqual(decision[1], 1)
+            self.assertIsNotNone(decision[2])
+            self.assertIsNone(decision[3])
+            self.assertEqual(prediction[0], "ads_pipeline")
+            self.assertEqual(prediction[1], "v2_scae")
+            self.assertIsNotNone(prediction[2])
+
+        report = build_handoff_report(self.db_path)
+        self.assertTrue(report["ok"], report["unresolved_output_manifest_refs"])
+        self.assertGreaterEqual(
+            report["manifest_counts_by_validation_status"].get("valid", 0),
+            len(ADS_PIPELINE_STAGE_ORDER),
+        )
+
+    def test_production_pilot_factory_runs_bounded_batch(self):
+        self._seed_market(
+            external_market_id="operational-pilot-b",
+            slug="operational-pilot-b",
+            title="Will the second production pilot complete?",
+            best_bid=0.58,
+            best_ask=0.62,
+        )
+        self.conn.commit()
+        config = self.config(require_scoreable_prediction=True, max_cases=2, require_manifest_handoffs=True)
+        handlers = build_production_pilot_handlers(
+            db_path=config.db_path,
+            runner_mode=config.runner_mode,
+            forecast_timestamp=config.forecast_timestamp,
+            max_cases=config.max_cases,
+            metadata=config.metadata,
+        )
+
+        result = run_one_case_canary(config, handlers)
+
+        self.assertTrue(result["ok"], result["errors"])
+        self.assertEqual(result["result"]["terminal_status"], "auto005_max_cases_complete")
+        self.assertEqual(result["protected_count_deltas"]["forecast_decision_records"], 2)
+        self.assertEqual(result["protected_count_deltas"]["market_predictions"], 2)
 
 
 if __name__ == "__main__":

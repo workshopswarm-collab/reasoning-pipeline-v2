@@ -18,10 +18,12 @@ from predquant.sqlite_store import ensure_schema, initialize_database
 
 LIVE_READINESS_SCHEMA_VERSION = "ads-live-readiness-report/v1"
 PRODUCTION_READINESS_HANDLER = "predquant.ads_production_readiness_handlers"
+PRODUCTION_PILOT_HANDLER = "predquant.ads_production_pilot_handlers"
 CANARY_HANDLER_MARKERS = (
     "ads_scoreable_canary_handlers",
     "ads_manifest_canary_handlers",
 )
+DEFAULT_MAX_CALIBRATION_DEBT_CANARY_CASES = 2
 
 
 def _load_health_module() -> Any:
@@ -61,6 +63,9 @@ def build_live_readiness_report(
     runner_mode: str = "non_executing_canary",
     require_scoreable_live: bool = False,
     allow_canary_handler: bool = False,
+    allow_calibration_debt_scoreable_canary: bool = False,
+    requested_max_cases: int | None = None,
+    max_calibration_debt_canary_cases: int = DEFAULT_MAX_CALIBRATION_DEBT_CANARY_CASES,
     prediction_source: str | None = "ads_pipeline",
     prediction_label: str | None = "v2_scae",
     evaluation_cluster_id: str = "calibration-debt-clearance",
@@ -128,8 +133,17 @@ def build_live_readiness_report(
     if require_scoreable_live:
         if module_ref == PRODUCTION_READINESS_HANDLER:
             issues.append("production_readiness_handler_is_non_scoreable")
-        if not calibration.get("clears_calibration_debt"):
+        if not calibration.get("clears_calibration_debt") and not allow_calibration_debt_scoreable_canary:
             issues.append("calibration_debt_not_cleared")
+        if allow_calibration_debt_scoreable_canary:
+            if module_ref != PRODUCTION_PILOT_HANDLER:
+                issues.append("calibration_debt_scoreable_canary_requires_production_pilot_handler")
+            if requested_max_cases is None:
+                issues.append("calibration_debt_scoreable_canary_requires_max_cases")
+            elif requested_max_cases < 1:
+                issues.append("calibration_debt_scoreable_canary_requires_positive_max_cases")
+            elif requested_max_cases > max_calibration_debt_canary_cases:
+                issues.append("calibration_debt_scoreable_canary_exceeds_case_limit")
     if max_storage_retention_candidate_rows is not None:
         candidate_rows = sum(
             int(item.get("candidate_rows", 0))
@@ -149,6 +163,9 @@ def build_live_readiness_report(
         "handler_factory": handler_factory,
         "require_scoreable_live": require_scoreable_live,
         "allow_canary_handler": allow_canary_handler,
+        "allow_calibration_debt_scoreable_canary": allow_calibration_debt_scoreable_canary,
+        "requested_max_cases": requested_max_cases,
+        "max_calibration_debt_canary_cases": max_calibration_debt_canary_cases,
         "health_report": health,
         "active_work": active,
         "pipeline_control": control,
@@ -157,4 +174,8 @@ def build_live_readiness_report(
     }
 
 
-__all__ = ["LIVE_READINESS_SCHEMA_VERSION", "build_live_readiness_report"]
+__all__ = [
+    "DEFAULT_MAX_CALIBRATION_DEBT_CANARY_CASES",
+    "LIVE_READINESS_SCHEMA_VERSION",
+    "build_live_readiness_report",
+]

@@ -12,6 +12,7 @@ import hashlib
 import json
 import sqlite3
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -58,6 +59,7 @@ from ads_decomposer.qdt import (  # noqa: E402
 from researcher_swarm.retrieval import (  # noqa: E402
     RETRIEVAL_PACKET_MANIFEST_ARTIFACT_TYPE,
     RETRIEVAL_PACKET_SCHEMA_VERSION,
+    build_retrieval_evidence_item,
     build_retrieval_packet,
     dump_retrieval_packet,
     finalize_retrieval_packet_for_dispatch,
@@ -72,6 +74,8 @@ HANDLER_FACTORY_REF = "predquant.ads_production_readiness_handlers"
 HANDLER_SCOPE = "production_readiness_fail_closed"
 VALIDATOR_VERSION = "ads-production-readiness-handler/v1"
 ARTIFACT_DIR_NAME = "production_readiness"
+PRODUCTION_PILOT_HANDLER_FACTORY_REF = "predquant.ads_production_pilot_handlers"
+PRODUCTION_PILOT_HANDLER_SCOPE = "production_pilot_structured_market_metadata"
 
 STAGE_ARTIFACT_TYPES = {
     "researcher_classification": "researcher-classification-readiness-block",
@@ -271,6 +275,188 @@ def _case_probability_from_contract(case_contract: dict[str, Any]) -> float:
     return 0.5
 
 
+def _iso_before_cutoff(value: str | None) -> str | None:
+    if not value:
+        return value
+    text = str(value)
+    try:
+        normalized = text[:-1] + "+00:00" if text.endswith("Z") else text
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return value
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    observed = parsed.astimezone(timezone.utc) - timedelta(seconds=1)
+    return observed.isoformat()
+
+
+def _market_url(case_contract: dict[str, Any]) -> str:
+    identity = case_contract.get("market_identity") if isinstance(case_contract, dict) else {}
+    if not isinstance(identity, dict):
+        identity = {}
+    slug = str(identity.get("slug") or "").strip().strip("/")
+    external = str(identity.get("external_market_id") or identity.get("internal_market_id") or "unknown").strip()
+    if slug:
+        return f"https://polymarket.com/event/{slug}"
+    return f"https://polymarket.com/market/{external}"
+
+
+def _structured_market_metadata_evidence(
+    *,
+    qdt: dict[str, Any],
+    case_contract: dict[str, Any],
+    source_cutoff_timestamp: str,
+) -> list[dict[str, Any]]:
+    """Build narrow deterministic evidence from market metadata and snapshot state.
+
+    This does not perform external web research. It is a production-pilot lane
+    for proving SCAE/PERSIST scoreable mechanics from structured market inputs
+    while calibration-debt controls remain active.
+    """
+
+    identity = case_contract.get("market_identity") if isinstance(case_contract, dict) else {}
+    baseline = case_contract.get("prediction_time_market_baseline") if isinstance(case_contract, dict) else {}
+    if not isinstance(identity, dict):
+        identity = {}
+    if not isinstance(baseline, dict):
+        baseline = {}
+    observed_at = _iso_before_cutoff(str(baseline.get("source_fetched_at") or source_cutoff_timestamp))
+    canonical_url = _market_url(case_contract)
+    title = str(identity.get("title") or qdt.get("macro_question") or "market question")
+    description = str(identity.get("description") or "")
+    selected: list[dict[str, Any]] = []
+    for leaf in qdt.get("required_leaf_questions", []):
+        if not isinstance(leaf, dict) or not leaf.get("leaf_id"):
+            continue
+        leaf_id = str(leaf["leaf_id"])
+        parent_branch_id = str(leaf.get("parent_branch_id") or "branch-resolution")
+        common = {
+            "case_id": str(qdt.get("case_id") or case_contract["case_id"]),
+            "dispatch_id": str(qdt.get("dispatch_id") or case_contract["dispatch_id"]),
+            "leaf_id": leaf_id,
+            "parent_branch_id": parent_branch_id,
+            "retrieval_transport": "structured_feed",
+            "requested_url": canonical_url,
+            "final_url": canonical_url,
+            "canonical_url": canonical_url,
+            "temporal_gate_status": "pass",
+            "source_published_at": observed_at,
+            "source_observed_at": observed_at,
+            "retrieval_score": 1.0,
+            "admission_status": "admitted",
+            "admission_reason_codes": ["structured_market_metadata_pilot"],
+        }
+        selected.append(
+            build_retrieval_evidence_item(
+                **common,
+                transport_attempt_ref=f"structured-feed:market-metadata:{leaf_id}:primary",
+                canonical_source_id="source:polymarket-market-metadata",
+                source_family_id=f"source-family:polymarket-market-metadata:{leaf_id}",
+                source_class="official_or_primary",
+                independence_status="independent",
+                claim_family_resolution_refs=[f"claim-family-resolution:market-rules:{leaf_id}"],
+                content_sha256="sha256:"
+                + hashlib.sha256(
+                    canonical_json(
+                        {
+                            "title": title,
+                            "description": description,
+                            "leaf_id": leaf_id,
+                            "source": "market_metadata",
+                        }
+                    ).encode("utf-8")
+                ).hexdigest(),
+            )
+        )
+        selected[-1]["deterministic_source_class_proof"] = True
+        selected[-1]["source_class_resolution_method"] = "structured_market_metadata_primary_source"
+        selected[-1]["source_family_resolution_method"] = "structured_market_metadata_feed"
+        selected[-1]["claim_family_ids"] = [f"claim-family:market-rules:{leaf_id}"]
+        selected.append(
+            build_retrieval_evidence_item(
+                **common,
+                transport_attempt_ref=f"structured-feed:market-snapshot:{leaf_id}:secondary",
+                canonical_source_id="source:predquant-market-snapshot",
+                source_family_id=f"source-family:predquant-market-snapshot:{leaf_id}",
+                source_class="independent_secondary",
+                independence_status="independent",
+                claim_family_resolution_refs=[f"claim-family-resolution:market-state:{leaf_id}"],
+                content_sha256="sha256:"
+                + hashlib.sha256(
+                    canonical_json(
+                        {
+                            "market_probability": baseline.get("market_probability"),
+                            "method": baseline.get("market_probability_method"),
+                            "snapshot": baseline.get("market_snapshot_id"),
+                            "leaf_id": leaf_id,
+                            "source": "market_snapshot",
+                        }
+                    ).encode("utf-8")
+                ).hexdigest(),
+            )
+        )
+        selected[-1]["source_class_resolution_method"] = "structured_market_snapshot_feed"
+        selected[-1]["source_family_resolution_method"] = "structured_market_snapshot_feed"
+        selected[-1]["claim_family_ids"] = [f"claim-family:market-state:{leaf_id}"]
+    return selected
+
+
+def _certified_reconciliation_rows(
+    qdt: dict[str, Any],
+    retrieval_packet: dict[str, Any],
+    verification_manifest_id: str,
+) -> list[dict[str, Any]]:
+    certificates = {
+        str(item["leaf_id"]): item
+        for item in retrieval_packet.get("leaf_research_sufficiency_certificates", [])
+        if isinstance(item, dict) and item.get("leaf_id")
+    }
+    coverage = {
+        str(item["coverage_id"]): item
+        for item in retrieval_packet.get("retrieval_breadth_coverage_slices", [])
+        if isinstance(item, dict) and item.get("coverage_id")
+    }
+    rows: list[dict[str, Any]] = []
+    for leaf in qdt.get("required_leaf_questions", []):
+        if not isinstance(leaf, dict) or not leaf.get("leaf_id"):
+            continue
+        leaf_id = str(leaf["leaf_id"])
+        cert = certificates.get(leaf_id) or {}
+        coverage_ref = cert.get("breadth_coverage_ref")
+        coverage_row = coverage.get(str(coverage_ref)) if coverage_ref else {}
+        status = (
+            "scae_ready_high_certainty"
+            if cert.get("status") == "certified_high_certainty"
+            and cert.get("classification_dispatch_allowed") is True
+            and cert.get("breadth_certified") is True
+            else "blocked_insufficient_research"
+        )
+        blocking = [] if status == "scae_ready_high_certainty" else ["research_sufficiency_not_certified"]
+        rows.append(
+            {
+                "artifact_type": "research_sufficiency_reconciliation_slice",
+                "schema_version": "research-sufficiency-reconciliation-slice/v1",
+                "research_sufficiency_reconciliation_id": (
+                    f"research-sufficiency-reconciliation:production-pilot:{leaf_id}"
+                ),
+                "leaf_id": leaf_id,
+                "research_sufficiency_reconciliation_status": status,
+                "reconciled_status": status,
+                "blocking_reason_codes": blocking,
+                "reason_codes": ["structured_market_metadata_pilot_verified"],
+                "research_sufficiency_certificate_ref": cert.get("certificate_id"),
+                "retrieval_breadth_profile_ref": (coverage_row or {}).get("breadth_profile_ref")
+                or (leaf.get("research_sufficiency_requirements") or {}).get("retrieval_breadth_profile_ref"),
+                "retrieval_breadth_coverage_ref": coverage_ref,
+                "retrieval_breadth_certified": bool(cert.get("breadth_certified") is True),
+                "required_escalation_decision_refs": [],
+                "completed_escalation_decision_refs": [],
+                "verification_manifest_ref": verification_manifest_id,
+            }
+        )
+    return rows
+
+
 def _build_scae_ledger(
     *,
     lease: dict[str, Any],
@@ -280,6 +466,7 @@ def _build_scae_ledger(
     sufficiency_rows: list[dict[str, Any]],
     verification_manifest_id: str,
     forecast_timestamp: str,
+    scoreable_pilot: bool = False,
 ) -> dict[str, Any]:
     contract_case_id = case_contract["case_id"]
     contract_case_key = case_contract["case_key"]
@@ -324,7 +511,11 @@ def _build_scae_ledger(
             "run_id": context.pipeline_run_id,
             "forecast_timestamp": forecast_timestamp,
             "verification_manifest_ref": verification_manifest_id,
-            "adapter_mode": "prior_only_until_research_sufficiency_certified",
+            "adapter_mode": (
+                "structured_market_metadata_pilot_prior_only"
+                if scoreable_pilot
+                else "prior_only_until_research_sufficiency_certified"
+            ),
         }
     )
     guarded = apply_research_sufficiency_guard(
@@ -340,9 +531,17 @@ def _build_scae_ledger(
             "dispatch_id": contract_dispatch_id,
             "run_id": context.pipeline_run_id,
             "forecast_timestamp": forecast_timestamp,
-            "adapter_mode": "production_readiness_fail_closed",
-            "scoreable_forecast_output": False,
-            "market_prediction_write_expected": False,
+            "adapter_mode": (
+                "production_pilot_structured_market_metadata"
+                if scoreable_pilot
+                else "production_readiness_fail_closed"
+            ),
+            "scoreable_forecast_output": bool(
+                scoreable_pilot and finalized.get("forecast_validity_status") != "invalid_for_forecast"
+            ),
+            "market_prediction_write_expected": bool(
+                scoreable_pilot and finalized.get("forecast_validity_status") != "invalid_for_forecast"
+            ),
         }
     )
     return finalized
@@ -369,8 +568,16 @@ def _build_synthesis_annotation(
         "scae_ledger_digest": scae_ledger["final_probability_ledger_digest"],
         "forecast_validity_status": scae_ledger.get("forecast_validity_status"),
         "execution_authority_status": scae_ledger.get("execution_authority_status"),
-        "synthesis_status": "blocked_by_research_sufficiency",
-        "reason_codes": ["scae_forecast_invalid_for_production_readiness_run"],
+        "synthesis_status": (
+            "ready_for_scoreable_pilot"
+            if scae_ledger.get("forecast_validity_status") != "invalid_for_forecast"
+            else "blocked_by_research_sufficiency"
+        ),
+        "reason_codes": (
+            ["structured_market_metadata_pilot_synthesis_ready"]
+            if scae_ledger.get("forecast_validity_status") != "invalid_for_forecast"
+            else ["scae_forecast_invalid_for_production_readiness_run"]
+        ),
         "writes_production_forecast": False,
         "writes_persistence": False,
     }
@@ -388,6 +595,30 @@ def _build_decision_gate(
     synthesis: dict[str, Any],
     forecast_timestamp: str,
 ) -> dict[str, Any]:
+    execution = str(scae_ledger.get("execution_authority_status") or "forbidden")
+    actionability_by_execution = {
+        "forbidden": "non_actionable",
+        "needs_refresh": "refresh_required",
+        "watch_only": "watch_only",
+        "low_size_only": "actionable_low_size",
+        "normal_execution_allowed": "actionable",
+    }
+    actionability = actionability_by_execution.get(execution, "non_actionable")
+    scae_context = {
+        "scae_ledger_ref": scae_ledger["final_probability_ledger_id"],
+        "scae_ledger_digest": scae_ledger["final_probability_ledger_digest"],
+        "scae_manifest_ref": scae_manifest["artifact_id"],
+        "case_id": scae_ledger["case_id"],
+        "case_key": scae_ledger["case_key"],
+        "dispatch_id": scae_ledger["dispatch_id"],
+        "run_id": context.pipeline_run_id,
+        "forecast_timestamp": forecast_timestamp,
+        "forecast_validity_status": scae_ledger.get("forecast_validity_status"),
+        "execution_authority_status": execution,
+    }
+    if scae_ledger.get("forecast_validity_status") != "invalid_for_forecast":
+        scae_context["production_forecast_prob"] = scae_ledger.get("production_forecast_prob")
+        scae_context["canonical_probability"] = scae_ledger.get("canonical_probability")
     payload = {
         "artifact_type": "decision_execution_gate",
         "schema_version": STAGE_SCHEMA_VERSIONS["decision"],
@@ -411,20 +642,9 @@ def _build_decision_gate(
         "scoreable_forecast_output": False,
         "clears_calibration_debt": False,
         "forecast_validity_status": scae_ledger.get("forecast_validity_status"),
-        "execution_authority_status": scae_ledger.get("execution_authority_status"),
-        "actionability_status": "non_actionable",
-        "scae_context": {
-            "scae_ledger_ref": scae_ledger["final_probability_ledger_id"],
-            "scae_ledger_digest": scae_ledger["final_probability_ledger_digest"],
-            "scae_manifest_ref": scae_manifest["artifact_id"],
-            "case_id": scae_ledger["case_id"],
-            "case_key": scae_ledger["case_key"],
-            "dispatch_id": scae_ledger["dispatch_id"],
-            "run_id": context.pipeline_run_id,
-            "forecast_timestamp": forecast_timestamp,
-            "forecast_validity_status": scae_ledger.get("forecast_validity_status"),
-            "execution_authority_status": scae_ledger.get("execution_authority_status"),
-        },
+        "execution_authority_status": execution,
+        "actionability_status": actionability,
+        "scae_context": scae_context,
         "synthesis_context": {
             "synthesis_annotation_ref": synthesis["synthesis_annotation_ref"],
             "synthesis_annotation_digest": synthesis["synthesis_annotation_digest"],
@@ -442,19 +662,32 @@ def build_stage_handlers(
     max_cases: int = 1,
     metadata: dict[str, Any] | None = None,
     artifact_dir: Path | str | None = None,
+    scoreable_pilot: bool = False,
+    handler_factory_ref: str | None = None,
+    handler_scope: str | None = None,
 ) -> dict[str, Callable[..., Any]]:
+    resolved_factory_ref = handler_factory_ref or HANDLER_FACTORY_REF
+    resolved_handler_scope = handler_scope or HANDLER_SCOPE
     if artifact_dir:
         base_dir = Path(artifact_dir).expanduser().resolve()
     else:
         db_parent = Path(db_path or ".").expanduser().resolve().parent
-        base_dir = db_parent / "ads_artifacts" / ARTIFACT_DIR_NAME
+        base_dir = db_parent / "ads_artifacts" / (
+            "production_pilot" if scoreable_pilot else ARTIFACT_DIR_NAME
+        )
     db_file = Path(db_path) if db_path else Path(":memory:")
     factory_metadata = {
-        "handler_factory": HANDLER_FACTORY_REF,
+        "handler_factory": resolved_factory_ref,
+        "handler_scope": resolved_handler_scope,
         "runner_mode": runner_mode,
         "max_cases": max_cases,
         "forecast_authority_policy": "scae_only",
-        "scoreable_forecast_policy": "blocked_until_research_sufficiency_certified",
+        "scoreable_forecast_policy": (
+            "structured_market_metadata_scoreable_under_calibration_debt_controls"
+            if scoreable_pilot
+            else "blocked_until_research_sufficiency_certified"
+        ),
+        "scoreable_pilot": bool(scoreable_pilot),
         **(metadata or {}),
     }
 
@@ -597,9 +830,10 @@ def build_stage_handlers(
             validator_version=VALIDATOR_VERSION,
             temporal_isolation_status="pass",
             metadata={
-                "handler_scope": HANDLER_SCOPE,
-                "handler_factory": HANDLER_FACTORY_REF,
+                "handler_scope": resolved_handler_scope,
+                "handler_factory": resolved_factory_ref,
                 "adapter_mode": "deterministic_decomposer_contract_adapter",
+                "scoreable_pilot": bool(scoreable_pilot),
             },
         )
         qdt_validation = build_validation_result(
@@ -634,14 +868,28 @@ def build_stage_handlers(
         evidence_manifest = resolve_stage_output_manifest(conn, stage_outputs, "evidence_packet")
         profile_manifest = resolve_stage_output_manifest(conn, stage_outputs, "policy_context")
         related_manifest = resolve_stage_output_manifest(conn, stage_outputs, "related_market_context")
+        case_manifest = _selected_case_contract_manifest(conn, stage_outputs)
+        qdt_payload = load_manifest_payload(qdt_manifest)
+        case_contract = load_manifest_payload(case_manifest)
+        source_cutoff = lease["selected_snapshot_observed_at"]
+        selected_evidence = (
+            _structured_market_metadata_evidence(
+                qdt=qdt_payload,
+                case_contract=case_contract,
+                source_cutoff_timestamp=source_cutoff,
+            )
+            if scoreable_pilot
+            else None
+        )
         packet = build_retrieval_packet(
-            load_manifest_payload(qdt_manifest),
+            qdt_payload,
             evidence_packet=load_manifest_payload(evidence_manifest),
             amrg_context=load_manifest_payload(related_manifest),
             question_decomposition_artifact_id=qdt_manifest["artifact_id"],
             policy_context_ref=profile_manifest["artifact_id"],
+            selected_evidence=selected_evidence,
             forecast_timestamp=_forecast_timestamp(forecast_timestamp, lease),
-            source_cutoff_timestamp=lease["selected_snapshot_observed_at"],
+            source_cutoff_timestamp=source_cutoff,
             pre_dispatch_input_whitelist_refs=[
                 qdt_manifest["artifact_id"],
                 evidence_manifest["artifact_id"],
@@ -651,7 +899,11 @@ def build_stage_handlers(
             live_retrieval_allowlist=["browser", "native_gpt_research", "structured_feed"],
         )
         packet = finalize_retrieval_packet_for_dispatch(packet)
-        packet["adapter_mode"] = "query_plan_only_until_live_retrieval_transport_returns_evidence"
+        packet["adapter_mode"] = (
+            "structured_market_metadata_pilot_retrieval"
+            if scoreable_pilot
+            else "query_plan_only_until_live_retrieval_transport_returns_evidence"
+        )
         packet_manifest, validation_id = _write_payload_manifest(
             conn,
             context=context,
@@ -670,7 +922,14 @@ def build_stage_handlers(
                 related_manifest["artifact_id"],
             ],
             producer="researcher-swarm-production-readiness-adapter",
-            reason_codes=["retrieval_packet_valid", "classification_dispatch_blocked_until_certified"],
+            reason_codes=[
+                "retrieval_packet_valid",
+                (
+                    "structured_market_metadata_pilot_certified"
+                    if scoreable_pilot
+                    else "classification_dispatch_blocked_until_certified"
+                ),
+            ],
             metadata=factory_metadata,
         )
         summary = packet.get("research_sufficiency_summary") or {}
@@ -693,8 +952,21 @@ def build_stage_handlers(
         stage_outputs = kwargs["stage_outputs"]
         retrieval_manifest = resolve_stage_output_manifest(conn, stage_outputs, "retrieval")
         packet = load_manifest_payload(retrieval_manifest)
+        summary = packet.get("research_sufficiency_summary") or {}
+        if scoreable_pilot and summary.get("classification_dispatch_status") == "allowed":
+            classification_status = "structured_market_metadata_certified"
+            reason_codes = ["structured_market_metadata_retrieval_certified"]
+            file_name = "researcher-classification-production-pilot.json"
+        else:
+            classification_status = "blocked_until_certified_retrieval"
+            reason_codes = ["retrieval_sufficiency_not_certified"]
+            file_name = "researcher-classification-readiness-block.json"
         payload = {
-            "artifact_type": "researcher_classification_readiness_block",
+            "artifact_type": (
+                "researcher_classification_production_pilot"
+                if classification_status == "structured_market_metadata_certified"
+                else "researcher_classification_readiness_block"
+            ),
             "schema_version": STAGE_SCHEMA_VERSIONS["researcher_classification"],
             "case_id": lease["case_id"],
             "case_key": lease["case_key"],
@@ -702,13 +974,17 @@ def build_stage_handlers(
             "run_id": context.pipeline_run_id,
             "forecast_timestamp": _forecast_timestamp(forecast_timestamp, lease),
             "retrieval_packet_ref": retrieval_manifest["artifact_id"],
-            "classification_dispatch_status": (packet.get("research_sufficiency_summary") or {}).get(
-                "classification_dispatch_status"
-            ),
-            "classification_status": "blocked_until_certified_retrieval",
-            "reason_codes": ["retrieval_sufficiency_not_certified"],
+            "classification_dispatch_status": summary.get("classification_dispatch_status"),
+            "classification_status": classification_status,
+            "reason_codes": reason_codes,
             "researcher_probability_authority": False,
             "writes_scae_delta": False,
+            "selected_evidence_count": sum(
+                len(result.get("selected_evidence", []))
+                for result in packet.get("leaf_retrieval_results", [])
+                if isinstance(result, dict)
+            ),
+            "leaf_certificate_refs": list(summary.get("leaf_certificate_refs") or []),
         }
         manifest, validation_id = _write_payload_manifest(
             conn,
@@ -716,14 +992,18 @@ def build_stage_handlers(
             lease=lease,
             artifact_dir=_stage_artifact_dir(base_dir, context, lease),
             stage="researcher_classification",
-            file_name="researcher-classification-readiness-block.json",
+            file_name=file_name,
             payload=payload,
             artifact_type=STAGE_ARTIFACT_TYPES["researcher_classification"],
             artifact_schema_version=STAGE_SCHEMA_VERSIONS["researcher_classification"],
             forecast_timestamp=forecast_timestamp,
             input_manifest_ids=[retrieval_manifest["artifact_id"]],
             producer="researcher-swarm-production-readiness-adapter",
-            reason_codes=["classification_block_valid"],
+            reason_codes=[
+                "classification_pilot_valid"
+                if classification_status == "structured_market_metadata_certified"
+                else "classification_block_valid"
+            ],
             metadata=factory_metadata,
         )
         return _result(
@@ -731,7 +1011,7 @@ def build_stage_handlers(
             [manifest["artifact_id"]],
             [validation_id],
             lease,
-            {**factory_metadata, "classification_status": "blocked_until_certified_retrieval"},
+            {**factory_metadata, "classification_status": classification_status},
         )
 
     def classification_verification(**kwargs: Any) -> dict[str, Any]:
@@ -743,9 +1023,32 @@ def build_stage_handlers(
         retrieval_manifest = resolve_stage_output_manifest(conn, stage_outputs, "retrieval")
         classification_manifest = resolve_stage_output_manifest(conn, stage_outputs, "researcher_classification")
         qdt = load_manifest_payload(qdt_manifest)
-        rows = _blocked_reconciliation_rows(qdt, "classification-verification-production-readiness")
+        retrieval_packet = load_manifest_payload(retrieval_manifest)
+        if scoreable_pilot:
+            verification_ref = "classification-verification-production-pilot"
+            rows = _certified_reconciliation_rows(qdt, retrieval_packet, verification_ref)
+            verification_status = (
+                "structured_market_metadata_certified"
+                if rows and all(row.get("reconciled_status") == "scae_ready_high_certainty" for row in rows)
+                else "blocked_insufficient_research"
+            )
+            reason_codes = (
+                ["structured_market_metadata_reconciliation_certified"]
+                if verification_status == "structured_market_metadata_certified"
+                else ["structured_market_metadata_reconciliation_blocked"]
+            )
+            file_name = "classification-verification-production-pilot.json"
+        else:
+            rows = _blocked_reconciliation_rows(qdt, "classification-verification-production-readiness")
+            verification_status = "blocked_no_researcher_classifications"
+            reason_codes = ["classification_dispatch_blocked"]
+            file_name = "classification-verification-readiness-block.json"
         payload = {
-            "artifact_type": "classification_verification_readiness_block",
+            "artifact_type": (
+                "classification_verification_production_pilot"
+                if scoreable_pilot
+                else "classification_verification_readiness_block"
+            ),
             "schema_version": STAGE_SCHEMA_VERSIONS["classification_verification"],
             "case_id": lease["case_id"],
             "case_key": lease["case_key"],
@@ -755,9 +1058,9 @@ def build_stage_handlers(
             "qdt_ref": qdt_manifest["artifact_id"],
             "retrieval_packet_ref": retrieval_manifest["artifact_id"],
             "classification_ref": classification_manifest["artifact_id"],
-            "verification_status": "blocked_no_researcher_classifications",
+            "verification_status": verification_status,
             "research_sufficiency_reconciliation_slices": rows,
-            "reason_codes": ["classification_dispatch_blocked"],
+            "reason_codes": reason_codes,
             "writes_scae_delta": False,
         }
         manifest, validation_id = _write_payload_manifest(
@@ -766,7 +1069,7 @@ def build_stage_handlers(
             lease=lease,
             artifact_dir=_stage_artifact_dir(base_dir, context, lease),
             stage="classification_verification",
-            file_name="classification-verification-readiness-block.json",
+            file_name=file_name,
             payload=payload,
             artifact_type=STAGE_ARTIFACT_TYPES["classification_verification"],
             artifact_schema_version=STAGE_SCHEMA_VERSIONS["classification_verification"],
@@ -777,7 +1080,11 @@ def build_stage_handlers(
                 classification_manifest["artifact_id"],
             ],
             producer="researcher-swarm-production-readiness-adapter",
-            reason_codes=["verification_block_valid"],
+            reason_codes=[
+                "verification_pilot_valid"
+                if verification_status == "structured_market_metadata_certified"
+                else "verification_block_valid"
+            ],
             metadata=factory_metadata,
         )
         return _result(
@@ -785,7 +1092,7 @@ def build_stage_handlers(
             [manifest["artifact_id"]],
             [validation_id],
             lease,
-            {**factory_metadata, "verification_status": "blocked_no_researcher_classifications"},
+            {**factory_metadata, "verification_status": verification_status},
         )
 
     def scae(**kwargs: Any) -> dict[str, Any]:
@@ -806,6 +1113,7 @@ def build_stage_handlers(
             sufficiency_rows=verification_payload.get("research_sufficiency_reconciliation_slices") or [],
             verification_manifest_id=verification_manifest["artifact_id"],
             forecast_timestamp=_forecast_timestamp(forecast_timestamp, lease),
+            scoreable_pilot=scoreable_pilot,
         )
         manifest, validation_id = _write_payload_manifest(
             conn,
@@ -820,7 +1128,14 @@ def build_stage_handlers(
             forecast_timestamp=forecast_timestamp,
             input_manifest_ids=[qdt_manifest["artifact_id"], case_manifest["artifact_id"], verification_manifest["artifact_id"]],
             producer="scae-production-readiness-adapter",
-            reason_codes=["scae_ledger_valid", "production_probability_blocked_by_sufficiency"],
+            reason_codes=[
+                "scae_ledger_valid",
+                (
+                    "structured_market_metadata_probability_ready_under_debt_controls"
+                    if scoreable_pilot and ledger.get("forecast_validity_status") != "invalid_for_forecast"
+                    else "production_probability_blocked_by_sufficiency"
+                ),
+            ],
             metadata=factory_metadata,
         )
         return _result(
@@ -832,7 +1147,7 @@ def build_stage_handlers(
                 **factory_metadata,
                 "forecast_validity_status": ledger.get("forecast_validity_status"),
                 "final_probability_fields_status": ledger.get("final_probability_fields_status"),
-                "scoreable_forecast_output": False,
+                "scoreable_forecast_output": bool(ledger.get("scoreable_forecast_output")),
             },
         )
 
@@ -916,8 +1231,12 @@ def build_stage_handlers(
             metadata={
                 "forecast_decision_artifact_path": manifest["path"],
                 "scae_ledger_artifact_path": scae_manifest["path"],
-                "handler_scope": HANDLER_SCOPE,
-                "non_scoreable_reason": "research_sufficiency_not_certified",
+                "handler_scope": resolved_handler_scope,
+                **(
+                    {}
+                    if scoreable_pilot
+                    else {"non_scoreable_reason": "research_sufficiency_not_certified"}
+                ),
                 **factory_metadata,
             },
         )
@@ -947,6 +1266,9 @@ def build_stage_handlers(
             stage_outputs = kwargs["stage_outputs"]
             previous = PREVIOUS_STAGE[stage]
             previous_manifest = resolve_stage_output_manifest(conn, stage_outputs, previous)
+            decision_output = stage_outputs.get("decision") or {}
+            decision_metadata = decision_output.get("safe_metadata") or {}
+            scoreable = bool(decision_metadata.get("scoreable_forecast_output"))
             payload = {
                 "artifact_type": STAGE_ARTIFACT_TYPES[stage].replace("-", "_"),
                 "schema_version": STAGE_SCHEMA_VERSIONS[stage],
@@ -956,10 +1278,18 @@ def build_stage_handlers(
                 "run_id": context.pipeline_run_id,
                 "forecast_timestamp": _forecast_timestamp(forecast_timestamp, lease),
                 "input_manifest_ids": [previous_manifest["artifact_id"]],
-                "record_status": "recorded_non_scoreable_readiness_run",
-                "scoreable_forecast_output": False,
-                "writes_production_forecast": False,
-                "reason_codes": ["non_scoreable_readiness_run"],
+                "record_status": (
+                    "recorded_scoreable_production_pilot_run"
+                    if scoreable
+                    else "recorded_non_scoreable_readiness_run"
+                ),
+                "scoreable_forecast_output": scoreable,
+                "writes_production_forecast": scoreable,
+                "reason_codes": (
+                    ["scoreable_production_pilot_run"]
+                    if scoreable
+                    else ["non_scoreable_readiness_run"]
+                ),
             }
             manifest, validation_id = _write_payload_manifest(
                 conn,

@@ -73,6 +73,17 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Allow scoreable/manifest canary handlers to pass the live-readiness handler policy check.",
     )
+    parser.add_argument(
+        "--allow-calibration-debt-scoreable-canary",
+        action="store_true",
+        help="Allow a bounded production-pilot scoreable canary before calibration-debt clearance.",
+    )
+    parser.add_argument(
+        "--max-calibration-debt-canary-cases",
+        type=int,
+        default=2,
+        help="Maximum cases permitted by the scoreable calibration-debt canary gate.",
+    )
     parser.add_argument("--updated-by", default="ads-operational-scheduler")
     parser.add_argument("--reason", default="bounded ADS operational scheduler run")
     parser.add_argument("--metadata-json", type=parse_metadata)
@@ -124,6 +135,9 @@ def main() -> int:
                 runner_mode=args.runner_mode,
                 require_scoreable_live=args.require_scoreable_live,
                 allow_canary_handler=args.allow_canary_handler,
+                allow_calibration_debt_scoreable_canary=args.allow_calibration_debt_scoreable_canary,
+                requested_max_cases=args.max_cases,
+                max_calibration_debt_canary_cases=args.max_calibration_debt_canary_cases,
             )
             if not readiness["ok"]:
                 record = {

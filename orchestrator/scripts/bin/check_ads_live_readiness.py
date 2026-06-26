@@ -27,6 +27,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--handler-factory")
     parser.add_argument("--require-scoreable-live", action="store_true")
     parser.add_argument("--allow-canary-handler", action="store_true")
+    parser.add_argument("--allow-calibration-debt-scoreable-canary", action="store_true")
+    parser.add_argument("--requested-max-cases", type=int)
+    parser.add_argument("--max-calibration-debt-canary-cases", type=int, default=2)
     parser.add_argument("--prediction-source", default="ads_pipeline")
     parser.add_argument("--prediction-label", default="v2_scae")
     parser.add_argument("--evaluation-cluster-id", default="calibration-debt-clearance")
@@ -49,6 +52,9 @@ def main() -> int:
         runner_mode=args.runner_mode,
         require_scoreable_live=args.require_scoreable_live,
         allow_canary_handler=args.allow_canary_handler,
+        allow_calibration_debt_scoreable_canary=args.allow_calibration_debt_scoreable_canary,
+        requested_max_cases=args.requested_max_cases,
+        max_calibration_debt_canary_cases=args.max_calibration_debt_canary_cases,
         prediction_source=args.prediction_source,
         prediction_label=args.prediction_label,
         evaluation_cluster_id=args.evaluation_cluster_id,

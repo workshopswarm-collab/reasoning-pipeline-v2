@@ -106,6 +106,46 @@ class AdsLiveReadinessTest(unittest.TestCase):
         self.assertIn("production_readiness_handler_is_non_scoreable", report["issues"])
         self.assertIn("calibration_debt_not_cleared", report["issues"])
 
+    def test_scoreable_gate_blocks_production_pilot_without_debt_canary_allowance(self):
+        report = build_live_readiness_report(
+            self.db_path,
+            runner_mode="calibration_debt_production",
+            handler_factory="predquant.ads_production_pilot_handlers:build_stage_handlers",
+            require_scoreable_live=True,
+            requested_max_cases=1,
+        )
+
+        self.assertFalse(report["ok"])
+        self.assertIn("calibration_debt_not_cleared", report["issues"])
+
+    def test_scoreable_gate_allows_bounded_production_pilot_debt_canary(self):
+        report = build_live_readiness_report(
+            self.db_path,
+            runner_mode="calibration_debt_production",
+            handler_factory="predquant.ads_production_pilot_handlers:build_stage_handlers",
+            require_scoreable_live=True,
+            allow_calibration_debt_scoreable_canary=True,
+            requested_max_cases=1,
+        )
+
+        self.assertTrue(report["ok"], report["issues"])
+        self.assertTrue(report["allow_calibration_debt_scoreable_canary"])
+        self.assertEqual(report["requested_max_cases"], 1)
+
+    def test_scoreable_gate_blocks_overlarge_debt_canary_batch(self):
+        report = build_live_readiness_report(
+            self.db_path,
+            runner_mode="calibration_debt_production",
+            handler_factory="predquant.ads_production_pilot_handlers:build_stage_handlers",
+            require_scoreable_live=True,
+            allow_calibration_debt_scoreable_canary=True,
+            requested_max_cases=3,
+            max_calibration_debt_canary_cases=2,
+        )
+
+        self.assertFalse(report["ok"])
+        self.assertIn("calibration_debt_scoreable_canary_exceeds_case_limit", report["issues"])
+
 
 if __name__ == "__main__":
     unittest.main()
