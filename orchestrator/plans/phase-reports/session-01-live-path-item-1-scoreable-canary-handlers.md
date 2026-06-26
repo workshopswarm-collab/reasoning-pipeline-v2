@@ -11,4 +11,4 @@
 - Shared Inventory Updates Requested: None.
 - Shared Map/Matrix Updates Requested: Note that a bounded scoreable canary factory now exists for live-path validation, but true specialist workspace adapters remain separate work.
 - Blockers: The factory intentionally echoes the selected market snapshot baseline as the canary probability source. It verifies runner/control/persistence mechanics, not real SCAE forecast quality. A production live cutover still needs real stage adapters for evidence, policy context, related markets, decomposition, retrieval, classification, verification, SCAE, synthesis, decision, training trace, and replay record surfaces.
-- Commit SHA: 9e74faf834a7a9e3ad06675699049b9d0bec8ba6
+- Commit SHA: 01a77bf4d47b9681db02482d3288e157b7957a88
