@@ -33,7 +33,7 @@ Status values: `not_started`, `fixture_defined`, `implemented`, `passing`, `waiv
 | FIX-008 | Cutover | 2,5 | Stale/illiquid prior | Market prior reliability shrinks toward validated structural/base-rate anchor when present; no instant-snapshot-only shrink. | passing |
 | FIX-009 | Cutover | 2,5 | Fresh/liquid strong prior | Public old evidence receives assimilation discount and does not double count priced information. | passing |
 | FIX-010 | Cutover | 3,5 | Thin retrieval | Retrieval quality lowers leverage, widens interval, and preserves actionability warning. | not_started |
-| FIX-011 | Cutover | 3,4,5 | Protected-primary source failure | Source access failure slice persists; critical/source-of-truth leaf cannot use degraded fallback for execution authority. | not_started |
+| FIX-011 | Cutover | 3,4,5 | Protected-primary source failure | Source access failure slice persists; critical/source-of-truth leaf cannot use degraded fallback for execution authority. | passing |
 | FIX-012 | Cutover | 4,5 | Contradictory classifications | Direction/quality verification quarantines or excludes ambiguous rows without deadlocking non-critical forecast. | not_started |
 | FIX-013 | Cutover | 3,4,5 | Duplicate same-claim evidence | Same claim across leaves contributes once through shared-claim union; no additive duplicate force. | passing |
 | FIX-014 | Cutover | 3,5 | Ambiguous claim equivalence | Uncertain same-claim vs independent-claim defaults conservative, not independent corroboration. | passing |
@@ -55,7 +55,7 @@ Status values: `not_started`, `fixture_defined`, `implemented`, `passing`, `waiv
 | FIX-028 | Maturity | 3,6 | Decomposer-miss learning | Post-resolution decomposer-miss labels feed promoted QDT scoring overlay without leaking same-case outcomes into active dispatch. | not_started |
 | FIX-029 | Cutover | 1 | Exact Section 10 operational schema names | Schema name map has no unresolved runtime surface used by live components. | passing |
 | FIX-030 | Cutover | 1 | Structured execution log, error, and replay command | Every failed, blocked, retried, or artifact-validation-failed stage writes `v2_stage_execution_events`, status, safe bounded log refs or explicit no-log reason, error grouping key, replay command, and safe metadata. | not_started |
-| FIX-034 | Cutover | 3,4,5 | Insufficient research cannot become clean forecast | Leaf remains uncertified after expansion; SCAE marks forecast invalid or policy watch-only with structural unanswerability proof, never normal high-confidence evidence. | not_started |
+| FIX-034 | Cutover | 3,4,5 | Insufficient research cannot become clean forecast | Leaf remains uncertified after expansion; SCAE marks forecast invalid or policy watch-only with structural unanswerability proof, never normal high-confidence evidence. | passing |
 
 ## Wave Requirements
 
