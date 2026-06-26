@@ -161,6 +161,9 @@ class ScaeConditionalBranchTest(unittest.TestCase):
         self.assertEqual(summary["target_given_upstream_branch_probability_candidate"], up)
         self.assertEqual(summary["target_given_not_upstream_branch_probability_candidate"], not_up)
         self.assertEqual(summary["conditional_recombined_probability_candidate"], expected)
+        self.assertEqual(summary["adjusted_upstream_probability"], 0.4)
+        self.assertEqual(summary["upstream_probability_as_of"], "2026-06-25T12:00:00+00:00")
+        self.assertEqual(summary["upstream_prior_reliability_context"]["prior_reliability_class"], "usable_market")
         serialized = json.dumps(bundle, sort_keys=True)
         for forbidden_field in [
             "raw_ledger_probability",

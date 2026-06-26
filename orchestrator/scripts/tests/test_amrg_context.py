@@ -814,6 +814,24 @@ class AMRGContextTest(unittest.TestCase):
         self.assertEqual(cycle_edge["causal_graph_status"], "blocked_cycle_or_concurrent_timing")
         self.assertIn("causal_graph_cycle_rejected", cycle_edge["anchor_validation_reason_codes"])
 
+    def test_reflexive_anchor_candidate_is_rejected_and_downgraded(self):
+        context = self.strict_anchor_context()
+        edge = context["relationship_edges"][0]
+        edge_id = edge["edge_id"]
+        edge["upstream_market_id"] = "same-market"
+        edge["target_market_id"] = "same-market"
+
+        rejected = apply_strict_precedence_anchor_validation(
+            context,
+            qdt_anchor_contracts=[self.qdt_anchor_contract(edge_id)],
+        )
+
+        rejected_edge = rejected["relationship_edges"][0]
+        self.assertEqual(rejected_edge["relationship_status"], WEAK_CONTEXT_ONLY)
+        self.assertEqual(rejected_edge["anchor_validation_status"], "rejected")
+        self.assertIn("reflexive_causal_edge_rejected", rejected_edge["anchor_validation_reason_codes"])
+        self.assertEqual(rejected["prior_anchor_slices"][0]["allowed_use"], "validation_audit_only")
+
     def test_anchor_candidate_without_qdt_condition_scoped_leaves_is_rejected(self):
         context = self.strict_anchor_context()
         edge_id = context["relationship_edges"][0]["edge_id"]

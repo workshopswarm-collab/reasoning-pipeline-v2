@@ -240,6 +240,26 @@ class TuningProfileTest(unittest.TestCase):
         self.assertEqual(without_pointer["conservative_overlay_ids"], [])
         self.assertIn("conservative_thin_liquidity_overlay", with_pointer["conservative_overlay_ids"])
 
+    def test_unpromoted_overlay_cannot_apply_live_even_with_pointer(self):
+        packet, contract_result = self.build_packet(
+            category="novelty",
+            source_status="unknown",
+        )
+        registry = default_tunable_registry_metadata()
+        for overlay in registry["conservative_overlays"]:
+            if overlay["overlay_id"] == "conservative_source_unknown_overlay":
+                overlay["promotion_status"] = "inactive_candidate"
+
+        with self.assertRaisesRegex(TuningProfileError, "must be promoted"):
+            resolve_tuning_profile_context(
+                evidence_packet=packet,
+                evidence_packet_ref=contract_result["artifact_id"],
+                registry_metadata=registry,
+                active_overlay_pointers={
+                    "conservative_source_unknown_overlay": self.active_pointer("ptr-source-unknown"),
+                },
+            )
+
     def test_profile_context_rejects_numeric_scae_authoring(self):
         packet, contract_result = self.build_packet(category="politics")
         context = resolve_tuning_profile_context(

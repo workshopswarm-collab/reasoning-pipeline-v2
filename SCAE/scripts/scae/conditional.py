@@ -484,6 +484,7 @@ def _summary(
         "amrg_anchor_ref": anchor.get("prior_anchor_slice_id") or anchor.get("edge_id"),
         "amrg_anchor_validation_status": anchor.get("validation_status") or anchor.get("anchor_validation_status"),
         "adjusted_upstream_probability": adjusted_upstream_probability,
+        "upstream_probability_as_of": anchor.get("upstream_probability_as_of"),
         "upstream_prior_reliability_context": copy.deepcopy(upstream_reliability_context),
         "target_given_upstream_branch_probability_candidate": by_scope.get(TARGET_GIVEN_UPSTREAM, {}).get(
             "conditional_branch_probability_candidate"

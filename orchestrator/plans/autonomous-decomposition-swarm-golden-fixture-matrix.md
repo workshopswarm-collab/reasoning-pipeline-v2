@@ -39,9 +39,9 @@ Status values: `not_started`, `fixture_defined`, `implemented`, `passing`, `waiv
 | FIX-014 | Cutover | 3,5 | Ambiguous claim equivalence | Uncertain same-claim vs independent-claim defaults conservative, not independent corroboration. | passing |
 | FIX-015 | Cutover | 3,5 | Same-mechanism distinct claims | Same mechanism reduces independence or widens intervals but does not merge as same claim. | not_started |
 | FIX-016 | Cutover | 3,5 | Expanded decomposition branch sub-ledger | Effective leaf budget above compact default uses sign-partitioned branch sub-ledgers, not flat summation. | passing |
-| FIX-017 | Cutover | 2,3,5 | AMRG causal cycle downgrade | Concurrent/overlapping/cyclic relation downgrades to diagnostic and cannot create prior anchor. | not_started |
-| FIX-018 | Cutover | 2,5 | AMRG adjusted upstream prior reliability | Validated upstream anchor records adjusted upstream probability, reliability context, and source timestamps. | not_started |
-| FIX-036 | Cutover | 2,3 | AMRG local vector neighbor | Local Ollama-routed `BAAI/bge-base-en-v1.5` embeds active-safe descriptors, writes an index snapshot and capped neighbor candidates, and vector-only candidates remain weak context unless later validated. | not_started |
+| FIX-017 | Cutover | 2,3,5 | AMRG causal cycle downgrade | Concurrent/overlapping/cyclic relation downgrades to diagnostic and cannot create prior anchor. | passing |
+| FIX-018 | Cutover | 2,5 | AMRG adjusted upstream prior reliability | Validated upstream anchor records adjusted upstream probability, reliability context, and source timestamps. | passing |
+| FIX-036 | Cutover | 2,3 | AMRG local vector neighbor | Local Ollama-routed `BAAI/bge-base-en-v1.5` embeds active-safe descriptors, writes an index snapshot and capped neighbor candidates, and vector-only candidates remain weak context unless later validated. | passing |
 | FIX-038 | Cutover | 1,2,5 | SCAE forecast benchmark provenance | SCAE `production_forecast_prob` creates an idempotent `market_predictions` row tied to the case contract prediction-time snapshot; resolution scoring records prediction Brier, market Brier, Brier edge, scoring version, and resolution payload hash. | passing |
 | FIX-019 | Maturity | 2,3,4 | AMRG shared reuse temporal rejection | Cached retrieval/classification reuse is rejected when consuming dispatch temporal provenance is unsafe. | not_started |
 | FIX-020 | Cutover | 5 | Structural-prior/base-rate fingerprint overlap | SCAE rejects duplicate structural prior as signed evidence unless distinct fresh not-priced proof exists. | passing |
@@ -50,7 +50,7 @@ Status values: `not_started`, `fixture_defined`, `implemented`, `passing`, `waiv
 | FIX-023 | Cutover | 5 | Direct-cutover cap stack | Per-update, per-cluster, per-branch, and total caps apply; debt-mode caps are stricter. | passing |
 | FIX-024 | Calibration debt | 5,6 | Calibration-debt hard gates | First-100 trace completeness alone cannot clear debt; resolved/tail/regime/pointer-stability gates are required. | not_started |
 | FIX-025 | Cutover | 2,5 | Near-resolution market shrinkage | Near-resolution prior handling distinguishes source-grade contradiction from ordinary uncertainty. | not_started |
-| FIX-026 | Cutover | 2,5 | Effective tuning profile selection | Unknown/underpowered domains use global baseline plus conservative overlays; sports/crypto tags remain excluded from initial active profiles. | not_started |
+| FIX-026 | Cutover | 2,5 | Effective tuning profile selection | Unknown/underpowered domains use global baseline plus conservative overlays; sports/crypto tags remain excluded from initial active profiles. | passing |
 | FIX-027 | Maturity | 6 | Profile canary/rollback | Candidate profile runs in deterministic canary bucket and can roll back by lane-local pointer. | not_started |
 | FIX-028 | Maturity | 3,6 | Decomposer-miss learning | Post-resolution decomposer-miss labels feed promoted QDT scoring overlay without leaking same-case outcomes into active dispatch. | not_started |
 | FIX-029 | Cutover | 1 | Exact Section 10 operational schema names | Schema name map has no unresolved runtime surface used by live components. | passing |

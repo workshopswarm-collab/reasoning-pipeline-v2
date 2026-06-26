@@ -2411,13 +2411,13 @@ def apply_strict_precedence_anchor_validation(
             validated_edges.append(edge)
             continue
         edge_context = {
-            **edge,
             "case_id": context["case_id"],
             "dispatch_id": context["dispatch_id"],
             "selected_market_id": str(context["market_id"]),
             "target_market_id": str(context["market_id"]),
             "related_market_id": str(edge.get("market_id")),
             "candidate_set_id": context["candidate_set_id"],
+            **edge,
         }
         result = validate_strict_precedence_anchor(
             edge_context,
