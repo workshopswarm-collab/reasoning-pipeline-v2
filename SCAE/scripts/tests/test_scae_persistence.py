@@ -39,7 +39,12 @@ from scae.persistence import (  # noqa: E402
     write_scae_research_sufficiency_inputs,
 )
 from scae.policy import default_scae_policy  # noqa: E402
-from predquant.sqlite_store import ensure_schema  # noqa: E402
+from predquant.sqlite_store import (  # noqa: E402
+    BRIER_SCORING_VERSION,
+    ensure_schema,
+    payload_hash,
+    write_resolution_score,
+)
 
 
 class ScaePersistenceTest(unittest.TestCase):
@@ -814,6 +819,70 @@ class ScaePersistenceTest(unittest.TestCase):
             metadata = json.loads(row[12])
             self.assertEqual(metadata["scoreable_prediction_source"], "scae.production_forecast_prob")
             self.assertEqual(metadata["contract_market_snapshot_id"], snapshot_id)
+
+    def test_scae_market_prediction_bridge_scores_against_prediction_time_market_baseline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "predictions.sqlite3"
+            market_id, snapshot_id, _ = self.seed_prediction_market(db_path)
+            ledger = self.finalized_ledger()
+            gate = self.decision_gate(ledger)
+            contract = self.ads_case_contract(ledger, market_id, snapshot_id)
+
+            prediction = write_scae_market_prediction(db_path, ledger, gate, contract)
+            score = write_resolution_score(
+                db_path=db_path,
+                external_market_id="scae-market-1",
+                outcome=1.0,
+                resolved_at="2026-06-26T12:00:00+00:00",
+                resolution_source="polymarket-resolution-sync",
+                resolution_payload={"result": "yes", "source_id": "scae-score-fixture"},
+                resolution_method="api",
+                prediction_source="ads_pipeline",
+                prediction_label="v2_scae",
+            )
+
+            self.assertEqual(score["feature_id"], "SCORE-001")
+            self.assertEqual(score["settled_market"]["updated_predictions"], 1)
+            self.assertEqual(score["scorecards"]["written_scorecards"], 1)
+            with sqlite3.connect(db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                prediction_row = conn.execute(
+                    """
+                    SELECT prediction_brier, market_brier, scoring_version,
+                           scoring_resolution_payload_hash, market_snapshot_id,
+                           market_probability, market_probability_method
+                    FROM market_predictions
+                    WHERE id = ?
+                    """,
+                    (prediction["prediction_id"],),
+                ).fetchone()
+                scorecard = conn.execute(
+                    "SELECT prediction_brier, market_brier, metadata FROM evaluator_scorecards"
+                ).fetchone()
+
+            self.assertAlmostEqual(
+                prediction_row["prediction_brier"],
+                (ledger["production_forecast_prob"] - 1.0) ** 2,
+            )
+            self.assertAlmostEqual(prediction_row["market_brier"], (0.47 - 1.0) ** 2)
+            self.assertEqual(prediction_row["scoring_version"], BRIER_SCORING_VERSION)
+            self.assertEqual(
+                prediction_row["scoring_resolution_payload_hash"],
+                payload_hash({"result": "yes", "source_id": "scae-score-fixture"}),
+            )
+            self.assertEqual(prediction_row["market_snapshot_id"], snapshot_id)
+            self.assertEqual(prediction_row["market_probability"], 0.47)
+            self.assertEqual(prediction_row["market_probability_method"], "bid_ask_midpoint")
+            self.assertEqual(scorecard["prediction_brier"], prediction_row["prediction_brier"])
+            self.assertEqual(scorecard["market_brier"], prediction_row["market_brier"])
+            metadata = json.loads(scorecard["metadata"])
+            self.assertEqual(metadata["prediction_id"], prediction["prediction_id"])
+            self.assertEqual(metadata["market_snapshot_id"], snapshot_id)
+            self.assertEqual(metadata["scoring_version"], BRIER_SCORING_VERSION)
+            self.assertEqual(
+                metadata["resolution_payload_hash"],
+                prediction_row["scoring_resolution_payload_hash"],
+            )
 
     def test_scae_market_prediction_bridge_blocks_invalid_forecast_without_prediction_row(self):
         with tempfile.TemporaryDirectory() as tmp:
