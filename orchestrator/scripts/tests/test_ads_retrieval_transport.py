@@ -161,6 +161,32 @@ class AdsRetrievalTransportTest(unittest.TestCase):
         self.assertTrue(all(event[0] == "fetch" for event in provider.events[:first_search_index]))
         self.assertGreater(len(transport.fetched_candidates), len(transport.search_candidate_urls))
 
+    def test_embedded_resolution_urls_become_direct_candidates(self) -> None:
+        provider = FakeBrowserProvider(search_results=[{"url": "https://secondary.example/report"}])
+        case_contract = copy.deepcopy(self.case_contract)
+        case_contract["market_identity"]["description"] = (
+            "This market resolves using Tesla releases at https://ir.tesla.com/press. "
+            "If unavailable, use https://example.com/fallback-report."
+        )
+
+        transport = collect_live_retrieval_candidates(
+            qdt=self._resolution_mechanics_qdt(),
+            evidence_packet=self.evidence_packet,
+            case_contract=case_contract,
+            amrg_context=None,
+            source_cutoff_timestamp=CUTOFF_AT,
+            forecast_timestamp=FORECAST_AT,
+            provider_policy=RetrievalProviderPolicy(max_direct_urls=8, max_search_results_per_variant=1),
+            browser_provider=provider,
+        )
+
+        direct_urls = [item["url"] for item in transport.direct_url_candidates]
+        self.assertIn("https://ir.tesla.com/press", direct_urls)
+        self.assertIn("https://example.com/fallback-report", direct_urls)
+        self.assertTrue(
+            all(event[0] == "fetch" for event in provider.events[: len(transport.direct_url_candidates)])
+        )
+
     def test_bad_post_cutoff_duplicate_and_disallowed_urls_flow_to_rejections(self) -> None:
         provider = FakeBrowserProvider(
             fetch_payloads={

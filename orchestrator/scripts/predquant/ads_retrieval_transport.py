@@ -8,6 +8,7 @@ family, temporal safety, or research sufficiency from provider output.
 from __future__ import annotations
 
 import hashlib
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
@@ -230,8 +231,25 @@ def _collect_direct_url_hints(
         ("case_contract.market_rules", case_contract.get("market_rules")),
         ("case_contract.resolution_rules", case_contract.get("resolution_rules")),
         ("case_contract.market_identity", case_contract.get("market_identity")),
+        ("evidence_packet.market_identity", evidence_packet.get("market_identity")),
     ):
         for url, source_ref in _urls_from_resolution_fields(root, root_name):
+            _add_hint(
+                hints,
+                url,
+                source_ref=source_ref,
+                source_class="market_rules_or_resolution_source",
+                source_class_resolution_method="market_rules_resolution_url",
+            )
+    for root_name, root in (
+        ("case_contract.market_identity", case_contract.get("market_identity")),
+        ("case_contract.market_rules", case_contract.get("market_rules")),
+        ("case_contract.resolution_rules", case_contract.get("resolution_rules")),
+        ("evidence_packet.market_identity", evidence_packet.get("market_identity")),
+        ("evidence_packet.market_rules", evidence_packet.get("market_rules")),
+        ("evidence_packet.market_reality_constraints", evidence_packet.get("market_reality_constraints")),
+    ):
+        for url, source_ref in _urls_from_free_text(root, root_name):
             _add_hint(
                 hints,
                 url,
@@ -442,11 +460,23 @@ def _urls_from_resolution_fields(root: Any, prefix: str) -> list[tuple[str, str]
     return matches
 
 
+def _urls_from_free_text(root: Any, prefix: str) -> list[tuple[str, str]]:
+    if not isinstance(root, dict):
+        return []
+    matches: list[tuple[str, str]] = []
+    for key, value in root.items():
+        lowered = str(key).lower()
+        if not any(token in lowered for token in ("description", "rule", "resolution", "source", "url")):
+            continue
+        matches.extend(_extract_urls(value, f"{prefix}.{key}"))
+    return matches
+
+
 def _extract_urls(value: Any, prefix: str) -> list[tuple[str, str]]:
     found: list[tuple[str, str]] = []
     if isinstance(value, str):
-        if value.startswith(("http://", "https://")):
-            found.append((value, prefix))
+        for match in re.finditer(r"https?://[^\s<>)\"']+", value):
+            found.append((match.group(0).rstrip(".,;:"), prefix))
     elif isinstance(value, list):
         for idx, item in enumerate(value):
             found.extend(_extract_urls(item, f"{prefix}[{idx}]"))
