@@ -16,6 +16,12 @@ from predquant.ads_pipeline_runner import RUNNER_MODES  # noqa: E402
 from predquant.sqlite_store import DEFAULT_DB_PATH  # noqa: E402
 
 
+def load_json(path: Path | None, default):
+    if path is None:
+        return default
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -42,6 +48,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--evaluation-cluster-id", default="calibration-debt-clearance")
     parser.add_argument("--first100-trace-complete", action="store_true")
     parser.add_argument("--trace-manifest-count", type=int)
+    parser.add_argument("--tail-slice-diagnostics-json", type=Path)
+    parser.add_argument("--regime-diagnostics-json", type=Path)
+    parser.add_argument("--protected-component-diagnostics-json", type=Path)
+    parser.add_argument("--pointer-stability-evidence-json", type=Path)
     parser.add_argument("--max-market-snapshot-age-seconds", type=float, default=3600.0)
     parser.add_argument("--max-brier-age-seconds", type=float, default=172800.0)
     parser.add_argument("--max-resolution-sync-age-seconds", type=float, default=5400.0)
@@ -71,6 +81,10 @@ def main() -> int:
         evaluation_cluster_id=args.evaluation_cluster_id,
         first100_trace_complete=args.first100_trace_complete,
         trace_manifest_count=args.trace_manifest_count,
+        tail_slice_diagnostics=load_json(args.tail_slice_diagnostics_json, None),
+        regime_diagnostics=load_json(args.regime_diagnostics_json, None),
+        protected_component_diagnostics=load_json(args.protected_component_diagnostics_json, None),
+        pointer_stability_evidence=load_json(args.pointer_stability_evidence_json, None),
         max_market_snapshot_age_seconds=args.max_market_snapshot_age_seconds,
         max_brier_age_seconds=args.max_brier_age_seconds,
         max_resolution_sync_age_seconds=args.max_resolution_sync_age_seconds,

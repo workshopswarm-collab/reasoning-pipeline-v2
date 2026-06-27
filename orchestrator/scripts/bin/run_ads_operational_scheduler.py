@@ -38,6 +38,12 @@ def parse_metadata(value: str | None) -> dict:
     return parsed
 
 
+def load_json(path: Path | None, default):
+    if path is None:
+        return default
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -47,6 +53,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--runner-mode", choices=RUNNER_MODES, default="non_executing_canary")
     parser.add_argument("--handler-factory", help="Dotted module/path plus optional :factory for downstream stage handlers.")
+    parser.add_argument(
+        "--decomposer-runtime-transport-response",
+        type=Path,
+        help="Optional model-runtime transport response JSON passed to production handler factories.",
+    )
     parser.add_argument("--forecast-timestamp", help="Forecast timestamp passed to handler factory/case policy.")
     parser.add_argument("--max-cases", type=int, default=1, help="Maximum cases for this bounded scheduler run.")
     parser.add_argument("--retry-backoff-seconds", type=int, default=60)
@@ -84,6 +95,16 @@ def parse_args() -> argparse.Namespace:
         default=2,
         help="Maximum cases permitted by the scoreable calibration-debt canary gate.",
     )
+    parser.add_argument("--scoreable-readiness-mode", choices=("pilot_scoreable_readiness", "true_scoreable_live_readiness"))
+    parser.add_argument("--qdt-adapter-mode")
+    parser.add_argument("--researcher-runtime-mode")
+    parser.add_argument("--research-input-mode")
+    parser.add_argument("--first100-trace-complete", action="store_true")
+    parser.add_argument("--trace-manifest-count", type=int)
+    parser.add_argument("--tail-slice-diagnostics-json", type=Path)
+    parser.add_argument("--regime-diagnostics-json", type=Path)
+    parser.add_argument("--protected-component-diagnostics-json", type=Path)
+    parser.add_argument("--pointer-stability-evidence-json", type=Path)
     parser.add_argument("--updated-by", default="ads-operational-scheduler")
     parser.add_argument("--reason", default="bounded ADS operational scheduler run")
     parser.add_argument("--metadata-json", type=parse_metadata)
@@ -95,6 +116,9 @@ def main() -> int:
     args = parse_args()
     db_path = Path(args.db_path)
     metadata = args.metadata_json or {}
+    handler_factory_kwargs = {}
+    if args.decomposer_runtime_transport_response is not None:
+        handler_factory_kwargs["decomposer_runtime_transport_response_path"] = args.decomposer_runtime_transport_response
     handlers = None
     if args.handler_factory:
         config = OperationalCanaryConfig(
@@ -108,6 +132,7 @@ def main() -> int:
             require_manifest_handoffs=args.require_manifest_handoffs,
             skip_existing_ads_predictions=args.skip_existing_ads_predictions,
             metadata=metadata,
+            handler_factory_kwargs=handler_factory_kwargs,
         )
         handlers = build_handlers_from_factory(load_handler_factory(args.handler_factory), config)
     else:
@@ -122,6 +147,7 @@ def main() -> int:
             require_manifest_handoffs=args.require_manifest_handoffs,
             skip_existing_ads_predictions=args.skip_existing_ads_predictions,
             metadata=metadata,
+            handler_factory_kwargs=handler_factory_kwargs,
         )
 
     conn = sqlite3.connect(db_path, isolation_level=None)
@@ -134,10 +160,20 @@ def main() -> int:
                 handler_factory=args.handler_factory,
                 runner_mode=args.runner_mode,
                 require_scoreable_live=args.require_scoreable_live,
+                scoreable_readiness_mode=args.scoreable_readiness_mode,
+                qdt_adapter_mode=args.qdt_adapter_mode,
+                researcher_runtime_mode=args.researcher_runtime_mode,
+                research_input_mode=args.research_input_mode,
                 allow_canary_handler=args.allow_canary_handler,
                 allow_calibration_debt_scoreable_canary=args.allow_calibration_debt_scoreable_canary,
                 requested_max_cases=args.max_cases,
                 max_calibration_debt_canary_cases=args.max_calibration_debt_canary_cases,
+                first100_trace_complete=args.first100_trace_complete,
+                trace_manifest_count=args.trace_manifest_count,
+                tail_slice_diagnostics=load_json(args.tail_slice_diagnostics_json, None),
+                regime_diagnostics=load_json(args.regime_diagnostics_json, None),
+                protected_component_diagnostics=load_json(args.protected_component_diagnostics_json, None),
+                pointer_stability_evidence=load_json(args.pointer_stability_evidence_json, None),
             )
             if not readiness["ok"]:
                 record = {

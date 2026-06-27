@@ -64,6 +64,11 @@ def parse_args() -> argparse.Namespace:
         help="Dotted module or .py path plus optional :factory. Factory must return ADS stage handlers.",
     )
     parser.add_argument(
+        "--decomposer-runtime-transport-response",
+        type=Path,
+        help="Optional model-runtime transport response JSON passed to production handler factories.",
+    )
+    parser.add_argument(
         "--allow-non-scoreable",
         action="store_true",
         help="Do not require exactly one forecast_decision_records row and one market_predictions row.",
@@ -87,6 +92,9 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    handler_factory_kwargs = {}
+    if args.decomposer_runtime_transport_response is not None:
+        handler_factory_kwargs["decomposer_runtime_transport_response_path"] = args.decomposer_runtime_transport_response
     config = OperationalCanaryConfig(
         db_path=Path(args.db_path),
         runner_mode=args.runner_mode,
@@ -100,6 +108,7 @@ def main() -> int:
         require_manifest_handoffs=args.require_manifest_handoffs,
         skip_existing_ads_predictions=args.skip_existing_ads_predictions,
         metadata=args.metadata_json or {},
+        handler_factory_kwargs=handler_factory_kwargs,
     )
     if not args.handler_factory:
         print(

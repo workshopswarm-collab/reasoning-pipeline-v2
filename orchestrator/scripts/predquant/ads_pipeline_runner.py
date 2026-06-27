@@ -144,14 +144,41 @@ class RetryableStageError(PipelineRunnerContractError):
         *,
         retry_after_seconds: int | None = None,
         retry_policy_ref: str = "auto004-transient-stage-retry/v1",
+        failure_class: str = "dependency_not_ready",
+        safe_reason_code: str = TERMINAL_REASON_RETRY_SCHEDULED,
+        failure_policy_ref: str | None = None,
+        lease_release_or_drain_action: str = "keep_lease_recoverable",
+        pipeline_decision: str = "continue_after_retry_backoff",
     ):
         super().__init__(message)
         self.retry_after_seconds = retry_after_seconds
         self.retry_policy_ref = retry_policy_ref
+        self.failure_class = failure_class
+        self.safe_reason_code = safe_reason_code
+        self.failure_policy_ref = failure_policy_ref
+        self.lease_release_or_drain_action = lease_release_or_drain_action
+        self.pipeline_decision = pipeline_decision
 
 
 class NonRetryableStageError(PipelineRunnerContractError):
     """Raised when a stage failure should quarantine the leased case."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        failure_class: str = "missing_required_artifact",
+        safe_reason_code: str = "auto003_stage_failed",
+        failure_policy_ref: str | None = None,
+        lease_release_or_drain_action: str = "quarantine_case_lease",
+        pipeline_decision: str = "quarantine_and_block_scoreable_persistence",
+    ):
+        super().__init__(message)
+        self.failure_class = failure_class
+        self.safe_reason_code = safe_reason_code
+        self.failure_policy_ref = failure_policy_ref
+        self.lease_release_or_drain_action = lease_release_or_drain_action
+        self.pipeline_decision = pipeline_decision
 
 
 @dataclass(frozen=True)
@@ -1427,15 +1454,34 @@ def _record_stage_failed(
     failed_event_id = _stage_event_id(context, "stage_failed")
     error_event_id = stable_id("pipeline-error", context.pipeline_run_id, context.case_lease_id, context.stage)
     replay_command = _stage_replay_command(context.stage, context)
+    failure_class = str(getattr(exc, "failure_class", "missing_required_artifact") or "missing_required_artifact")
+    safe_reason_code = str(getattr(exc, "safe_reason_code", "auto003_stage_failed") or "auto003_stage_failed")
+    failure_policy_ref = getattr(exc, "failure_policy_ref", None)
+    lease_release_or_drain_action = str(
+        getattr(exc, "lease_release_or_drain_action", "quarantine_case_lease")
+        or "quarantine_case_lease"
+    )
+    pipeline_decision = str(
+        getattr(exc, "pipeline_decision", "quarantine_and_block_scoreable_persistence")
+        or "quarantine_and_block_scoreable_persistence"
+    )
+    failure_metadata = {
+        "feature_id": "AUTO-003",
+        "safe_reason_code": safe_reason_code,
+        "lease_release_or_drain_action": lease_release_or_drain_action,
+        "pipeline_decision": pipeline_decision,
+    }
+    if failure_policy_ref:
+        failure_metadata["failure_policy_ref"] = str(failure_policy_ref)
     error = build_pipeline_error_event(
         error_event_id=error_event_id,
         execution_event_id=failed_event_id,
         context=context,
-        failure_class="missing_required_artifact",
+        failure_class=failure_class,
         failure_grouping_key=f"{context.stage}:auto003_stage_failed:{exc.__class__.__name__}",
         retryability="terminal",
         safe_message=str(exc)[:512] or exc.__class__.__name__,
-        safe_metadata={"feature_id": "AUTO-003"},
+        safe_metadata=failure_metadata,
         replay_command=replay_command,
     )
     event = build_stage_execution_event(
@@ -1452,13 +1498,13 @@ def _record_stage_failed(
         script_path=RUNNER_SCRIPT_PATH,
         command_sha256_value=RUNNER_COMMAND_SHA256,
         error_event_id=error_event_id,
-        failure_class="missing_required_artifact",
+        failure_class=failure_class,
         safe_exception_class=exc.__class__.__name__,
         safe_exception_message=str(exc)[:512] or exc.__class__.__name__,
         no_log_reason="auto003_stage_failed_without_raw_log",
         redaction_status="not_needed",
         replay_command=replay_command,
-        safe_metadata={"feature_id": "AUTO-003"},
+        safe_metadata=failure_metadata,
     )
     write_stage_execution_event(conn, event)
     write_pipeline_error_event(conn, error)
@@ -1469,9 +1515,9 @@ def _record_stage_failed(
         duration_ms=0,
         latest_execution_event_ids=[started_event_id, failed_event_id],
         error_event_ids=[error_event_id],
-        reason_codes=["auto003_stage_failed"],
+        reason_codes=[safe_reason_code],
         replay_command=replay_command,
-        metadata={"feature_id": "AUTO-003", "safe_exception_class": exc.__class__.__name__},
+        metadata={**failure_metadata, "safe_exception_class": exc.__class__.__name__},
     )
     write_stage_status_snapshot(conn, status)
     return error_event_id
@@ -1497,17 +1543,30 @@ def _record_stage_retry_scheduled(
     replay_command = _stage_replay_command(context.stage, context)
     next_retry_at = add_seconds(utc_now_iso(), retry_after_seconds)
     safe_message = str(exc)[:512] or exc.__class__.__name__
+    failure_class = str(getattr(exc, "failure_class", "dependency_not_ready") or "dependency_not_ready")
+    safe_reason_code = str(getattr(exc, "safe_reason_code", TERMINAL_REASON_RETRY_SCHEDULED) or TERMINAL_REASON_RETRY_SCHEDULED)
+    failure_policy_ref = getattr(exc, "failure_policy_ref", None)
+    lease_release_or_drain_action = str(
+        getattr(exc, "lease_release_or_drain_action", "keep_lease_recoverable")
+        or "keep_lease_recoverable"
+    )
+    pipeline_decision = str(getattr(exc, "pipeline_decision", "continue_after_retry_backoff") or "continue_after_retry_backoff")
     metadata = {
         "feature_id": "AUTO-004",
         "retry_policy_ref": exc.retry_policy_ref,
         "retry_after_seconds": retry_after_seconds,
         "started_execution_event_id": started_event_id,
+        "safe_reason_code": safe_reason_code,
+        "lease_release_or_drain_action": lease_release_or_drain_action,
+        "pipeline_decision": pipeline_decision,
     }
+    if failure_policy_ref:
+        metadata["failure_policy_ref"] = str(failure_policy_ref)
     error = build_pipeline_error_event(
         error_event_id=error_event_id,
         execution_event_id=retry_event_id,
         context=context,
-        failure_class="dependency_not_ready",
+        failure_class=failure_class,
         failure_grouping_key=f"{context.stage}:auto004_retry_scheduled:{exc.__class__.__name__}",
         retryability="retryable",
         safe_message=safe_message,
@@ -1528,7 +1587,7 @@ def _record_stage_retry_scheduled(
         script_path=RUNNER_SCRIPT_PATH,
         command_sha256_value=RUNNER_COMMAND_SHA256,
         error_event_id=error_event_id,
-        failure_class="dependency_not_ready",
+        failure_class=failure_class,
         safe_exception_class=exc.__class__.__name__,
         safe_exception_message=safe_message,
         no_log_reason="auto004_retry_scheduled_without_raw_log",
@@ -1547,7 +1606,7 @@ def _record_stage_retry_scheduled(
         duration_ms=0,
         latest_execution_event_ids=[started_event_id, retry_event_id],
         error_event_ids=[error_event_id],
-        reason_codes=[TERMINAL_REASON_RETRY_SCHEDULED],
+        reason_codes=[safe_reason_code],
         replay_command=replay_command,
         metadata={**metadata, "next_retry_at": next_retry_at},
     )

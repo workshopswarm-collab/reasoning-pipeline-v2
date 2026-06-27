@@ -47,6 +47,7 @@ class OperationalCanaryConfig:
     skip_existing_ads_predictions: bool = False
     protected_tables: tuple[str, ...] = DEFAULT_PROTECTED_TABLES
     metadata: dict[str, Any] = field(default_factory=dict)
+    handler_factory_kwargs: dict[str, Any] = field(default_factory=dict)
 
 
 def table_exists(conn: sqlite3.Connection, table: str) -> bool:
@@ -319,6 +320,7 @@ def build_handlers_from_factory(
         forecast_timestamp=config.forecast_timestamp,
         max_cases=config.max_cases,
         metadata=dict(config.metadata),
+        **dict(config.handler_factory_kwargs),
     )
     if not isinstance(handlers, dict):
         raise PipelineRunnerContractError("handler factory must return a dict")

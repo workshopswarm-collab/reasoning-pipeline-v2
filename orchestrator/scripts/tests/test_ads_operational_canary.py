@@ -11,7 +11,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from predquant.ads_operational_canary import OperationalCanaryConfig, run_one_case_canary, validate_preflight
 from predquant.ads_pipeline_runner import ADS_PIPELINE_STAGE_ORDER, PipelineRunnerContractError
 from predquant.ads_manifest_canary_handlers import build_stage_handlers as build_manifest_stage_handlers
-from predquant.ads_production_handlers import build_stage_handlers as build_true_production_handlers
+from predquant.ads_production_handlers import (
+    ADS_PRODUCTION_STAGE_FAILURE_POLICY_ID,
+    ADS_PRODUCTION_STAGE_FAILURE_POLICY_SCHEMA_VERSION,
+    build_stage_handlers as build_true_production_handlers,
+)
 from predquant.ads_production_pilot_handlers import build_stage_handlers as build_production_pilot_handlers
 from predquant.ads_production_readiness_handlers import (
     _verified_evidence_delta_context,
@@ -425,7 +429,7 @@ class AdsOperationalCanaryTest(unittest.TestCase):
             conn.row_factory = sqlite3.Row
             qdt_row = conn.execute(
                 """
-                SELECT artifact_id, artifact_path, input_manifest_ids
+                SELECT artifact_id, artifact_path, input_manifest_ids, metadata
                 FROM case_artifact_manifest
                 WHERE artifact_type = 'question-decomposition'
                 ORDER BY id DESC
@@ -468,6 +472,15 @@ class AdsOperationalCanaryTest(unittest.TestCase):
                 LIMIT 1
                 """
             ).fetchone()
+            decomposition_status = conn.execute(
+                """
+                SELECT metadata
+                FROM v2_stage_status_snapshots
+                WHERE stage = 'decomposition' AND status = 'complete'
+                ORDER BY id DESC
+                LIMIT 1
+                """
+            ).fetchone()
             qdt_run_count = conn.execute("SELECT COUNT(*) FROM qdt_decomposition_runs").fetchone()[0]
             qdt_leaf_count = conn.execute("SELECT COUNT(*) FROM qdt_required_research_questions").fetchone()[0]
             qdt_sufficiency_count = conn.execute(
@@ -486,6 +499,7 @@ class AdsOperationalCanaryTest(unittest.TestCase):
         self.assertIsNotNone(amrg_row)
         self.assertIsNotNone(retrieval_row)
         self.assertIsNotNone(classification_row)
+        self.assertIsNotNone(decomposition_status)
         qdt = json.loads(Path(qdt_row["artifact_path"]).read_text(encoding="utf-8"))
         runtime = json.loads(Path(runtime_row["artifact_path"]).read_text(encoding="utf-8"))
         amrg = json.loads(Path(amrg_row["artifact_path"]).read_text(encoding="utf-8"))
@@ -493,7 +507,9 @@ class AdsOperationalCanaryTest(unittest.TestCase):
         classification_payload = json.loads(Path(classification_row["artifact_path"]).read_text(encoding="utf-8"))
         qdt_input_manifest_ids = set(json.loads(qdt_row["input_manifest_ids"]))
         classification_input_manifest_ids = set(json.loads(classification_row["input_manifest_ids"]))
+        qdt_metadata = json.loads(qdt_row["metadata"])
         amrg_metadata = json.loads(amrg_row["metadata"])
+        decomposition_status_metadata = json.loads(decomposition_status["metadata"])
 
         leaf_ids = {leaf["leaf_id"] for leaf in qdt["required_leaf_questions"]}
         self.assertFalse(
@@ -502,6 +518,23 @@ class AdsOperationalCanaryTest(unittest.TestCase):
         self.assertEqual(qdt["adapter_mode"], "decomposer_model_runtime_live")
         self.assertEqual(qdt["runtime_call_ref"], runtime["runtime_call_id"])
         self.assertIn(runtime_row["artifact_id"], qdt_input_manifest_ids)
+        self.assertEqual(qdt_metadata["handler_scope"], "true_production_specialist_runtime")
+        self.assertEqual(
+            qdt_metadata["handler_factory"],
+            "predquant.ads_production_handlers",
+        )
+        self.assertFalse(qdt_metadata["scoreable_pilot"])
+        self.assertTrue(qdt_metadata["decomposer_runtime"])
+        self.assertEqual(
+            decomposition_status_metadata["stage_failure_policy_schema_version"],
+            ADS_PRODUCTION_STAGE_FAILURE_POLICY_SCHEMA_VERSION,
+        )
+        self.assertEqual(
+            decomposition_status_metadata["stage_failure_policy_id"],
+            ADS_PRODUCTION_STAGE_FAILURE_POLICY_ID,
+        )
+        self.assertEqual(decomposition_status_metadata["scoreable_write_surface"], "decision_stage_only")
+        self.assertEqual(decomposition_status_metadata["handler_scope"], "true_production_specialist_runtime")
         self.assertEqual(runtime["resolved_model_id"], "gpt-5.5-high")
         self.assertEqual(runtime["mode"], "live")
         self.assertFalse(runtime["fixture_mode"])

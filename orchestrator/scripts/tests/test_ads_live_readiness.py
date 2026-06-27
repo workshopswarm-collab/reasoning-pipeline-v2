@@ -9,7 +9,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from predquant.ads_live_readiness import build_live_readiness_report
-from predquant.sqlite_store import SCHEMA
+from predquant.sqlite_store import SCHEMA, record_prediction_with_snapshot, write_resolution_score
 
 
 class AdsLiveReadinessTest(unittest.TestCase):
@@ -71,6 +71,98 @@ class AdsLiveReadinessTest(unittest.TestCase):
                 json.dumps({"source": "unit-test"}, sort_keys=True),
             ),
         )
+
+    def _prediction_payload(self, external_market_id: str) -> dict:
+        return {
+            "platform": "polymarket",
+            "external_market_id": external_market_id,
+            "slug": external_market_id,
+            "title": f"Will {external_market_id} resolve yes?",
+            "status": "open",
+            "snapshot": {
+                "observed_at": "2099-12-31T23:55:00+00:00",
+                "best_bid": 0.49,
+                "best_ask": 0.53,
+                "raw_payload": {"source": "true-live-readiness-test", "market": external_market_id},
+            },
+        }
+
+    def _seed_calibration_debt_clearance_evidence(self, count: int = 100):
+        self.conn.commit()
+        for index in range(count):
+            external_market_id = f"true-live-readiness-{index:03d}"
+            record_prediction_with_snapshot(
+                db_path=self.db_path,
+                payload=self._prediction_payload(external_market_id),
+                predicted_probability=0.65,
+                prediction_run_id=f"run-{external_market_id}",
+                forecast_artifact_id=f"forecast-{external_market_id}",
+                case_key=f"polymarket:{external_market_id}",
+                case_id=f"case-{external_market_id}",
+                dispatch_id=f"dispatch-{external_market_id}",
+                engine_stage="scae",
+                prediction_source="ads_pipeline",
+                prediction_label="v2_scae",
+                predicted_at="2100-01-01T00:01:00+00:00",
+                input_artifact_path="artifacts/scae-ledger.json",
+                input_artifact_sha256="sha256:ledger",
+                prediction_artifact_path="artifacts/forecast-decision.json",
+                prediction_artifact_sha256="sha256:decision",
+                metadata={"forecast_decision_id": f"decision-{external_market_id}"},
+            )
+            write_resolution_score(
+                db_path=self.db_path,
+                external_market_id=external_market_id,
+                outcome=1.0,
+                resolved_at="2100-01-02T00:00:00+00:00",
+                resolution_source="polymarket-resolution-sync",
+                resolution_payload={"result": "yes", "source_id": external_market_id},
+                resolution_method="api",
+                prediction_source="ads_pipeline",
+                prediction_label="v2_scae",
+                evaluation_cluster_id="calibration-debt-clearance",
+            )
+
+    def _passing_tail_diagnostics(self):
+        return [
+            {
+                "slice_id": "tail:p90_100",
+                "case_count": 100,
+                "status": "pass",
+                "absolute_calibration_error": 0.02,
+                "log_loss_degradation": 0.0,
+                "catastrophic_tail_failures": 0,
+            }
+        ]
+
+    def _passing_regime_diagnostics(self):
+        return [
+            {
+                "regime_id": "regime:liquid-open",
+                "case_count": 100,
+                "status": "pass",
+                "absolute_calibration_error": 0.02,
+            }
+        ]
+
+    def _passing_protected_component_diagnostics(self):
+        return [
+            {
+                "component_id": "protected:source-of-truth",
+                "case_count": 100,
+                "status": "pass",
+                "max_brier_degradation": 0.0,
+            }
+        ]
+
+    def _passing_pointer_stability(self):
+        return {
+            "status": "passed",
+            "active_policy_pointer_ref": "scae-policy:pointer:current",
+            "stable_window_count": 1,
+            "window_started_at": "2100-01-01T00:00:00+00:00",
+            "window_completed_at": "2100-01-08T00:00:00+00:00",
+        }
 
     def test_production_readiness_handler_passes_non_scoreable_gate(self):
         report = build_live_readiness_report(
@@ -176,6 +268,36 @@ class AdsLiveReadinessTest(unittest.TestCase):
                 "researcher_runtime_mode": "metadata_only",
                 "research_input_mode": "structured_market_metadata_certified",
             },
+        )
+
+    def test_true_live_readiness_accepts_true_production_handler_with_cal001_inputs(self):
+        self._seed_calibration_debt_clearance_evidence()
+
+        report = build_live_readiness_report(
+            self.db_path,
+            runner_mode="calibration_debt_production",
+            handler_factory="predquant.ads_production_handlers:build_stage_handlers",
+            require_scoreable_live=True,
+            scoreable_readiness_mode="true_scoreable_live_readiness",
+            qdt_adapter_mode="decomposer_model_runtime_live",
+            researcher_runtime_mode="model_executed",
+            research_input_mode="verified_researcher_scae_evidence",
+            first100_trace_complete=True,
+            trace_manifest_count=100,
+            tail_slice_diagnostics=self._passing_tail_diagnostics(),
+            regime_diagnostics=self._passing_regime_diagnostics(),
+            protected_component_diagnostics=self._passing_protected_component_diagnostics(),
+            pointer_stability_evidence=self._passing_pointer_stability(),
+        )
+
+        self.assertTrue(report["ok"], report["issues"])
+        self.assertEqual(report["status"], "ready")
+        self.assertTrue(report["require_scoreable_live"])
+        self.assertEqual(report["scoreable_readiness_mode"], "true_scoreable_live_readiness")
+        self.assertTrue(report["calibration_debt_report"]["clears_calibration_debt"])
+        self.assertEqual(
+            report["calibration_debt_report"]["brier_score_report"]["scorecards"]["scorecards"],
+            100,
         )
 
     def test_scoreable_gate_blocks_overlarge_debt_canary_batch(self):
