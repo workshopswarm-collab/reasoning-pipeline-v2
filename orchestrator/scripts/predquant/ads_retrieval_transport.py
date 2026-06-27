@@ -90,8 +90,19 @@ def collect_live_retrieval_candidates(
     from researcher_swarm.retrieval import build_retrieval_query_contexts
 
     policy = provider_policy or RetrievalProviderPolicy()
-    browser_fetch_configured = browser_provider is not None and hasattr(browser_provider, "fetch_url")
-    browser_search_configured = browser_provider is not None and hasattr(browser_provider, "search_candidate_urls")
+    browser_provider_diagnostics = _provider_diagnostics(browser_provider)
+    browser_fetch_configured = _provider_capability_configured(
+        browser_provider,
+        "fetch_url",
+        browser_provider_diagnostics,
+        "fetch_configured",
+    )
+    browser_search_configured = _provider_capability_configured(
+        browser_provider,
+        "search_candidate_urls",
+        browser_provider_diagnostics,
+        "search_configured",
+    )
     contexts = build_retrieval_query_contexts(
         qdt,
         evidence_packet=evidence_packet,
@@ -192,6 +203,8 @@ def collect_live_retrieval_candidates(
         "browser_fetch_authority": "url_fetch_extraction_only",
         "deterministic_admission_authority": "build_live_retrieval_packet_from_candidates",
     }
+    if browser_provider_diagnostics:
+        result.transport_diagnostics["browser_provider_diagnostics"] = browser_provider_diagnostics
     return result
 
 
@@ -372,6 +385,26 @@ def _provider_fetch(browser_provider: Any | None, url: str) -> dict[str, Any]:
             "reason_codes": ["browser_provider_returned_non_object"],
         }
     return fetched
+
+
+def _provider_diagnostics(browser_provider: Any | None) -> dict[str, Any]:
+    if browser_provider is None or not hasattr(browser_provider, "provider_diagnostics"):
+        return {}
+    diagnostics = browser_provider.provider_diagnostics()
+    return diagnostics if isinstance(diagnostics, dict) else {}
+
+
+def _provider_capability_configured(
+    browser_provider: Any | None,
+    method_name: str,
+    diagnostics: dict[str, Any],
+    diagnostic_key: str,
+) -> bool:
+    if browser_provider is None or not hasattr(browser_provider, method_name):
+        return False
+    if diagnostic_key in diagnostics:
+        return bool(diagnostics.get(diagnostic_key))
+    return True
 
 
 def _search_candidate_urls(browser_provider: Any | None, context: dict[str, Any], variant: dict[str, Any], *, searched_at: str) -> list[dict[str, Any]]:

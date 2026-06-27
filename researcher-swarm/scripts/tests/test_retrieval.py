@@ -27,7 +27,7 @@ from researcher_swarm.assignments import (  # noqa: E402
     LeafResearchAssignmentError,
     build_leaf_research_assignments,
 )
-from researcher_swarm.browser_provider import BrowserProviderAdapter  # noqa: E402
+from researcher_swarm.browser_provider import BrowserProviderAdapter, ConfiguredBrowserProvider, build_provider  # noqa: E402
 from researcher_swarm.retrieval import (  # noqa: E402
     RetrievalPacketError,
     attach_native_research_transport_diagnostics,
@@ -1441,6 +1441,88 @@ class RetrievalPacketContractTest(unittest.TestCase):
         self.assertFalse(records[0]["web_fetch_used_for_search"])
         self.assertTrue(records[0]["fetch_required_before_admission"])
         self.assertEqual(fetched["web_fetch_role"], "url_fetch_extraction_only")
+
+    def test_configured_browser_provider_uses_explicit_search_boundary(self) -> None:
+        context = build_retrieval_query_contexts(self.qdt, evidence_packet=self.evidence_packet)[0]
+        calls = []
+
+        class Response:
+            url = "https://api.search.brave.com/res/v1/web/search"
+            headers = {"content-type": "application/json"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self, *_args):
+                return json.dumps(
+                    {
+                        "web": {
+                            "results": [
+                                {
+                                    "url": "https://source.example/report",
+                                    "title": "Source report",
+                                    "description": "Independent source result.",
+                                }
+                            ]
+                        }
+                    }
+                ).encode("utf-8")
+
+        def opener(request, timeout):
+            calls.append((request.full_url, dict(request.header_items()), timeout))
+            return Response()
+
+        provider = ConfiguredBrowserProvider(search_api_key="test-key", opener=opener)
+        records = provider.search_candidate_urls(context, context["query_variants"][0], searched_at="2026-06-24T12:00:00+00:00")
+
+        self.assertEqual(records[0]["url"], "https://source.example/report")
+        self.assertEqual(records[0]["result_source"], "brave_search_api")
+        self.assertFalse(records[0]["web_fetch_used_for_search"])
+        self.assertIn("X-subscription-token", calls[0][1])
+        self.assertTrue(provider.provider_diagnostics()["search_configured"])
+
+    def test_configured_browser_provider_fetch_is_url_extraction_only(self) -> None:
+        class Response:
+            url = "https://source.example/final"
+            headers = {
+                "content-type": "text/html",
+                "last-modified": "Wed, 24 Jun 2026 11:30:00 GMT",
+                "date": "Wed, 24 Jun 2026 11:40:00 GMT",
+            }
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self, *_args):
+                return b"<html><head><style>.x{}</style></head><body><h1>Official source</h1><script>x()</script><p>Evidence text.</p></body></html>"
+
+        provider = ConfiguredBrowserProvider(search_api_key=None, opener=lambda _request, timeout: Response())
+        records = provider.search_candidate_urls(
+            build_retrieval_query_contexts(self.qdt, evidence_packet=self.evidence_packet)[0],
+            build_retrieval_query_contexts(self.qdt, evidence_packet=self.evidence_packet)[0]["query_variants"][0],
+        )
+        fetched = provider.fetch_url("https://source.example/page")
+
+        self.assertEqual(records, [])
+        self.assertEqual(provider.last_search_error, "brave_search_api_key_not_configured")
+        self.assertEqual(fetched["final_url"], "https://source.example/final")
+        self.assertIn("Official source", fetched["content"])
+        self.assertNotIn("x()", fetched["content"])
+        self.assertEqual(fetched["source_published_at"], "2026-06-24T11:30:00+00:00")
+        self.assertEqual(fetched["web_fetch_role"], "url_fetch_extraction_only")
+        self.assertFalse(provider.provider_diagnostics()["authority_boundary"]["certifies_source_class"])
+
+    def test_default_configured_provider_factory_is_fail_closed_without_search_key(self) -> None:
+        provider = build_provider()
+
+        self.assertIsInstance(provider, ConfiguredBrowserProvider)
+        self.assertFalse(provider.provider_diagnostics()["search_configured"])
 
     def test_phase7_native_candidate_caps_forbidden_fields_and_nonblocking_unavailability(self) -> None:
         context = build_retrieval_query_contexts(self.qdt, evidence_packet=self.evidence_packet)[0]

@@ -68,6 +68,21 @@ class FakeBrowserProvider:
         return records
 
 
+class DiagnosticsBrowserProvider(FakeBrowserProvider):
+    def __init__(self, *, search_configured: bool, fetch_configured: bool):
+        super().__init__(search_results=[{"url": "https://secondary.example/report"}])
+        self.search_configured = search_configured
+        self.fetch_configured = fetch_configured
+
+    def provider_diagnostics(self) -> dict:
+        return {
+            "provider_id": "diagnostics-provider",
+            "search_configured": self.search_configured,
+            "fetch_configured": self.fetch_configured,
+            "web_fetch_must_not_be_used_as_search": True,
+        }
+
+
 class AdsRetrievalTransportTest(unittest.TestCase):
     def setUp(self) -> None:
         handoff = {
@@ -186,6 +201,26 @@ class AdsRetrievalTransportTest(unittest.TestCase):
         self.assertTrue(
             all(event[0] == "fetch" for event in provider.events[: len(transport.direct_url_candidates)])
         )
+
+    def test_provider_diagnostics_control_configured_search_status(self) -> None:
+        provider = DiagnosticsBrowserProvider(search_configured=False, fetch_configured=True)
+
+        transport = collect_live_retrieval_candidates(
+            qdt=self._resolution_mechanics_qdt(),
+            evidence_packet=self.evidence_packet,
+            case_contract=self.case_contract,
+            amrg_context=None,
+            source_cutoff_timestamp=CUTOFF_AT,
+            forecast_timestamp=FORECAST_AT,
+            provider_policy=RetrievalProviderPolicy(max_direct_urls=1, max_search_results_per_variant=1),
+            browser_provider=provider,
+        )
+
+        diagnostics = transport.transport_diagnostics
+        self.assertEqual(diagnostics["browser_provider_status"], "available")
+        self.assertTrue(diagnostics["browser_fetch_configured"])
+        self.assertFalse(diagnostics["browser_search_configured"])
+        self.assertEqual(diagnostics["browser_provider_diagnostics"]["provider_id"], "diagnostics-provider")
 
     def test_bad_post_cutoff_duplicate_and_disallowed_urls_flow_to_rejections(self) -> None:
         provider = FakeBrowserProvider(
