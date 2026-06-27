@@ -64,9 +64,12 @@ from ads_decomposer.qdt import (  # noqa: E402
 from researcher_swarm.retrieval import (  # noqa: E402
     RETRIEVAL_PACKET_MANIFEST_ARTIFACT_TYPE,
     RETRIEVAL_PACKET_SCHEMA_VERSION,
+    attach_native_research_transport_diagnostics,
     build_live_retrieval_packet_from_candidates,
     build_retrieval_evidence_item,
     build_retrieval_packet,
+    build_retrieval_query_contexts,
+    build_search_candidate_url,
     dump_retrieval_packet,
     finalize_retrieval_packet_for_dispatch,
 )
@@ -482,6 +485,42 @@ def _live_fixture_direct_candidates(
     return candidates
 
 
+def _live_fixture_search_candidate_urls(
+    *,
+    qdt: dict[str, Any],
+    evidence_packet: dict[str, Any],
+    candidates: list[dict[str, Any]],
+    searched_at: str,
+) -> list[dict[str, Any]]:
+    contexts = {
+        str(context["leaf_id"]): context
+        for context in build_retrieval_query_contexts(qdt, evidence_packet=evidence_packet)
+    }
+    records: list[dict[str, Any]] = []
+    for candidate in candidates:
+        if candidate.get("navigation_mode") != "web_search":
+            continue
+        context = contexts.get(str(candidate.get("leaf_id")))
+        if not context:
+            continue
+        variants = context.get("query_variants") or []
+        if not variants:
+            continue
+        records.append(
+            build_search_candidate_url(
+                context,
+                variants[0],
+                rank=int(candidate.get("result_rank") or len(records) + 1),
+                url=str(candidate.get("canonical_url") or candidate.get("url") or candidate.get("requested_url") or ""),
+                title="production readiness fixture candidate",
+                snippet=str(candidate.get("content") or ""),
+                searched_at=searched_at,
+                result_source="production_readiness_fixture_search_provider",
+            )
+        )
+    return records
+
+
 def _certified_reconciliation_rows(
     qdt: dict[str, Any],
     retrieval_packet: dict[str, Any],
@@ -750,6 +789,7 @@ def build_stage_handlers(
     decomposer_runtime_mode: str = "fixture",
     decomposer_runtime_transport_response_path: str | Path | None = None,
     live_policy_overlay: bool = False,
+    live_retrieval_runtime: bool = False,
     live_fixture_retrieval: bool = False,
     block_at_leaf_research_barrier: bool = False,
     amrg_vector_runtime: bool = False,
@@ -781,6 +821,7 @@ def build_stage_handlers(
         "decomposer_runtime": bool(decomposer_runtime),
         "decomposer_runtime_mode": decomposer_runtime_mode,
         "live_policy_overlay": bool(live_policy_overlay),
+        "live_retrieval_runtime": bool(live_retrieval_runtime),
         "live_fixture_retrieval": bool(live_fixture_retrieval),
         "block_at_leaf_research_barrier": bool(block_at_leaf_research_barrier),
         "amrg_vector_runtime": bool(amrg_vector_runtime),
@@ -1054,16 +1095,24 @@ def build_stage_handlers(
         case_contract = load_manifest_payload(case_manifest)
         source_cutoff = lease["selected_snapshot_observed_at"]
         if live_fixture_retrieval:
+            evidence_payload = load_manifest_payload(evidence_manifest)
             fetched_candidates = _live_fixture_direct_candidates(
                 qdt=qdt_payload,
                 case_contract=case_contract,
                 source_cutoff_timestamp=source_cutoff,
             )
+            search_candidate_urls = _live_fixture_search_candidate_urls(
+                qdt=qdt_payload,
+                evidence_packet=evidence_payload,
+                candidates=fetched_candidates,
+                searched_at=_forecast_timestamp(forecast_timestamp, lease),
+            )
             packet = build_live_retrieval_packet_from_candidates(
                 qdt_payload,
-                evidence_packet=load_manifest_payload(evidence_manifest),
+                evidence_packet=evidence_payload,
                 amrg_context=load_manifest_payload(related_manifest),
                 fetched_candidates=fetched_candidates,
+                search_candidate_urls=search_candidate_urls,
                 question_decomposition_artifact_id=qdt_manifest["artifact_id"],
                 policy_context_ref=profile_manifest["artifact_id"],
                 forecast_timestamp=_forecast_timestamp(forecast_timestamp, lease),
@@ -1076,6 +1125,34 @@ def build_stage_handlers(
                 ],
                 live_retrieval_allowlist=["browser", "native_gpt_research", "structured_feed"],
                 live_policy_overlay=live_policy_overlay,
+                runtime_mode="live_fixture_candidate_retrieval_runtime",
+            )
+        elif live_retrieval_runtime:
+            packet = build_live_retrieval_packet_from_candidates(
+                qdt_payload,
+                evidence_packet=load_manifest_payload(evidence_manifest),
+                amrg_context=load_manifest_payload(related_manifest),
+                fetched_candidates=[],
+                search_candidate_urls=[],
+                native_research_candidates=[],
+                question_decomposition_artifact_id=qdt_manifest["artifact_id"],
+                policy_context_ref=profile_manifest["artifact_id"],
+                forecast_timestamp=_forecast_timestamp(forecast_timestamp, lease),
+                source_cutoff_timestamp=source_cutoff,
+                pre_dispatch_input_whitelist_refs=[
+                    qdt_manifest["artifact_id"],
+                    evidence_manifest["artifact_id"],
+                    profile_manifest["artifact_id"],
+                    related_manifest["artifact_id"],
+                ],
+                live_retrieval_allowlist=["browser", "native_gpt_research", "structured_feed"],
+                live_policy_overlay=live_policy_overlay,
+                runtime_mode="live_retrieval_runtime",
+            )
+            packet = attach_native_research_transport_diagnostics(
+                packet,
+                availability_status="unavailable",
+                unavailable_reason="native_research_transport_not_configured",
             )
         elif scoreable_pilot:
             selected_evidence = _structured_market_metadata_evidence(
@@ -1124,6 +1201,8 @@ def build_stage_handlers(
             packet = finalize_retrieval_packet_for_dispatch(packet)
         if live_fixture_retrieval:
             packet["adapter_mode"] = "live_candidate_fixture_retrieval_runtime"
+        elif live_retrieval_runtime:
+            packet["adapter_mode"] = "real_retrieval_runtime_blocked_until_transport_evidence"
         elif scoreable_pilot:
             packet["adapter_mode"] = "structured_market_metadata_pilot_retrieval"
         else:
@@ -1151,6 +1230,9 @@ def build_stage_handlers(
                 (
                     "live_candidate_fixture_retrieval_certified"
                     if live_fixture_retrieval
+                    else
+                    "real_retrieval_runtime_blocked_until_evidence"
+                    if live_retrieval_runtime
                     else
                     "structured_market_metadata_pilot_certified"
                     if scoreable_pilot

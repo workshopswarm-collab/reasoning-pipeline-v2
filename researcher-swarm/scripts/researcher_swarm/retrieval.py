@@ -53,6 +53,7 @@ RETRIEVAL_CANDIDATE_RECORD_SCHEMA_VERSION = "retrieval-candidate-record/v1"
 NATIVE_RESEARCH_ATTEMPT_SCHEMA_VERSION = "native-research-attempt/v1"
 BROWSER_RETRIEVAL_ATTEMPT_SCHEMA_VERSION = "browser-retrieval-attempt/v1"
 BROWSER_PROVIDER_DIAGNOSTIC_SCHEMA_VERSION = "browser-search-provider-diagnostic/v1"
+SEARCH_CANDIDATE_URL_SCHEMA_VERSION = "search-candidate-url/v1"
 SOURCE_METADATA_CLASSIFIER_SCHEMA_VERSION = "source-metadata-classifier/v1"
 SOURCE_METADATA_CLASSIFIER_UNAVAILABLE_SCHEMA_VERSION = "source-metadata-classifier-unavailable/v1"
 SOURCE_METADATA_RESOLUTION_SCHEMA_VERSION = "source-metadata-resolution/v1"
@@ -70,6 +71,7 @@ EXPECTED_SOURCE_MISSINGNESS_CANDIDATE_SCHEMA_VERSION = "expected-source-missingn
 RETRIEVAL_EXPANSION_ATTEMPT_SCHEMA_VERSION = "retrieval-expansion-attempt/v1"
 RETRIEVAL_FALLBACK_STATE_SCHEMA_VERSION = "retrieval-fallback-state/v1"
 RESEARCH_SUFFICIENCY_CERTIFICATE_SCHEMA_VERSION = "research-sufficiency-certificate/v1"
+NATIVE_RESEARCH_CANDIDATE_DISCOVERY_SCHEMA_VERSION = "native-research-candidate-discovery/v1"
 NATIVE_RESEARCH_TRANSPORT_DIAGNOSTIC_SCHEMA_VERSION = "native-research-transport-diagnostic/v1"
 RETRIEVAL_VALIDATOR_VERSION = "ads-ret-002-004-retrieval-schema/v1"
 RETRIEVAL_QUERY_PLANNER_VERSION = "ads-ret-001-query-planner/v1"
@@ -110,6 +112,30 @@ SOURCE_METADATA_CLASSIFIER_FORBIDDEN_OUTPUTS = (
     "temporal_safety_final_authority",
     "decision_output",
 )
+NATIVE_RESEARCH_FORBIDDEN_OUTPUT_FRAGMENTS = (
+    "probability",
+    "forecast_probability",
+    "fair_value",
+    "scae_delta",
+    "source_family_final_authority",
+    "claim_family_final_authority",
+    "temporal_safety_final_authority",
+    "sufficiency_certification",
+    "research_sufficiency",
+    "decision_recommendation",
+    "decision_output",
+)
+SEARCH_CANDIDATE_RANK_CAPS = {
+    "primary_leaf_retrieval": 10,
+    "contradiction_search": 6,
+    "negative_check": 5,
+}
+NATIVE_RESEARCH_CANDIDATE_CAPS = {
+    "critical_source_of_truth": 12,
+    "high_direct_or_catalyst": 8,
+    "normal_medium": 5,
+    "mechanics_rules_only": 4,
+}
 
 ALLOWED_RETRIEVAL_TRANSPORTS = {
     "browser",
@@ -420,6 +446,26 @@ def _ensure_no_forbidden_keys(value: Any, field: str) -> None:
         raise RetrievalPacketError("; ".join(errors))
 
 
+def _reject_forbidden_native_research_outputs(value: Any, errors: list[str], path: str = "native_research") -> None:
+    if isinstance(value, dict):
+        for key, child in value.items():
+            normalized = str(key).lower()
+            if any(fragment in normalized for fragment in NATIVE_RESEARCH_FORBIDDEN_OUTPUT_FRAGMENTS):
+                errors.append(f"{path}.{key} is forbidden in RET-010 native research candidate discovery")
+            _reject_forbidden_native_research_outputs(child, errors, f"{path}.{key}")
+    elif isinstance(value, list):
+        for idx, child in enumerate(value):
+            _reject_forbidden_native_research_outputs(child, errors, f"{path}[{idx}]")
+
+
+def _ensure_no_forbidden_native_research_outputs(value: Any, field: str) -> None:
+    errors: list[str] = []
+    _reject_forbidden_native_research_outputs(value, errors, field)
+    _reject_forbidden_retrieval_keys(value, errors, field)
+    if errors:
+        raise RetrievalPacketError("; ".join(errors))
+
+
 def _branch_index(qdt: dict[str, Any]) -> dict[str, dict[str, Any]]:
     branches = qdt.get("branches")
     if not isinstance(branches, list):
@@ -605,6 +651,7 @@ def compose_query_variants(
     market_terms: list[str] | None = None,
     required_evidence_fields: list[str] | None = None,
     source_class_targets: list[str] | None = None,
+    amrg_retrieval_hints: list[str] | None = None,
     variant_count: int = 3,
 ) -> list[dict[str, Any]]:
     leaf_question = _normalized_space(str(leaf.get("question_text", "")))
@@ -614,6 +661,7 @@ def compose_query_variants(
     terms = " ".join((market_terms or [])[:8])
     fields = " ".join((required_evidence_fields or [])[:8])
     source_targets = " ".join((source_class_targets or [])[:4]).replace("_", " ")
+    amrg_hints = " ".join((amrg_retrieval_hints or [])[:4])
     branch_label = ""
     if isinstance(branch, dict) and _is_non_empty_string(branch.get("branch_question")):
         branch_label = str(branch["branch_question"])
@@ -630,6 +678,7 @@ def compose_query_variants(
         f"{leaf_question} latest direct evidence timestamp source {terms} before cutoff",
         f"{macro} {leaf_question} source of truth official database record {terms}",
         f"{leaf_question} independent secondary corroboration {terms} {fields}",
+        f"{leaf_question} related market retrieval hint {amrg_hints} {terms}",
     ]
 
     seen: set[str] = set()
@@ -714,6 +763,59 @@ def allowed_amrg_hint_refs(amrg_context: dict[str, Any] | None, leaf: dict[str, 
     return refs
 
 
+def amrg_retrieval_hint_texts(amrg_context: dict[str, Any] | None, leaf: dict[str, Any], limit: int = 4) -> list[str]:
+    if not isinstance(amrg_context, dict):
+        return []
+    leaf_refs = set(str(ref) for ref in leaf.get("amrg_usage_refs", []) if _is_non_empty_string(ref))
+    hints: list[str] = []
+
+    def add_hint(value: Any) -> None:
+        if len(hints) >= limit:
+            return
+        if _is_non_empty_string(value):
+            text = _bounded_query_text(str(value))
+            if text and text not in hints:
+                hints.append(text)
+
+    for collection_key in ("amrg_decomposer_context", "candidate_edges", "edge_records", "related_markets"):
+        collection = amrg_context.get(collection_key)
+        if not isinstance(collection, list):
+            continue
+        for item in collection:
+            if len(hints) >= limit:
+                break
+            if not isinstance(item, dict):
+                continue
+            item_refs = {
+                str(item.get(field))
+                for field in ("edge_id", "artifact_id", "candidate_id", "market_id")
+                if _is_non_empty_string(item.get(field))
+            }
+            if leaf_refs and item_refs and not (leaf_refs & item_refs):
+                continue
+            allowed_effects = item.get("allowed_effects")
+            allowed_qdt_uses = item.get("allowed_qdt_uses")
+            if isinstance(allowed_effects, list) and "retrieval_query_hint" not in allowed_effects:
+                continue
+            if isinstance(allowed_qdt_uses, list) and "retrieval_hint" not in allowed_qdt_uses:
+                continue
+            add_hint(
+                item.get("retrieval_hint")
+                or item.get("retrieval_query_hint")
+                or item.get("question_text")
+                or item.get("market_question")
+                or item.get("title")
+            )
+    direct_hints = amrg_context.get("retrieval_query_hints")
+    if isinstance(direct_hints, list):
+        for item in direct_hints:
+            if isinstance(item, dict):
+                add_hint(item.get("query_text") or item.get("text") or item.get("hint"))
+            else:
+                add_hint(item)
+    return hints[:limit]
+
+
 def build_leaf_retrieval_query_context(
     *,
     qdt: dict[str, Any],
@@ -731,6 +833,7 @@ def build_leaf_retrieval_query_context(
     required_fields = list(leaf.get("required_evidence_fields", []))
     source_targets = breadth_profile["source_class_requirements"]["required"]
     tier = breadth_profile["retrieval_volume_tier"]
+    amrg_hint_texts = amrg_retrieval_hint_texts(amrg_context, leaf)
     query_variants = compose_query_variants(
         macro_question=str(qdt.get("macro_question", "")),
         leaf=leaf,
@@ -738,6 +841,7 @@ def build_leaf_retrieval_query_context(
         market_terms=market_terms,
         required_evidence_fields=required_fields,
         source_class_targets=source_targets,
+        amrg_retrieval_hints=amrg_hint_texts,
         variant_count=int(tier["query_variant_count"]),
     )
     contradiction_variants = []
@@ -799,6 +903,7 @@ def build_leaf_retrieval_query_context(
         "negative_check_query_variants": negative_queries,
         "direct_url_candidates": direct_url_candidates,
         "amrg_hint_refs": allowed_amrg_hint_refs(amrg_context, leaf),
+        "amrg_retrieval_hint_text_sha256": [_prefixed_sha256(text) for text in amrg_hint_texts],
         "forecast_timestamp": forecast_timestamp,
         "source_cutoff_timestamp": source_cutoff_timestamp,
         "planner_version": RETRIEVAL_QUERY_PLANNER_VERSION,
@@ -858,13 +963,154 @@ def build_browser_search_provider_diagnostic(
         "schema_version": BROWSER_PROVIDER_DIAGNOSTIC_SCHEMA_VERSION,
         "provider_id": OPENCLAW_BROWSER_PROVIDER_ID,
         "provider_refs": ["openclaw:web_fetch", "openclaw:browser_transport"],
-        "capabilities": ["web_search", "direct_url", "site_search", "followed_link"],
+        "capabilities": ["web_search", "direct_url", "direct_url_fetch", "url_extraction", "configured_search_provider"],
         "availability_status": availability_status,
         "news_feed_api_enabled": False,
+        "web_fetch_role": "url_fetch_extraction_only",
+        "web_fetch_must_not_be_used_as_search": True,
+        "search_requires_configured_provider": True,
         "direct_url_priority": "official_or_resolution_urls_first",
         "unavailable_reason": unavailable_reason,
         "checked_at": checked_at,
         "feature_gate_status": "browser_provider_resolution_pending_RET_004_RET_009",
+    }
+
+
+def _search_rank_cap(query_role: str) -> int:
+    return SEARCH_CANDIDATE_RANK_CAPS.get(query_role, SEARCH_CANDIDATE_RANK_CAPS["primary_leaf_retrieval"])
+
+
+def build_search_candidate_url(
+    query_context: dict[str, Any],
+    query_variant: dict[str, Any],
+    *,
+    rank: int,
+    url: str,
+    title: str = "",
+    snippet: str = "",
+    provider_id: str = OPENCLAW_BROWSER_PROVIDER_ID,
+    searched_at: str | None = None,
+    result_source: str = "configured_browser_search_provider",
+    query_role: str | None = None,
+) -> dict[str, Any]:
+    if not _is_non_empty_string(url):
+        raise RetrievalPacketError("search candidate URL is required")
+    role = str(query_role or query_variant.get("query_role") or "primary_leaf_retrieval")
+    if role not in SEARCH_CANDIDATE_RANK_CAPS:
+        role = "primary_leaf_retrieval"
+    rank_int = int(rank)
+    if rank_int < 1 or rank_int > _search_rank_cap(role):
+        raise RetrievalPacketError(f"{role} search rank {rank_int} exceeds cap {_search_rank_cap(role)}")
+    canonical_url = canonicalize_source_url(url)
+    seed = {
+        "leaf_id": query_context.get("leaf_id"),
+        "query_variant_id": query_variant.get("query_variant_id"),
+        "query_role": role,
+        "rank": rank_int,
+        "canonical_url": canonical_url,
+        "provider_id": provider_id,
+    }
+    return {
+        "artifact_type": "search_candidate_url",
+        "schema_version": SEARCH_CANDIDATE_URL_SCHEMA_VERSION,
+        "search_candidate_url_id": _sha_id("search-candidate-url", seed),
+        "leaf_id": query_context.get("leaf_id"),
+        "query_context_ref": query_context.get("query_context_ref"),
+        "query_variant_id": query_variant.get("query_variant_id"),
+        "query_role": role,
+        "rank": rank_int,
+        "url": url,
+        "canonical_url": canonical_url,
+        "title_sha256": _prefixed_sha256(_bounded_excerpt(title, max_chars=240)),
+        "snippet_sha256": _prefixed_sha256(_bounded_excerpt(snippet, max_chars=480)),
+        "provider_id": provider_id,
+        "searched_at": searched_at,
+        "result_source": result_source,
+        "rank_cap": _search_rank_cap(role),
+        "web_fetch_used_for_search": False,
+        "fetch_required_before_admission": True,
+        "feature_id": "RET-001",
+    }
+
+
+def _native_research_candidate_cap(query_context: dict[str, Any]) -> int:
+    targets = query_context.get("breadth_targets") if isinstance(query_context.get("breadth_targets"), dict) else {}
+    purpose = str(query_context.get("purpose") or "")
+    protected = bool(targets.get("protected_primary_required"))
+    min_sources = int(targets.get("min_independent_source_families", 0) or 0)
+    if protected or purpose == "source_of_truth":
+        tier = "critical_source_of_truth"
+    elif purpose in {"direct_evidence", "catalyst"} or min_sources >= 3:
+        tier = "high_direct_or_catalyst"
+    elif purpose == "resolution_mechanics":
+        tier = "mechanics_rules_only"
+    else:
+        tier = "normal_medium"
+    return NATIVE_RESEARCH_CANDIDATE_CAPS[tier]
+
+
+def _compact_native_candidate(raw: dict[str, Any], query_context: dict[str, Any]) -> dict[str, Any]:
+    _ensure_no_forbidden_native_research_outputs(raw, "native_research_candidate")
+    url = str(raw.get("url") or raw.get("candidate_url") or "").strip()
+    if not url:
+        raise RetrievalPacketError("native research candidate URL is required")
+    related_leaf_id = str(raw.get("related_leaf_id") or raw.get("leaf_id") or query_context.get("leaf_id") or "")
+    return {
+        "url": url,
+        "canonical_url": canonicalize_source_url(url),
+        "source_label": _bounded_excerpt(raw.get("source_label") or raw.get("title") or "unknown", max_chars=160),
+        "why_it_may_matter": _bounded_excerpt(raw.get("why_it_may_matter") or raw.get("why_may_matter"), max_chars=360),
+        "related_leaf_id": related_leaf_id,
+        "candidate_claim_text": _bounded_excerpt(raw.get("candidate_claim_text") or raw.get("claim_text"), max_chars=480),
+        "uncertainty_notes": _bounded_excerpt(raw.get("uncertainty_notes") or "", max_chars=360),
+    }
+
+
+def build_native_research_candidate_discovery(
+    query_context: dict[str, Any],
+    query_variant: dict[str, Any],
+    candidate_urls: list[dict[str, Any]],
+    *,
+    attempt_ref: str | None = None,
+    resolved_model_id: str = "gpt-5.5-high",
+    discovered_at: str | None = None,
+) -> dict[str, Any]:
+    if not isinstance(candidate_urls, list):
+        raise RetrievalPacketError("native research candidate_urls must be a list")
+    cap = _native_research_candidate_cap(query_context)
+    compact = [_compact_native_candidate(item, query_context) for item in candidate_urls[:cap] if isinstance(item, dict)]
+    seed = {
+        "leaf_id": query_context.get("leaf_id"),
+        "query_variant_id": query_variant.get("query_variant_id"),
+        "attempt_ref": attempt_ref,
+        "urls": [item["canonical_url"] for item in compact],
+    }
+    return {
+        "artifact_type": "native_research_candidate_discovery",
+        "schema_version": NATIVE_RESEARCH_CANDIDATE_DISCOVERY_SCHEMA_VERSION,
+        "discovery_id": _sha_id("native-research-candidate-discovery", seed),
+        "leaf_id": query_context.get("leaf_id"),
+        "query_context_ref": query_context.get("query_context_ref"),
+        "query_variant_id": query_variant.get("query_variant_id"),
+        "native_research_attempt_ref": attempt_ref,
+        "model_lane_id": "native_research_candidate_discovery",
+        "resolved_model_id": resolved_model_id,
+        "candidate_cap": cap,
+        "candidate_urls": compact,
+        "candidate_url_count": len(compact),
+        "candidate_url_count_omitted_by_cap": max(0, len(candidate_urls) - cap),
+        "discovered_at": discovered_at,
+        "fetch_required_before_admission": True,
+        "authority_boundary": {
+            "candidate_discovery": True,
+            "source_family_final_authority": False,
+            "claim_family_final_authority": False,
+            "temporal_safety_final_authority": False,
+            "research_sufficiency_authority": False,
+            "forecast_authority": False,
+        },
+        "forbidden_output_fragments": list(NATIVE_RESEARCH_FORBIDDEN_OUTPUT_FRAGMENTS),
+        "feature_id": "RET-010",
     }
 
 
@@ -879,6 +1125,7 @@ def build_browser_retrieval_attempt(
     captured_at: str | None = None,
     extraction_status: str = "rejected",
     result_rank: int = 0,
+    search_candidate_url_ref: str | None = None,
 ) -> dict[str, Any]:
     if extraction_status not in ALLOWED_BROWSER_EXTRACTION_STATUSES:
         raise RetrievalPacketError(f"unknown browser extraction status: {extraction_status}")
@@ -899,8 +1146,10 @@ def build_browser_retrieval_attempt(
         "browser_session_ref": None,
         "browser_provider_id": OPENCLAW_BROWSER_PROVIDER_ID,
         "openclaw_transport_ref": "openclaw:web_fetch",
-        "provider_capabilities": ["web_search", "direct_url"],
+        "provider_capabilities": ["web_search", "direct_url", "direct_url_fetch", "url_extraction", "configured_search_provider"],
         "provider_availability_status": "unavailable",
+        "web_fetch_role": "url_fetch_extraction_only",
+        "search_candidate_url_ref": search_candidate_url_ref,
         "news_feed_api_enabled": False,
         "navigation_mode": navigation_mode,
         "direct_url_source_ref": None,
@@ -965,7 +1214,7 @@ def build_native_research_attempt(
         "contradiction_candidate_refs": list(contradiction_candidate_refs or []),
         "negative_check_candidate_refs": list(negative_check_candidate_refs or []),
         "model_proposed_source_metadata": proposed_metadata,
-        "candidate_output_schema_version": "native-research-candidates/v1",
+        "candidate_output_schema_version": NATIVE_RESEARCH_CANDIDATE_DISCOVERY_SCHEMA_VERSION,
         "attempt_status": attempt_status,
         "native_transport_availability_status": transport_availability_status,
         "failure_reason_codes": list(failure_reason_codes or ["native_transport_unavailable_not_blocking"]),
@@ -3973,7 +4222,16 @@ def _candidate_navigation_sort_key(candidate: dict[str, Any]) -> tuple[int, int,
 
 def _candidate_query_variant(context: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
     requested = str(candidate.get("query_variant_id") or "")
-    variants = context.get("query_variants") if isinstance(context.get("query_variants"), list) else []
+    variants = []
+    if isinstance(context.get("query_variants"), list):
+        variants.extend(context["query_variants"])
+    if isinstance(context.get("contradiction_query_variants"), list):
+        variants.extend(context["contradiction_query_variants"])
+    negative = context.get("negative_check_query_variants")
+    if isinstance(negative, dict):
+        for values in negative.values():
+            if isinstance(values, list):
+                variants.extend(item for item in values if isinstance(item, dict))
     for variant in variants:
         if isinstance(variant, dict) and variant.get("query_variant_id") == requested:
             return variant
@@ -4106,12 +4364,132 @@ def _compact_supplemental_admission_result(record: dict[str, Any]) -> dict[str, 
     }
 
 
+def _context_query_variant_by_id(context: dict[str, Any], query_variant_id: str) -> dict[str, Any]:
+    return _candidate_query_variant(context, {"query_variant_id": query_variant_id})
+
+
+def _search_candidate_url_ref_by_key(records: list[dict[str, Any]]) -> dict[tuple[str, str], str]:
+    refs: dict[tuple[str, str], str] = {}
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        key = (str(record.get("leaf_id") or ""), canonicalize_source_url(record.get("canonical_url"), record.get("url")))
+        if key[0] and key[1]:
+            refs[key] = str(record.get("search_candidate_url_id") or "")
+    return refs
+
+
+def _materialize_search_candidate_url_records(
+    contexts_by_leaf: dict[str, dict[str, Any]],
+    search_candidate_urls: list[dict[str, Any]] | None,
+    *,
+    searched_at: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    records: list[dict[str, Any]] = []
+    diagnostics: list[dict[str, Any]] = []
+    seen_by_variant: dict[str, set[str]] = {}
+    for raw in search_candidate_urls or []:
+        if not isinstance(raw, dict):
+            raise RetrievalPacketError("search_candidate_urls must contain objects")
+        leaf_id = str(raw.get("leaf_id") or "")
+        context = contexts_by_leaf.get(leaf_id)
+        if not context:
+            raise RetrievalPacketError(f"search candidate leaf_id is not dispatchable: {leaf_id}")
+        variant = _context_query_variant_by_id(context, str(raw.get("query_variant_id") or ""))
+        role = str(raw.get("query_role") or variant.get("query_role") or "primary_leaf_retrieval")
+        if role not in SEARCH_CANDIDATE_RANK_CAPS:
+            role = "primary_leaf_retrieval"
+        rank = int(raw.get("rank") or raw.get("result_rank") or 0)
+        if rank < 1:
+            raise RetrievalPacketError("search candidate rank must be positive")
+        variant_key = str(variant.get("query_variant_id"))
+        if rank > _search_rank_cap(role):
+            diagnostics.append(
+                {
+                    "schema_version": "search-candidate-url-omission/v1",
+                    "leaf_id": leaf_id,
+                    "query_variant_id": variant_key,
+                    "query_role": role,
+                    "rank": rank,
+                    "url": raw.get("url"),
+                    "omission_reason_codes": ["search_rank_cap_exceeded"],
+                }
+            )
+            continue
+        canonical_url = canonicalize_source_url(raw.get("canonical_url"), raw.get("url"))
+        seen_urls = seen_by_variant.setdefault(variant_key, set())
+        if canonical_url in seen_urls:
+            diagnostics.append(
+                {
+                    "schema_version": "search-candidate-url-omission/v1",
+                    "leaf_id": leaf_id,
+                    "query_variant_id": variant_key,
+                    "query_role": role,
+                    "rank": rank,
+                    "url": raw.get("url"),
+                    "canonical_url": canonical_url,
+                    "omission_reason_codes": ["duplicate_search_candidate_url"],
+                }
+            )
+            continue
+        seen_urls.add(canonical_url)
+        if raw.get("schema_version") == SEARCH_CANDIDATE_URL_SCHEMA_VERSION:
+            records.append(copy.deepcopy(raw))
+            continue
+        records.append(
+            build_search_candidate_url(
+                context,
+                variant,
+                rank=rank,
+                url=str(raw.get("url") or raw.get("canonical_url") or ""),
+                title=str(raw.get("title") or ""),
+                snippet=str(raw.get("snippet") or ""),
+                provider_id=str(raw.get("provider_id") or OPENCLAW_BROWSER_PROVIDER_ID),
+                searched_at=str(raw.get("searched_at") or searched_at),
+                result_source=str(raw.get("result_source") or "configured_browser_search_provider"),
+                query_role=role,
+            )
+        )
+    return records, diagnostics
+
+
+def _materialize_native_candidate_discoveries(
+    contexts_by_leaf: dict[str, dict[str, Any]],
+    native_research_candidates: list[dict[str, Any]] | None,
+    *,
+    discovered_at: str,
+) -> list[dict[str, Any]]:
+    discoveries: list[dict[str, Any]] = []
+    for raw in native_research_candidates or []:
+        if not isinstance(raw, dict):
+            raise RetrievalPacketError("native_research_candidates must contain objects")
+        leaf_id = str(raw.get("leaf_id") or raw.get("related_leaf_id") or "")
+        context = contexts_by_leaf.get(leaf_id)
+        if not context:
+            raise RetrievalPacketError(f"native research candidate leaf_id is not dispatchable: {leaf_id}")
+        variant = _context_query_variant_by_id(context, str(raw.get("query_variant_id") or ""))
+        candidate_urls = raw.get("candidate_urls") if isinstance(raw.get("candidate_urls"), list) else [raw]
+        discoveries.append(
+            build_native_research_candidate_discovery(
+                context,
+                variant,
+                candidate_urls,
+                attempt_ref=raw.get("native_research_attempt_ref") or raw.get("attempt_ref"),
+                resolved_model_id=str(raw.get("resolved_model_id") or "gpt-5.5-high"),
+                discovered_at=str(raw.get("discovered_at") or discovered_at),
+            )
+        )
+    return discoveries
+
+
 def build_live_retrieval_packet_from_candidates(
     qdt: dict[str, Any],
     *,
     evidence_packet: dict[str, Any] | None = None,
     amrg_context: dict[str, Any] | None = None,
     fetched_candidates: list[dict[str, Any]] | None = None,
+    search_candidate_urls: list[dict[str, Any]] | None = None,
+    native_research_candidates: list[dict[str, Any]] | None = None,
     supplemental_candidates: list[dict[str, Any]] | None = None,
     question_decomposition_artifact_id: str | None = None,
     policy_context_ref: str | None = None,
@@ -4121,6 +4499,7 @@ def build_live_retrieval_packet_from_candidates(
     live_retrieval_allowlist: list[str] | None = None,
     live_policy_overlay: bool = True,
     finalize_for_dispatch: bool = True,
+    runtime_mode: str = "live_retrieval_runtime",
 ) -> dict[str, Any]:
     """Materialize live-shaped browser/supplemental candidates through deterministic retrieval validators."""
 
@@ -4140,6 +4519,18 @@ def build_live_retrieval_packet_from_candidates(
     chunks: list[dict[str, Any]] = []
     spans: list[dict[str, Any]] = []
     attempt_refs_by_leaf: dict[str, list[str]] = {leaf_id: [] for leaf_id in contexts_by_leaf}
+    search_candidate_records, search_candidate_omissions = _materialize_search_candidate_url_records(
+        contexts_by_leaf,
+        search_candidate_urls,
+        searched_at=forecast,
+    )
+    search_ref_by_leaf_url = _search_candidate_url_ref_by_key(search_candidate_records)
+    native_candidate_discoveries = _materialize_native_candidate_discoveries(
+        contexts_by_leaf,
+        native_research_candidates,
+        discovered_at=forecast,
+    )
+    seen_canonical_urls_by_leaf: dict[str, set[str]] = {leaf_id: set() for leaf_id in contexts_by_leaf}
 
     for candidate in sorted(fetched_candidates or [], key=_candidate_navigation_sort_key):
         if not isinstance(candidate, dict):
@@ -4154,6 +4545,41 @@ def build_live_retrieval_packet_from_candidates(
         canonical_url = canonicalize_source_url(candidate.get("canonical_url"), final_url, requested_url)
         navigation_mode = str(candidate.get("navigation_mode") or ("direct_url" if candidate.get("direct_url") else "web_search"))
         extraction_status = str(candidate.get("extraction_status") or "accepted")
+        search_candidate_ref = candidate.get("search_candidate_url_ref") or search_ref_by_leaf_url.get(
+            (leaf_id, canonical_url)
+        )
+        if navigation_mode != "direct_url" and not search_candidate_ref and candidate.get("retrieval_transport") != "native_gpt_research":
+            omitted.append(
+                build_retrieval_candidate_record(
+                    leaf_id=leaf_id,
+                    query_context_ref=str(context["query_context_ref"]),
+                    query_variant_id=str(variant["query_variant_id"]),
+                    retrieval_transport=str(candidate.get("retrieval_transport") or "browser"),
+                    transport_attempt_ref=str(candidate.get("transport_attempt_ref") or _sha_id("unfetched-search-candidate", candidate)),
+                    candidate_status="rejected",
+                    requested_url=requested_url,
+                    canonical_url=canonical_url,
+                    omission_reason_codes=["web_search_candidate_missing_search_candidate_url_ref"],
+                    temporal_gate_status="unknown_not_counted",
+                )
+            )
+            continue
+        if canonical_url and canonical_url in seen_canonical_urls_by_leaf.setdefault(leaf_id, set()):
+            omitted.append(
+                build_retrieval_candidate_record(
+                    leaf_id=leaf_id,
+                    query_context_ref=str(context["query_context_ref"]),
+                    query_variant_id=str(variant["query_variant_id"]),
+                    retrieval_transport=str(candidate.get("retrieval_transport") or "browser"),
+                    transport_attempt_ref=str(candidate.get("transport_attempt_ref") or _sha_id("duplicate-candidate", candidate)),
+                    candidate_status="omitted",
+                    requested_url=requested_url,
+                    canonical_url=canonical_url,
+                    omission_reason_codes=["duplicate_canonical_url"],
+                    temporal_gate_status=str(candidate.get("temporal_gate_status") or "unknown_not_counted"),
+                )
+            )
+            continue
         attempt = build_browser_retrieval_attempt(
             context,
             variant,
@@ -4164,12 +4590,15 @@ def build_live_retrieval_packet_from_candidates(
             captured_at=candidate.get("captured_at") or _iso_before_cutoff(cutoff),
             extraction_status=extraction_status,
             result_rank=int(candidate.get("result_rank", len(attempt_refs_by_leaf[leaf_id]) + 1) or 0),
+            search_candidate_url_ref=search_candidate_ref,
         )
         attempt["provider_availability_status"] = "available"
         attempt["normalized_domain"] = _registrable_domain(canonical_url)
         attempt["direct_url_source_ref"] = candidate.get("direct_url_source_ref")
         browser_attempts.append(attempt)
         attempt_refs_by_leaf[leaf_id].append(attempt["attempt_id"])
+        if canonical_url:
+            seen_canonical_urls_by_leaf.setdefault(leaf_id, set()).add(canonical_url)
         if extraction_status == "accepted" and candidate.get("admission_status", "admitted") == "admitted":
             evidence, chunk, span = _materialize_candidate_evidence(
                 qdt=qdt,
@@ -4288,6 +4717,9 @@ def build_live_retrieval_packet_from_candidates(
         live_policy_overlay=live_policy_overlay,
     )
     packet["browser_retrieval_attempts"] = browser_attempts
+    packet["search_candidate_urls"] = search_candidate_records
+    packet["search_candidate_url_omissions"] = search_candidate_omissions
+    packet["native_research_candidate_discoveries"] = native_candidate_discoveries
     packet["browser_search_provider_diagnostics"] = [
         build_browser_search_provider_diagnostic(
             availability_status="available" if browser_attempts else "unavailable",
@@ -4301,9 +4733,13 @@ def build_live_retrieval_packet_from_candidates(
     packet["supplemental_evidence_admission_results"] = supplemental_records
     packet["retrieval_runtime_summary"] = {
         "schema_version": "retrieval-runtime-summary/v1",
-        "runtime_mode": "live_candidate_fixture",
+        "runtime_mode": runtime_mode,
         "direct_url_attempt_count": sum(1 for item in browser_attempts if item.get("navigation_mode") == "direct_url"),
         "web_search_attempt_count": sum(1 for item in browser_attempts if item.get("navigation_mode") == "web_search"),
+        "search_candidate_url_count": len(search_candidate_records),
+        "search_candidate_omission_count": len(search_candidate_omissions),
+        "native_candidate_discovery_count": len(native_candidate_discoveries),
+        "native_candidate_url_count": sum(len(item.get("candidate_urls", [])) for item in native_candidate_discoveries),
         "admitted_initial_evidence_count": len(selected) - sum(
             1 for item in supplemental_records if item.get("normalization_status") == "normalized"
         ),
@@ -4313,6 +4749,10 @@ def build_live_retrieval_packet_from_candidates(
         "omitted_or_rejected_candidate_count": len(omitted),
         "web_fetch_is_url_fetch_not_search": True,
         "deterministic_admission_authority": "retrieval_source_claim_temporal_breadth_validators",
+        "direct_url_priority_enforced": True,
+        "duplicate_canonical_url_omissions": sum(
+            1 for item in omitted if "duplicate_canonical_url" in item.get("omission_reason_codes", [])
+        ),
     }
     packet.setdefault("schema_feature_gates", {})["RET-001"] = "implemented"
     packet.setdefault("schema_feature_gates", {})["RET-004"] = "implemented"
@@ -4547,7 +4987,10 @@ def build_retrieval_packet(
         "browser_search_provider_diagnostics": [
             build_browser_search_provider_diagnostic(checked_at=forecast)
         ],
+        "search_candidate_urls": [],
+        "search_candidate_url_omissions": [],
         "native_research_attempts": [],
+        "native_research_candidate_discoveries": [],
         "native_research_transport_diagnostics": [],
         "browser_retrieval_attempts": [],
         "source_metadata_classifier_slices": source_metadata_classifier_slices,
@@ -4732,6 +5175,116 @@ def validate_candidate_record(item: Any, path: str, errors: list[str]) -> None:
         errors.append(f"{path}.temporal_gate_status is invalid")
     if not _reason_codes_are_compact(item.get("omission_reason_codes")):
         errors.append(f"{path}.omission_reason_codes must be compact reason codes")
+
+
+def validate_search_candidate_url(item: Any, path: str, errors: list[str]) -> None:
+    if not isinstance(item, dict):
+        errors.append(f"{path} must be an object")
+        return
+    for field in (
+        "artifact_type",
+        "schema_version",
+        "search_candidate_url_id",
+        "leaf_id",
+        "query_context_ref",
+        "query_variant_id",
+        "query_role",
+        "rank",
+        "url",
+        "canonical_url",
+        "provider_id",
+        "result_source",
+        "rank_cap",
+        "web_fetch_used_for_search",
+        "fetch_required_before_admission",
+    ):
+        if field not in item:
+            errors.append(f"{path} missing {field}")
+    if item.get("artifact_type") != "search_candidate_url":
+        errors.append(f"{path}.artifact_type must be search_candidate_url")
+    if item.get("schema_version") != SEARCH_CANDIDATE_URL_SCHEMA_VERSION:
+        errors.append(f"{path}.schema_version must be {SEARCH_CANDIDATE_URL_SCHEMA_VERSION}")
+    role = str(item.get("query_role") or "")
+    if role not in SEARCH_CANDIDATE_RANK_CAPS:
+        errors.append(f"{path}.query_role is invalid")
+    else:
+        rank = int(item.get("rank") or 0)
+        if rank < 1 or rank > _search_rank_cap(role):
+            errors.append(f"{path}.rank exceeds {role} cap")
+        if item.get("rank_cap") != _search_rank_cap(role):
+            errors.append(f"{path}.rank_cap is invalid")
+    if item.get("web_fetch_used_for_search") is not False:
+        errors.append(f"{path}.web_fetch_used_for_search must be false")
+    if item.get("fetch_required_before_admission") is not True:
+        errors.append(f"{path}.fetch_required_before_admission must be true")
+    if not _is_non_empty_string(item.get("canonical_url")):
+        errors.append(f"{path}.canonical_url is required")
+
+
+def validate_native_research_candidate_discovery(item: Any, path: str, errors: list[str]) -> None:
+    if not isinstance(item, dict):
+        errors.append(f"{path} must be an object")
+        return
+    for field in (
+        "artifact_type",
+        "schema_version",
+        "discovery_id",
+        "leaf_id",
+        "query_context_ref",
+        "query_variant_id",
+        "model_lane_id",
+        "resolved_model_id",
+        "candidate_cap",
+        "candidate_urls",
+        "candidate_url_count",
+        "fetch_required_before_admission",
+        "authority_boundary",
+    ):
+        if field not in item:
+            errors.append(f"{path} missing {field}")
+    if item.get("artifact_type") != "native_research_candidate_discovery":
+        errors.append(f"{path}.artifact_type must be native_research_candidate_discovery")
+    if item.get("schema_version") != NATIVE_RESEARCH_CANDIDATE_DISCOVERY_SCHEMA_VERSION:
+        errors.append(f"{path}.schema_version must be {NATIVE_RESEARCH_CANDIDATE_DISCOVERY_SCHEMA_VERSION}")
+    if item.get("model_lane_id") != "native_research_candidate_discovery":
+        errors.append(f"{path}.model_lane_id is invalid")
+    candidates = item.get("candidate_urls")
+    if not isinstance(candidates, list):
+        errors.append(f"{path}.candidate_urls must be a list")
+        candidates = []
+    if int(item.get("candidate_url_count") or 0) != len(candidates):
+        errors.append(f"{path}.candidate_url_count must match candidate_urls")
+    cap = int(item.get("candidate_cap") or 0)
+    if cap <= 0 or len(candidates) > cap:
+        errors.append(f"{path}.candidate_urls exceeds candidate_cap")
+    for idx, candidate in enumerate(candidates):
+        if not isinstance(candidate, dict):
+            errors.append(f"{path}.candidate_urls[{idx}] must be an object")
+            continue
+        candidate_errors: list[str] = []
+        _reject_forbidden_native_research_outputs(candidate, candidate_errors, f"{path}.candidate_urls[{idx}]")
+        if candidate_errors:
+            errors.extend(candidate_errors)
+        for field in ("url", "source_label", "why_it_may_matter", "related_leaf_id", "candidate_claim_text", "uncertainty_notes"):
+            if field not in candidate:
+                errors.append(f"{path}.candidate_urls[{idx}] missing {field}")
+        if not _is_non_empty_string(candidate.get("url")):
+            errors.append(f"{path}.candidate_urls[{idx}].url is required")
+    boundary = item.get("authority_boundary")
+    if not isinstance(boundary, dict):
+        errors.append(f"{path}.authority_boundary must be an object")
+    else:
+        for field in (
+            "source_family_final_authority",
+            "claim_family_final_authority",
+            "temporal_safety_final_authority",
+            "research_sufficiency_authority",
+            "forecast_authority",
+        ):
+            if boundary.get(field) is not False:
+                errors.append(f"{path}.authority_boundary.{field} must be false")
+    if item.get("fetch_required_before_admission") is not True:
+        errors.append(f"{path}.fetch_required_before_admission must be true")
 
 
 def validate_source_metadata_classifier_slice(item: Any, path: str, errors: list[str]) -> None:
@@ -5272,7 +5825,10 @@ def validate_retrieval_packet(packet: dict[str, Any]) -> RetrievalValidationResu
         "retrieval_stage_execution_events",
         "protected_primary_access_failures",
         "missingness_candidates",
+        "search_candidate_urls",
+        "search_candidate_url_omissions",
         "native_research_attempts",
+        "native_research_candidate_discoveries",
         "native_research_transport_diagnostics",
         "source_metadata_classifier_slices",
         "source_metadata_classifier_unavailable_diagnostics",
@@ -5379,7 +5935,10 @@ def validate_retrieval_packet(packet: dict[str, Any]) -> RetrievalValidationResu
         "retrieval_stage_execution_events",
         "protected_primary_access_failures",
         "missingness_candidates",
+        "search_candidate_urls",
+        "search_candidate_url_omissions",
         "native_research_attempts",
+        "native_research_candidate_discoveries",
         "native_research_transport_diagnostics",
         "source_metadata_classifier_slices",
         "source_metadata_classifier_unavailable_diagnostics",
@@ -5392,6 +5951,14 @@ def validate_retrieval_packet(packet: dict[str, Any]) -> RetrievalValidationResu
         errors.append("research_sufficiency_summary must be an object")
     for idx, candidate in enumerate(packet.get("omitted_candidates", []) if isinstance(packet.get("omitted_candidates"), list) else []):
         validate_candidate_record(candidate, f"omitted_candidates[{idx}]", errors)
+    for idx, item in enumerate(packet.get("search_candidate_urls", []) if isinstance(packet.get("search_candidate_urls"), list) else []):
+        validate_search_candidate_url(item, f"search_candidate_urls[{idx}]", errors)
+    for idx, item in enumerate(packet.get("native_research_candidate_discoveries", []) if isinstance(packet.get("native_research_candidate_discoveries"), list) else []):
+        validate_native_research_candidate_discovery(
+            item,
+            f"native_research_candidate_discoveries[{idx}]",
+            errors,
+        )
     for idx, item in enumerate(packet.get("retrieval_metadata_fill_diagnostics", []) if isinstance(packet.get("retrieval_metadata_fill_diagnostics"), list) else []):
         validate_retrieval_metadata_fill_diagnostic(item, f"retrieval_metadata_fill_diagnostics[{idx}]", errors)
     for idx, item in enumerate(packet.get("contradiction_search_attempts", []) if isinstance(packet.get("contradiction_search_attempts"), list) else []):

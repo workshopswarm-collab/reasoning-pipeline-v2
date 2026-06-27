@@ -42,6 +42,8 @@ def main() -> int:
     parser.add_argument("--evidence-packet", type=Path, help="evidence-packet/v2 JSON path")
     parser.add_argument("--amrg-context", type=Path, help="related-live-market-context JSON path")
     parser.add_argument("--candidates", type=Path, help="Browser/web-fetch candidate JSON list")
+    parser.add_argument("--search-candidates", type=Path, help="search-candidate-url/v1 raw/provider result JSON list")
+    parser.add_argument("--native-candidates", type=Path, help="native-research-candidate-discovery raw JSON list")
     parser.add_argument("--supplemental-candidates", type=Path, help="Supplemental candidate JSON list")
     parser.add_argument("--output", type=Path, help="Write retrieval packet JSON")
     parser.add_argument("--question-decomposition-artifact-id")
@@ -54,11 +56,23 @@ def main() -> int:
             if args.supplemental_candidates
             else []
         )
+        search_candidates = (
+            _list_payload(args.search_candidates, "search_candidate_urls")
+            if args.search_candidates
+            else []
+        )
+        native_candidates = (
+            _list_payload(args.native_candidates, "native_research_candidates")
+            if args.native_candidates
+            else []
+        )
         packet = build_live_retrieval_packet_from_candidates(
             load_json_object(args.qdt),
             evidence_packet=load_json_object(args.evidence_packet) if args.evidence_packet else None,
             amrg_context=load_json_object(args.amrg_context) if args.amrg_context else None,
             fetched_candidates=candidates,
+            search_candidate_urls=search_candidates,
+            native_research_candidates=native_candidates,
             supplemental_candidates=supplemental,
             question_decomposition_artifact_id=args.question_decomposition_artifact_id,
             policy_context_ref=args.policy_context_ref,

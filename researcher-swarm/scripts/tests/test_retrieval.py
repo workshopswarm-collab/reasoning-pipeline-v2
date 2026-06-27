@@ -27,6 +27,7 @@ from researcher_swarm.assignments import (  # noqa: E402
     LeafResearchAssignmentError,
     build_leaf_research_assignments,
 )
+from researcher_swarm.browser_provider import BrowserProviderAdapter  # noqa: E402
 from researcher_swarm.retrieval import (  # noqa: E402
     RetrievalPacketError,
     attach_native_research_transport_diagnostics,
@@ -48,6 +49,8 @@ from researcher_swarm.retrieval import (  # noqa: E402
     build_retrieval_packet_manifest,
     build_retrieval_query_contexts,
     build_retrieval_fallback_state,
+    build_search_candidate_url,
+    build_native_research_candidate_discovery,
     finalize_retrieval_packet_for_dispatch,
     build_source_metadata_classifier_slice,
     build_source_metadata_resolution_placeholder,
@@ -202,6 +205,25 @@ class RetrievalPacketContractTest(unittest.TestCase):
         for index in range(start, count):
             candidates.append(self._live_candidate(context, index))
         return candidates
+
+    def _search_candidates_for_context(self, context: dict, candidates: list[dict]) -> list[dict]:
+        variant = context["query_variants"][0]
+        records = []
+        for candidate in candidates:
+            if candidate.get("navigation_mode") != "web_search":
+                continue
+            records.append(
+                build_search_candidate_url(
+                    context,
+                    variant,
+                    rank=int(candidate["result_rank"]),
+                    url=candidate["canonical_url"],
+                    title=f"Candidate {candidate['result_rank']}",
+                    snippet=candidate["content"],
+                    searched_at="2026-06-24T11:59:00+00:00",
+                )
+            )
+        return records
 
     def test_query_contexts_cover_every_leaf_with_sufficiency_and_breadth_targets(self) -> None:
         contexts = build_retrieval_query_contexts(self.qdt, evidence_packet=self.evidence_packet)
@@ -1298,11 +1320,13 @@ class RetrievalPacketContractTest(unittest.TestCase):
         qdt["required_leaf_questions"] = [qdt["required_leaf_questions"][0]]
         context = build_retrieval_query_contexts(qdt, evidence_packet=self.evidence_packet)[0]
         candidates = self._live_candidates_for_context(context, include_direct=False, count=5)
+        search_candidates = self._search_candidates_for_context(context, candidates)
 
         packet = build_live_retrieval_packet_from_candidates(
             qdt,
             evidence_packet=self.evidence_packet,
             fetched_candidates=candidates,
+            search_candidate_urls=search_candidates,
             question_decomposition_artifact_id="artifact:qdt-1",
             policy_context_ref="artifact:profile-1",
         )
@@ -1324,18 +1348,29 @@ class RetrievalPacketContractTest(unittest.TestCase):
             for context in contexts
             for candidate in self._live_candidates_for_context(context, include_direct=True, count=5)
         ]
+        search_candidates = [
+            search_candidate
+            for context in contexts
+            for search_candidate in self._search_candidates_for_context(
+                context,
+                [candidate for candidate in candidates if candidate["leaf_id"] == context["leaf_id"]],
+            )
+        ]
 
         packet = build_live_retrieval_packet_from_candidates(
             self.qdt,
             evidence_packet=self.evidence_packet,
             fetched_candidates=candidates,
+            search_candidate_urls=search_candidates,
             question_decomposition_artifact_id="artifact:qdt-1",
             policy_context_ref="artifact:profile-1",
+            runtime_mode="live_fixture_candidate_retrieval_runtime",
         )
         assignments = build_leaf_research_assignments(qdt=self.qdt, retrieval_packet=packet)
 
-        self.assertEqual(packet["retrieval_runtime_summary"]["runtime_mode"], "live_candidate_fixture")
+        self.assertEqual(packet["retrieval_runtime_summary"]["runtime_mode"], "live_fixture_candidate_retrieval_runtime")
         self.assertGreater(packet["retrieval_runtime_summary"]["direct_url_attempt_count"], 0)
+        self.assertEqual(packet["retrieval_runtime_summary"]["search_candidate_url_count"], len(search_candidates))
         self.assertEqual(packet["research_sufficiency_summary"]["classification_dispatch_status"], "allowed")
         self.assertTrue(packet["leaf_evidence_dockets"])
         self.assertTrue(all(docket["admitted_evidence_refs"] for docket in packet["leaf_evidence_dockets"]))
@@ -1344,11 +1379,122 @@ class RetrievalPacketContractTest(unittest.TestCase):
         self.assertEqual(len(assignments), len(self.qdt["required_leaf_questions"]))
         self.assertTrue(all(assignment["assigned_evidence_refs"] for assignment in assignments))
 
+    def test_phase7_direct_url_priority_search_candidate_caps_and_dedupe(self) -> None:
+        qdt = copy.deepcopy(self.qdt)
+        qdt["required_leaf_questions"] = [qdt["required_leaf_questions"][0]]
+        context = build_retrieval_query_contexts(qdt, evidence_packet=self.evidence_packet)[0]
+        candidates = self._live_candidates_for_context(context, include_direct=True, count=5)
+        duplicate = copy.deepcopy(candidates[-1])
+        duplicate["result_rank"] = 6
+        candidates.append(duplicate)
+        search_candidates = self._search_candidates_for_context(context, candidates)
+        rank_over_cap = {
+            "leaf_id": context["leaf_id"],
+            "query_variant_id": context["query_variants"][0]["query_variant_id"],
+            "query_role": "primary_leaf_retrieval",
+            "rank": 11,
+            "url": "https://outside-cap.example/result",
+        }
+
+        packet = build_live_retrieval_packet_from_candidates(
+            qdt,
+            evidence_packet=self.evidence_packet,
+            fetched_candidates=candidates,
+            search_candidate_urls=[*search_candidates, rank_over_cap],
+            question_decomposition_artifact_id="artifact:qdt-1",
+            policy_context_ref="artifact:profile-1",
+        )
+
+        self.assertEqual(packet["browser_retrieval_attempts"][0]["navigation_mode"], "direct_url")
+        self.assertTrue(packet["browser_retrieval_attempts"][0]["search_candidate_url_ref"] is None)
+        self.assertTrue(
+            all(
+                attempt["search_candidate_url_ref"]
+                for attempt in packet["browser_retrieval_attempts"]
+                if attempt["navigation_mode"] == "web_search"
+            )
+        )
+        self.assertEqual(packet["retrieval_runtime_summary"]["search_candidate_omission_count"], 2)
+        self.assertEqual(packet["retrieval_runtime_summary"]["duplicate_canonical_url_omissions"], 1)
+        self.assertTrue(packet["retrieval_runtime_summary"]["web_fetch_is_url_fetch_not_search"])
+        with self.assertRaisesRegex(RetrievalPacketError, "exceeds cap"):
+            build_search_candidate_url(
+                context,
+                context["query_variants"][0],
+                rank=11,
+                url="https://outside-cap.example/result",
+            )
+
+    def test_phase7_web_fetch_adapter_does_not_act_as_search(self) -> None:
+        context = build_retrieval_query_contexts(self.qdt, evidence_packet=self.evidence_packet)[0]
+        adapter = BrowserProviderAdapter(
+            search_provider=lambda _context, _variant: [
+                {"rank": 1, "url": "https://search.example/result", "title": "Search result"}
+            ],
+            web_fetch=lambda url: {"final_url": url, "extraction_status": "accepted"},
+        )
+
+        records = adapter.search_candidate_urls(context, context["query_variants"][0])
+        fetched = adapter.fetch_url("https://search.example/result")
+
+        self.assertEqual(records[0]["schema_version"], "search-candidate-url/v1")
+        self.assertFalse(records[0]["web_fetch_used_for_search"])
+        self.assertTrue(records[0]["fetch_required_before_admission"])
+        self.assertEqual(fetched["web_fetch_role"], "url_fetch_extraction_only")
+
+    def test_phase7_native_candidate_caps_forbidden_fields_and_nonblocking_unavailability(self) -> None:
+        context = build_retrieval_query_contexts(self.qdt, evidence_packet=self.evidence_packet)[0]
+        candidates = [
+            {
+                "url": f"https://native.example/source-{idx}",
+                "source_label": f"Native source {idx}",
+                "why_it_may_matter": "May identify a source to fetch.",
+                "related_leaf_id": context["leaf_id"],
+                "candidate_claim_text": "A bounded claim candidate.",
+                "uncertainty_notes": "Needs deterministic validation.",
+            }
+            for idx in range(20)
+        ]
+        discovery = build_native_research_candidate_discovery(
+            context,
+            context["query_variants"][0],
+            candidates,
+        )
+
+        self.assertLessEqual(discovery["candidate_url_count"], discovery["candidate_cap"])
+        self.assertGreater(discovery["candidate_url_count_omitted_by_cap"], 0)
+        self.assertFalse(discovery["authority_boundary"]["research_sufficiency_authority"])
+        with self.assertRaisesRegex(RetrievalPacketError, "forbidden"):
+            build_native_research_candidate_discovery(
+                context,
+                context["query_variants"][0],
+                [
+                    {
+                        "url": "https://native.example/bad",
+                        "source_label": "Bad",
+                        "why_it_may_matter": "Bad",
+                        "related_leaf_id": context["leaf_id"],
+                        "candidate_claim_text": "Bad",
+                        "probability": 0.5,
+                    }
+                ],
+            )
+
+        certifiable = finalize_retrieval_packet_for_dispatch(self._certifiable_packet())
+        with_diagnostic = attach_native_research_transport_diagnostics(
+            certifiable,
+            availability_status="unavailable",
+            unavailable_reason="native_transport_not_configured",
+        )
+        self.assertEqual(with_diagnostic["research_sufficiency_summary"]["classification_dispatch_status"], "allowed")
+        self.assertEqual(with_diagnostic["native_research_transport_diagnostics"][0]["availability_status"], "unavailable")
+
     def test_phase3_supplemental_source_counts_only_after_deterministic_admission(self) -> None:
         qdt = copy.deepcopy(self.qdt)
         qdt["required_leaf_questions"] = [qdt["required_leaf_questions"][0]]
         context = build_retrieval_query_contexts(qdt, evidence_packet=self.evidence_packet)[0]
         initial = self._live_candidates_for_context(context, include_direct=False, count=4)
+        search_candidates = self._search_candidates_for_context(context, initial)
         supplemental_ref = f"supplemental:{context['leaf_id']}:official"
         supplemental = {
             "supplemental_evidence_ref": supplemental_ref,
@@ -1372,6 +1518,7 @@ class RetrievalPacketContractTest(unittest.TestCase):
             qdt,
             evidence_packet=self.evidence_packet,
             fetched_candidates=initial,
+            search_candidate_urls=search_candidates,
             supplemental_candidates=[supplemental],
             question_decomposition_artifact_id="artifact:qdt-1",
             policy_context_ref="artifact:profile-1",

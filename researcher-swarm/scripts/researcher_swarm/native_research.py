@@ -9,16 +9,20 @@ from __future__ import annotations
 
 from .retrieval import (
     NATIVE_RESEARCH_ATTEMPT_SCHEMA_VERSION,
+    NATIVE_RESEARCH_CANDIDATE_DISCOVERY_SCHEMA_VERSION,
     NATIVE_RESEARCH_RESOLVER_VERSION,
     NATIVE_RESEARCH_TRANSPORT_DIAGNOSTIC_SCHEMA_VERSION,
+    build_native_research_candidate_discovery,
     build_native_research_attempt,
     build_native_research_transport_diagnostic,
 )
 
 __all__ = [
     "NATIVE_RESEARCH_ATTEMPT_SCHEMA_VERSION",
+    "NATIVE_RESEARCH_CANDIDATE_DISCOVERY_SCHEMA_VERSION",
     "NATIVE_RESEARCH_RESOLVER_VERSION",
     "NATIVE_RESEARCH_TRANSPORT_DIAGNOSTIC_SCHEMA_VERSION",
+    "build_native_research_candidate_discovery",
     "build_native_research_attempt",
     "build_native_research_transport_diagnostic",
 ]

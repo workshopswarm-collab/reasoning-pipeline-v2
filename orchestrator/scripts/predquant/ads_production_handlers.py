@@ -23,6 +23,7 @@ def build_stage_handlers(**kwargs: Any) -> dict[str, Callable[..., Any]]:
     kwargs.pop("handler_scope", None)
     kwargs.pop("decomposer_runtime", None)
     kwargs.pop("live_policy_overlay", None)
+    kwargs.pop("live_retrieval_runtime", None)
     kwargs.pop("live_fixture_retrieval", None)
     kwargs.pop("block_at_leaf_research_barrier", None)
     kwargs.pop("amrg_vector_runtime", None)
@@ -34,7 +35,8 @@ def build_stage_handlers(**kwargs: Any) -> dict[str, Callable[..., Any]]:
         decomposer_runtime=True,
         decomposer_runtime_mode=runtime_mode,
         live_policy_overlay=True,
-        live_fixture_retrieval=True,
+        live_retrieval_runtime=True,
+        live_fixture_retrieval=False,
         block_at_leaf_research_barrier=True,
         amrg_vector_runtime=True,
     )
