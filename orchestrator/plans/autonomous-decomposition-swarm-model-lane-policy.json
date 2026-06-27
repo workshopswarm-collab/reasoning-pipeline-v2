@@ -10,11 +10,14 @@
   },
   "lanes": {
     "decomposer_qdt_generation": {
-      "provider": "openai",
-      "default_model_id": "gpt-5.5-high",
-      "allowed_model_ids": [
-        "gpt-5.5-high"
-      ],
+            "provider": "openai",
+            "default_model_id": "gpt-5.5-high",
+            "provider_route": "openclaw_codex_oauth/decomposer",
+            "oauth_route_required": true,
+            "runtime_agent_id": "decomposer",
+            "allowed_model_ids": [
+                "gpt-5.5-high"
+            ],
       "owner_feature_id": "MODEL-002",
       "consumer_feature_ids": [
         "QDT-001",
@@ -40,11 +43,14 @@
       ]
     },
     "researcher_leaf_nli_classification": {
-      "provider": "openai",
-      "default_model_id": "gpt-5.5-high",
-      "allowed_model_ids": [
-        "gpt-5.5-high"
-      ],
+            "provider": "openai",
+            "default_model_id": "gpt-5.5-high",
+            "provider_route": "openclaw_codex_oauth/researcher-swarm",
+            "oauth_route_required": true,
+            "runtime_agent_id": "researcher-swarm",
+            "allowed_model_ids": [
+                "gpt-5.5-high"
+            ],
       "owner_feature_id": "MODEL-003",
       "consumer_feature_ids": [
         "CLS-001",
@@ -108,9 +114,12 @@
         "native_research_candidate_discovery": {
             "provider": "openai",
             "default_model_id": "gpt-5.5-high",
+            "provider_route": "openclaw_codex_oauth/researcher-swarm/native-research",
+            "oauth_route_required": true,
+            "runtime_agent_id": "researcher-swarm",
             "allowed_model_ids": [
                 "gpt-5.5-high"
-      ],
+            ],
       "native_research_capability_required": true,
       "owner_feature_id": "RET-010",
       "consumer_feature_ids": [

@@ -25,6 +25,8 @@ from researcher_swarm.model_context import (  # noqa: E402
     RESEARCHER_MODEL_CONTEXT_SCHEMA_VERSION,
     RESEARCHER_MODEL_ID,
     RESEARCHER_MODEL_LANE_ID,
+    RESEARCHER_PROVIDER_ROUTE,
+    RESEARCHER_RUNTIME_AGENT_ID,
     ResearcherModelContextError,
     resolve_researcher_leaf_nli_model_context,
     validate_researcher_model_execution_context,
@@ -63,6 +65,9 @@ class ResearcherModelContextTest(unittest.TestCase):
         self.assertEqual(context["feature_id"], "MODEL-003")
         self.assertEqual(context["model_lane_id"], RESEARCHER_MODEL_LANE_ID)
         self.assertEqual(context["resolved_model_id"], RESEARCHER_MODEL_ID)
+        self.assertEqual(context["provider_route"], RESEARCHER_PROVIDER_ROUTE)
+        self.assertTrue(context["oauth_route_required"])
+        self.assertEqual(context["runtime_agent_id"], RESEARCHER_RUNTIME_AGENT_ID)
         self.assertEqual(context["model_policy_ref"], MODEL_LANE_POLICY_REF)
         self.assertEqual(context["prompt_template_id"], RESEARCHER_NLI_PROMPT_TEMPLATE_ID)
         self.assertEqual(context["prompt_template_sha256"], RESEARCHER_NLI_PROMPT_TEMPLATE_SHA256)
@@ -98,6 +103,13 @@ class ResearcherModelContextTest(unittest.TestCase):
         policy["lanes"][RESEARCHER_MODEL_LANE_ID]["default_model_id"] = "gpt-5.4-high"
 
         with self.assertRaisesRegex(ResearcherModelContextError, "default_model_id"):
+            resolve_researcher_leaf_nli_model_context(model_lane_policy_path=self._write_policy(policy))
+
+    def test_missing_oauth_route_is_rejected(self) -> None:
+        policy = self._policy()
+        policy["lanes"][RESEARCHER_MODEL_LANE_ID]["oauth_route_required"] = False
+
+        with self.assertRaisesRegex(ResearcherModelContextError, "OAuth route"):
             resolve_researcher_leaf_nli_model_context(model_lane_policy_path=self._write_policy(policy))
 
     def test_missing_required_artifact_fields_are_rejected(self) -> None:

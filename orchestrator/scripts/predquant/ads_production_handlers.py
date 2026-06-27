@@ -196,6 +196,7 @@ def build_stage_handlers(**kwargs: Any) -> dict[str, Callable[..., Any]]:
     kwargs.pop("live_retrieval_runtime", None)
     kwargs.pop("live_fixture_retrieval", None)
     kwargs.pop("block_at_leaf_research_barrier", None)
+    kwargs.pop("researcher_swarm_openclaw_runtime", None)
     kwargs.pop("amrg_vector_runtime", None)
     runtime_mode = kwargs.pop("decomposer_runtime_mode", "live")
     handlers = _build_stage_handlers(
@@ -210,6 +211,7 @@ def build_stage_handlers(**kwargs: Any) -> dict[str, Callable[..., Any]]:
         live_retrieval_runtime=True,
         live_fixture_retrieval=False,
         block_at_leaf_research_barrier=True,
+        researcher_swarm_openclaw_runtime=True,
         amrg_vector_runtime=True,
     )
     return {stage: wrap_production_stage_handler(stage, handler) for stage, handler in handlers.items()}

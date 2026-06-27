@@ -61,6 +61,11 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help="Optional model-runtime transport response JSON passed to production handler factories.",
     )
+    parser.add_argument(
+        "--researcher-swarm-runtime-bundle-response",
+        type=Path,
+        help="Optional researcher-swarm-runtime-bundle JSON passed to production handler factories.",
+    )
     parser.add_argument("--forecast-timestamp", help="Forecast timestamp passed to handler factory/case policy.")
     parser.add_argument("--max-cases", type=int, default=1, help="Maximum cases for this bounded scheduler run.")
     parser.add_argument("--retry-backoff-seconds", type=int, default=60)
@@ -130,6 +135,8 @@ def main() -> int:
     handler_factory_kwargs = {}
     if args.decomposer_runtime_transport_response is not None:
         handler_factory_kwargs["decomposer_runtime_transport_response_path"] = args.decomposer_runtime_transport_response
+    if args.researcher_swarm_runtime_bundle_response is not None:
+        handler_factory_kwargs["researcher_swarm_runtime_bundle_response_path"] = args.researcher_swarm_runtime_bundle_response
     handlers = None
     if args.handler_factory:
         config = OperationalCanaryConfig(

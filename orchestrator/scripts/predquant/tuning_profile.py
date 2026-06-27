@@ -673,6 +673,13 @@ def validate_model_lane_policy(policy: dict[str, Any]) -> None:
             raise TuningProfileError(f"{lane_id} provider must be openai")
         if lane.get("default_model_id") != model_id:
             raise TuningProfileError(f"{lane_id} default_model_id must be {model_id}")
+        if lane.get("oauth_route_required") is not True:
+            raise TuningProfileError(f"{lane_id} must require OpenClaw OAuth route")
+        provider_route = lane.get("provider_route")
+        if not isinstance(provider_route, str) or not provider_route.startswith("openclaw_codex_oauth/"):
+            raise TuningProfileError(f"{lane_id} provider_route must use OpenClaw Codex OAuth")
+        if not isinstance(lane.get("runtime_agent_id"), str) or not lane["runtime_agent_id"]:
+            raise TuningProfileError(f"{lane_id} runtime_agent_id is required")
         require_lane_fields(lane_id, lane, {"resolved_model_id", "prompt_template_sha256", "model_policy_ref"})
         require_forbidden_outputs(lane_id, lane, {"probability", "scae_evidence_delta"} if lane_id == "native_research_candidate_discovery" else set())
     native = lanes["native_research_candidate_discovery"]

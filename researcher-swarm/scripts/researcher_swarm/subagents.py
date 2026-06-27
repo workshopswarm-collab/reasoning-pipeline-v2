@@ -903,11 +903,17 @@ def build_researcher_swarm_runtime_bundle(
         for row in (barrier or {}).get("terminal_state_by_leaf", [])
         if isinstance(row, dict) and _is_non_empty_string(row.get("assignment_ref"))
     }
+    subagent_results_by_assignment = {
+        str(result.get("assignment_ref")): result
+        for result in (subagent_results or [])
+        if isinstance(result, dict) and _is_non_empty_string(result.get("assignment_ref"))
+    }
     leaf_runtime_status: list[dict[str, Any]] = []
     for assignment in assignments:
         assignment_ref = str(assignment.get("assignment_id"))
         leaf_id = str(assignment.get("leaf_id"))
         barrier_row = barrier_rows_by_assignment.get(assignment_ref, {})
+        result = subagent_results_by_assignment.get(assignment_ref, {})
         accepted_coverage = leaf_id in accepted_classification_leaf_ids
         blocker_recorded = (
             leaf_id in non_scoreable_leaf_ids
@@ -924,6 +930,9 @@ def build_researcher_swarm_runtime_bundle(
                 "assignment_ref": assignment_ref,
                 "leaf_id": leaf_id,
                 "terminal_status": barrier_row.get("terminal_status", "missing"),
+                "subagent_session_ref": result.get("subagent_session_ref"),
+                "model_executed": result.get("model_executed") is True,
+                "resolved_model_id": result.get("resolved_model_id"),
                 "accepted_classification_coverage": accepted_coverage,
                 "blocker_recorded": blocker_recorded,
                 "ready_for_reconciliation": bool(accepted_coverage or blocker_recorded),

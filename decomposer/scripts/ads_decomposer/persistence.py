@@ -129,6 +129,14 @@ def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
     return {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
 
 
+def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (table,),
+    ).fetchone()
+    return row is not None
+
+
 def _table_column_not_null(conn: sqlite3.Connection, table: str, column: str) -> bool:
     for row in conn.execute(f"PRAGMA table_info({table})").fetchall():
         if str(row[1]) == column:
@@ -143,64 +151,85 @@ def _ensure_columns(conn: sqlite3.Connection, table: str, columns: dict[str, str
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
+QDT_DECOMPOSITION_RUN_COMPATIBILITY_COLUMNS = {
+    "decomposition_run_id": "TEXT",
+    "schema_version": "TEXT",
+    "case_key": "TEXT",
+    "qdt_artifact_id": "TEXT",
+    "qdt_artifact_ref": "TEXT",
+    "artifact_path": "TEXT",
+    "artifact_sha256": "TEXT",
+    "prompt_template_id": "TEXT",
+    "prompt_template_sha256": "TEXT",
+    "model_lane_id": "TEXT",
+    "resolved_model_id": "TEXT",
+    "model_policy_ref": "TEXT",
+    "model_execution_context_sha256": "TEXT",
+    "input_manifest_ids": "TEXT NOT NULL DEFAULT '[]'",
+    "output_schema_version": "TEXT",
+    "branch_ids": "TEXT NOT NULL DEFAULT '[]'",
+    "dependency_group_ids": "TEXT NOT NULL DEFAULT '[]'",
+    "related_market_context_usage": "TEXT NOT NULL DEFAULT '{}'",
+    "amrg_anchor_dependency_contract_refs": "TEXT NOT NULL DEFAULT '[]'",
+    "candidate_selection_audit": "TEXT NOT NULL DEFAULT '{}'",
+    "validation_summary": "TEXT NOT NULL DEFAULT '{}'",
+    "qdt_digest": "TEXT",
+    "updated_at": "TEXT",
+}
+
+QDT_REQUIRED_RESEARCH_QUESTION_COMPATIBILITY_COLUMNS = {
+    "decomposition_run_id": "TEXT",
+    "schema_version": "TEXT",
+    "case_key": "TEXT",
+    "qdt_artifact_id": "TEXT",
+    "leaf_id": "TEXT",
+    "leaf_json_pointer": "TEXT",
+    "leaf_digest": "TEXT",
+    "static_information_weight": "TEXT",
+    "weight_reason_codes": "TEXT NOT NULL DEFAULT '[]'",
+    "required_evidence_fields": "TEXT NOT NULL DEFAULT '[]'",
+    "required_sufficiency_requirement_id": "TEXT",
+    "retrieval_breadth_profile_ref": "TEXT",
+    "required_source_classes": "TEXT NOT NULL DEFAULT '[]'",
+    "required_value_fields": "TEXT NOT NULL DEFAULT '[]'",
+    "required_negative_checks": "TEXT NOT NULL DEFAULT '[]'",
+    "market_component_terms": "TEXT NOT NULL DEFAULT '[]'",
+    "structural_validation": "TEXT NOT NULL DEFAULT '{}'",
+    "question_digest": "TEXT",
+    "updated_at": "TEXT",
+}
+
+
+def _ensure_legacy_qdt_compatibility_columns(conn: sqlite3.Connection) -> None:
+    if _table_exists(conn, QDT_DECOMPOSITION_RUNS_TABLE):
+        _ensure_columns(
+            conn,
+            QDT_DECOMPOSITION_RUNS_TABLE,
+            QDT_DECOMPOSITION_RUN_COMPATIBILITY_COLUMNS,
+        )
+    if _table_exists(conn, QDT_REQUIRED_RESEARCH_QUESTIONS_TABLE):
+        _ensure_columns(
+            conn,
+            QDT_REQUIRED_RESEARCH_QUESTIONS_TABLE,
+            QDT_REQUIRED_RESEARCH_QUESTION_COMPATIBILITY_COLUMNS,
+        )
+
+
 def ensure_qdt_persistence_schema(conn: sqlite3.Connection) -> None:
     """Create or upgrade the Session 3 MIG-003 persistence destinations."""
 
     ensure_artifact_manifest_schema(conn)
+    _ensure_legacy_qdt_compatibility_columns(conn)
     conn.executescript(MIG_003_QDT_PERSISTENCE_MIGRATION.read_text(encoding="utf-8"))
     _ensure_columns(
         conn,
         QDT_DECOMPOSITION_RUNS_TABLE,
-        {
-            "decomposition_run_id": "TEXT",
-            "schema_version": "TEXT",
-            "case_key": "TEXT",
-            "qdt_artifact_id": "TEXT",
-            "qdt_artifact_ref": "TEXT",
-            "artifact_path": "TEXT",
-            "artifact_sha256": "TEXT",
-            "prompt_template_id": "TEXT",
-            "prompt_template_sha256": "TEXT",
-            "model_lane_id": "TEXT",
-            "resolved_model_id": "TEXT",
-            "model_policy_ref": "TEXT",
-            "model_execution_context_sha256": "TEXT",
-            "input_manifest_ids": "TEXT NOT NULL DEFAULT '[]'",
-            "output_schema_version": "TEXT",
-            "branch_ids": "TEXT NOT NULL DEFAULT '[]'",
-            "dependency_group_ids": "TEXT NOT NULL DEFAULT '[]'",
-            "related_market_context_usage": "TEXT NOT NULL DEFAULT '{}'",
-            "amrg_anchor_dependency_contract_refs": "TEXT NOT NULL DEFAULT '[]'",
-            "candidate_selection_audit": "TEXT NOT NULL DEFAULT '{}'",
-            "validation_summary": "TEXT NOT NULL DEFAULT '{}'",
-            "qdt_digest": "TEXT",
-            "updated_at": "TEXT",
-        },
+        QDT_DECOMPOSITION_RUN_COMPATIBILITY_COLUMNS,
     )
     _ensure_columns(
         conn,
         QDT_REQUIRED_RESEARCH_QUESTIONS_TABLE,
-        {
-            "decomposition_run_id": "TEXT",
-            "schema_version": "TEXT",
-            "case_key": "TEXT",
-            "qdt_artifact_id": "TEXT",
-            "leaf_id": "TEXT",
-            "leaf_json_pointer": "TEXT",
-            "leaf_digest": "TEXT",
-            "static_information_weight": "TEXT",
-            "weight_reason_codes": "TEXT NOT NULL DEFAULT '[]'",
-            "required_evidence_fields": "TEXT NOT NULL DEFAULT '[]'",
-            "required_sufficiency_requirement_id": "TEXT",
-            "retrieval_breadth_profile_ref": "TEXT",
-            "required_source_classes": "TEXT NOT NULL DEFAULT '[]'",
-            "required_value_fields": "TEXT NOT NULL DEFAULT '[]'",
-            "required_negative_checks": "TEXT NOT NULL DEFAULT '[]'",
-            "market_component_terms": "TEXT NOT NULL DEFAULT '[]'",
-            "structural_validation": "TEXT NOT NULL DEFAULT '{}'",
-            "question_digest": "TEXT",
-            "updated_at": "TEXT",
-        },
+        QDT_REQUIRED_RESEARCH_QUESTION_COMPATIBILITY_COLUMNS,
     )
     conn.executescript(
         """

@@ -234,6 +234,34 @@ class QDTPersistenceTest(unittest.TestCase):
         with self.assertRaises(QDTPersistenceError):
             write_qdt_research_sufficiency_requirements(self.conn, unsafe_probability)
 
+    def test_schema_upgrade_preflights_legacy_qdt_tables_before_migration_indexes(self) -> None:
+        self.conn.close()
+        self.conn = sqlite3.connect(":memory:")
+        self.conn.row_factory = sqlite3.Row
+        self.conn.executescript(LEGACY_SQLITE_SCHEMA)
+
+        ensure_qdt_persistence_schema(self.conn)
+
+        run_columns = {
+            row["name"]
+            for row in self.conn.execute("PRAGMA table_info(qdt_decomposition_runs)").fetchall()
+        }
+        question_columns = {
+            row["name"]
+            for row in self.conn.execute("PRAGMA table_info(qdt_required_research_questions)").fetchall()
+        }
+        indexes = {
+            row["name"]
+            for row in self.conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index'"
+            ).fetchall()
+        }
+        self.assertIn("qdt_artifact_id", run_columns)
+        self.assertIn("decomposition_run_id", question_columns)
+        self.assertIn("leaf_id", question_columns)
+        self.assertIn("idx_qdt_decomposition_runs_artifact", indexes)
+        self.assertIn("idx_qdt_required_questions_run_leaf", indexes)
+
     def test_upgrades_legacy_sqlite_qdt_tables_before_writing(self) -> None:
         self.conn.close()
         self.conn = sqlite3.connect(":memory:")

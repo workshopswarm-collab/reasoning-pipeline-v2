@@ -20,6 +20,7 @@ from ads_decomposer.model_runtime import (  # noqa: E402
     execute_model_runtime_call,
     execute_model_runtime_call_for_lane,
     model_execution_context_from_runtime_call,
+    _parse_openclaw_agent_stdout,
     resolve_model_runtime_lane,
 )
 
@@ -36,7 +37,7 @@ class ModelRuntimeContractTest(unittest.TestCase):
             "model_lane_id": "decomposer_qdt_generation",
             "provider": "openai",
             "resolved_model_id": "gpt-5.5-high",
-            "provider_route": "openai/gpt-5.5-high",
+            "provider_route": "openclaw_codex_oauth/decomposer",
             "prompt_template_id": "decomposer-qdt/v1",
             "prompt_template_sha256": "sha256:" + "1" * 64,
             "input_manifest_refs": ["artifact:case", "artifact:evidence"],
@@ -61,7 +62,8 @@ class ModelRuntimeContractTest(unittest.TestCase):
                 self.assertEqual(lane["model_lane_id"], lane_id)
                 self.assertEqual(lane["provider"], "openai")
                 self.assertEqual(lane["resolved_model_id"], "gpt-5.5-high")
-                self.assertEqual(lane["provider_route"], "openai/gpt-5.5-high")
+                self.assertTrue(lane["provider_route"].startswith("openclaw_codex_oauth/"))
+                self.assertTrue(lane["oauth_route_required"])
                 self.assertEqual(lane["timeout_seconds"], MODEL_RUNTIME_TIMEOUTS[lane_id])
                 self.assertIn("resolved_model_id", lane["required_artifact_fields"])
 
@@ -87,7 +89,7 @@ class ModelRuntimeContractTest(unittest.TestCase):
         def transport(payload: dict[str, Any]) -> dict[str, Any]:
             attempts["count"] += 1
             self.assertEqual(payload["schema_version"], MODEL_RUNTIME_TRANSPORT_REQUEST_SCHEMA_VERSION)
-            self.assertEqual(payload["provider_route"], "openai/gpt-5.5-high")
+            self.assertEqual(payload["provider_route"], "openclaw_codex_oauth/decomposer")
             self.assertEqual(payload["timeout_seconds"], 180)
             self.assertEqual(payload["request_payload"], {"question": "Will example happen?"})
             if attempts["count"] == 1:
@@ -171,6 +173,35 @@ class ModelRuntimeContractTest(unittest.TestCase):
         self.assertIsInstance(runtime, dict)
         self.assertEqual(runtime["execution_status"], "failed_transport")
         self.assertEqual(runtime["retry_count"], 1)
+
+    def test_openclaw_agent_stdout_unwraps_gateway_reply(self) -> None:
+        stdout = json_text = (
+            '{"reply":"{\\"schema_version\\":\\"model-runtime-transport-response/v1\\",'
+            '\\"response_payload\\":{\\"ok\\":true},'
+            '\\"provider_status\\":{\\"status\\":\\"completed\\"}}"}'
+        )
+
+        parsed = _parse_openclaw_agent_stdout(stdout)
+
+        self.assertEqual(json_text, stdout)
+        self.assertEqual(parsed["schema_version"], MODEL_RUNTIME_TRANSPORT_RESPONSE_SCHEMA_VERSION)
+        self.assertEqual(parsed["response_payload"], {"ok": True})
+        self.assertEqual(parsed["provider_status"]["status"], "completed")
+
+    def test_openclaw_agent_stdout_unwraps_payload_text_shape(self) -> None:
+        stdout = (
+            '{"runId":"run-1","status":"ok","result":{"payloads":[{"text":"'
+            '{\\"schema_version\\":\\"model-runtime-transport-response/v1\\",'
+            '\\"response_payload\\":{\\"ok\\":true},'
+            '\\"provider_status\\":{\\"status\\":\\"completed\\"}}'
+            '"}],"finalAssistantVisibleText":"ignored"}}'
+        )
+
+        parsed = _parse_openclaw_agent_stdout(stdout)
+
+        self.assertEqual(parsed["schema_version"], MODEL_RUNTIME_TRANSPORT_RESPONSE_SCHEMA_VERSION)
+        self.assertEqual(parsed["response_payload"], {"ok": True})
+        self.assertEqual(parsed["provider_status"]["status"], "completed")
 
 
 if __name__ == "__main__":

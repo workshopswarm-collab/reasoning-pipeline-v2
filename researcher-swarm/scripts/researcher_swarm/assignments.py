@@ -21,7 +21,9 @@ from .model_context import (
     DEFAULT_MODEL_LANE_POLICY_PATH,
     RESEARCHER_MODEL_ID,
     RESEARCHER_MODEL_LANE_ID,
+    RESEARCHER_PROVIDER_ROUTE,
     RESEARCHER_PROVIDER_MODEL_KEY,
+    RESEARCHER_RUNTIME_AGENT_ID,
     resolve_researcher_leaf_nli_model_context,
     validate_researcher_model_execution_context,
 )
@@ -325,6 +327,9 @@ def _compact_model_execution_context(context: dict[str, Any]) -> dict[str, Any]:
         "model_lane_id": context.get("model_lane_id"),
         "resolved_model_id": context.get("resolved_model_id"),
         "provider_model_key": context.get("provider_model_key") or RESEARCHER_PROVIDER_MODEL_KEY,
+        "provider_route": context.get("provider_route") or RESEARCHER_PROVIDER_ROUTE,
+        "oauth_route_required": context.get("oauth_route_required"),
+        "runtime_agent_id": context.get("runtime_agent_id") or RESEARCHER_RUNTIME_AGENT_ID,
         "model_policy_ref": context.get("model_policy_ref"),
         "model_policy_sha256": context.get("model_policy_sha256"),
         "model_context_digest": context.get("model_context_digest"),
@@ -545,6 +550,8 @@ def _validate_model_execution_context(value: Any, errors: list[str]) -> None:
     expected = {
         "model_lane_id": RESEARCHER_MODEL_LANE_ID,
         "resolved_model_id": RESEARCHER_MODEL_ID,
+        "provider_route": RESEARCHER_PROVIDER_ROUTE,
+        "runtime_agent_id": RESEARCHER_RUNTIME_AGENT_ID,
         "prompt_template_id": RESEARCHER_NLI_PROMPT_TEMPLATE_ID,
         "prompt_template_sha256": RESEARCHER_NLI_PROMPT_TEMPLATE_SHA256,
     }
@@ -553,6 +560,8 @@ def _validate_model_execution_context(value: Any, errors: list[str]) -> None:
             errors.append(f"model_execution_context.{field} must be {expected_value}")
     if value.get("provider_model_key") != RESEARCHER_PROVIDER_MODEL_KEY:
         errors.append(f"model_execution_context.provider_model_key must be {RESEARCHER_PROVIDER_MODEL_KEY}")
+    if value.get("oauth_route_required") is not True:
+        errors.append("model_execution_context.oauth_route_required must be true")
     for field in ("model_policy_ref", "model_policy_sha256", "model_context_digest"):
         if not _is_non_empty_string(value.get(field)):
             errors.append(f"model_execution_context.{field} is required")

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -35,8 +36,11 @@ from researcher_swarm.classification import (  # noqa: E402
 from researcher_swarm.model_context import (  # noqa: E402
     RESEARCHER_MODEL_ID,
     RESEARCHER_MODEL_LANE_ID,
+    RESEARCHER_PROVIDER_ROUTE,
     RESEARCHER_PROVIDER_MODEL_KEY,
+    RESEARCHER_RUNTIME_AGENT_ID,
 )
+from researcher_swarm.openclaw_runtime import parse_openclaw_researcher_swarm_stdout  # noqa: E402
 from researcher_swarm.retrieval import (  # noqa: E402
     build_retrieval_evidence_item,
     build_retrieval_packet,
@@ -209,6 +213,9 @@ class LeafResearchAssignmentContractTest(unittest.TestCase):
             self.assertEqual(model_context["model_lane_id"], RESEARCHER_MODEL_LANE_ID)
             self.assertEqual(model_context["resolved_model_id"], RESEARCHER_MODEL_ID)
             self.assertEqual(model_context["provider_model_key"], RESEARCHER_PROVIDER_MODEL_KEY)
+            self.assertEqual(model_context["provider_route"], RESEARCHER_PROVIDER_ROUTE)
+            self.assertTrue(model_context["oauth_route_required"])
+            self.assertEqual(model_context["runtime_agent_id"], RESEARCHER_RUNTIME_AGENT_ID)
             self.assertEqual(model_context["prompt_template_id"], RESEARCHER_NLI_PROMPT_TEMPLATE_ID)
             self.assertEqual(model_context["prompt_template_sha256"], RESEARCHER_NLI_PROMPT_TEMPLATE_SHA256)
             self.assertNotIn("authority_boundary", model_context)
@@ -433,8 +440,52 @@ class LeafResearchAssignmentContractTest(unittest.TestCase):
         self.assertFalse(bundle["proceed_to_verification_scae"])
         self.assertFalse(bundle["all_leaves_have_assignment_and_resolution"])
         self.assertTrue(all(row["reason_codes"] == ["leaf_unclassified"] for row in bundle["leaf_runtime_status"]))
+        self.assertTrue(all(row["model_executed"] for row in bundle["leaf_runtime_status"]))
+        self.assertTrue(
+            all(row["resolved_model_id"] == RESEARCHER_PROVIDER_MODEL_KEY for row in bundle["leaf_runtime_status"])
+        )
         validation = validate_researcher_swarm_runtime_bundle(bundle)
         self.assertTrue(validation.valid, validation.errors)
+
+    def test_openclaw_runtime_parser_accepts_gateway_reply_bundle(self) -> None:
+        assignments = build_leaf_research_assignments(qdt=self.qdt, retrieval_packet=self._certifiable_packet())
+        results = [
+            build_leaf_subagent_result(
+                assignment,
+                terminal_status="insufficient_evidence_blocker",
+                subagent_session_ref=f"session:{idx}",
+                runtime_provenance={
+                    "model_executed": True,
+                    "resolved_model_id": RESEARCHER_PROVIDER_MODEL_KEY,
+                    "runtime_call_ref": f"model-runtime-call:{idx}",
+                },
+                reason_codes=["insufficient_evidence_blocker"],
+            )
+            for idx, assignment in enumerate(assignments)
+        ]
+        bundle = build_researcher_swarm_runtime_bundle(
+            assignments,
+            qdt=self.qdt,
+            retrieval_packet=self._certifiable_packet(),
+            subagent_results=results,
+            true_production_mode=True,
+        )
+        stdout = json.dumps(
+            {
+                "runId": "run-1",
+                "status": "ok",
+                "result": {
+                    "payloads": [{"text": json.dumps(bundle, sort_keys=True)}],
+                    "finalAssistantVisibleText": "ignored",
+                },
+            },
+            sort_keys=True,
+        )
+
+        parsed = parse_openclaw_researcher_swarm_stdout(stdout)
+
+        self.assertEqual(parsed["runtime_bundle_id"], bundle["runtime_bundle_id"])
+        self.assertTrue(all(row["model_executed"] for row in parsed["leaf_runtime_status"]))
 
     def test_leaf_research_barrier_rejects_non_executed_or_wrong_model_result(self) -> None:
         assignments = build_leaf_research_assignments(qdt=self.qdt, retrieval_packet=self._certifiable_packet())

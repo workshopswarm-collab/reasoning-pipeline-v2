@@ -1,42 +1,69 @@
 # ADS v2 Live Operations Architecture Audit And Implementation Plan
 
-Date: 2026-06-26
+Date: 2026-06-26; refreshed 2026-06-27
 Author: Workbench
 Scope: Development plan for fixing ADS v2 live-operation readiness while reusing the current Orchestrator, Decomposer, Researcher Swarm, AMRG, and SCAE architecture.
 
 ## Executive Summary
 
-The ADS v2 pipeline architecture is generally set up. The control plane, manifests, leases, stage logging, readiness gates, canary harnesses, bounded scheduler, storage maintenance, scoring/calibration reporting, AMRG contract layer, and SCAE deterministic engine are present and tested.
+The ADS v2 pipeline architecture is now materially beyond the earlier pilot-only state. The control plane, manifests, leases, stage logging, readiness gates, canary harnesses, bounded scheduler, storage maintenance, scoring/calibration reporting, AMRG contract layer, and SCAE deterministic engine are present and tested. Current working-tree code also includes the true-production handler factory, Decomposer model-runtime transport, AMRG live vector runtime path, Researcher Swarm OpenClaw runtime adapter, stricter leaf-research barriers, and real-runtime canary reporting.
 
-The major live-readiness gap is not the skeleton of the pipeline. It is that the current scoreable live path uses the production-pilot adapter rather than the intended v2 intelligence layer. The pilot adapter generates deterministic/template QDTs, uses structured market metadata as certified evidence, and then exercises SCAE/PERSIST plumbing. This proves safety and persistence, but it does not prove question-specific GPT 5.5 high decomposition, GPT 5.5 high leaf research, or live research sufficiency.
+The remaining live-readiness gap is not the execution skeleton. It is the end-to-end live evidence path. A bounded true-production clone canary can now execute the Decomposer runtime path and complete all stages non-scoreably, but the live retrieval stage currently supplies no fetched, searched, or native candidate URLs into the retrieval materializer. That produces a certified retrieval blocker, prevents real Researcher Swarm execution, and leaves SCAE without verified classification-derived evidence deltas.
 
-The fix should modify and extend the existing architecture, not create a parallel pipeline. The current runner and handoff contracts should remain the execution spine. The deterministic pilot lane should remain available as a fixture/canary lane, but scoreable production readiness should require real Decomposer and Researcher runtime artifacts.
+The fix should continue to modify the existing architecture, not create a parallel pipeline. The current runner, manifests, handler boundary, and SCAE authority model should remain the execution spine. The deterministic pilot lane should remain available as a fixture/canary lane, but true production readiness must require source-populated retrieval sufficiency, real Researcher model execution, verified sidecars, and SCAE evidence deltas derived from those verified artifacts.
 
 ## Audit Basis
 
 Repo state checked from `/Users/agent2/.openclaw`:
 
-- `main...origin/main` aligned before this plan was written.
-- Runtime integration dependency gates pass for all ADS inventory rows.
+- `main...origin/main` is not ahead/behind in the current workspace, with ADS runtime integration edits still present in the working tree. Treat those working-tree changes as current audit state until they are reconciled and pushed.
 - Focused verification:
-  - Orchestrator tests: 200 passing.
-  - Decomposer tests: 43 passing.
-  - Researcher Swarm tests: 138 passing.
-  - SCAE tests: 100 passing.
-- Live readiness report for bounded calibration-debt scoreable canary with `predquant.ads_production_pilot_handlers` is `ok=true`.
+  - Orchestrator tests: 217 passing.
+  - Decomposer tests: 64 passing.
+  - Researcher Swarm tests: 169 passing.
+  - SCAE tests: 104 passing.
+- Live DB health check passed in the latest read-only audit with 44 markets, 43 open markets, 1 resolved market, 3664 snapshots, 7 ADS predictions, 8 forecast decision records, 0 scored ADS predictions, and 0 unscored resolved ADS predictions.
+- True-live readiness with `predquant.ads_production_handlers:build_stage_handlers` blocks on `calibration_debt_not_cleared`.
+- The same true-live readiness command accepted a caller-supplied placeholder SCAE delta ref as a counted ref while still blocking on CAL-001. CAL-001 masks the issue today; true readiness should reject placeholder/non-manifest refs directly.
+- Bounded pilot scoreable readiness with `predquant.ads_production_pilot_handlers:build_stage_handlers` is still `ok=true`, which is useful for fixture/pilot plumbing but not evidence of the v2 intelligence path.
+- The latest live DB real-runtime canary report still reflects pilot artifacts and fails true-runtime expectations with QDT/runtime and protected-delta issues.
+- A scratch clone true-production canary using `predquant.ads_production_handlers:build_stage_handlers` and fresh OpenClaw OAuth Decomposer transport completed all 13 stages non-scoreably with:
+  - active runs after: 0,
+  - active leases after: 0,
+  - unresolved manifests: 0,
+  - stage error events: 0,
+  - forecast decision records delta: +1,
+  - market predictions delta: +0,
+  - QDT model runtime evidence present for `gpt-5.5-high` with `fixture_mode=false`,
+  - Decomposer consumed deterministic AMRG relationship hints in the final post-cleanup canary,
+  - Researcher classification blocked with `blocked_until_certified_retrieval`.
+- The same clone canary with `--require-researcher-model-executed` failed as expected with `real_runtime_canary:researcher_model_runtime_not_verified`.
+- A later live-shaped clone audit first failed safely at decomposition with `no such column: qdt_artifact_id`; current Decomposer persistence now includes compatibility upgrade code, and the final post-cleanup clone canary completed against the live-shaped clone without the QDT table reset workaround.
+- Pipeline control remains disabled after bounded runs, and the live DB has no active runs or leases.
+- Storage maintenance reports `apply_required=true` even though retention candidates are currently zero; this is a warning/maintenance item, not the intelligence blocker.
 - CAL-001 remains blocked for continuous/full production because there are 0 scoreable resolved/scored ADS predictions, no first-100 trace completeness evidence, no tail/regime/protected-component diagnostics, and no pointer-stability evidence.
 
 Important memory context:
 
-- `memory/2026-06-26.md#L53-L63`: production-pilot lane landed and passed clone/live one-case and two-case runs; live DB had 7 ADS predictions and 8 forecast decision records after pilot; continuous scoreable production remains blocked by CAL-001.
-- `memory/2026-06-26.md#L68-L73`: the Bank of Israel live example used the production-pilot lane and produced a generic QDT rather than a bespoke question decomposition; the required fix is real GPT 5.5 high Decomposer/Researcher runtime.
+- `memory/2026-06-26.md#L72-L93`: the original architecture audit identified the skeleton as healthy and the intelligence layer as the key gap.
+- `memory/2026-06-26.md#L94-L143`: prior implementation work was proceeding in strict phase order through Phase 6, with Phase 7 real retrieval/sufficiency as the next major blocker.
 
-Ollama documentation basis for AMRG local embeddings:
+Specification basis:
 
-- Ollama serves the local API at `http://localhost:11434/api` by default after installation: https://docs.ollama.com/api/introduction
-- Current embeddings API is `POST /api/embed` with `model` and `input`; it accepts a string or list of strings and returns `embeddings`: https://docs.ollama.com/capabilities/embeddings
-- Ollama API docs mark legacy `POST /api/embeddings` as superseded by `POST /api/embed`; implementation should use `/api/embed`: https://github.com/ollama/ollama/blob/main/docs/api.md#generate-embeddings
-- Ollama supports model download through `ollama pull <model>` and API pull through `POST /api/pull`: https://github.com/ollama/ollama/blob/main/docs/api.md#pull-a-model
+- `autonomous-decomposition-swarm-architecture-spec---dbda0f1c----c13d6bea-f02f-4991-8d2c-d69ad5a7dc5a.md` makes SCAE the only live numeric authority, constrains AMRG to non-authoritative context/anchor effects, requires live GPT 5.5 high decomposition/research lanes, and requires retrieval sufficiency before classification/SCAE.
+- `orchestrator/plans/autonomous-decomposition-swarm-implementation-plan.md` keeps the same phase order. This plan now treats Phases 0-6 as substantially implemented in the working tree and Phase 7 as the current critical path.
+
+### Grounding Observations From Current Audit
+
+These observations are the reason the plan below emphasizes retrieval, positive runtime evidence, and release-safe persistence over new architecture:
+
+1. The true-production handler exists and can complete a bounded non-scoreable clone run, so the runner/control-plane skeleton should be extended rather than replaced.
+2. The true-production retrieval path still invokes `build_live_retrieval_packet_from_candidates()` with empty `fetched_candidates`, `search_candidate_urls`, and `native_research_candidates`; that is the immediate runtime blocker.
+3. The Researcher OpenClaw runtime adapter and barrier checks exist, but strict canary evidence fails with `researcher_model_runtime_not_verified` because retrieval blocks before Researcher dispatch.
+4. The runtime-bundle-ready verification path still needs to consume accepted sidecars and direction/quality verification artifacts instead of relying on pilot-style certified reconciliation rows over the retrieval packet.
+5. AMRG vector runtime is present but observed as unavailable in the audit environment; AMRG assist was observed as `not_requested`.
+6. True-readiness mode currently needs stronger positive-evidence checks: manifest-derived SCAE delta refs, actual researcher runtime bundle refs, source-populated retrieval packets, and non-placeholder runtime provenance.
+7. QDT persistence compatibility must be release-proven against live-shaped DB clones; the observed `qdt_artifact_id` failure is a cutover risk until the upgrade path is demonstrated without clone-only surgery.
 
 ## Current Architecture Readiness
 
@@ -53,55 +80,70 @@ Ollama documentation basis for AMRG local embeddings:
    - `ads_handoff.py` and `ads_handoff_resolver.py` provide persisted manifests, digest/path validation, strict stage-output resolution, and validation refs.
    - Production-readiness handlers already prove a full strict-manifest chain can run.
 
-4. **Live readiness and scheduler gates**
+4. **True-production handler shell**
+   - `predquant.ads_production_handlers:build_stage_handlers` now forces `scoreable_pilot=false`, `decomposer_runtime=true`, `live_retrieval_runtime=true`, `live_fixture_retrieval=false`, `researcher_swarm_openclaw_runtime=true`, and `amrg_vector_runtime=true`.
+   - The bounded clone canary proved the handler can run all stages non-scoreably without leaking active runs, active leases, or scoreable predictions.
+
+5. **Decomposer model-runtime path**
+   - The Decomposer runtime path can emit a model-runtime call record, model-executed QDT artifact, and handoff provenance for `gpt-5.5-high`.
+   - The bounded post-cleanup clone canary proved handler/runtime plumbing with fresh OpenClaw OAuth Decomposer transport.
+
+6. **Live readiness and scheduler gates**
    - `ads_live_readiness.py` checks health, active runs/leases, storage, calibration debt, handler policy, and bounded calibration-debt canary limits.
    - `run_ads_operational_scheduler.py` can require readiness and disable after bounded runs.
 
-5. **Operator and maintenance surfaces**
+7. **Operator and maintenance surfaces**
    - `report_ads_handoffs.py`, `maintain_ads_storage.py`, `run_ads_scoring_calibration_loop.py`, and health checks exist.
    - Storage maintenance reports retention candidates and DB/WAL sizes.
 
-6. **SCAE**
+8. **SCAE**
    - SCAE is already positioned correctly as the only numeric forecast authority.
    - Prior/evidence/netting/missingness/conditional/interval/persistence tests pass.
    - Persistence bridge writes scoreable `market_predictions` with prediction-time market baseline.
 
-7. **Decomposer and Researcher contract layers**
+9. **Decomposer and Researcher contract layers**
    - Decomposer has QDT schema validation, structural validation, sufficiency requirements, no-probability restrictions, model-lane metadata, and persistence helpers.
    - Researcher Swarm has retrieval packets, breadth/sufficiency structures, assignment schemas, isolation audits, sidecar validation, classification matrix, verification, coverage, escalation, and persistence helpers.
+   - Researcher Swarm now has an OpenClaw runtime adapter and runtime bundle validation/barrier contracts, but it has not yet been exercised end-to-end because retrieval blocks first.
+   - AMRG now has live descriptor/vector runtime code paths with explicit unavailable diagnostics.
 
 ### Primary Weaknesses
 
-1. **Scoreable pilot is not the intended intelligence path**
-   - `ads_production_readiness_handlers.py` calls `build_fixture_qdt_candidate()` and tags QDTs as `deterministic_decomposer_contract_adapter`.
-   - Retrieval and classification are certified from structured market metadata in scoreable pilot mode.
-   - This should remain a pilot lane only.
+1. **Live retrieval transport is the current hard blocker**
+   - The true-production retrieval handler calls the live retrieval packet builder with empty `fetched_candidates`, empty `search_candidate_urls`, and empty native candidates.
+   - The retrieval materializer can validate and certify supplied evidence, but it is not yet wired to a real direct URL, search, web fetch, curated registry, or native candidate discovery transport in the production handler.
+   - The clone canary therefore correctly records `retrieval_sufficiency_not_certified` and blocks Researcher execution.
 
-2. **Decomposer runtime is placeholder**
-   - `decomposer/scripts/bin/run_decomposition.py` only echoes a runtime envelope.
-   - `resolve_decomposer_model_lane()` records `gpt-5.5-high` metadata, but `provenance_status` still says prompt-template placeholder.
-   - No GPT 5.5 high call generates a QDT today.
+2. **Researcher runtime exists but is not yet proven in the full pipeline**
+   - The OpenClaw runtime adapter and bundle validators exist.
+   - The strict clone canary with `--require-researcher-model-executed` fails because no researcher bundle or sidecars can exist while retrieval is uncertified.
+   - Passing that strict canary should be the Phase 8 completion criterion.
 
-3. **Researcher runtime is metadata-only**
-   - `researcher_swarm/model_context.py` currently requires `execution_mode=metadata_only` and `model_call_performed=False`.
-   - `researcher-swarm/scripts/bin/run_researcher_swarm.py` only reports a planned run with `live_spawn_authority=false`.
-   - `run_native_gpt_research.py` defaults to unavailable diagnostic.
-
-4. **Readiness currently has pilot and production semantics too close together**
-   - With `--allow-calibration-debt-scoreable-canary`, the readiness gate can pass the production-pilot handler for bounded runs.
-   - That is correct for pilot canaries, but a separate true-production readiness mode should require real model-executed Decomposer/Researcher artifacts.
-
-5. **SCAE lacks real verified evidence intake in live path**
+3. **Verification-to-SCAE mapping is still incomplete for true runtime**
    - SCAE itself is healthy.
-   - The missing link is mapping real verified researcher NLI classifications into SCAE evidence delta candidates and ledger inputs.
+   - The production verification path still needs to consume accepted runtime sidecars/classification matrices, direction/quality verification artifacts, and reconciliation proofs before building SCAE evidence deltas.
+   - A runtime-bundle-ready path must not reuse pilot-style certified rows over the retrieval packet.
 
-6. **CAL-001 blocks full production**
+4. **AMRG vector and assist are partially live but not operationally ready**
+   - The AMRG vector path now builds descriptors and attempts the local Ollama route, but the audit environment reported `vector_status=unavailable` and `preflight_status=unavailable`.
+   - AMRG model assist remains `not_requested` unless a response file or transport is configured.
+   - The final post-cleanup canary showed Decomposer hint-consumption metadata for deterministic AMRG relationship hints.
+
+5. **True readiness still needs positive evidence hardening**
+   - True-readiness mode correctly rejects pilot handlers and blocks on CAL-001.
+   - It should also derive QDT, retrieval, researcher, AMRG, and SCAE evidence from the latest real-runtime canary manifests instead of trusting optional CLI-supplied signals or placeholder refs.
+
+6. **QDT persistence compatibility is a release risk until re-proven**
+   - A live-shaped clone audit exposed `no such column: qdt_artifact_id` during decomposition before a clone-only reset workaround.
+   - Current Decomposer persistence code includes upgrade helpers, but the release gate should require a live-shaped clone canary without schema surgery.
+
+7. **CAL-001 blocks full production**
    - This is expected. There are pilot predictions, but no resolved/scored ADS prediction evidence yet.
    - Continuous scoreable operation should remain blocked until CAL-001 evidence exists.
 
 ## AMRG Assessment
 
-AMRG is one of the healthier subsystems architecturally. It is not merely a stub. It has active-safe market descriptors, deterministic candidate generation, vector-neighbor contracts, advisory model-assist packet/output validation, refresh lifecycle, strict-precedence anchor validation surfaces, shared-cache reuse eligibility, and persistence.
+AMRG remains one of the healthier subsystems architecturally. It is not merely a stub. It has active-safe market descriptors, deterministic candidate generation, live vector-runtime plumbing, vector-neighbor contracts, advisory model-assist packet/output validation, refresh lifecycle, strict-precedence anchor validation surfaces, shared-cache reuse eligibility, and persistence.
 
 ### AMRG Strengths
 
@@ -115,11 +157,12 @@ AMRG is one of the healthier subsystems architecturally. It is not merely a stub
    - Validated strict-precedence anchors can provide condition-scoped anchor validation input.
    - Probability authority, SCAE deltas, QDT selection/repair, forecast writes, fair values, and interval authority are forbidden.
 
-3. **Vector lane contract exists**
+3. **Vector lane is implemented with fail-closed diagnostics**
    - `amrg_vector_embedding` is local Ollama `BAAI/bge-base-en-v1.5`.
    - Vector unavailable diagnostics are non-blocking.
    - Vector candidates are capped and weak-context-only.
-   - The current model-lane policy already requires provider `ollama`, route `ollama/local`, and download command `ollama pull BAAI/bge-base-en-v1.5`; the implementation plan below should turn that contract into a real Ollama `/api/embed` preflight and runtime path.
+   - The current model-lane policy requires provider `ollama`, route `ollama/local`, and download command `ollama pull BAAI/bge-base-en-v1.5`.
+   - The clone canary built 43 descriptors and 42 candidate descriptors, then recorded the Ollama vector route as unavailable without blocking deterministic AMRG.
 
 4. **Advisory model assist is bounded**
    - AMRG model assist can classify existing candidate rows using fixed vocabularies.
@@ -134,46 +177,70 @@ AMRG is one of the healthier subsystems architecturally. It is not merely a stub
 
 ### AMRG Gaps
 
-1. **Live path does not appear to populate real vector candidates**
-   - The production-readiness handler passes only `_active_market_index(conn, lease["market_id"])` into `materialize_related_live_market_context()`.
-   - It does not build descriptors, run the local BGE embedding route, create an index snapshot, or supply vector neighbor candidates during live runs.
+1. **Vector runtime depends on operator-local service readiness**
+   - The code path is present, but the audited environment did not have a reachable/ready Ollama BGE route.
+   - Operator preflight needs to make the unavailable state obvious before a run, not only after the AMRG stage.
 
-2. **AMRG model assist is a packet/provenance contract, not an invoked runtime**
-   - Output validation exists, but there is no live model-assist execution path in the pilot handler.
+2. **AMRG model assist is not default-wired**
+   - Output validation exists, but there is no default OpenClaw OAuth assist invocation in the true-production handler.
+   - `not_requested` is acceptable only when the run policy explicitly treats assist as optional.
 
 3. **Strict-precedence anchors are not exercised by real QDTs**
-   - QDT currently comes from the deterministic fixture candidate.
-   - Anchor contracts can be validated, but live QDT generation is not asking for or validating real question-specific anchor dependency contracts.
+   - Anchor contracts can be validated, and the final audited Decomposer QDT consumed deterministic AMRG relationship hints, but it did not yet request real question-specific anchor dependency contracts.
 
-4. **Refresh policy is not actively wired into live production-pilot AMRG**
-   - Refresh logic exists, but the current handler does not pass a refresh policy/results loop.
+4. **Refresh policy still needs a promoted-effect live proof**
+   - Refresh logic exists, and the clone canary reported `fresh_no_refresh_needed`.
+   - Promoted-effect refresh and downgrade paths still need a live run that actually promotes and refreshes effects.
 
 5. **Shared cache reuse is contract-ready but not integrated into live retrieval**
    - Eligibility logic exists and is tested.
-   - Live retrieval still uses structured metadata pilot artifacts, not cache-aware real retrieval/research execution.
+   - True-production live retrieval is still not sourcing real candidate URLs or cache-aware source material.
 
 6. **Operator visibility is incomplete for AMRG quality**
-   - We need a compact report of candidate sources, vector availability, effect status, downgrade reasons, strict-precedence anchor status, and whether the Decomposer actually consumed AMRG hints.
+   - The AMRG operator report is useful, but readiness/canary gates should consume its key fields: vector status, model-assist status, relationship effects, refresh status, strict-precedence anchor state, and Decomposer hint consumption.
 
 ## Readiness Verdict
 
-Architecture readiness excluding the intended intelligence layer: **high for bounded canary operations, medium for unattended live operations.**
+Architecture readiness excluding full live evidence intelligence: **high for bounded canary/control-plane operations, medium for non-scoreable true-runtime skeleton runs, low for unattended scoreable true production.**
 
-The current architecture is suitable as the base for the real v2 pipeline. It should not be replaced. The next work should wire real Decomposer, retrieval, Researcher, and SCAE evidence intake through the existing runner, manifests, AMRG context, and readiness gates.
+The current architecture is suitable as the base for the real v2 pipeline. It should not be replaced. The next work should wire real retrieval transport, source sufficiency, Researcher execution, and SCAE evidence intake through the existing runner, manifests, AMRG context, and readiness gates.
 
 The current pipeline is **not** ready for unattended scoreable live operation because:
 
-- QDT is template-derived.
-- Researcher execution is not live GPT 5.5 high.
-- Native/browser retrieval is not producing sufficiency-certified live evidence for scoreable runs.
-- SCAE live scoreable path is receiving pilot evidence, not verified NLI classifications.
+- Retrieval is not producing source-populated, sufficiency-certified live evidence.
+- Researcher execution is therefore not proven in the end-to-end true-production path.
+- SCAE is not yet receiving verified runtime classification-derived evidence deltas.
+- AMRG vector/model-assist live dependencies are either unavailable or not requested in the audited run.
+- True-live readiness needs manifest-derived positive evidence requirements beyond optional signal inputs.
+- QDT persistence compatibility needs a clean live-shaped clone proof without table reset/workaround.
 - CAL-001 is still blocked.
 
 ## Implementation Plan
 
+### Progress Status After 2026-06-27 Audit
+
+| Phase | Current status | Next focus |
+| --- | --- | --- |
+| 0 - Pilot/production semantics | Substantially implemented | Keep pilot lane available, but prevent pilot artifacts from satisfying true-production readiness. |
+| 1 - Shared model runtime | Substantially implemented for Decomposer fresh-route proof | Extend the same OpenClaw OAuth runtime provenance to remaining model-backed lanes. |
+| 2 - OpenClaw execution boundary | Partially implemented | Reuse for Researcher and AMRG assist with explicit provenance and failure classes. |
+| 3 - Evidence collection runtime contract | Partially implemented | Connect source discovery/fetch attempts to persisted retrieval candidates. |
+| 4 - Real Decomposer execution | Substantially implemented | Require question-specific QDT, fresh-route evidence when policy requires it, and live-shaped DB migration compatibility. |
+| 5 - AMRG-to-Decomposer context | Partially implemented | AMRG hint consumption is now proven; anchor dependency requests still need a non-fixture proof. |
+| 6 - AMRG vector/assist | Vector path implemented, assist optional/not requested | Add operator preflight, ready-route canary, and default/explicit assist policy. |
+| 7 - Real retrieval/sufficiency | Current hard blocker | Wire direct URLs, search/provider candidates, web fetch, native discovery, and sufficiency certificates into the true handler. |
+| 8 - Researcher execution | Runtime adapter and barriers exist, end-to-end blocked | Pass strict canary with `--require-researcher-model-executed`. |
+| 9 - Verification to SCAE | Deterministic helpers exist, true runtime intake incomplete | Map accepted sidecars/classification verification into SCAE evidence delta refs. |
+| 10 - True production handler | Handler shell exists and runs non-scoreably | Replace empty retrieval and pilot-style verification shortcuts before scoreable use. |
+| 11 - Canary ladder | Real-runtime report exists | Gate on retrieval sufficiency, researcher execution, AMRG diagnostics, and SCAE delta refs. |
+| 12 - Observability/readiness | Many reports exist | Derive true-readiness from latest manifests/canary report, not caller-provided placeholders. |
+| 13 - CAL-001 expansion | Blocked | Accumulate real scored evidence only after true intelligence path is scoreable. |
+
 ### Phase 0 - Preserve Pilot Lane And Add Production Semantics
 
 Goal: keep the existing production-pilot path useful without letting it masquerade as true v2 intelligence.
+
+2026-06-27 audit status: this phase is substantially implemented. Pilot readiness can still pass for bounded fixture/scaffolding work, while true-live readiness rejects pilot handlers and currently blocks on CAL-001. The remaining gap is to make true readiness derive positive runtime evidence from manifests/canary reports, not only from caller-supplied flags.
 
 Modify existing surfaces:
 
@@ -193,16 +260,23 @@ Tasks:
    - metadata-only researcher context,
    - structured-market-metadata certification as the only research input.
 4. Add test coverage proving bounded pilot still works but true live readiness blocks pilot handlers.
+5. Ensure true-production readiness treats pilot scoreable readiness as non-transferable evidence:
+   - pilot `ok=true` may prove runner/persistence plumbing only,
+   - it must not clear QDT runtime, retrieval sufficiency, researcher runtime, SCAE evidence delta, or CAL-001 gates.
+6. In readiness output, report which evidence came from live manifests/canary reports and which evidence was provided by CLI override or placeholder input.
 
 Acceptance:
 
 - Existing pilot tests still pass.
 - A true-live readiness report refuses the pilot handler even if CAL-001 canary bypass is requested.
 - Operator output names the lane clearly as pilot/fixture.
+- True-production readiness cannot be satisfied by pilot artifacts, transport-response-only evidence when fresh live transport is required, or placeholder SCAE delta refs.
 
 ### Phase 1 - Add Shared Model Runtime Transport
 
 Goal: provide a reusable model-call adapter for Decomposer, Researcher, and native research without embedding provider details throughout the pipeline.
+
+2026-06-27 audit status: this phase is substantially implemented for Decomposer and enough to validate handler/runtime plumbing with fresh OpenClaw OAuth transport. AMRG assist/native research/researcher execution still need consistent runtime provenance and failure handling.
 
 Modify existing surfaces:
 
@@ -239,6 +313,15 @@ Tasks:
    - no retry for forbidden probability/fair-value/SCAE-delta output.
 4. Add no-probability/fair-value/SCAE-delta scanner for all model outputs.
 5. Add offline fixture mode for unit tests, but require explicit fixture mode in metadata.
+6. Add route-specific readiness checks that distinguish:
+   - fixture response,
+   - transport-response file,
+   - fresh OpenClaw OAuth model call,
+   - provider unavailable,
+   - schema repair,
+   - forbidden-output rejection.
+7. Reuse the same runtime provenance vocabulary for Decomposer, native candidate discovery, Researcher NLI sidecars, AMRG assist, and any source-metadata assist.
+8. Add canary/report criteria that make transport-response proof acceptable for contract testing but insufficient for fresh live-route cutover.
 
 Acceptance:
 
@@ -246,10 +329,13 @@ Acceptance:
 - Runtime provenance can represent both `metadata_only` and `model_executed`.
 - Forbidden probability fields are rejected before downstream validation.
 - Tests cover fixture mode, live-mode provenance, retry exhaustion, schema repair once, and fail-closed forbidden output.
+- A canary can separately report "runtime contract proven" and "fresh external route proven" for each model-backed lane.
 
 ### Phase 2 - GPT Runtime And Subagent Wiring Contract
 
 Goal: make the intended intelligence import path explicit before wiring live model execution.
+
+2026-06-27 audit status: the decomposition runtime boundary and Researcher Swarm runtime adapter/barrier contracts exist, but the full control-plane launch/result path has not been proven end to end because retrieval blocks before researcher dispatch. This phase remains partially implemented until a strict canary proves researcher subagent execution and terminal leaf results.
 
 Ownership rules:
 
@@ -334,6 +420,13 @@ Runtime requirements:
    - no leaf subagent result accepted in true-production mode unless runtime provenance shows `model_executed` with resolved model `openai/gpt-5.5-high`,
    - no sidecar acceptance if isolation audit shows contamination,
    - no verification/SCAE stage start until the barrier artifact says all leaves are terminal and sufficient or explicitly blocked.
+6. Add an Orchestrator-owned researcher launch/result adapter proof:
+   - consumes the current assignment bundle,
+   - launches/collects isolated leaf researcher runtime results,
+   - writes terminal sidecar/isolation/subagent refs,
+   - hands those refs back to `run_researcher_swarm.py` validation,
+   - records a barrier artifact that can be consumed by verification.
+7. Make the current `researcher-classification-readiness-block` path explicitly non-scoreable and non-evidence for model execution.
 
 Acceptance:
 
@@ -344,10 +437,13 @@ Acceptance:
 - A deliberately slow/missing leaf keeps the case blocked before verification/SCAE.
 - A contaminated leaf subagent output fails closed and blocks scoreable prediction.
 - A successful run shows Decomposer provenance, per-leaf subagent refs, isolation audits, sidecars, and a passing barrier artifact in the handoff report.
+- The strict clone canary with `--require-researcher-model-executed` passes only after Phase 7 retrieval sufficiency enables real Researcher dispatch.
 
 ### Phase 3 - Evidence Collection Runtime Contract
 
 Goal: make evidence collection a first-class runtime stage, separate from classification and separate from SCAE probability authority.
+
+2026-06-27 audit status: the contract is well specified and many deterministic validation structures exist, but the true-production handler currently reaches the retrieval materializer with empty candidate lists. The phase is therefore contract-rich but runtime-incomplete; its remaining work collapses into the Phase 7 transport and sufficiency blocker.
 
 Ownership rules:
 
@@ -524,6 +620,13 @@ Tasks:
 5. Add a leaf evidence docket artifact containing initial admitted evidence, rejected/omitted candidates, supplemental candidates, supplemental admission results, and sufficiency status.
 6. Enforce that classifier sidecars reference only admitted evidence ids unless they are explicitly proposing supplemental evidence.
 7. Add tests for source chasing, contradiction search, negative check search, supplemental candidate rejection, and no-SCAE/no-probability leakage.
+8. Add source-attempt persistence for the empty-candidate case seen in the audit:
+   - distinguish "no candidates supplied",
+   - "provider unavailable",
+   - "fetch attempted and failed",
+   - "candidate rejected",
+   - "candidate admitted but insufficient".
+9. Require the retrieval stage manifest to expose source-attempt counts and admitted evidence counts before Researcher dispatch can be considered.
 
 Acceptance:
 
@@ -532,10 +635,13 @@ Acceptance:
 - A leaf subagent can discover a supplemental official source and have it admitted only after deterministic validation.
 - A leaf subagent that uses unadmitted evidence in classification fails closed.
 - Handoff report shows evidence docket refs before sidecar/classification refs.
+- The current empty-candidate true-production retrieval path is no longer able to look like a normal ready retrieval packet; it must be a clear blocker with remediation diagnostics.
 
 ### Phase 4 - Implement Real GPT 5.5 High Decomposer
 
 Goal: replace template QDT generation with question-specific QDT generation while preserving deterministic validation.
+
+2026-06-27 audit status: this phase is substantially implemented in the current working tree. The final scratch clone true-production canary produced QDT model-runtime evidence for `gpt-5.5-high` through fresh OpenClaw OAuth transport, and the live-shaped DB clone exercised the QDT persistence migration guard without a table reset workaround. The phase is complete for Decomposer cutover; remaining cutover risk sits downstream in retrieval sufficiency, Researcher execution, and SCAE evidence intake.
 
 Modify existing surfaces:
 
@@ -567,16 +673,28 @@ Tasks:
 3. Persist `MIG-003` decomposition run and sufficiency requirements.
 4. Return a manifest-backed `question-decomposition.json`.
 5. Update the live stage handler to consume the Decomposer output manifest instead of `build_fixture_qdt_candidate()`.
+6. Add a fresh-route Decomposer canary that does not rely on `--decomposer-runtime-transport-response` when policy requires external model reachability.
+7. Make QDT persistence migrations upgrade-safe against live-shaped DB clones before relying on true-production canaries for release evidence.
+8. Persist and report whether QDT leaves consumed AMRG hints or produced anchor dependency requests.
+9. Add a no-workaround live-shaped clone migration proof:
+   - start from a clone of the current live DB,
+   - do not reset or manually rebuild QDT tables,
+   - run the true-production decomposition stage,
+   - verify `qdt_decomposition_runs`, required questions, sufficiency requirements, and anchor slices have the expected compatibility columns and indexes.
 
 Acceptance:
 
 - Fixture question produces question-specific leaves, not the generic source/direct/mechanics template.
 - QDT still rejects probability/fair value/SCAE outputs.
 - Handoff report shows Decomposer model execution provenance with `gpt-5.5-high`.
+- The Decomposer phase can distinguish question-specific live-route output from transport-response contract proof.
+- A live-shaped DB clone can pass the Decomposer persistence path without clone-only table reset or schema surgery.
 
 ### Phase 5 - Wire AMRG Into Real Decomposition
 
 Goal: make AMRG useful to the Decomposer without giving it forecast authority.
+
+2026-06-27 audit status: AMRG context artifacts and operator reporting exist, and the final audited Decomposer QDT consumed deterministic AMRG relationship hints while preserving AMRG as non-authoritative context. This phase is still partially implemented because question-specific anchor dependency requests remain unproven.
 
 Modify existing surfaces:
 
@@ -602,16 +720,24 @@ Tasks:
 6. Let Decomposer request anchor dependency contracts only when the question genuinely needs upstream/conditional market structure.
 7. Validate requested anchor contracts against AMRG strict-precedence constraints.
 8. Add operator metadata showing which AMRG hints were considered and which QDT leaves reference them.
+9. Add a canary fixture/case where AMRG provides at least one useful deterministic retrieval hint and the Decomposer either:
+   - references it in a leaf/retrieval hint with allowed-use metadata,
+   - or explicitly records why it was ignored.
+10. Require strict-precedence anchor requests to carry the validated AMRG anchor ref and downgrade/block when refresh or precedence validation is stale.
+11. Add negative tests proving AMRG cannot alter QDT selection, repair QDTs, emit SCAE deltas, or provide probability anchors without strict-precedence validation.
 
 Acceptance:
 
 - Generic context candidates influence prompt context only.
 - QDT anchor dependency contracts are only accepted after deterministic AMRG validation.
 - AMRG remains non-authoritative for probability, QDT selection, and SCAE deltas.
+- Operator reports can show per-hint Decomposer consumption status for true-production runs, not only AMRG candidate availability.
 
 ### Phase 6 - Activate AMRG Vector And Advisory Assist Paths
 
 Goal: turn AMRG optional components from contract-only into bounded runtime contributors.
+
+2026-06-27 audit status: the vector runtime path is present and the true-production clone canary built descriptors and persisted unavailable diagnostics. The local Ollama route was unavailable, model assist was `not_requested`, and the final audited QDT consumed deterministic AMRG hints. Treat this phase as partially implemented and operationally incomplete until vector readiness and assist policy are explicitly resolved.
 
 Modify existing surfaces:
 
@@ -685,6 +811,8 @@ Tasks:
    - validate output with existing forbidden-output scanner,
    - persist provenance,
    - keep model-only candidates weak context.
+   - wire an OpenClaw OAuth assist transport or require run policy to record `model_assist_status=not_requested` as an explicit optional choice.
+   - add a canary assertion that model assist is either invoked successfully, explicitly unavailable, or explicitly disabled by policy.
 6. Wire `amrg-refresh-policy/v1` into live AMRG and persist the effective policy with every AMRG context artifact:
    - market exposure/price/context descriptor TTL: 1 hour,
    - weak relationship context TTL: 24 hours,
@@ -707,6 +835,12 @@ Tasks:
    - refresh/downgrade reasons,
    - strict-precedence anchor validation state,
    - whether the Decomposer consumed each AMRG hint.
+9. Add an operator preflight for the local Ollama route:
+   - checks service reachability,
+   - checks configured model availability,
+   - reports pull allowance,
+   - runs one dimension-valid smoke embed when the route is expected to be ready,
+   - emits the same status vocabulary used by AMRG artifacts and real-runtime canary reports.
 
 Acceptance:
 
@@ -715,10 +849,13 @@ Acceptance:
 - Missing Ollama service, missing model, failed `ollama pull`, failed `/api/embed`, wrong dimensions, or non-finite vectors all produce explicit unavailable/degraded diagnostics and do not block deterministic AMRG.
 - Model assist cannot promote edges or author probabilities.
 - AMRG report identifies whether the real Decomposer consumed AMRG hints.
+- If vector or assist is optional for a run, the operator report and readiness output say so explicitly; an accidental unavailable/not-requested state must not look like a ready vector/assist lane.
 
 ### Phase 7 - Implement Real Retrieval And Sufficiency
 
 Goal: replace structured-market-metadata certification with actual retrieval evidence and high-certainty sufficiency certificates.
+
+2026-06-27 audit status: this is the current hard blocker. The retrieval materializer can build deterministic packets from supplied candidates, but the true-production handler currently invokes it with no fetched candidates, no search candidate URLs, and no native candidates. That correctly blocks Researcher execution with `retrieval_sufficiency_not_certified`.
 
 Modify existing surfaces:
 
@@ -733,32 +870,39 @@ Modify existing surfaces:
 Tasks:
 
 1. For each QDT leaf, construct queries from the leaf text, required evidence fields, source classes, and AMRG retrieval hints.
-2. Capture direct official/resolution URLs first.
-3. Add a concrete browser/search provider adapter behind `researcher_swarm.browser_provider`.
-4. Treat `openclaw.web_fetch` as URL fetch/extraction only; it must not be treated as search.
-5. Add `search-candidate-url/v1` with query variant id, query role, rank, URL, title/snippet hashes, provider id, searched-at timestamp, and result source.
-6. Use this fallback order:
+2. Replace the true-production handler's empty-candidate retrieval call with a real candidate acquisition step:
+   - direct URLs from market metadata, rules, resolution source, source registry, and AMRG retrieval hints,
+   - provider search results when no direct source is enough,
+   - OpenClaw/web fetch extraction for known URLs,
+   - native GPT candidate discovery only as candidate URL discovery.
+3. Persist every source access attempt, including no-candidate, provider-unavailable, fetch-failed, admitted, rejected, duplicate, stale, and insufficient statuses.
+4. Capture direct official/resolution URLs first.
+5. Add a concrete browser/search provider adapter behind `researcher_swarm.browser_provider`.
+6. Treat `openclaw.web_fetch` as URL fetch/extraction only; it must not be treated as search.
+7. Add `search-candidate-url/v1` with query variant id, query role, rank, URL, title/snippet hashes, provider id, searched-at timestamp, and result source.
+8. Use this fallback order:
    - direct URLs from market/rules/evidence/AMRG/registry,
    - structured feeds and curated source registry,
    - configured browser/search provider,
    - native GPT candidate discovery,
    - targeted expansion.
-7. Enforce search rank caps:
+9. Enforce search rank caps:
    - primary query: top 10 URLs per query variant,
    - contradiction query: top 6 URLs,
    - negative-check query: top 5 URLs per required check.
-8. Use GPT 5.5 high native research as candidate discovery, not final source metadata authority.
-9. Add `native-research-candidate-discovery/v1`:
+10. Use GPT 5.5 high native research as candidate discovery, not final source metadata authority.
+11. Add `native-research-candidate-discovery/v1`:
    - critical/source-of-truth: max 12 candidate URLs,
    - high/direct/catalyst: max 8 candidate URLs,
    - normal: max 5 candidate URLs,
    - mechanics/rules-only: max 4 candidate URLs.
-10. Native research output must include URL, source label, why it may matter, related leaf id, candidate claim text, and uncertainty notes.
-11. Native research output must not include source-family final authority, claim-family final authority, temporal safety final authority, sufficiency certification, probability, fair value, SCAE delta, or decision recommendation.
-12. Fetch every native-research URL and deterministically admit or reject it before classification can use it.
-13. Provide leaf subagents with scoped retrieval budgets and allowed transports for follow-up research from assigned evidence.
-14. Resolve source class/family, claim family, temporal safety, breadth, contradiction, negative checks, and missingness deterministically for both pre-dispatch evidence and subagent-discovered supplemental evidence.
-15. Require `RET-008` sufficiency certificate or structural unanswerability proof before classification dispatch; after subagent follow-up research, require an updated sufficiency/reconciliation artifact before verification/SCAE.
+12. Native research output must include URL, source label, why it may matter, related leaf id, candidate claim text, and uncertainty notes.
+13. Native research output must not include source-family final authority, claim-family final authority, temporal safety final authority, sufficiency certification, probability, fair value, SCAE delta, or decision recommendation.
+14. Fetch every native-research URL and deterministically admit or reject it before classification can use it.
+15. Provide leaf subagents with scoped retrieval budgets and allowed transports for follow-up research from assigned evidence.
+16. Resolve source class/family, claim family, temporal safety, breadth, contradiction, negative checks, and missingness deterministically for both pre-dispatch evidence and subagent-discovered supplemental evidence.
+17. Require `RET-008` sufficiency certificate or structural unanswerability proof before classification dispatch; after subagent follow-up research, require an updated sufficiency/reconciliation artifact before verification/SCAE.
+18. Add a clone canary that reaches at least one source-populated high-certainty retrieval certificate before Researcher dispatch.
 
 Acceptance:
 
@@ -767,10 +911,13 @@ Acceptance:
 - Leaf-discovered supplemental evidence is admitted only after deterministic metadata/temporal/sufficiency validation.
 - Native GPT research unavailability is diagnostic unless all other transports fail sufficiency.
 - Tests prove direct URL priority, no-search `web_fetch` behavior, rank cap enforcement, dedupe, fallback diagnostics, native candidate caps, and forbidden native research fields.
+- A true-production canary no longer blocks solely because no retrieval candidates were supplied.
 
 ### Phase 8 - Implement Real Researcher Swarm Execution
 
 Goal: run GPT 5.5 high leaf researchers under strict isolation and sidecar schemas.
+
+2026-06-27 audit status: the OpenClaw runtime adapter, model-execution evidence checks, and leaf barrier contracts are present, but the end-to-end path is blocked before researcher dispatch. A strict clone canary with `--require-researcher-model-executed` currently fails with `researcher_model_runtime_not_verified`.
 
 Modify existing surfaces:
 
@@ -810,6 +957,8 @@ Tasks:
 8. Persist assignments, isolation audits, classifications, supplemental evidence refs, coverage proofs, escalation decisions, and reconciliation.
 9. Build and persist the leaf-research barrier artifact before verification/SCAE starts.
 10. Keep Orchestrator as the state machine; Researcher Swarm should not select global next work or write forecasts.
+11. Require runtime bundles to contain real sidecar refs, classification refs, isolation audit refs, and model-executed provenance before they can satisfy true-production readiness.
+12. Add an end-to-end clone canary that passes `--require-researcher-model-executed` after Phase 7 retrieval sufficiency is live.
 
 Acceptance:
 
@@ -819,10 +968,13 @@ Acceptance:
 - The pipeline does not advance past researcher classification while any dispatchable leaf is active, missing, timed out, contaminated, or unclassified.
 - True-production leaf subagent results are rejected unless runtime provenance shows `model_executed` with resolved model `openai/gpt-5.5-high`.
 - Any researcher probability attempt fails closed.
+- A `researcher-classification-readiness-block` artifact is accepted only as an explicit non-scoreable blocker, never as proof of researcher execution.
 
 ### Phase 9 - Implement Verification-To-SCAE Evidence Mapping
 
 Goal: feed real verified researcher classifications into SCAE without weakening SCAE authority.
+
+2026-06-27 audit status: SCAE remains healthy, but true runtime classification intake is incomplete. The runtime-bundle-ready path must consume accepted sidecars and verification artifacts, not reuse pilot-style certified reconciliation rows over the retrieval packet.
 
 Modify existing surfaces:
 
@@ -841,36 +993,48 @@ Tasks:
 1. Verify all non-neutral classifications for direction and evidence quality.
 2. Reconcile leaf coverage and sufficiency.
 3. Build `scae-evidence-delta-candidate/v1` from accepted classification matrix rows.
-4. Apply initial deterministic direction mapping:
+4. Replace any runtime-bundle-ready shortcut that calls pilot-style `_certified_reconciliation_rows(qdt, retrieval_packet, verification_ref)` with a path that reads:
+   - runtime bundle refs,
+   - accepted sidecar refs,
+   - classification matrix rows,
+   - isolation audit refs,
+   - direction verification refs,
+   - quality verification refs,
+   - sufficiency reconciliation refs.
+5. Persist a SCAE evidence delta bundle ref and require it in true-production readiness/canary output.
+6. Apply initial deterministic direction mapping:
    - `supports_yes` -> positive sign,
    - `supports_no` -> negative sign,
    - `mixed` -> branch/netting candidate, not a direct single delta,
    - `neutral`, `irrelevant`, `insufficient` -> no delta.
-5. Apply initial uncapped log-odds tiers before SCAE caps/netting:
+7. Apply initial uncapped log-odds tiers before SCAE caps/netting:
    - strong: 0.35,
    - moderate: 0.20,
    - weak: 0.08,
    - none: 0.
-6. Apply discounts:
+8. Apply discounts:
    - confidence high 1.0, medium 0.6, low 0.0,
    - quality high 1.0, medium 0.7, low/unusable 0.0.
-7. Apply dependence/netting rules before ledger input:
+9. Apply dependence/netting rules before ledger input:
    - deltas sharing a claim family or source family are netted/capped,
    - contradictory family pairs are carried as opposing candidates,
    - SCAE remains final numeric authority and may further cap, discount, drop, or mark watch-only.
-8. Reject missing/low-certainty/unverified inputs or downgrade to non-scoreable/watch-only.
-9. Run deterministic SCAE ledger.
-10. Persist only SCAE `production_forecast_prob`.
+10. Reject missing/low-certainty/unverified inputs or downgrade to non-scoreable/watch-only.
+11. Run deterministic SCAE ledger.
+12. Persist only SCAE `production_forecast_prob`.
 
 Acceptance:
 
 - SCAE ledger references real classification/verification artifacts.
 - Non-SCAE model outputs never author numeric probabilities.
 - Invalid or thin evidence does not produce scoreable forecasts.
+- Real-runtime canary requires non-empty SCAE evidence delta refs before a run can be considered true-scoreable-ready.
 
 ### Phase 10 - Replace Production-Pilot Handler With True Production Handler
 
 Goal: create the real production handler factory using existing runner extension points.
+
+2026-06-27 audit status: the true-production handler factory exists and runs a bounded non-scoreable clone canary. It is not scoreable-ready because retrieval candidate acquisition is empty, researcher execution is blocked, and verification-to-SCAE mapping still needs real runtime artifact intake. The live-shaped clone audit also exposed QDT persistence compatibility as a release gate for this handler path.
 
 Modify existing surfaces:
 
@@ -887,35 +1051,42 @@ Tasks:
 1. Build stage handlers for the current `ADS_PIPELINE_STAGE_ORDER`.
 2. For early stages, reuse current case/evidence/profile/AMRG materializers.
 3. For decomposition/retrieval/researcher/SCAE, invoke the real runtime entrypoints from Phases 4, 7, 8, and 9.
-4. Keep strict manifest handoffs required.
-5. Keep scoreable writes in decision stage only.
-6. Make handler metadata distinguish:
+4. Remove the empty-candidate retrieval invocation from the true-production path once Phase 7 lands.
+5. Remove any runtime-bundle-ready verification shortcut that bypasses accepted sidecars and verification artifacts once Phase 9 lands.
+6. Keep strict manifest handoffs required.
+7. Keep scoreable writes in decision stage only.
+8. Make handler metadata distinguish:
    - pilot fixture,
    - production readiness non-scoreable,
    - true production specialist runtime.
-7. Add `ads-production-stage-failure-policy/v1` with failure classes:
+9. Add `ads-production-stage-failure-policy/v1` with failure classes:
    - `retryable_transport`,
    - `retryable_model_transport`,
    - `invalid_artifact_terminal`,
    - `thin_evidence_watch_only`,
    - `policy_violation_quarantine`,
    - `fatal_operational`.
-8. Apply retry/failure behavior:
+10. Apply retry/failure behavior:
    - transport/model transport: at most 1 retry,
    - deterministic validation failure: no retry unless a bounded repair path is explicitly defined,
    - policy violation/contamination/forbidden output: quarantine and block scoreable persistence.
-9. Every failure must write stage status, error event, safe reason code, replay command/ref, lease release/drain action, and pipeline disable/continue decision.
-10. Decision stage remains the only scoreable write surface; failed upstream stages cannot write predictions.
+11. Every failure must write stage status, error event, safe reason code, replay command/ref, lease release/drain action, and pipeline disable/continue decision.
+12. Decision stage remains the only scoreable write surface; failed upstream stages cannot write predictions.
+13. Before using this handler as cutover evidence, run it on a live-shaped clone without QDT table reset or manual schema surgery.
 
 Acceptance:
 
 - `run_ads_one_case_canary.py --handler-factory predquant.ads_production_handlers` runs on a clone and produces real QDT/research/SCAE artifacts.
 - Handoff report shows all stage output manifests valid and no unresolved refs.
 - True-live readiness accepts the production handler and rejects pilot/readiness handlers.
+- Acceptance requires a canary with both QDT and Researcher model-executed evidence, not only a non-scoreable skeleton run.
+- The handler can run against a live-shaped clone without a decomposition persistence migration failure.
 
 ### Phase 11 - Canary Ladder With Real Specialist Runtime
 
 Goal: prove the real v2 intelligence path without jumping to unattended operations.
+
+2026-06-27 audit status: the real-runtime canary report exists and caught the current gap. It passes the non-scoreable skeleton run only when researcher execution is not required, and fails with `researcher_model_runtime_not_verified` when strict researcher evidence is required. The canary ladder must also catch live-shaped DB migration failures before they reach live operations.
 
 Tasks:
 
@@ -934,7 +1105,11 @@ Tasks:
     - unresolved manifest refs = 0,
     - stage error events = 0 except explicitly expected failure-injection tests,
     - pipeline disabled or stopped according to run policy,
-    - handoff report `ok=true`.
+    - handoff report `ok=true`,
+    - QDT model-executed evidence present for `gpt-5.5-high`,
+    - retrieval sufficiency certified or structural unanswerability proven,
+    - Researcher model-executed evidence present for `gpt-5.5-high` when the canary claims true runtime readiness,
+    - SCAE evidence delta refs present before any scoreable prediction is allowed.
 11. Enforce prediction deltas:
     - one-case scoreable canary writes forecast decision records +1,
     - market predictions +1 only if SCAE validity is scoreable,
@@ -945,18 +1120,28 @@ Tasks:
     - DB WAL growth block above 2 GB,
     - single case wall time warning above 30 minutes,
     - block above 60 minutes unless explicitly running a failure-injection test.
+13. Add a migration-compatibility rung before any live DB execution:
+    - clone current live DB,
+    - run without QDT table reset/workaround,
+    - fail the ladder on missing compatibility columns/indexes or migration-order exceptions,
+    - record the migration proof artifact in the canary report.
 
 Acceptance:
 
 - No active runs/leases after any run.
 - QDTs are question-specific and model-executed by GPT 5.5 high.
 - Research sidecars are model-executed by GPT 5.5 high.
+- Retrieval is source-populated and sufficiency-certified before researcher dispatch.
+- AMRG vector/assist status is explicit and policy-compatible.
 - SCAE is the only numeric authority.
 - Scoreable predictions are written only when sufficiency/verification passes.
+- Live-shaped clone compatibility passes before live execution rungs are allowed.
 
 ### Phase 12 - Observability And Operator Review
 
 Goal: make live operation inspectable before expansion.
+
+2026-06-27 audit status: handoff, AMRG, health, storage, calibration, and real-runtime reports exist. True readiness still needs to derive positive evidence from the latest manifests/canary report rather than optional caller-supplied placeholders. The latest read-only readiness check counted a placeholder SCAE delta ref, and storage maintenance reported `apply_required=true`; both should be explicit operator signals.
 
 Modify existing surfaces:
 
@@ -986,8 +1171,14 @@ Tasks:
    - missing AMRG refresh status for promoted effects,
    - missing SCAE evidence delta refs,
    - stale storage maintenance plan.
-3. Add alert severities: `blocker`, `warning`, and `info`.
-4. Add blocker thresholds:
+3. In true-scoreable readiness, derive the QDT, retrieval, researcher, AMRG, and SCAE signals from the latest relevant run manifests and real-runtime canary report:
+   - reject placeholder SCAE delta refs,
+   - reject missing researcher runtime bundle refs,
+   - reject retrieval packets with no admitted source evidence unless structural unanswerability is explicitly proven,
+   - reject AMRG promoted effects without fresh/compatible refresh status,
+   - reject Decomposer runtime evidence that only proves a transport-response fixture when fresh live transport is required by policy.
+4. Add alert severities: `blocker`, `warning`, and `info`.
+5. Add blocker thresholds:
    - active lease older than 60 minutes,
    - active run older than 90 minutes,
    - stale intake/snapshot above policy threshold,
@@ -997,23 +1188,32 @@ Tasks:
    - metadata-only researcher in true-production mode,
    - non-SCAE probability authority,
    - DB WAL above 2 GB.
-5. Add warning thresholds:
+6. Add warning thresholds:
    - DB WAL above 512 MB,
    - storage maintenance overdue,
    - AMRG vector unavailable,
    - AMRG weak-context-only,
    - native research unavailable but browser retrieval sufficient,
    - source freshness barely passes.
-6. Operator report must show blocker/warning counts, exact run/case refs, remediation command/ref, and whether scheduler may continue.
+7. Operator report must show blocker/warning counts, exact run/case refs, remediation command/ref, and whether scheduler may continue.
+8. Surface the live read-only audit state in operator output:
+   - active runs/leases,
+   - pipeline enabled/disabled state,
+   - storage maintenance `apply_required`,
+   - count of placeholder/CLI-supplied readiness refs,
+   - latest real-runtime canary evidence source.
 
 Acceptance:
 
 - Operator can tell whether a run was pilot, readiness, or true production.
 - Operator can trace every scoreable prediction back to QDT, retrieval, researcher, verification, SCAE, decision, and replay manifests.
+- Operator can see when readiness was blocked only by CAL-001 while other positive-evidence checks were supplied by placeholders or CLI overrides.
 
 ### Phase 13 - CAL-001 Evidence Accumulation And Production Expansion
 
 Goal: move from bounded calibration-debt canaries to controlled production only after empirical evidence exists.
+
+2026-06-27 audit status: CAL-001 remains blocked. The live DB has 7 ADS predictions, 8 forecast decision records, 0 scored ADS predictions, 0 scorecards, and no first-100 trace completeness evidence, tail/regime/protected-component diagnostics, or pointer-stability evidence. Expansion must wait for real-runtime, non-pilot scoreable predictions that resolve and score; pilot predictions and non-scoreable clone decisions cannot clear this gate.
 
 Tasks:
 
@@ -1038,25 +1238,44 @@ Tasks:
    - rolling scored Brier worse than market baseline by 0.05 or more after at least 20 newly scored predictions,
    - calibration diagnostics fail tail/regime/protected-component guardrails.
 6. Persist expansion decisions as operator policy artifacts with reviewed scorecard refs.
+7. Split calibration evidence by lane:
+   - pilot/fixture predictions,
+   - true-production non-scoreable decisions,
+   - true-production scoreable predictions.
+8. Count only true-production scoreable predictions with full QDT, retrieval, researcher, verification, SCAE, decision, training-trace, and replay refs toward CAL-001 clearance.
+9. Require scorecards to carry runtime evidence refs so a scored prediction cannot clear calibration debt if it lacks true v2 intelligence provenance.
 
 Acceptance:
 
 - CAL-001 gates pass with real scored evidence.
 - Scheduler true-live gate allows production handler without calibration-debt canary bypass.
 - Continuous operation remains bounded by stop/disable policy and monitoring.
+- CAL-001 reports make clear that pilot/scaffolding predictions are excluded from true-production expansion evidence.
 
 ## Concrete First Implementation Slice
 
 The smallest high-value implementation slice is:
 
-1. Phase 0 readiness distinction and pilot labeling.
-2. Phase 1 model runtime abstraction with fixture mode.
-3. Phase 2 GPT/runtime/subagent wiring contract with a mocked fan-out/barrier test.
-4. Phase 3 evidence collection runtime contract.
-5. Phase 4 real Decomposer execution with GPT 5.5 high and QDT validation.
-6. One clone canary proving a question-specific QDT manifest and a blocked downstream stage until all leaf assignments are terminal.
+1. A no-workaround live-shaped clone proof for QDT persistence compatibility:
+   - clone the current live DB,
+   - run the true-production Decomposer persistence path,
+   - verify the `qdt_artifact_id` compatibility issue is resolved without table reset or manual schema surgery.
+2. Phase 7 retrieval transport wiring in the true-production handler:
+   - direct source URLs,
+   - configured search/provider candidates,
+   - URL fetch/extraction,
+   - native GPT candidate discovery as URL discovery only,
+   - persisted admitted/rejected source attempts.
+3. A clone canary proving at least one source-populated retrieval packet reaches `RET-008` sufficiency or a structural unanswerability proof.
+4. Phase 8 Researcher Swarm dispatch on that certified retrieval packet, with a strict canary passing `--require-researcher-model-executed`.
+5. Phase 9 verification-to-SCAE evidence delta mapping from accepted sidecars/classification verification artifacts.
+6. Phase 12 true-readiness hardening so the gate derives positive evidence from manifests/canary reports and rejects placeholders.
+7. AMRG operational polish in parallel only where it does not delay Phase 7:
+   - Ollama preflight/reporting,
+   - explicit model-assist policy,
+   - Decomposer hint-consumption proof.
 
-This slice fixes the visible problem VM caught: the QDT was template-like. It also gives downstream phases a real task contract instead of forcing Researcher/SCAE work to build around a fake decomposition.
+This slice fixes the current blockers shown by the 2026-06-27 audits: QDT runtime plumbing can run but needs live-shaped migration proof, and retrieval is not yet producing certified source evidence, so Researcher and SCAE cannot prove the real v2 intelligence path.
 
 ## Non-Goals
 
@@ -1066,3 +1285,4 @@ This slice fixes the visible problem VM caught: the QDT was template-like. It al
 - Do not loosen CAL-001 for continuous production.
 - Do not bypass strict manifests for convenience.
 - Do not replace AMRG; extend its current active-safe/vector/anchor/refresh architecture.
+- Do not treat CLI placeholder refs, pilot predictions, or clone-only schema workarounds as production-readiness evidence.

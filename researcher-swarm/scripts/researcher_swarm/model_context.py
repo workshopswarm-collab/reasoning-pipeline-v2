@@ -14,6 +14,8 @@ RESEARCHER_MODEL_CONTEXT_RESOLVER_VERSION = "ads-model-003-researcher-model-cont
 RESEARCHER_MODEL_LANE_ID = "researcher_leaf_nli_classification"
 RESEARCHER_MODEL_ID = "gpt-5.5-high"
 RESEARCHER_PROVIDER_MODEL_KEY = "openai/gpt-5.5-high"
+RESEARCHER_PROVIDER_ROUTE = "openclaw_codex_oauth/researcher-swarm"
+RESEARCHER_RUNTIME_AGENT_ID = "researcher-swarm"
 RESEARCHER_PROMPT_TEMPLATE_ID = "researcher-leaf-nli/v1"
 RESEARCHER_SIDECAR_SCHEMA_VERSION = "researcher-sidecar/v2"
 RESEARCHER_CLASSIFICATION_OUTPUT_SCHEMA_VERSION = "researcher-classification/v1"
@@ -136,6 +138,16 @@ def _researcher_lane_from_policy(policy: dict[str, Any]) -> dict[str, Any]:
         raise ResearcherModelContextError(
             f"researcher leaf NLI default_model_id must be {RESEARCHER_MODEL_ID}"
         )
+    if lane.get("oauth_route_required") is not True:
+        raise ResearcherModelContextError("researcher leaf NLI model lane must require OAuth route")
+    if lane.get("provider_route") != RESEARCHER_PROVIDER_ROUTE:
+        raise ResearcherModelContextError(
+            f"researcher leaf NLI provider_route must be {RESEARCHER_PROVIDER_ROUTE}"
+        )
+    if lane.get("runtime_agent_id") != RESEARCHER_RUNTIME_AGENT_ID:
+        raise ResearcherModelContextError(
+            f"researcher leaf NLI runtime_agent_id must be {RESEARCHER_RUNTIME_AGENT_ID}"
+        )
     allowed_model_ids = _string_list(lane.get("allowed_model_ids"))
     if RESEARCHER_MODEL_ID not in allowed_model_ids:
         raise ResearcherModelContextError(
@@ -220,6 +232,9 @@ def resolve_researcher_leaf_nli_model_context(
         "resolver_version": RESEARCHER_MODEL_CONTEXT_RESOLVER_VERSION,
         "model_lane_id": RESEARCHER_MODEL_LANE_ID,
         "provider": lane["provider"],
+        "provider_route": lane["provider_route"],
+        "oauth_route_required": True,
+        "runtime_agent_id": lane["runtime_agent_id"],
         "default_model_id": default_model_id,
         "allowed_model_ids": allowed_model_ids,
         "resolved_model_id": resolved_model_id,
@@ -274,6 +289,9 @@ def validate_researcher_model_execution_context(
         "feature_id": "MODEL-003",
         "model_lane_id": RESEARCHER_MODEL_LANE_ID,
         "provider": "openai",
+        "provider_route": RESEARCHER_PROVIDER_ROUTE,
+        "oauth_route_required": True,
+        "runtime_agent_id": RESEARCHER_RUNTIME_AGENT_ID,
         "resolved_model_id": RESEARCHER_MODEL_ID,
         "prompt_template_id": RESEARCHER_PROMPT_TEMPLATE_ID,
         "sidecar_schema_version": RESEARCHER_SIDECAR_SCHEMA_VERSION,

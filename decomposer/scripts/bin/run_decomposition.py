@@ -27,10 +27,13 @@ from ads_decomposer.model_runtime import (  # noqa: E402
     ModelRuntimeError,
     execute_model_runtime_call,
     model_execution_context_from_runtime_call,
-    openai_responses_transport_from_env,
+    openclaw_codex_agent_transport_from_env,
     prefixed_sha256,
 )
 from ads_decomposer.qdt import (  # noqa: E402
+    ALLOWED_CONDITION_SCOPES,
+    ALLOWED_PURPOSES,
+    ALLOWED_STATIC_INFORMATION_WEIGHTS,
     COMPACT_DEFAULT_LEAF_BUDGET,
     QUESTION_DECOMPOSITION_SCHEMA_VERSION,
     QDTError,
@@ -194,10 +197,223 @@ def _basic_response_validator(response: Any) -> tuple[bool, list[str]]:
     return not errors, errors
 
 
+PURPOSE_ALIASES = {
+    "official_resolution": "source_of_truth",
+    "official_source": "source_of_truth",
+    "source": "source_of_truth",
+    "source_of_truth_evidence": "source_of_truth",
+    "resolution_criteria": "resolution_mechanics",
+    "resolution_rules": "resolution_mechanics",
+    "market_rules": "resolution_mechanics",
+    "rules": "resolution_mechanics",
+    "status": "direct_evidence",
+    "event_status": "direct_evidence",
+    "candidate_status": "direct_evidence",
+    "filing_status": "direct_evidence",
+    "nomination_status": "direct_evidence",
+    "endorsement_status": "direct_evidence",
+    "current_status": "direct_evidence",
+    "historical_base_rate": "base_rate",
+    "history": "base_rate",
+    "pricing": "market_pricing",
+    "market": "market_pricing",
+    "mechanics": "resolution_mechanics",
+}
+
+
+def _normalized_token(value: Any) -> str:
+    text = re.sub(r"[^a-zA-Z0-9]+", "_", str(value or "").strip().lower())
+    return re.sub(r"_+", "_", text).strip("_")
+
+
+def _normalize_purpose(value: Any) -> str:
+    token = _normalized_token(value)
+    if token in ALLOWED_PURPOSES:
+        return token
+    if token in PURPOSE_ALIASES:
+        return PURPOSE_ALIASES[token]
+    if "source" in token or "official" in token:
+        return "source_of_truth"
+    if "rule" in token or "criteria" in token or "mechanic" in token:
+        return "resolution_mechanics"
+    if "price" in token or "market" in token:
+        return "market_pricing"
+    if "base" in token or "historic" in token:
+        return "base_rate"
+    if "catalyst" in token:
+        return "catalyst"
+    if "structure" in token:
+        return "structural"
+    if token:
+        return "direct_evidence"
+    return "other"
+
+
+def _normalize_condition_scope(value: Any) -> str:
+    token = _normalized_token(value)
+    if token in ALLOWED_CONDITION_SCOPES:
+        return token
+    if token in {"shared", "shared_context_leaf", "context"}:
+        return "shared_context"
+    return "unconditional"
+
+
+def _compact_reason_codes(value: Any, fallback: str) -> list[str]:
+    if isinstance(value, list):
+        codes = []
+        for item in value:
+            token = _normalized_token(item)
+            if token:
+                codes.append(token[:80])
+        if codes:
+            return codes
+    return [fallback]
+
+
+def _ensure_model_candidate_contract_shape(repaired: dict[str, Any]) -> dict[str, Any]:
+    leaves = repaired.get("required_leaf_questions")
+    if not isinstance(leaves, list):
+        return repaired
+    branches = repaired.get("branches")
+    if not isinstance(branches, list):
+        branches = []
+        repaired["branches"] = branches
+    branch_by_id = {
+        str(branch.get("branch_id")): branch
+        for branch in branches
+        if isinstance(branch, dict) and isinstance(branch.get("branch_id"), str)
+    }
+    if not branch_by_id:
+        branch = {
+            "branch_id": "branch-resolution",
+            "branch_question": "Resolve the market-specific outcome.",
+            "branch_role": "model_repaired_branch",
+            "dependency_group_id": "dep-group-resolution",
+            "required_evidence_purposes": ["source_of_truth", "direct_evidence"],
+            "leaf_ids": [],
+            "amrg_usage_refs": [],
+            "structural_validation": {"depth": 1},
+        }
+        branches.append(branch)
+        branch_by_id[branch["branch_id"]] = branch
+
+    default_branch_id = next(iter(branch_by_id))
+    membership: dict[str, list[str]] = {branch_id: [] for branch_id in branch_by_id}
+    leaf_purposes_by_branch: dict[str, set[str]] = {branch_id: set() for branch_id in branch_by_id}
+
+    for idx, leaf in enumerate(leaves):
+        if not isinstance(leaf, dict):
+            continue
+        leaf_id = str(leaf.get("leaf_id") or f"leaf-model-{idx + 1}")
+        if not leaf_id.startswith("leaf-"):
+            leaf_id = "leaf-" + _normalized_token(leaf_id)
+        leaf["leaf_id"] = leaf_id
+        parent_id = str(leaf.get("parent_branch_id") or default_branch_id)
+        if parent_id not in branch_by_id:
+            parent_id = default_branch_id
+        leaf["parent_branch_id"] = parent_id
+        membership.setdefault(parent_id, []).append(leaf_id)
+        purpose = _normalize_purpose(leaf.get("purpose"))
+        leaf["purpose"] = purpose
+        leaf_purposes_by_branch.setdefault(parent_id, set()).add(purpose)
+        weighting = leaf.get("bayesian_weighting")
+        if not isinstance(weighting, dict):
+            weighting = {}
+        if weighting.get("static_information_weight") not in ALLOWED_STATIC_INFORMATION_WEIGHTS:
+            weighting["static_information_weight"] = "medium"
+        weighting["weight_reason_codes"] = _compact_reason_codes(
+            weighting.get("weight_reason_codes"),
+            "model_schema_normalized",
+        )
+        leaf["bayesian_weighting"] = weighting
+        leaf["leaf_dependency_group_id"] = str(
+            leaf.get("leaf_dependency_group_id")
+            or branch_by_id[parent_id].get("dependency_group_id")
+            or f"dep-group-{parent_id.removeprefix('branch-')}"
+        )
+        leaf["leaf_condition_scope"] = _normalize_condition_scope(leaf.get("leaf_condition_scope"))
+        if not isinstance(leaf.get("required_evidence_fields"), list) or not leaf["required_evidence_fields"]:
+            leaf["required_evidence_fields"] = [f"{purpose}_status"]
+        if not isinstance(leaf.get("market_component_terms"), list):
+            leaf["market_component_terms"] = []
+        if not isinstance(leaf.get("amrg_usage_refs"), list):
+            leaf["amrg_usage_refs"] = []
+        structural = leaf.get("structural_validation")
+        if not isinstance(structural, dict):
+            structural = {}
+        structural["depth"] = 2
+        structural.setdefault("answerability_status", "answerable")
+        leaf["structural_validation"] = structural
+
+    has_anchor_contracts = bool(repaired.get("amrg_anchor_dependency_contracts"))
+    if not has_anchor_contracts:
+        for leaf in leaves:
+            if isinstance(leaf, dict) and leaf.get("leaf_condition_scope") in {
+                "target_given_upstream",
+                "target_given_not_upstream",
+            }:
+                leaf["leaf_condition_scope"] = "unconditional"
+
+    for branch in branches:
+        if not isinstance(branch, dict):
+            continue
+        branch_id = str(branch.get("branch_id") or default_branch_id)
+        if not branch_id.startswith("branch-"):
+            branch_id = "branch-" + _normalized_token(branch_id)
+            branch["branch_id"] = branch_id
+        if not branch.get("branch_question"):
+            branch["branch_question"] = f"Resolve {branch_id} from market-specific leaves."
+        if not branch.get("branch_role"):
+            branch["branch_role"] = "model_repaired_branch"
+        if not branch.get("dependency_group_id"):
+            branch["dependency_group_id"] = f"dep-group-{branch_id.removeprefix('branch-')}"
+        branch["leaf_ids"] = membership.get(branch_id, [])
+        purposes = sorted(leaf_purposes_by_branch.get(branch_id, set()))
+        branch["required_evidence_purposes"] = purposes or ["other"]
+        if not isinstance(branch.get("amrg_usage_refs"), list):
+            branch["amrg_usage_refs"] = []
+        structural = branch.get("structural_validation")
+        if not isinstance(structural, dict):
+            structural = {}
+        structural["depth"] = 1
+        branch["structural_validation"] = structural
+
+    return repaired
+
+
+def _unwrap_model_candidate_container(response: dict[str, Any]) -> dict[str, Any]:
+    for key in (
+        "response_payload",
+        "qdt_candidate",
+        "candidate",
+        "model_candidate",
+        "question_decomposition_candidate",
+        "question_decomposition",
+        "decomposition",
+        "payload",
+    ):
+        nested = response.get(key)
+        if isinstance(nested, dict):
+            if isinstance(nested.get("branches"), list) or isinstance(nested.get("required_leaf_questions"), list):
+                return dict(nested)
+            deeper = _unwrap_model_candidate_container(nested)
+            if deeper is not nested:
+                return deeper
+    candidates = response.get("candidates")
+    if isinstance(candidates, list):
+        for candidate in candidates:
+            if isinstance(candidate, dict) and (
+                isinstance(candidate.get("branches"), list)
+                or isinstance(candidate.get("required_leaf_questions"), list)
+            ):
+                return dict(candidate)
+    return response
+
+
 def _response_repairer(response: Any, _errors: list[str]) -> Any:
     if not isinstance(response, dict):
         return response
-    repaired = dict(response)
+    repaired = _unwrap_model_candidate_container(dict(response))
     if "required_leaf_questions" not in repaired:
         for alias in ("leaf_questions", "leaves", "required_research_questions"):
             if isinstance(repaired.get(alias), list):
@@ -240,7 +456,7 @@ def _response_repairer(response: Any, _errors: list[str]) -> Any:
                 }
                 for parent_id in parent_ids
             ]
-    return repaired
+    return _ensure_model_candidate_contract_shape(repaired)
 
 
 def _candidate_from_model_payload(
@@ -537,7 +753,7 @@ def _configured_live_transport() -> Transport:
     response_path = os.environ.get("ADS_DECOMPOSER_LIVE_RESPONSE_PATH")
     if response_path:
         return _transport_response_file(Path(response_path))
-    return openai_responses_transport_from_env()
+    return openclaw_codex_agent_transport_from_env()
 
 
 def main() -> int:

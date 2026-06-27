@@ -74,7 +74,12 @@ from researcher_swarm.retrieval import (  # noqa: E402
     finalize_retrieval_packet_for_dispatch,
 )
 from researcher_swarm.assignments import build_leaf_research_assignments  # noqa: E402
-from researcher_swarm.subagents import build_leaf_research_barrier, build_leaf_researcher_spawn_plan  # noqa: E402
+from researcher_swarm.openclaw_runtime import run_openclaw_researcher_swarm_runtime  # noqa: E402
+from researcher_swarm.subagents import (  # noqa: E402
+    build_leaf_research_barrier,
+    build_leaf_researcher_spawn_plan,
+    validate_researcher_swarm_runtime_bundle,
+)
 from scae.evidence import build_evidence_delta_candidate_bundle  # noqa: E402
 from scae.intervals import build_pre_debt_ledger_output  # noqa: E402
 from scae.ledger import apply_research_sufficiency_guard, finalize_scae_probability_fields  # noqa: E402
@@ -908,6 +913,8 @@ def build_stage_handlers(
     live_retrieval_runtime: bool = False,
     live_fixture_retrieval: bool = False,
     block_at_leaf_research_barrier: bool = False,
+    researcher_swarm_openclaw_runtime: bool = False,
+    researcher_swarm_runtime_bundle_response_path: str | Path | None = None,
     amrg_vector_runtime: bool = False,
     amrg_vector_allow_pull: bool = False,
     amrg_model_assist_output_path: str | Path | None = None,
@@ -940,6 +947,8 @@ def build_stage_handlers(
         "live_retrieval_runtime": bool(live_retrieval_runtime),
         "live_fixture_retrieval": bool(live_fixture_retrieval),
         "block_at_leaf_research_barrier": bool(block_at_leaf_research_barrier),
+        "researcher_swarm_openclaw_runtime": bool(researcher_swarm_openclaw_runtime),
+        "researcher_swarm_runtime_bundle_response_configured": researcher_swarm_runtime_bundle_response_path is not None,
         "amrg_vector_runtime": bool(amrg_vector_runtime),
         "amrg_vector_allow_pull": bool(amrg_vector_allow_pull),
         "amrg_model_assist_configured": amrg_model_assist_output_path is not None,
@@ -1383,37 +1392,69 @@ def build_stage_handlers(
         if block_at_leaf_research_barrier and summary.get("classification_dispatch_status") == "allowed":
             assignments = build_leaf_research_assignments(qdt=qdt_payload, retrieval_packet=packet)
             spawn_plan = build_leaf_researcher_spawn_plan(assignments)
-            barrier = build_leaf_research_barrier(assignments, true_production_mode=True)
-            classification_status = "blocked_leaf_research_barrier"
-            reason_codes = barrier.get("blocker_reason_codes") or ["leaf_research_barrier_not_terminal"]
-            file_name = "leaf-research-barrier.json"
-            payload = {
-                "artifact_type": "leaf_research_barrier",
-                "schema_version": "leaf-research-barrier/v1",
-                "case_id": lease["case_id"],
-                "case_key": lease["case_key"],
-                "dispatch_id": lease["dispatch_id"],
-                "run_id": context.pipeline_run_id,
-                "forecast_timestamp": _forecast_timestamp(forecast_timestamp, lease),
-                "qdt_ref": qdt_manifest["artifact_id"],
-                "retrieval_packet_ref": retrieval_manifest["artifact_id"],
-                "classification_dispatch_status": summary.get("classification_dispatch_status"),
-                "classification_status": classification_status,
-                "reason_codes": reason_codes,
-                "assignments": assignments,
-                "spawn_plan": spawn_plan,
-                "leaf_research_barrier": barrier,
-                "researcher_probability_authority": False,
-                "writes_scae_delta": False,
-                "selected_evidence_count": sum(
-                    len(result.get("selected_evidence", []))
-                    for result in packet.get("leaf_retrieval_results", [])
-                    if isinstance(result, dict)
-                ),
-                "leaf_certificate_refs": list(summary.get("leaf_certificate_refs") or []),
-            }
-            manifest_artifact_type = "leaf-research-barrier"
-            manifest_schema_version = "leaf-research-barrier/v1"
+            if researcher_swarm_runtime_bundle_response_path is not None:
+                payload = json.loads(Path(researcher_swarm_runtime_bundle_response_path).read_text(encoding="utf-8"))
+            elif researcher_swarm_openclaw_runtime:
+                payload = run_openclaw_researcher_swarm_runtime(
+                    assignments=assignments,
+                    qdt=qdt_payload,
+                    retrieval_packet=packet,
+                    true_production_mode=True,
+                    max_concurrent=5,
+                )
+            else:
+                payload = None
+            if payload is not None:
+                runtime_validation = validate_researcher_swarm_runtime_bundle(payload)
+                if not runtime_validation.valid:
+                    raise ValueError(
+                        "researcher swarm runtime bundle invalid: "
+                        + "; ".join(runtime_validation.errors)
+                    )
+                classification_status = (
+                    "researcher_swarm_runtime_bundle_accepted"
+                    if payload.get("proceed_to_verification_scae") is True
+                    else "blocked_leaf_research_barrier"
+                )
+                reason_codes = list(payload.get("validation_errors") or [])
+                if not reason_codes and classification_status == "blocked_leaf_research_barrier":
+                    barrier = payload.get("leaf_research_barrier") if isinstance(payload.get("leaf_research_barrier"), dict) else {}
+                    reason_codes = list(barrier.get("blocker_reason_codes") or ["leaf_research_barrier_not_terminal"])
+                file_name = "researcher-swarm-runtime-bundle.json"
+                manifest_artifact_type = "researcher-swarm-runtime-bundle"
+                manifest_schema_version = "researcher-swarm-runtime-bundle/v1"
+            else:
+                barrier = build_leaf_research_barrier(assignments, true_production_mode=True)
+                classification_status = "blocked_leaf_research_barrier"
+                reason_codes = barrier.get("blocker_reason_codes") or ["leaf_research_barrier_not_terminal"]
+                file_name = "leaf-research-barrier.json"
+                payload = {
+                    "artifact_type": "leaf_research_barrier",
+                    "schema_version": "leaf-research-barrier/v1",
+                    "case_id": lease["case_id"],
+                    "case_key": lease["case_key"],
+                    "dispatch_id": lease["dispatch_id"],
+                    "run_id": context.pipeline_run_id,
+                    "forecast_timestamp": _forecast_timestamp(forecast_timestamp, lease),
+                    "qdt_ref": qdt_manifest["artifact_id"],
+                    "retrieval_packet_ref": retrieval_manifest["artifact_id"],
+                    "classification_dispatch_status": summary.get("classification_dispatch_status"),
+                    "classification_status": classification_status,
+                    "reason_codes": reason_codes,
+                    "assignments": assignments,
+                    "spawn_plan": spawn_plan,
+                    "leaf_research_barrier": barrier,
+                    "researcher_probability_authority": False,
+                    "writes_scae_delta": False,
+                    "selected_evidence_count": sum(
+                        len(result.get("selected_evidence", []))
+                        for result in packet.get("leaf_retrieval_results", [])
+                        if isinstance(result, dict)
+                    ),
+                    "leaf_certificate_refs": list(summary.get("leaf_certificate_refs") or []),
+                }
+                manifest_artifact_type = "leaf-research-barrier"
+                manifest_schema_version = "leaf-research-barrier/v1"
         elif scoreable_pilot and summary.get("classification_dispatch_status") == "allowed":
             classification_status = "structured_market_metadata_certified"
             reason_codes = ["structured_market_metadata_retrieval_certified"]
@@ -1496,7 +1537,13 @@ def build_stage_handlers(
         classification_manifest = resolve_stage_output_manifest(conn, stage_outputs, "researcher_classification")
         qdt = load_manifest_payload(qdt_manifest)
         retrieval_packet = load_manifest_payload(retrieval_manifest)
-        if scoreable_pilot:
+        classification_payload = load_manifest_payload(classification_manifest)
+        runtime_bundle_ready = (
+            isinstance(classification_payload, dict)
+            and classification_payload.get("artifact_type") == "researcher_swarm_runtime_bundle"
+            and classification_payload.get("proceed_to_verification_scae") is True
+        )
+        if scoreable_pilot or runtime_bundle_ready:
             verification_ref = "classification-verification-production-pilot"
             rows = _certified_reconciliation_rows(qdt, retrieval_packet, verification_ref)
             verification_status = (
@@ -1504,12 +1551,20 @@ def build_stage_handlers(
                 if rows and all(row.get("reconciled_status") == "scae_ready_high_certainty" for row in rows)
                 else "blocked_insufficient_research"
             )
-            reason_codes = (
-                ["structured_market_metadata_reconciliation_certified"]
-                if verification_status == "structured_market_metadata_certified"
-                else ["structured_market_metadata_reconciliation_blocked"]
-            )
-            file_name = "classification-verification-production-pilot.json"
+            if runtime_bundle_ready:
+                reason_codes = (
+                    ["researcher_swarm_runtime_bundle_reconciliation_certified"]
+                    if verification_status == "structured_market_metadata_certified"
+                    else ["researcher_swarm_runtime_bundle_reconciliation_blocked"]
+                )
+                file_name = "classification-verification-runtime-bundle.json"
+            else:
+                reason_codes = (
+                    ["structured_market_metadata_reconciliation_certified"]
+                    if verification_status == "structured_market_metadata_certified"
+                    else ["structured_market_metadata_reconciliation_blocked"]
+                )
+                file_name = "classification-verification-production-pilot.json"
         else:
             rows = _blocked_reconciliation_rows(qdt, "classification-verification-production-readiness")
             verification_status = "blocked_no_researcher_classifications"

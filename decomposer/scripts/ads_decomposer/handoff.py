@@ -311,6 +311,14 @@ def resolve_decomposer_model_lane(
         raise DecomposerHandoffError("decomposer QDT model lane provider must be openai")
     if lane.get("default_model_id") != DECOMPOSER_MODEL_ID:
         raise DecomposerHandoffError(f"decomposer QDT model must be {DECOMPOSER_MODEL_ID}")
+    provider_route = lane.get("provider_route")
+    if not isinstance(provider_route, str) or not provider_route.startswith("openclaw_codex_oauth/"):
+        raise DecomposerHandoffError("decomposer QDT model lane must use OpenClaw Codex OAuth route")
+    if lane.get("oauth_route_required") is not True:
+        raise DecomposerHandoffError("decomposer QDT model lane must require OAuth route")
+    runtime_agent_id = lane.get("runtime_agent_id")
+    if not isinstance(runtime_agent_id, str) or not runtime_agent_id:
+        raise DecomposerHandoffError("decomposer QDT model lane runtime_agent_id is required")
     if DECOMPOSER_MODEL_ID not in lane.get("allowed_model_ids", []):
         raise DecomposerHandoffError(f"{DECOMPOSER_MODEL_ID} must be allowed for decomposer QDT")
     missing_forbidden = FORBIDDEN_MODEL_OUTPUTS - set(lane.get("forbidden_outputs", []))
@@ -346,7 +354,9 @@ def resolve_decomposer_model_lane(
         "model_lane_id": DECOMPOSER_MODEL_LANE_ID,
         "provider": lane["provider"],
         "resolved_model_id": lane["default_model_id"],
-        "provider_route": f"{lane['provider']}/{lane['default_model_id']}",
+        "provider_route": provider_route,
+        "oauth_route_required": True,
+        "runtime_agent_id": runtime_agent_id,
         "model_policy_ref": str(policy_path),
         "model_policy_id": policy["policy_id"],
         "prompt_template_id": prompt_template_id,

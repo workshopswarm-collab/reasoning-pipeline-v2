@@ -55,7 +55,9 @@ class RuntimeDecompositionEntrypointTest(unittest.TestCase):
             "model_execution_context": {
                 "model_lane_id": DECOMPOSER_MODEL_LANE_ID,
                 "provider": "openai",
-                "provider_route": "openai/gpt-5.5-high",
+                "provider_route": "openclaw_codex_oauth/decomposer",
+                "oauth_route_required": True,
+                "runtime_agent_id": "decomposer",
                 "resolved_model_id": DECOMPOSER_MODEL_ID,
                 "model_policy_ref": "orchestrator/plans/autonomous-decomposition-swarm-model-lane-policy.json",
                 "prompt_template_id": DECOMPOSER_PROMPT_TEMPLATE_ID,
@@ -126,7 +128,7 @@ class RuntimeDecompositionEntrypointTest(unittest.TestCase):
 
         def transport(payload: dict) -> dict:
             requests.append(payload)
-            self.assertEqual(payload["provider_route"], "openai/gpt-5.5-high")
+            self.assertEqual(payload["provider_route"], "openclaw_codex_oauth/decomposer")
             self.assertEqual(payload["prompt_template_id"], DECOMPOSER_PROMPT_TEMPLATE_ID)
             self.assertEqual(payload["request_payload"]["macro_question"], handoff["macro_question"])
             return {
@@ -167,6 +169,54 @@ class RuntimeDecompositionEntrypointTest(unittest.TestCase):
         self.assertTrue(validate_question_decomposition(qdt).valid)
         self.assertEqual(runtime["repair_count"], 1)
         self.assertEqual(qdt["model_execution_context"]["repair_count"], 1)
+
+    def test_schema_repair_normalizes_model_enum_and_structural_drift(self) -> None:
+        handoff = self._handoff()
+        repairable = build_question_specific_fixture_response(handoff)
+        repairable["branches"][0]["required_evidence_purposes"] = [
+            "official_resolution",
+            "candidate_status",
+        ]
+        repairable["required_leaf_questions"][0]["purpose"] = "official_resolution"
+        repairable["required_leaf_questions"][0]["structural_validation"].pop("answerability_status")
+        repairable["required_leaf_questions"][1]["purpose"] = "candidate_status"
+        repairable["required_leaf_questions"][1]["leaf_condition_scope"] = "if_candidate_files"
+        repairable["required_leaf_questions"][1]["structural_validation"].pop("answerability_status")
+
+        qdt, runtime = build_question_decomposition_from_handoff(
+            handoff,
+            runtime_mode="fixture",
+            fixture_response=repairable,
+        )
+
+        self.assertTrue(validate_question_decomposition(qdt).valid)
+        self.assertEqual(runtime["repair_count"], 1)
+        purposes = {leaf["purpose"] for leaf in qdt["required_leaf_questions"]}
+        self.assertIn("source_of_truth", purposes)
+        self.assertIn("direct_evidence", purposes)
+        self.assertTrue(
+            all(
+                leaf["structural_validation"]["answerability_status"] == "answerable"
+                for leaf in qdt["required_leaf_questions"]
+            )
+        )
+
+    def test_schema_repair_unwraps_nested_model_candidate_payload(self) -> None:
+        handoff = self._handoff()
+        nested = {
+            "qdt_candidate": build_question_specific_fixture_response(handoff),
+            "notes": "model wrapped the compact candidate",
+        }
+
+        qdt, runtime = build_question_decomposition_from_handoff(
+            handoff,
+            runtime_mode="fixture",
+            fixture_response=nested,
+        )
+
+        self.assertTrue(validate_question_decomposition(qdt).valid)
+        self.assertEqual(runtime["repair_count"], 1)
+        self.assertEqual(qdt["adapter_mode"], "decomposer_model_runtime_fixture")
 
     def test_cli_live_mode_accepts_transport_response_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:

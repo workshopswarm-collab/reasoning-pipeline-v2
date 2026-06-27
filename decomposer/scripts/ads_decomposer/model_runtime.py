@@ -11,12 +11,12 @@ import copy
 import hashlib
 import json
 import os
+import shutil
+import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
-from urllib import error as urllib_error
-from urllib import request as urllib_request
 
 
 MODEL_RUNTIME_CALL_SCHEMA_VERSION = "model-runtime-call/v1"
@@ -33,7 +33,8 @@ DEFAULT_MAX_TRANSPORT_RETRIES = 1
 DEFAULT_MAX_SCHEMA_REPAIRS = 1
 MODEL_RUNTIME_TRANSPORT_REQUEST_SCHEMA_VERSION = "model-runtime-transport-request/v1"
 MODEL_RUNTIME_TRANSPORT_RESPONSE_SCHEMA_VERSION = "model-runtime-transport-response/v1"
-OPENAI_RESPONSES_PATH = "/responses"
+OPENCLAW_CODEX_OAUTH_PROVIDER_ROUTE_PREFIX = "openclaw_codex_oauth"
+DEFAULT_OPENCLAW_DECOMPOSER_AGENT_ID = "decomposer"
 DEFAULT_MODEL_LANE_POLICY_PATH = (
     Path(__file__).resolve().parents[3]
     / "orchestrator"
@@ -171,12 +172,22 @@ def resolve_model_runtime_lane(
     resolved_model_id = requested or default_model_id
     if lane_id in MODEL_RUNTIME_TIMEOUTS and resolved_model_id != "gpt-5.5-high":
         raise ModelRuntimeError(f"{lane_id} must resolve to gpt-5.5-high")
+    provider_route = str(lane.get("provider_route") or f"{provider}/{resolved_model_id}")
+    oauth_route_required = bool(lane.get("oauth_route_required", False))
+    runtime_agent_id = lane.get("runtime_agent_id")
+    if lane_id in MODEL_RUNTIME_TIMEOUTS:
+        if oauth_route_required is not True:
+            raise ModelRuntimeError(f"{lane_id} must require OpenClaw OAuth routing")
+        if not provider_route.startswith(OPENCLAW_CODEX_OAUTH_PROVIDER_ROUTE_PREFIX + "/"):
+            raise ModelRuntimeError(f"{lane_id} provider_route must use OpenClaw Codex OAuth")
     return {
         "schema_version": "model-runtime-lane-resolution/v1",
         "model_lane_id": lane_id,
         "provider": provider,
         "resolved_model_id": resolved_model_id,
-        "provider_route": f"{provider}/{resolved_model_id}",
+        "provider_route": provider_route,
+        "oauth_route_required": oauth_route_required,
+        "runtime_agent_id": runtime_agent_id,
         "model_policy_ref": str(Path(model_lane_policy_path)),
         "model_policy_id": policy.get("policy_id"),
         "default_model_id": default_model_id,
@@ -290,113 +301,201 @@ def _unwrap_transport_response(raw: Any) -> tuple[Any, Any, Any]:
     return raw, None, None
 
 
-def _responses_api_body(request_payload: dict[str, Any]) -> dict[str, Any]:
-    system_text = (
-        "You are the ADS Decomposer. Produce only JSON for the requested "
-        "question-decomposition candidate. Do not include probabilities, fair "
-        "values, SCAE deltas, decisions, or forecast outputs."
-    )
-    return {
-        "model": request_payload["resolved_model_id"],
-        "input": [
-            {
-                "role": "system",
-                "content": [{"type": "input_text", "text": system_text}],
+def _openclaw_agent_prompt(request_payload: dict[str, Any]) -> str:
+    compact_candidate_schema = {
+        "schema_version": MODEL_RUNTIME_TRANSPORT_RESPONSE_SCHEMA_VERSION,
+        "response_payload": {
+            "candidate_id": "qdt-candidate-model-runtime",
+            "market_complexity_score": 0.62,
+            "branches": [
+                {
+                    "branch_id": "branch-resolution",
+                    "branch_question": "Question-specific branch to resolve the market outcome.",
+                    "branch_role": "model_generated_branch",
+                    "dependency_group_id": "dep-group-resolution",
+                    "required_evidence_purposes": ["source_of_truth", "direct_evidence"],
+                    "leaf_ids": ["leaf-official-resolution", "leaf-current-status"],
+                    "amrg_usage_refs": [],
+                    "structural_validation": {"depth": 1},
+                }
+            ],
+            "required_leaf_questions": [
+                {
+                    "leaf_id": "leaf-official-resolution",
+                    "parent_branch_id": "branch-resolution",
+                    "question_text": "Market-specific research question for a single leaf.",
+                    "purpose": "source_of_truth",
+                    "bayesian_weighting": {
+                        "static_information_weight": "critical",
+                        "weight_reason_codes": ["official_resolution_authority"],
+                    },
+                    "leaf_dependency_group_id": "dep-group-resolution",
+                    "leaf_condition_scope": "unconditional",
+                    "required_evidence_fields": ["official_status", "resolution_criteria"],
+                    "market_component_terms": [],
+                    "amrg_usage_refs": [],
+                    "structural_validation": {"depth": 2},
+                }
+            ],
+            "related_market_context_usage": {
+                "usage_status": "related_context_used",
+                "related_context_artifact_ref": None,
+                "amrg_usage_refs": [],
+                "weak_context_only": False,
+                "anchor_dependency_status": "not_declared_phase2",
             },
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "input_text",
-                        "text": canonical_json(request_payload["request_payload"]),
-                    }
-                ],
-            },
-        ],
-        "store": False,
-        "text": {"format": {"type": "json_object"}},
-        "metadata": {
-            "runtime_call_id": request_payload["runtime_call_id"],
-            "model_lane_id": request_payload["model_lane_id"],
-            "prompt_template_id": request_payload["prompt_template_id"],
+            "amrg_anchor_dependency_contracts": [],
         },
+        "provider_status": {"status": "completed"},
+    }
+    return (
+        "You are the ADS Decomposer runtime transport for the Autonomous "
+        "Decomposition-Swarm pipeline.\n\n"
+        "Return exactly one JSON object and no Markdown. The object must use "
+        f"schema_version={MODEL_RUNTIME_TRANSPORT_RESPONSE_SCHEMA_VERSION!r} "
+        "and must contain response_payload with this compact model candidate "
+        "shape, not a full question_decomposition artifact. The local runtime "
+        "will wrap the compact candidate into the canonical QDT artifact after "
+        "validation. Every branch leaf_ids list must exactly match the leaves "
+        "whose parent_branch_id references that branch. required_leaf_questions "
+        "must be non-empty and must fit the requested leaf_budget. Use only "
+        "question-specific leaf IDs, branch IDs, questions, evidence fields, "
+        "and market terms for the runtime request. Do not include "
+        "probabilities, fair values, SCAE deltas, decisions, execution advice, "
+        "or production forecast outputs anywhere in the response payload.\n\n"
+        "Required response skeleton:\n"
+        + canonical_json(compact_candidate_schema)
+        + "\n\n"
+        "Runtime transport request JSON:\n"
+        + canonical_json(request_payload)
+    )
+
+
+def _extract_openclaw_reply_text(value: Any) -> str | None:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        texts = [_extract_openclaw_reply_text(item) for item in value]
+        joined = "\n".join(text for text in texts if text)
+        return joined or None
+    if not isinstance(value, dict):
+        return None
+    if value.get("schema_version") == MODEL_RUNTIME_TRANSPORT_RESPONSE_SCHEMA_VERSION:
+        return canonical_json(value)
+    for key in (
+        "reply",
+        "response",
+        "message",
+        "content",
+        "text",
+        "output",
+        "stdout",
+        "payloads",
+        "finalAssistantVisibleText",
+        "finalAssistantRawText",
+    ):
+        text = _extract_openclaw_reply_text(value.get(key))
+        if text:
+            return text
+    result = value.get("result")
+    text = _extract_openclaw_reply_text(result)
+    if text:
+        return text
+    return None
+
+
+def _parse_openclaw_agent_stdout(stdout: str) -> dict[str, Any]:
+    try:
+        parsed = json.loads(stdout)
+    except json.JSONDecodeError:
+        parsed = stdout
+    text = _extract_openclaw_reply_text(parsed)
+    if not text:
+        raise RuntimeError("OpenClaw agent response did not contain reply text")
+    payload = _json_payload(text)
+    if not isinstance(payload, dict):
+        raise RuntimeError("OpenClaw agent reply did not parse to a JSON object")
+    if payload.get("schema_version") == MODEL_RUNTIME_TRANSPORT_RESPONSE_SCHEMA_VERSION:
+        return payload
+    return {
+        "schema_version": MODEL_RUNTIME_TRANSPORT_RESPONSE_SCHEMA_VERSION,
+        "response_payload": payload,
+        "provider_status": {"transport": "openclaw_agent_reply_wrapped"},
     }
 
 
-def _extract_responses_output_payload(payload: dict[str, Any]) -> Any:
-    output_text = payload.get("output_text")
-    if isinstance(output_text, str) and output_text.strip():
-        return _json_payload(output_text)
-    texts: list[str] = []
-    output = payload.get("output")
-    if isinstance(output, list):
-        for item in output:
-            if not isinstance(item, dict):
-                continue
-            content = item.get("content")
-            if not isinstance(content, list):
-                continue
-            for part in content:
-                if not isinstance(part, dict):
-                    continue
-                text = part.get("text")
-                if isinstance(text, str) and text.strip():
-                    texts.append(text)
-    if texts:
-        return _json_payload("\n".join(texts))
-    raise ModelRuntimeError("OpenAI Responses payload did not contain JSON text output")
+def openclaw_codex_agent_transport_from_env(
+    *,
+    agent_id: str | None = None,
+    cli_path: str | None = None,
+    session_key_prefix: str | None = None,
+    model: str | None = None,
+) -> Transport:
+    """Return an OpenClaw Gateway agent transport using Codex OAuth auth.
 
-
-def openai_responses_transport_from_env() -> Transport:
-    """Return a stdlib HTTPS OpenAI Responses API transport.
-
-    The transport intentionally depends only on environment configuration so the
-    runtime contract can be exercised without adding an SDK dependency.
+    This replaces direct API-key transport for ADS live model lanes. OpenClaw
+    owns provider OAuth and Codex execution; this transport only adapts the
+    Gateway agent response back into the existing model-runtime response
+    contract.
     """
 
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        raise ModelRuntimeError("OPENAI_API_KEY is required for live OpenAI model runtime")
-    base_url = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
-    url = base_url + OPENAI_RESPONSES_PATH
+    resolved_agent_id = (
+        agent_id
+        or os.environ.get("ADS_DECOMPOSER_OPENCLAW_AGENT_ID")
+        or DEFAULT_OPENCLAW_DECOMPOSER_AGENT_ID
+    )
+    resolved_cli = cli_path or os.environ.get("ADS_OPENCLAW_CLI") or shutil.which("openclaw")
+    if not resolved_cli:
+        raise ModelRuntimeError("openclaw CLI is required for OpenClaw Codex OAuth runtime")
+    resolved_prefix = (
+        session_key_prefix
+        or os.environ.get("ADS_DECOMPOSER_OPENCLAW_SESSION_KEY_PREFIX")
+        or "ads-decomposer"
+    )
+    resolved_model = model or os.environ.get("ADS_DECOMPOSER_OPENCLAW_MODEL")
 
     def transport(request_payload: dict[str, Any]) -> dict[str, Any]:
-        body = _responses_api_body(request_payload)
-        data = canonical_json(body).encode("utf-8")
-        request = urllib_request.Request(
-            url,
-            data=data,
-            method="POST",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
+        timeout = int(request_payload.get("timeout_seconds") or DEFAULT_TIMEOUT_SECONDS)
+        runtime_call_id = str(request_payload.get("runtime_call_id") or stable_id("runtime", request_payload))
+        session_key = f"{resolved_prefix}-{runtime_call_id}".replace(":", "-")
+        command = [
+            resolved_cli,
+            "agent",
+            "--agent",
+            resolved_agent_id,
+            "--session-key",
+            session_key,
+            "--message",
+            _openclaw_agent_prompt(request_payload),
+            "--json",
+            "--timeout",
+            str(timeout),
+        ]
+        if resolved_model:
+            command.extend(["--model", resolved_model])
+        completed = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout + 30,
         )
-        try:
-            with urllib_request.urlopen(
-                request,
-                timeout=int(request_payload.get("timeout_seconds") or DEFAULT_TIMEOUT_SECONDS),
-            ) as response:
-                raw = response.read().decode("utf-8")
-        except urllib_error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"OpenAI Responses API HTTP {exc.code}: {detail[:500]}") from exc
-        payload = json.loads(raw)
-        if not isinstance(payload, dict):
-            raise RuntimeError("OpenAI Responses API returned a non-object payload")
-        response_payload = _extract_responses_output_payload(payload)
-        return {
-            "schema_version": MODEL_RUNTIME_TRANSPORT_RESPONSE_SCHEMA_VERSION,
-            "response_payload": response_payload,
-            "token_usage": copy.deepcopy(payload.get("usage")),
-            "provider_status": {
-                "provider": "openai",
-                "api": "responses",
-                "response_id": payload.get("id"),
-                "status": payload.get("status"),
-                "model": payload.get("model"),
-            },
-        }
+        if completed.returncode != 0:
+            detail = (completed.stderr or completed.stdout or "").strip()
+            raise RuntimeError(f"OpenClaw agent transport failed: {detail[:500]}")
+        response = _parse_openclaw_agent_stdout(completed.stdout)
+        provider_status = copy.deepcopy(response.get("provider_status") or {})
+        provider_status.update(
+            {
+                "transport": "openclaw_agent",
+                "auth_route": "openclaw_codex_oauth",
+                "agent_id": resolved_agent_id,
+                "session_key": session_key,
+                "provider_route": request_payload.get("provider_route"),
+            }
+        )
+        response["provider_status"] = provider_status
+        return response
 
     return transport
 
@@ -679,7 +778,7 @@ __all__ = [
     "execute_model_runtime_call",
     "execute_model_runtime_call_for_lane",
     "model_execution_context_from_runtime_call",
-    "openai_responses_transport_from_env",
+    "openclaw_codex_agent_transport_from_env",
     "prefixed_sha256",
     "resolve_model_runtime_lane",
     "scan_forbidden_model_outputs",
