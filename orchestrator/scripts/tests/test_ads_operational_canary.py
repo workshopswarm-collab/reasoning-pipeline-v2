@@ -378,6 +378,15 @@ class AdsOperationalCanaryTest(unittest.TestCase):
                 LIMIT 1
                 """
             ).fetchone()
+            amrg_row = conn.execute(
+                """
+                SELECT artifact_id, artifact_path, metadata
+                FROM case_artifact_manifest
+                WHERE artifact_type IN ('related-live-market-context', 'no-related-context-waiver')
+                ORDER BY id DESC
+                LIMIT 1
+                """
+            ).fetchone()
             retrieval_row = conn.execute(
                 """
                 SELECT artifact_id, artifact_path, input_manifest_ids
@@ -411,14 +420,17 @@ class AdsOperationalCanaryTest(unittest.TestCase):
 
         self.assertIsNotNone(qdt_row)
         self.assertIsNotNone(runtime_row)
+        self.assertIsNotNone(amrg_row)
         self.assertIsNotNone(retrieval_row)
         self.assertIsNotNone(barrier_row)
         qdt = json.loads(Path(qdt_row["artifact_path"]).read_text(encoding="utf-8"))
         runtime = json.loads(Path(runtime_row["artifact_path"]).read_text(encoding="utf-8"))
+        amrg = json.loads(Path(amrg_row["artifact_path"]).read_text(encoding="utf-8"))
         retrieval = json.loads(Path(retrieval_row["artifact_path"]).read_text(encoding="utf-8"))
         barrier_payload = json.loads(Path(barrier_row["artifact_path"]).read_text(encoding="utf-8"))
         qdt_input_manifest_ids = set(json.loads(qdt_row["input_manifest_ids"]))
         barrier_input_manifest_ids = set(json.loads(barrier_row["input_manifest_ids"]))
+        amrg_metadata = json.loads(amrg_row["metadata"])
 
         leaf_ids = {leaf["leaf_id"] for leaf in qdt["required_leaf_questions"]}
         self.assertFalse(
@@ -431,6 +443,13 @@ class AdsOperationalCanaryTest(unittest.TestCase):
         self.assertEqual(runtime["mode"], "live")
         self.assertFalse(runtime["fixture_mode"])
         self.assertEqual(runtime["execution_status"], "succeeded")
+        self.assertEqual(amrg["vector_runtime"]["status"], "unavailable")
+        self.assertEqual(
+            amrg["vector_runtime"]["diagnostic_unavailable_reasons"],
+            ["vector_candidate_descriptor_pool_empty"],
+        )
+        self.assertEqual(amrg_metadata["amrg_vector_status"], "unavailable")
+        self.assertEqual(amrg["amrg_operator_report"]["schema_version"], "amrg-operator-report/v1")
         self.assertEqual(qdt_run_count, 1)
         self.assertEqual(qdt_leaf_count, len(qdt["required_leaf_questions"]))
         self.assertEqual(qdt_sufficiency_count, len(qdt["required_leaf_questions"]))

@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import math
+import os
 import re
 import sqlite3
 from collections import Counter
@@ -13,6 +14,9 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from urllib import error as urllib_error
+from urllib import parse as urllib_parse
+from urllib import request as urllib_request
 
 from predquant.ads_case_contract import parse_timestamp
 from predquant.ads_handoff import (
@@ -42,6 +46,9 @@ AMRG_MODEL_ASSIST_LANE_ID = "amrg_model_assist"
 AMRG_MODEL_ASSIST_PACKET_SCHEMA_VERSION = "amrg-model-assist-packet/v1"
 AMRG_MODEL_ASSIST_OUTPUT_SCHEMA_VERSION = "amrg-model-assist-output/v1"
 AMRG_MODEL_ASSIST_PROVENANCE_SCHEMA_VERSION = "amrg-model-assist-provenance/v1"
+AMRG_OLLAMA_PREFLIGHT_SCHEMA_VERSION = "amrg-ollama-vector-preflight/v1"
+AMRG_OPERATOR_REPORT_SCHEMA_VERSION = "amrg-operator-report/v1"
+AMRG_REFRESH_POLICY_SCHEMA_VERSION = "amrg-refresh-policy/v1"
 AMRG_REFRESH_LIFECYCLE_SCHEMA_VERSION = "amrg-refresh-lifecycle/v1"
 AMRG_SHARED_CACHE_ELIGIBILITY_SCHEMA_VERSION = "amrg-shared-cache-eligibility/v1"
 AMRG_VECTOR_MODEL_ID = "BAAI/bge-base-en-v1.5"
@@ -50,6 +57,9 @@ AMRG_VECTOR_PROVIDER = "ollama"
 AMRG_VECTOR_EMBEDDING_DIMENSION = 768
 AMRG_VECTOR_SIMILARITY_METRIC = "cosine"
 AMRG_VECTOR_CANDIDATE_SOURCE = "local_bge_vector_neighbor"
+AMRG_VECTOR_EMBED_ENDPOINT = "/api/embed"
+AMRG_VECTOR_KEEP_ALIVE = "5m"
+AMRG_VECTOR_RUNTIME_NEIGHBOR_CAP = 5
 AMRG_CONTEXT_MIGRATION = Path(__file__).resolve().parents[1] / "migrations" / "005_amrg_context_persistence.sql"
 AMRG_STAGE = "amrg"
 AMRG_PRODUCER = "session-02-amrg"
@@ -116,6 +126,7 @@ MODEL_ASSIST_STATUSES = {
     "not_requested",
     "not_invoked_missing_active_safe_manifest",
     "advisory_validated",
+    "advisory_unavailable_non_blocking",
     "advisory_rejected_forbidden_output",
 }
 AMRG_ALLOWED_EFFECTS_BY_STATUS = {
@@ -417,6 +428,255 @@ def ensure_amrg_vector_model(
     }
 
 
+class OllamaEmbeddingClient:
+    """Tiny stdlib client for the local Ollama embedding route."""
+
+    def __init__(self, base_url: str | None = None, *, timeout_seconds: int = 5) -> None:
+        self.base_url = (base_url or os.environ.get("OLLAMA_HOST") or "http://localhost:11434").rstrip("/")
+        self.timeout_seconds = int(timeout_seconds)
+
+    def _request(self, method: str, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        data = canonical_json(payload).encode("utf-8") if payload is not None else None
+        request = urllib_request.Request(
+            self.base_url + path,
+            data=data,
+            method=method,
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urllib_request.urlopen(request, timeout=self.timeout_seconds) as response:
+                raw = response.read().decode("utf-8")
+        except urllib_error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise AMRGError(f"ollama_http_{exc.code}: {detail[:200]}") from exc
+        except (urllib_error.URLError, TimeoutError) as exc:
+            raise AMRGError("ollama_route_unavailable") from exc
+        try:
+            parsed = json.loads(raw) if raw else {}
+        except json.JSONDecodeError as exc:
+            raise AMRGError("ollama_invalid_json_response") from exc
+        if not isinstance(parsed, dict):
+            raise AMRGError("ollama_response_must_be_object")
+        return parsed
+
+    def version(self) -> dict[str, Any]:
+        return self._request("GET", "/api/version")
+
+    def show_model(self, model: str) -> dict[str, Any]:
+        return self._request("POST", "/api/show", {"model": model})
+
+    def pull_model(self, model: str) -> dict[str, Any]:
+        return self._request("POST", "/api/pull", {"model": model, "stream": False})
+
+    def embed(
+        self,
+        model: str,
+        inputs: str | list[str],
+        *,
+        truncate: bool = False,
+        keep_alive: str | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "model": model,
+            "input": inputs,
+            "truncate": truncate,
+        }
+        if keep_alive is not None:
+            payload["keep_alive"] = keep_alive
+        return self._request("POST", AMRG_VECTOR_EMBED_ENDPOINT, payload)
+
+
+def redacted_ollama_base_url(base_url: str) -> str:
+    parsed = urllib_parse.urlparse(base_url)
+    hostname = parsed.hostname or ""
+    if hostname in {"localhost", "127.0.0.1", "::1"}:
+        return base_url.rstrip("/")
+    netloc = "<redacted>"
+    if parsed.port:
+        netloc += f":{parsed.port}"
+    return urllib_parse.urlunparse((parsed.scheme, netloc, "", "", "", ""))
+
+
+def _model_digest_from_show_payload(payload: dict[str, Any]) -> str:
+    for key in ("digest", "model_digest", "sha256"):
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            return value if value.startswith("sha256:") else f"sha256:{value}"
+    details = payload.get("details")
+    if isinstance(details, dict):
+        for key in ("digest", "model_digest", "sha256"):
+            value = details.get(key)
+            if isinstance(value, str) and value:
+                return value if value.startswith("sha256:") else f"sha256:{value}"
+    return prefixed_sha256(canonical_json(payload))
+
+
+def validate_embedding_vector(
+    vector: Any,
+    *,
+    expected_dimension: int = AMRG_VECTOR_EMBEDDING_DIMENSION,
+) -> list[float]:
+    if not isinstance(vector, list) or not vector:
+        raise AMRGError("embedding vector must be a non-empty list")
+    normalized: list[float] = []
+    for value in vector:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise AMRGError("embedding vector values must be numeric")
+        numeric = float(value)
+        if not math.isfinite(numeric):
+            raise AMRGError("embedding vector values must be finite")
+        normalized.append(numeric)
+    if len(normalized) != expected_dimension:
+        raise AMRGError(f"embedding dimension must be {expected_dimension}")
+    return normalized
+
+
+def parse_ollama_embeddings_response(
+    payload: dict[str, Any],
+    *,
+    expected_count: int,
+    expected_dimension: int = AMRG_VECTOR_EMBEDDING_DIMENSION,
+) -> list[list[float]]:
+    embeddings = payload.get("embeddings")
+    if not isinstance(embeddings, list):
+        raise AMRGError("ollama /api/embed response must include embeddings")
+    if len(embeddings) != expected_count:
+        raise AMRGError("ollama embedding count mismatch")
+    return [
+        validate_embedding_vector(vector, expected_dimension=expected_dimension)
+        for vector in embeddings
+    ]
+
+
+def _preflight_failure(
+    reason: str,
+    *,
+    lane: dict[str, Any],
+    client: Any,
+    source_cutoff_timestamp: str | None,
+    model_show_payload: dict[str, Any] | None = None,
+    pull_attempted: bool = False,
+    pull_succeeded: bool = False,
+    ollama_version: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "schema_version": AMRG_OLLAMA_PREFLIGHT_SCHEMA_VERSION,
+        "ok": False,
+        "provider": lane["provider"],
+        "route_id": lane["route_id"],
+        "resolved_model_id": lane["default_model_id"],
+        "download_command_contract": lane["download_command_contract"],
+        "ollama_base_url_redacted": redacted_ollama_base_url(getattr(client, "base_url", "")),
+        "ollama_version": ollama_version,
+        "model_digest": _model_digest_from_show_payload(model_show_payload) if model_show_payload else None,
+        "pull_attempted": pull_attempted,
+        "pull_succeeded": pull_succeeded,
+        "embed_endpoint": AMRG_VECTOR_EMBED_ENDPOINT,
+        "embedding_dimension": AMRG_VECTOR_EMBEDDING_DIMENSION,
+        "unavailable_reason": reason,
+        "diagnostic": build_unavailable_vector_source_diagnostic(
+            reason,
+            source_cutoff_timestamp=source_cutoff_timestamp,
+            metadata={
+                "preflight_schema_version": AMRG_OLLAMA_PREFLIGHT_SCHEMA_VERSION,
+                "route_id": lane["route_id"],
+                "resolved_model_id": lane["default_model_id"],
+                "ollama_base_url_redacted": redacted_ollama_base_url(getattr(client, "base_url", "")),
+                "download_command_contract": lane["download_command_contract"],
+            },
+        ),
+    }
+
+
+def preflight_ollama_vector_embeddings(
+    policy: dict[str, Any] | None = None,
+    *,
+    client: Any | None = None,
+    allow_pull: bool = False,
+    source_cutoff_timestamp: str | None = None,
+) -> dict[str, Any]:
+    lane = resolve_amrg_vector_embedding_lane(policy)
+    client = client or OllamaEmbeddingClient()
+    ollama_version = None
+    try:
+        version_payload = client.version()
+        ollama_version = str(version_payload.get("version") or version_payload.get("ollama_version") or "unknown")
+    except Exception:
+        return _preflight_failure(
+            "ollama_route_unavailable",
+            lane=lane,
+            client=client,
+            source_cutoff_timestamp=source_cutoff_timestamp,
+        )
+
+    pull_attempted = False
+    pull_succeeded = False
+    try:
+        model_payload = client.show_model(lane["default_model_id"])
+    except Exception:
+        if not allow_pull:
+            return _preflight_failure(
+                "ollama_bge_model_unavailable",
+                lane=lane,
+                client=client,
+                source_cutoff_timestamp=source_cutoff_timestamp,
+                pull_attempted=False,
+                ollama_version=ollama_version,
+            )
+        pull_attempted = True
+        try:
+            pull_payload = client.pull_model(lane["default_model_id"])
+            pull_succeeded = bool(pull_payload.get("status") in {None, "success"} or pull_payload.get("completed") is True)
+            model_payload = client.show_model(lane["default_model_id"])
+        except Exception:
+            return _preflight_failure(
+                "ollama_bge_model_pull_failed",
+                lane=lane,
+                client=client,
+                source_cutoff_timestamp=source_cutoff_timestamp,
+                pull_attempted=True,
+                pull_succeeded=False,
+                ollama_version=ollama_version,
+            )
+
+    try:
+        smoke_payload = client.embed(
+            lane["default_model_id"],
+            "AMRG embedding smoke test",
+            truncate=False,
+        )
+        parse_ollama_embeddings_response(smoke_payload, expected_count=1)
+    except Exception as exc:
+        return _preflight_failure(
+            str(exc) or "ollama_embed_smoke_failed",
+            lane=lane,
+            client=client,
+            source_cutoff_timestamp=source_cutoff_timestamp,
+            model_show_payload=model_payload,
+            pull_attempted=pull_attempted,
+            pull_succeeded=pull_succeeded,
+            ollama_version=ollama_version,
+        )
+
+    return {
+        "schema_version": AMRG_OLLAMA_PREFLIGHT_SCHEMA_VERSION,
+        "ok": True,
+        "provider": lane["provider"],
+        "route_id": lane["route_id"],
+        "resolved_model_id": lane["default_model_id"],
+        "download_command_contract": lane["download_command_contract"],
+        "ollama_base_url_redacted": redacted_ollama_base_url(getattr(client, "base_url", "")),
+        "ollama_version": ollama_version,
+        "model_digest": _model_digest_from_show_payload(model_payload),
+        "pull_attempted": pull_attempted,
+        "pull_succeeded": pull_succeeded,
+        "embed_endpoint": AMRG_VECTOR_EMBED_ENDPOINT,
+        "embedding_dimension": AMRG_VECTOR_EMBEDDING_DIMENSION,
+        "unavailable_reason": None,
+        "diagnostic": None,
+    }
+
+
 def validate_no_unsafe_market_fields(market: dict[str, Any]) -> None:
     for key in market:
         normalized = str(key).lower()
@@ -529,7 +789,12 @@ def validate_active_market_descriptor(descriptor: dict[str, Any]) -> None:
     validate_no_unsafe_market_fields(descriptor["active_safe_fields"])
 
 
-def build_unavailable_vector_source_diagnostic(reason: str, *, source_cutoff_timestamp: str | None) -> dict[str, Any]:
+def build_unavailable_vector_source_diagnostic(
+    reason: str,
+    *,
+    source_cutoff_timestamp: str | None,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     diagnostic = {
         "schema_version": AMRG_VECTOR_DIAGNOSTIC_SCHEMA_VERSION,
         "reason_code": "amrg_vector_candidate_source_unavailable",
@@ -546,7 +811,9 @@ def build_unavailable_vector_source_diagnostic(reason: str, *, source_cutoff_tim
             "decision",
         ],
         "source_cutoff_timestamp": source_cutoff_timestamp,
+        "metadata": metadata or {},
     }
+    ensure_no_raw_amrg_fields(diagnostic, "vector_source_diagnostic")
     return diagnostic
 
 
@@ -558,6 +825,7 @@ def build_vector_index_snapshot(
     source_cutoff_timestamp: str,
     model_policy_ref: str = "plans/autonomous-decomposition-swarm-model-lane-policy.json",
     embedding_model_sha256: str = "sha256:unavailable",
+    ollama_preflight: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if status not in {"ready", "unavailable", "degraded"}:
         raise AMRGError("index status must be ready, unavailable, or degraded")
@@ -587,6 +855,14 @@ def build_vector_index_snapshot(
         "diagnostic": build_unavailable_vector_source_diagnostic(unavailable_reason, source_cutoff_timestamp=source_cutoff_timestamp)
         if status == "unavailable" and unavailable_reason
         else None,
+        "ollama_preflight": ollama_preflight or {},
+        "ollama_base_url_redacted": (ollama_preflight or {}).get("ollama_base_url_redacted"),
+        "ollama_version": (ollama_preflight or {}).get("ollama_version"),
+        "model_digest": (ollama_preflight or {}).get("model_digest"),
+        "download_command_contract": (ollama_preflight or {}).get("download_command_contract")
+        or f"ollama pull {AMRG_VECTOR_MODEL_ID}",
+        "embed_endpoint": AMRG_VECTOR_EMBED_ENDPOINT,
+        "keep_alive": AMRG_VECTOR_KEEP_ALIVE if status == "ready" else None,
     }
     validate_vector_index_snapshot(snapshot)
     return snapshot
@@ -691,19 +967,20 @@ def build_ready_vector_index(
     *,
     source_cutoff_timestamp: str,
     embedding_model_sha256: str = "sha256:fixture-model",
+    ollama_preflight: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     for descriptor in descriptors:
         validate_active_market_descriptor(descriptor)
         embedding = embeddings_by_descriptor_sha256.get(descriptor["descriptor_sha256"])
         if embedding is None:
             raise AMRGError("missing embedding for descriptor")
-        if len(embedding) != AMRG_VECTOR_EMBEDDING_DIMENSION:
-            raise AMRGError("embedding dimension must be 768")
+        validate_embedding_vector(embedding)
     return build_vector_index_snapshot(
         descriptors,
         status="ready",
         source_cutoff_timestamp=source_cutoff_timestamp,
         embedding_model_sha256=embedding_model_sha256,
+        ollama_preflight=ollama_preflight,
     )
 
 
@@ -733,6 +1010,198 @@ def search_vector_neighbors(
         neighbor_scores=scores,
         cap=cap,
     )
+
+
+def selected_market_descriptor_from_evidence_packet(evidence_packet: dict[str, Any]) -> dict[str, Any]:
+    validate_evidence_packet_v2(evidence_packet)
+    identity = evidence_packet.get("market_identity") or {}
+    regime = evidence_packet.get("regime_seed_fields") or {}
+    return build_active_market_descriptor(
+        {
+            "id": identity.get("internal_market_id") or evidence_packet.get("market_id"),
+            "external_market_id": identity.get("external_market_id"),
+            "status": identity.get("status") or regime.get("status") or "open",
+            "title": identity.get("title"),
+            "description": identity.get("description"),
+            "category": identity.get("category") or regime.get("category"),
+            "outcome_type": identity.get("outcome_type") or regime.get("outcome_type"),
+            "closes_at": identity.get("closes_at") or regime.get("close_timestamp"),
+            "resolves_at": identity.get("resolves_at") or regime.get("resolve_timestamp"),
+            "normalized_entities": identity.get("normalized_entities") or [],
+            "contract_terms": identity.get("contract_terms") or [identity.get("outcome_type") or regime.get("outcome_type")],
+            "source_of_truth_kind": identity.get("source_of_truth_kind") or regime.get("source_of_truth_kind"),
+            "family_context_tokens": [],
+        },
+        evidence_packet["source_cutoff_timestamp"],
+        case_key=evidence_packet.get("case_key"),
+    )
+
+
+def active_market_vector_descriptors(
+    active_market_index: list[dict[str, Any] | Any],
+    *,
+    source_cutoff_timestamp: str,
+    selected_market_ids: set[str],
+) -> tuple[list[dict[str, Any]], Counter]:
+    records, exclusions = active_safe_candidate_records(
+        active_market_index,
+        source_cutoff_timestamp=source_cutoff_timestamp,
+        selected_market_ids=selected_market_ids,
+    )
+    descriptors: list[dict[str, Any]] = []
+    for record in records:
+        try:
+            descriptors.append(
+                build_active_market_descriptor(
+                    record["market"],
+                    source_cutoff_timestamp,
+                    case_key=str(record["market_id"]),
+                )
+            )
+        except AMRGError as exc:
+            exclusions[classify_active_safe_exclusion(exc)] += 1
+    return descriptors, exclusions
+
+
+def _vector_runtime_failure_result(
+    reason: str,
+    *,
+    source_cutoff_timestamp: str,
+    descriptors: list[dict[str, Any]] | None = None,
+    selected_descriptor: dict[str, Any] | None = None,
+    candidate_descriptors: list[dict[str, Any]] | None = None,
+    preflight: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if descriptors is None:
+        descriptors = ([selected_descriptor] if selected_descriptor else []) + list(candidate_descriptors or [])
+    diagnostic = (preflight or {}).get("diagnostic") or build_unavailable_vector_source_diagnostic(
+        reason,
+        source_cutoff_timestamp=source_cutoff_timestamp,
+    )
+    snapshot = build_vector_index_snapshot(
+        descriptors or [],
+        status="unavailable",
+        unavailable_reason=reason,
+        source_cutoff_timestamp=source_cutoff_timestamp,
+        ollama_preflight=preflight,
+    )
+    return {
+        "schema_version": "amrg-live-vector-runtime/v1",
+        "status": "unavailable",
+        "preflight": preflight or {},
+        "descriptors": descriptors or [],
+        "selected_descriptor": selected_descriptor,
+        "candidate_descriptors": candidate_descriptors or [],
+        "embeddings_by_descriptor_sha256": {},
+        "index_snapshot": snapshot,
+        "vector_candidates": [],
+        "vector_source_diagnostics": [diagnostic],
+        "descriptor_exclusion_counts": {},
+    }
+
+
+def build_live_amrg_vector_runtime(
+    *,
+    evidence_packet: dict[str, Any],
+    active_market_index: list[dict[str, Any] | Any],
+    policy: dict[str, Any] | None = None,
+    client: Any | None = None,
+    allow_pull: bool = False,
+    neighbor_cap: int = AMRG_VECTOR_RUNTIME_NEIGHBOR_CAP,
+) -> dict[str, Any]:
+    source_cutoff = parse_timestamp(evidence_packet["source_cutoff_timestamp"], "source_cutoff_timestamp").isoformat()
+    try:
+        selected_descriptor = selected_market_descriptor_from_evidence_packet(evidence_packet)
+    except AMRGError as exc:
+        return _vector_runtime_failure_result(
+            str(exc),
+            source_cutoff_timestamp=source_cutoff,
+        )
+    candidate_descriptors, exclusions = active_market_vector_descriptors(
+        active_market_index,
+        source_cutoff_timestamp=source_cutoff,
+        selected_market_ids=selected_market_identity_strings(evidence_packet),
+    )
+    if not candidate_descriptors:
+        return _vector_runtime_failure_result(
+            "vector_candidate_descriptor_pool_empty",
+            source_cutoff_timestamp=source_cutoff,
+            selected_descriptor=selected_descriptor,
+            candidate_descriptors=[],
+        )
+    preflight = preflight_ollama_vector_embeddings(
+        policy,
+        client=client,
+        allow_pull=allow_pull,
+        source_cutoff_timestamp=source_cutoff,
+    )
+    all_descriptors = [selected_descriptor] + candidate_descriptors
+    if not preflight["ok"]:
+        result = _vector_runtime_failure_result(
+            preflight.get("unavailable_reason") or "ollama_vector_preflight_failed",
+            source_cutoff_timestamp=source_cutoff,
+            selected_descriptor=selected_descriptor,
+            candidate_descriptors=candidate_descriptors,
+            preflight=preflight,
+        )
+        result["descriptor_exclusion_counts"] = dict(sorted(exclusions.items()))
+        return result
+
+    client = client or OllamaEmbeddingClient()
+    try:
+        embed_payload = client.embed(
+            preflight["resolved_model_id"],
+            [descriptor["descriptor_text"] for descriptor in all_descriptors],
+            truncate=False,
+            keep_alive=AMRG_VECTOR_KEEP_ALIVE,
+        )
+        embeddings = parse_ollama_embeddings_response(embed_payload, expected_count=len(all_descriptors))
+        embeddings_by_hash = {
+            descriptor["descriptor_sha256"]: embedding
+            for descriptor, embedding in zip(all_descriptors, embeddings)
+        }
+        index_snapshot = build_ready_vector_index(
+            candidate_descriptors,
+            {
+                descriptor["descriptor_sha256"]: embeddings_by_hash[descriptor["descriptor_sha256"]]
+                for descriptor in candidate_descriptors
+            },
+            source_cutoff_timestamp=source_cutoff,
+            embedding_model_sha256=preflight["model_digest"],
+            ollama_preflight=preflight,
+        )
+        vector_candidates = search_vector_neighbors(
+            query_descriptor=selected_descriptor,
+            query_embedding=embeddings_by_hash[selected_descriptor["descriptor_sha256"]],
+            index_snapshot=index_snapshot,
+            candidate_descriptors=candidate_descriptors,
+            embeddings_by_descriptor_sha256=embeddings_by_hash,
+            cap=neighbor_cap,
+        )
+    except Exception as exc:
+        result = _vector_runtime_failure_result(
+            str(exc) or "ollama_embed_failed",
+            source_cutoff_timestamp=source_cutoff,
+            selected_descriptor=selected_descriptor,
+            candidate_descriptors=candidate_descriptors,
+            preflight=preflight,
+        )
+        result["descriptor_exclusion_counts"] = dict(sorted(exclusions.items()))
+        return result
+
+    return {
+        "schema_version": "amrg-live-vector-runtime/v1",
+        "status": "ready",
+        "preflight": preflight,
+        "descriptors": all_descriptors,
+        "selected_descriptor": selected_descriptor,
+        "candidate_descriptors": candidate_descriptors,
+        "embeddings_by_descriptor_sha256": embeddings_by_hash,
+        "index_snapshot": index_snapshot,
+        "vector_candidates": vector_candidates,
+        "vector_source_diagnostics": [],
+        "descriptor_exclusion_counts": dict(sorted(exclusions.items())),
+    }
 
 
 def descriptor_rows_for_write(descriptors: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1786,6 +2255,7 @@ def build_related_live_market_context_or_waiver(
         "profile_context_ref": profile_context_ref,
         **pool,
     }
+    common["refresh_policy"] = normalize_refresh_policy(common, None)
     if not pool["candidates"]:
         waiver = {
             "artifact_type": "no_related_context_waiver",
@@ -2690,15 +3160,23 @@ def apply_strict_precedence_anchor_validation(
 def normalize_refresh_policy(context: dict[str, Any], refresh_policy: dict[str, Any] | None = None) -> dict[str, Any]:
     policy = dict(refresh_policy or {})
     refresh_as_of = policy.get("refresh_as_of_timestamp") or context["forecast_timestamp"]
-    ttl_seconds = int(policy.get("ttl_seconds", 900))
+    ttl_seconds = int(policy.get("ttl_seconds", policy.get("weak_relationship_context_ttl_seconds", 24 * 60 * 60)))
     if ttl_seconds < 0:
         raise AMRGError("refresh ttl_seconds must be non-negative")
     refresh_budget = int(policy.get("refresh_budget", DEFAULT_AMRG_CANDIDATE_CAP))
     if refresh_budget < 0:
         raise AMRGError("refresh_budget must be non-negative")
     return {
+        "schema_version": AMRG_REFRESH_POLICY_SCHEMA_VERSION,
         "refresh_as_of_timestamp": parse_timestamp(refresh_as_of, "refresh_as_of_timestamp").isoformat(),
         "ttl_seconds": ttl_seconds,
+        "market_descriptor_ttl_seconds": int(policy.get("market_descriptor_ttl_seconds", 60 * 60)),
+        "weak_relationship_context_ttl_seconds": int(policy.get("weak_relationship_context_ttl_seconds", 24 * 60 * 60)),
+        "vector_index_snapshot_ttl_seconds": int(policy.get("vector_index_snapshot_ttl_seconds", 24 * 60 * 60)),
+        "strict_precedence_anchor_validation_ttl_seconds": int(
+            policy.get("strict_precedence_anchor_validation_ttl_seconds", 6 * 60 * 60)
+        ),
+        "model_assist_classification_ttl_seconds": int(policy.get("model_assist_classification_ttl_seconds", 24 * 60 * 60)),
         "refresh_budget": refresh_budget,
         "max_snapshot_skew_seconds": int(policy.get("max_snapshot_skew_seconds", 900)),
     }
@@ -3155,7 +3633,7 @@ def apply_refresh_lifecycle(
         )
         budget_remaining -= consumed
         refreshed_edges.append(refreshed_edge)
-    refreshed = {**context, "relationship_edges": refreshed_edges}
+    refreshed = {**context, "relationship_edges": refreshed_edges, "refresh_policy": policy}
     validate_related_live_market_context(refreshed)
     return refreshed
 
@@ -3451,6 +3929,211 @@ def model_assist_downgrade_for_missing_manifest(context: dict[str, Any]) -> dict
     )
 
 
+def invoke_amrg_model_assist(
+    context: dict[str, Any],
+    *,
+    output: dict[str, Any] | None = None,
+    transport: Any | None = None,
+    output_artifact_ref: str | None = None,
+) -> dict[str, Any] | None:
+    if output is None and transport is None:
+        return None
+    if not context.get("input_manifest_hash"):
+        return model_assist_downgrade_for_missing_manifest(context)
+    packet = build_amrg_model_assist_packet(context)
+    try:
+        raw_output = output if output is not None else transport(packet)
+        if not isinstance(raw_output, dict):
+            raise AMRGError("model assist output must be an object")
+    except Exception as exc:
+        provenance = build_model_assist_provenance(
+            context,
+            packet=packet,
+            status="advisory_unavailable_non_blocking",
+            output_artifact_ref=output_artifact_ref,
+        )
+        provenance["metadata"]["unavailable_reason"] = str(exc)
+        return provenance
+    try:
+        validate_amrg_model_assist_output(raw_output)
+    except AMRGError as exc:
+        provenance = build_model_assist_provenance(
+            context,
+            packet=packet,
+            status="advisory_rejected_forbidden_output",
+            output_artifact_ref=output_artifact_ref,
+        )
+        provenance["forbidden_output_check_status"] = "failed"
+        provenance["metadata"]["rejection_reason"] = str(exc)
+        return provenance
+    return build_model_assist_provenance(
+        context,
+        packet=packet,
+        output=raw_output,
+        output_artifact_ref=output_artifact_ref,
+    )
+
+
+def compact_vector_runtime_metadata(vector_runtime: dict[str, Any] | None) -> dict[str, Any]:
+    if not vector_runtime:
+        return {
+            "schema_version": "amrg-live-vector-runtime-summary/v1",
+            "status": "not_requested",
+            "vector_candidate_count": 0,
+            "descriptor_count": 0,
+        }
+    preflight = vector_runtime.get("preflight") or {}
+    snapshot = vector_runtime.get("index_snapshot") or {}
+    diagnostics = vector_runtime.get("vector_source_diagnostics") or []
+    return {
+        "schema_version": "amrg-live-vector-runtime-summary/v1",
+        "status": vector_runtime.get("status"),
+        "preflight_status": "ok" if preflight.get("ok") else "unavailable",
+        "provider": preflight.get("provider") or snapshot.get("provider"),
+        "route_id": preflight.get("route_id") or snapshot.get("route_id"),
+        "resolved_model_id": preflight.get("resolved_model_id") or snapshot.get("resolved_model_id"),
+        "download_command_contract": preflight.get("download_command_contract") or snapshot.get("download_command_contract"),
+        "pull_attempted": bool(preflight.get("pull_attempted")),
+        "pull_succeeded": bool(preflight.get("pull_succeeded")),
+        "ollama_base_url_redacted": preflight.get("ollama_base_url_redacted") or snapshot.get("ollama_base_url_redacted"),
+        "ollama_version": preflight.get("ollama_version") or snapshot.get("ollama_version"),
+        "model_digest": preflight.get("model_digest") or snapshot.get("model_digest"),
+        "embed_endpoint": preflight.get("embed_endpoint") or snapshot.get("embed_endpoint"),
+        "embedding_dimension": preflight.get("embedding_dimension") or snapshot.get("embedding_dimension"),
+        "descriptor_count": len(vector_runtime.get("descriptors") or []),
+        "candidate_descriptor_count": len(vector_runtime.get("candidate_descriptors") or []),
+        "descriptor_sha256s": [
+            descriptor["descriptor_sha256"]
+            for descriptor in vector_runtime.get("descriptors", [])
+            if isinstance(descriptor, dict) and descriptor.get("descriptor_sha256")
+        ],
+        "index_snapshot_id": snapshot.get("index_snapshot_id"),
+        "index_status": snapshot.get("index_status"),
+        "vector_candidate_count": len(vector_runtime.get("vector_candidates") or []),
+        "diagnostic_unavailable_reasons": [
+            diagnostic.get("unavailable_reason")
+            for diagnostic in diagnostics
+            if isinstance(diagnostic, dict) and diagnostic.get("unavailable_reason")
+        ],
+        "descriptor_exclusion_counts": vector_runtime.get("descriptor_exclusion_counts") or {},
+    }
+
+
+def build_amrg_operator_report(
+    context: dict[str, Any],
+    *,
+    question_decomposition: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if context.get("artifact_type") == "related_live_market_context":
+        validate_related_live_market_context(context)
+    else:
+        validate_no_related_context_waiver(context)
+    hints = (
+        context.get("amrg_decomposer_context", {}).get("hints", [])
+        if isinstance(context.get("amrg_decomposer_context"), dict)
+        else []
+    )
+    consumed_leaf_refs: dict[str, list[str]] = {}
+    consumed_branch_refs: dict[str, list[str]] = {}
+    if isinstance(question_decomposition, dict):
+        metadata = question_decomposition.get("amrg_operator_metadata")
+        if isinstance(metadata, dict):
+            consumed_leaf_refs = {
+                str(leaf_id): [str(ref) for ref in refs]
+                for leaf_id, refs in (metadata.get("leaf_hint_refs") or {}).items()
+                if isinstance(refs, list)
+            }
+            consumed_branch_refs = {
+                str(branch_id): [str(ref) for ref in refs]
+                for branch_id, refs in (metadata.get("branch_hint_refs") or {}).items()
+                if isinstance(refs, list)
+            }
+    consumed_by_ref: dict[str, dict[str, list[str]]] = {
+        str(hint.get("hint_ref")): {"leaf_ids": [], "branch_ids": []}
+        for hint in hints
+        if isinstance(hint, dict) and hint.get("hint_ref")
+    }
+    for leaf_id, refs in consumed_leaf_refs.items():
+        for ref in refs:
+            consumed_by_ref.setdefault(ref, {"leaf_ids": [], "branch_ids": []})["leaf_ids"].append(leaf_id)
+    for branch_id, refs in consumed_branch_refs.items():
+        for ref in refs:
+            consumed_by_ref.setdefault(ref, {"leaf_ids": [], "branch_ids": []})["branch_ids"].append(branch_id)
+    vector_runtime = context.get("vector_runtime") if isinstance(context.get("vector_runtime"), dict) else {}
+    report = {
+        "schema_version": AMRG_OPERATOR_REPORT_SCHEMA_VERSION,
+        "candidate_set_id": context["candidate_set_id"],
+        "artifact_type": context["artifact_type"],
+        "candidate_count": len(context.get("candidates", [])),
+        "candidate_source_mix": dict(Counter(
+            source
+            for candidate in context.get("candidates", [])
+            for source in candidate.get("candidate_sources", [])
+        )),
+        "vector_status": vector_runtime.get("status", "not_requested"),
+        "ollama_route": {
+            "provider": vector_runtime.get("provider"),
+            "route_id": vector_runtime.get("route_id"),
+            "resolved_model_id": vector_runtime.get("resolved_model_id"),
+            "preflight_status": vector_runtime.get("preflight_status"),
+            "pull_attempted": bool(vector_runtime.get("pull_attempted")),
+            "ollama_base_url_redacted": vector_runtime.get("ollama_base_url_redacted"),
+        },
+        "embedding": {
+            "dimension": vector_runtime.get("embedding_dimension"),
+            "descriptor_count": vector_runtime.get("descriptor_count", 0),
+            "candidate_descriptor_count": vector_runtime.get("candidate_descriptor_count", 0),
+            "index_snapshot_id": vector_runtime.get("index_snapshot_id"),
+            "index_status": vector_runtime.get("index_status"),
+        },
+        "model_assist_status": context.get("model_assist_status", "not_requested"),
+        "relationship_status_counts": dict(Counter(
+            edge.get("relationship_status")
+            for edge in context.get("relationship_edges", [])
+            if isinstance(edge, dict)
+        )),
+        "refresh_status_counts": dict(Counter(
+            (edge.get("refresh_lifecycle_state") or {}).get("refresh_status")
+            for edge in context.get("relationship_edges", [])
+            if isinstance(edge, dict)
+        )),
+        "downgrade_reason_codes": sorted({
+            reason
+            for edge in context.get("relationship_edges", [])
+            for reason in edge.get("downgrade_reason_codes", [])
+        }),
+        "strict_precedence_anchor_state": dict(Counter(
+            edge.get("anchor_validation_status", "not_evaluated")
+            for edge in context.get("relationship_edges", [])
+            if edge.get("relationship_status") in STRICT_PRECEDENCE_ANCHOR_STATUSES
+        )),
+        "decomposer_consumption_status": (
+            "evaluated"
+            if isinstance(question_decomposition, dict)
+            else "pending_decomposition"
+        ),
+        "hint_consumption": [
+            {
+                "hint_ref": hint.get("hint_ref"),
+                "hint_category": hint.get("hint_category"),
+                "effect_status": hint.get("effect_status"),
+                "source_market_ref": hint.get("source_market_ref"),
+                "decomposer_consumed": bool(
+                    consumed_by_ref.get(str(hint.get("hint_ref")), {}).get("leaf_ids")
+                    or consumed_by_ref.get(str(hint.get("hint_ref")), {}).get("branch_ids")
+                ),
+                "consumed_by_leaf_ids": sorted(consumed_by_ref.get(str(hint.get("hint_ref")), {}).get("leaf_ids", [])),
+                "consumed_by_branch_ids": sorted(consumed_by_ref.get(str(hint.get("hint_ref")), {}).get("branch_ids", [])),
+            }
+            for hint in hints
+            if isinstance(hint, dict)
+        ],
+        "authority": "operator_audit_only_no_forecast_authority",
+    }
+    ensure_no_raw_amrg_fields(report, "amrg_operator_report")
+    return report
+
+
 def related_live_market_artifact_path(artifact_dir: Path | str, artifact: dict[str, Any]) -> Path:
     base = Path(artifact_dir) / artifact["case_id"]
     base.mkdir(parents=True, exist_ok=True)
@@ -3529,6 +4212,15 @@ def build_manifest_for_related_live_market_artifact(artifact: dict[str, Any], pa
                 if isinstance(artifact.get("amrg_decomposer_context"), dict)
                 else []
             ),
+            "amrg_vector_status": (artifact.get("vector_runtime") or {}).get("status"),
+            "amrg_vector_preflight_status": (artifact.get("vector_runtime") or {}).get("preflight_status"),
+            "amrg_vector_candidate_count": (artifact.get("vector_runtime") or {}).get("vector_candidate_count"),
+            "amrg_model_assist_status": artifact.get("model_assist_status"),
+            "amrg_operator_report_schema_version": (
+                artifact.get("amrg_operator_report", {}).get("schema_version")
+                if isinstance(artifact.get("amrg_operator_report"), dict)
+                else None
+            ),
         },
     )
     validate_artifact_manifest(manifest, expected_artifact_schema_version=schema_version)
@@ -3547,23 +4239,90 @@ def materialize_related_live_market_context(
     vector_source_diagnostics: Any = None,
     profile_context_ref: str | None = None,
     candidate_cap: int = DEFAULT_AMRG_CANDIDATE_CAP,
+    run_vector_runtime: bool = False,
+    ollama_client: Any | None = None,
+    allow_vector_pull: bool = False,
+    vector_neighbor_cap: int = AMRG_VECTOR_RUNTIME_NEIGHBOR_CAP,
+    model_assist_output: dict[str, Any] | None = None,
+    model_assist_transport: Any | None = None,
+    model_assist_output_artifact_ref: str | None = None,
+    refresh_policy: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    vector_runtime: dict[str, Any] | None = None
+    runtime_vector_candidates: list[dict[str, Any]] = []
+    runtime_vector_diagnostics: list[dict[str, Any]] = []
+    if run_vector_runtime:
+        vector_runtime = build_live_amrg_vector_runtime(
+            evidence_packet=evidence_packet,
+            active_market_index=active_market_index,
+            client=ollama_client,
+            allow_pull=allow_vector_pull,
+            neighbor_cap=vector_neighbor_cap,
+        )
+        runtime_vector_candidates = list(vector_runtime.get("vector_candidates") or [])
+        runtime_vector_diagnostics = list(vector_runtime.get("vector_source_diagnostics") or [])
+    combined_vector_candidates = list(vector_candidates or []) + runtime_vector_candidates
+    combined_vector_diagnostics = normalize_vector_diagnostics(vector_source_diagnostics) + runtime_vector_diagnostics
+
     artifact = build_related_live_market_context_or_waiver(
         evidence_packet=evidence_packet,
         evidence_packet_ref=evidence_packet_ref,
         active_market_index=active_market_index,
         exposure_context=exposure_context,
-        vector_candidates=vector_candidates,
-        vector_source_diagnostics=vector_source_diagnostics,
+        vector_candidates=combined_vector_candidates,
+        vector_source_diagnostics=combined_vector_diagnostics,
         profile_context_ref=profile_context_ref,
         candidate_cap=candidate_cap,
+    )
+    model_assist_provenance = invoke_amrg_model_assist(
+        artifact,
+        output=model_assist_output,
+        transport=model_assist_transport,
+        output_artifact_ref=model_assist_output_artifact_ref,
+    )
+    model_assist_status = (
+        model_assist_provenance["model_assist_status"]
+        if model_assist_provenance
+        else "not_requested"
     )
     if artifact["artifact_type"] == "related_live_market_context":
         artifact = enrich_related_live_market_context(
             artifact,
             evidence_packet=evidence_packet,
+            model_assist_status=model_assist_status,
+            refresh_policy=refresh_policy or artifact.get("refresh_policy"),
             active_market_index=active_market_index,
         )
+    artifact = {
+        **artifact,
+        "vector_runtime": compact_vector_runtime_metadata(vector_runtime),
+        "model_assist_status": model_assist_status,
+    }
+    artifact = attach_amrg_decomposer_context(artifact)
+    artifact = {
+        **artifact,
+        "amrg_operator_report": build_amrg_operator_report(artifact),
+    }
+    if artifact["artifact_type"] == "related_live_market_context":
+        validate_related_live_market_context(artifact)
+    else:
+        validate_no_related_context_waiver(artifact)
+
+    vector_descriptor_ids: list[str] = []
+    vector_index_snapshot_id = None
+    vector_neighbor_candidate_ids: list[str] = []
+    if vector_runtime:
+        vector_descriptor_ids = write_amrg_vector_descriptors(conn, vector_runtime.get("descriptors") or [])
+        vector_index_snapshot_id = write_amrg_vector_index_snapshot(conn, vector_runtime["index_snapshot"])
+        vector_neighbor_candidate_ids = write_amrg_vector_neighbor_candidates(
+            conn,
+            candidate_set_id=artifact["candidate_set_id"],
+            case_id=artifact["case_id"],
+            dispatch_id=artifact["dispatch_id"],
+            candidates=runtime_vector_candidates,
+        )
+    model_assist_id = write_model_assist_provenance(conn, model_assist_provenance) if model_assist_provenance else None
+
     path = write_related_live_market_artifact(related_live_market_artifact_path(artifact_dir, artifact), artifact)
     manifest = build_manifest_for_related_live_market_artifact(artifact, path)
     artifact_id = write_artifact_manifest(conn, manifest)
@@ -3574,6 +4333,10 @@ def materialize_related_live_market_context(
         "artifact_type": artifact["artifact_type"],
         "artifact": artifact,
         "manifest": manifest,
+        "vector_descriptor_ids": vector_descriptor_ids,
+        "vector_index_snapshot_id": vector_index_snapshot_id,
+        "vector_neighbor_candidate_ids": vector_neighbor_candidate_ids,
+        "model_assist_id": model_assist_id,
     }
 
 
@@ -4156,6 +4919,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--exposure-context-json", type=Path)
     parser.add_argument("--vector-candidates-json", type=Path)
     parser.add_argument("--vector-diagnostic-json", type=Path)
+    parser.add_argument("--run-vector-runtime", action="store_true")
+    parser.add_argument("--allow-vector-pull", action="store_true")
+    parser.add_argument("--ollama-host")
+    parser.add_argument("--model-assist-output-json", type=Path)
     parser.add_argument("--profile-context-ref")
     parser.add_argument("--candidate-cap", type=int, default=DEFAULT_AMRG_CANDIDATE_CAP)
     return parser
@@ -4168,6 +4935,8 @@ def main(argv: list[str] | None = None) -> int:
     exposure_context = load_json_path(args.exposure_context_json, None)
     vector_candidates = load_json_path(args.vector_candidates_json, [])
     vector_diagnostic = load_json_path(args.vector_diagnostic_json, None)
+    model_assist_output = load_json_path(args.model_assist_output_json, None)
+    ollama_client = OllamaEmbeddingClient(args.ollama_host) if args.ollama_host else None
     conn = sqlite3.connect(args.db_path)
     conn.row_factory = sqlite3.Row
     try:
@@ -4183,6 +4952,10 @@ def main(argv: list[str] | None = None) -> int:
                 vector_source_diagnostics=vector_diagnostic,
                 profile_context_ref=args.profile_context_ref,
                 candidate_cap=args.candidate_cap,
+                run_vector_runtime=args.run_vector_runtime,
+                allow_vector_pull=args.allow_vector_pull,
+                ollama_client=ollama_client,
+                model_assist_output=model_assist_output,
             )
         print(canonical_json({k: v for k, v in result.items() if k not in {"artifact", "manifest"}}))
         return 0

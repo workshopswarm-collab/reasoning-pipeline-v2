@@ -752,6 +752,9 @@ def build_stage_handlers(
     live_policy_overlay: bool = False,
     live_fixture_retrieval: bool = False,
     block_at_leaf_research_barrier: bool = False,
+    amrg_vector_runtime: bool = False,
+    amrg_vector_allow_pull: bool = False,
+    amrg_model_assist_output_path: str | Path | None = None,
 ) -> dict[str, Callable[..., Any]]:
     resolved_factory_ref = handler_factory_ref or HANDLER_FACTORY_REF
     resolved_handler_scope = handler_scope or HANDLER_SCOPE
@@ -780,6 +783,9 @@ def build_stage_handlers(
         "live_policy_overlay": bool(live_policy_overlay),
         "live_fixture_retrieval": bool(live_fixture_retrieval),
         "block_at_leaf_research_barrier": bool(block_at_leaf_research_barrier),
+        "amrg_vector_runtime": bool(amrg_vector_runtime),
+        "amrg_vector_allow_pull": bool(amrg_vector_allow_pull),
+        "amrg_model_assist_configured": amrg_model_assist_output_path is not None,
         **(metadata or {}),
     }
 
@@ -842,6 +848,11 @@ def build_stage_handlers(
         stage_outputs = kwargs["stage_outputs"]
         evidence_manifest = resolve_stage_output_manifest(conn, stage_outputs, "evidence_packet")
         profile_manifest = resolve_stage_output_manifest(conn, stage_outputs, "policy_context")
+        model_assist_output = (
+            json.loads(Path(amrg_model_assist_output_path).read_text(encoding="utf-8"))
+            if amrg_model_assist_output_path is not None
+            else None
+        )
         related_result = materialize_related_live_market_context(
             conn,
             evidence_packet=load_manifest_payload(evidence_manifest),
@@ -849,6 +860,12 @@ def build_stage_handlers(
             profile_context_ref=profile_manifest["artifact_id"],
             active_market_index=_active_market_index(conn, lease["market_id"]),
             artifact_dir=_stage_artifact_dir(base_dir, context, lease),
+            run_vector_runtime=amrg_vector_runtime,
+            allow_vector_pull=amrg_vector_allow_pull,
+            model_assist_output=model_assist_output,
+            model_assist_output_artifact_ref=str(amrg_model_assist_output_path)
+            if amrg_model_assist_output_path is not None
+            else None,
         )
         return _result(
             "related_market_context",
@@ -859,6 +876,8 @@ def build_stage_handlers(
                 **factory_metadata,
                 "evidence_packet_ref": evidence_manifest["artifact_id"],
                 "profile_context_ref": profile_manifest["artifact_id"],
+                "amrg_vector_status": related_result["artifact"].get("vector_runtime", {}).get("status"),
+                "amrg_model_assist_status": related_result["artifact"].get("model_assist_status"),
             },
         )
 

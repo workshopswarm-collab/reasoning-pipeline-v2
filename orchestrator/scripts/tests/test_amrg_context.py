@@ -20,6 +20,7 @@ from predquant.amrg import (
     apply_shared_cache_reuse_eligibility,
     build_amrg_decomposer_context,
     build_amrg_model_assist_packet,
+    build_amrg_operator_report,
     build_related_live_market_context_or_waiver,
     build_unavailable_vector_source_diagnostic,
     apply_strict_precedence_anchor_validation,
@@ -219,6 +220,12 @@ class AMRGContextTest(unittest.TestCase):
         entry.update(overrides)
         return entry
 
+    def ollama_embedding(self, first_value):
+        vector = [0.0] * 768
+        vector[0] = first_value
+        vector[1] = 1.0 - first_value
+        return vector
+
     def test_empty_candidate_pool_produces_explicit_manifested_waiver(self):
         conn = sqlite3.connect(":memory:")
         conn.row_factory = sqlite3.Row
@@ -259,6 +266,89 @@ class AMRGContextTest(unittest.TestCase):
                 AMRG_DECOMPOSER_CONTEXT_SCHEMA_VERSION,
             )
             self.assertEqual(metadata["amrg_decomposer_hint_count"], 0)
+        finally:
+            conn.close()
+
+    def test_materialize_live_vector_model_assist_and_operator_report(self):
+        class FakeOllama:
+            base_url = "http://localhost:11434"
+
+            def __init__(self, owner):
+                self.owner = owner
+
+            def version(self):
+                return {"version": "0.9.0"}
+
+            def show_model(self, model):
+                return {"digest": "fixture-digest"}
+
+            def embed(self, model, inputs, *, truncate=False, keep_alive=None):
+                count = len(inputs) if isinstance(inputs, list) else 1
+                return {
+                    "embeddings": [
+                        self.owner.ollama_embedding(1.0 if idx == 0 else 0.9 - (idx / 100))
+                        for idx in range(count)
+                    ]
+                }
+
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        try:
+            result = materialize_related_live_market_context(
+                conn,
+                evidence_packet=self.evidence_packet(),
+                evidence_packet_ref="artifact:evidence-packet",
+                artifact_dir=self.artifact_dir,
+                active_market_index=[self.market(2), self.market(3, title="Will unrelated beta happen?")],
+                run_vector_runtime=True,
+                ollama_client=FakeOllama(self),
+                model_assist_output={
+                    "artifact_type": "amrg_model_assist_output",
+                    "schema_version": AMRG_MODEL_ASSIST_OUTPUT_SCHEMA_VERSION,
+                    "model_lane_id": "amrg_model_assist",
+                    "resolved_model_id": "gpt-5.5-high",
+                    "authority": "advisory_only_no_promotion",
+                    "candidate_set_id": "candidate-set-filled-by-runtime",
+                    "edge_annotations": [],
+                },
+            )
+
+            artifact = result["artifact"]
+            self.assertEqual(artifact["vector_runtime"]["status"], "ready")
+            self.assertEqual(artifact["vector_runtime"]["preflight_status"], "ok")
+            self.assertEqual(artifact["vector_runtime"]["model_digest"], "sha256:fixture-digest")
+            self.assertEqual(artifact["model_assist_status"], "advisory_validated")
+            self.assertEqual(artifact["refresh_policy"]["schema_version"], "amrg-refresh-policy/v1")
+            self.assertEqual(artifact["refresh_policy"]["weak_relationship_context_ttl_seconds"], 24 * 60 * 60)
+            self.assertTrue(result["vector_descriptor_ids"])
+            self.assertIsNotNone(result["vector_index_snapshot_id"])
+            self.assertTrue(result["vector_neighbor_candidate_ids"])
+            self.assertIsNotNone(result["model_assist_id"])
+
+            manifest_metadata = result["manifest"]["metadata"]
+            self.assertEqual(manifest_metadata["amrg_vector_status"], "ready")
+            self.assertEqual(manifest_metadata["amrg_model_assist_status"], "advisory_validated")
+            self.assertEqual(
+                manifest_metadata["amrg_operator_report_schema_version"],
+                "amrg-operator-report/v1",
+            )
+
+            hint_ref = artifact["amrg_decomposer_context"]["hints"][0]["hint_ref"]
+            qdt_report = build_amrg_operator_report(
+                artifact,
+                question_decomposition={
+                    "amrg_operator_metadata": {
+                        "leaf_hint_refs": {"leaf-1": [hint_ref]},
+                        "branch_hint_refs": {},
+                    }
+                },
+            )
+            consumed = {
+                item["hint_ref"]: item
+                for item in qdt_report["hint_consumption"]
+            }
+            self.assertTrue(consumed[hint_ref]["decomposer_consumed"])
+            self.assertEqual(consumed[hint_ref]["consumed_by_leaf_ids"], ["leaf-1"])
         finally:
             conn.close()
 
