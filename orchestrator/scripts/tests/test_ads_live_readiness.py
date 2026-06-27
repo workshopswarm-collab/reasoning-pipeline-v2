@@ -89,6 +89,39 @@ class AdsLiveReadinessTest(unittest.TestCase):
             },
         }
 
+    def _true_runtime_prediction_metadata(self, external_market_id: str) -> dict:
+        return {
+            "forecast_decision_id": f"decision-{external_market_id}",
+            "runtime_kind": "true_production",
+            "scoreable_prediction_source": "scae.production_forecast_prob",
+            "qdt_manifest_ref": f"artifact:qdt:{external_market_id}",
+            "retrieval_packet_ref": f"artifact:retrieval:{external_market_id}",
+            "researcher_runtime_bundle_ref": f"artifact:researcher-runtime:{external_market_id}",
+            "classification_verification_ref": f"artifact:classification-verification:{external_market_id}",
+            "scae_ledger_ref": f"artifact:scae-ledger:{external_market_id}",
+            "trace_manifest_ref": f"artifact:trace:{external_market_id}",
+            "replay_manifest_ref": f"artifact:replay:{external_market_id}",
+            "scoreable_pilot": False,
+            "clone_run": False,
+            "non_executing_canary": False,
+            "runner_mode": "calibration_debt_production",
+            "handler_scope": "true_production",
+        }
+
+    def _passing_strict_non_scoreable_canary_report(self) -> dict:
+        return {
+            "schema_version": "ads-real-runtime-canary-report/v1",
+            "ok": True,
+            "issues": [],
+            "first_failing_gate": None,
+            "pipeline_run_id": "run:strict-non-scoreable",
+            "criteria": {
+                "expected_market_predictions": 0,
+                "require_scoreable_prediction": False,
+                "first_failing_gate": None,
+            },
+        }
+
     def _seed_calibration_debt_clearance_evidence(self, count: int = 100):
         self.conn.commit()
         for index in range(count):
@@ -110,7 +143,7 @@ class AdsLiveReadinessTest(unittest.TestCase):
                 input_artifact_sha256="sha256:ledger",
                 prediction_artifact_path="artifacts/forecast-decision.json",
                 prediction_artifact_sha256="sha256:decision",
-                metadata={"forecast_decision_id": f"decision-{external_market_id}"},
+                metadata=self._true_runtime_prediction_metadata(external_market_id),
             )
             write_resolution_score(
                 db_path=self.db_path,
@@ -255,22 +288,45 @@ class AdsLiveReadinessTest(unittest.TestCase):
         )
 
         self.assertFalse(report["ok"])
+        self.assertIn("strict_true_runtime_canary_evidence_missing", report["issues"])
         self.assertIn("calibration_debt_not_cleared", report["issues"])
 
-    def test_scoreable_gate_allows_bounded_production_pilot_debt_canary(self):
+    def test_scoreable_gate_allows_bounded_true_production_debt_canary(self):
         report = build_live_readiness_report(
             self.db_path,
             runner_mode="calibration_debt_production",
-            handler_factory="predquant.ads_production_pilot_handlers:build_stage_handlers",
+            handler_factory="predquant.ads_production_handlers:build_stage_handlers",
             require_scoreable_live=True,
             allow_calibration_debt_scoreable_canary=True,
             requested_max_cases=1,
+            strict_non_scoreable_canary_report=self._passing_strict_non_scoreable_canary_report(),
         )
 
         self.assertTrue(report["ok"], report["issues"])
         self.assertTrue(report["allow_calibration_debt_scoreable_canary"])
         self.assertEqual(report["requested_max_cases"], 1)
         self.assertEqual(report["scoreable_readiness_mode"], "pilot_scoreable_readiness")
+        self.assertEqual(
+            report["strict_non_scoreable_canary_signal_report"]["status"],
+            "passed",
+        )
+
+    def test_scoreable_gate_blocks_when_strict_canary_evidence_absent(self):
+        report = build_live_readiness_report(
+            self.db_path,
+            runner_mode="calibration_debt_production",
+            handler_factory="predquant.ads_production_handlers:build_stage_handlers",
+            require_scoreable_live=True,
+            allow_calibration_debt_scoreable_canary=True,
+            requested_max_cases=1,
+        )
+
+        self.assertFalse(report["ok"])
+        self.assertIn("strict_true_runtime_canary_evidence_missing", report["issues"])
+        self.assertEqual(
+            report["strict_non_scoreable_canary_signal_report"]["status"],
+            "missing",
+        )
 
     def test_true_live_readiness_rejects_pilot_even_with_debt_canary_allowance(self):
         report = build_live_readiness_report(
@@ -323,6 +379,7 @@ class AdsLiveReadinessTest(unittest.TestCase):
                 "amrg_assist_status": "assist_not_requested_by_policy",
                 "scae_evidence_delta_ref_count": 0,
                 "supplied_scae_evidence_delta_ref_count": 0,
+                "strict_non_scoreable_canary_status": "missing",
             },
         )
 
@@ -404,6 +461,7 @@ class AdsLiveReadinessTest(unittest.TestCase):
             regime_diagnostics=self._passing_regime_diagnostics(),
             protected_component_diagnostics=self._passing_protected_component_diagnostics(),
             pointer_stability_evidence=self._passing_pointer_stability(),
+            strict_non_scoreable_canary_report=self._passing_strict_non_scoreable_canary_report(),
         )
 
         self.assertFalse(report["ok"])
@@ -432,6 +490,7 @@ class AdsLiveReadinessTest(unittest.TestCase):
             regime_diagnostics=self._passing_regime_diagnostics(),
             protected_component_diagnostics=self._passing_protected_component_diagnostics(),
             pointer_stability_evidence=self._passing_pointer_stability(),
+            strict_non_scoreable_canary_report=self._passing_strict_non_scoreable_canary_report(),
         )
 
         self.assertTrue(report["ok"], report["issues"])

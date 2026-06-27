@@ -201,6 +201,42 @@ def _scae_evidence_signal_report(
     }
 
 
+def _strict_non_scoreable_canary_signal_report(report: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(report, dict):
+        return {
+            "status": "missing",
+            "ok": False,
+            "issue": "strict_true_runtime_canary_evidence_missing",
+            "first_failing_gate": None,
+            "pipeline_run_id": None,
+            "expected_market_predictions": None,
+            "require_scoreable_prediction": None,
+        }
+    criteria = report.get("criteria") if isinstance(report.get("criteria"), dict) else {}
+    expected_predictions = criteria.get("expected_market_predictions")
+    require_scoreable_prediction = criteria.get("require_scoreable_prediction")
+    first_failing_gate = report.get("first_failing_gate") or criteria.get("first_failing_gate")
+    issues = list(report.get("issues") or [])
+    non_scoreable_shape = expected_predictions == 0 and require_scoreable_prediction is False
+    ok = report.get("ok") is True and first_failing_gate is None and non_scoreable_shape
+    status = "passed" if ok else "blocked"
+    issue = None
+    if not ok:
+        issue = "strict_true_runtime_canary_not_passed"
+        if report.get("ok") is True and not non_scoreable_shape:
+            issue = "strict_true_runtime_canary_not_non_scoreable"
+    return {
+        "status": status,
+        "ok": ok,
+        "issue": issue,
+        "first_failing_gate": first_failing_gate,
+        "issues": issues,
+        "pipeline_run_id": report.get("pipeline_run_id"),
+        "expected_market_predictions": expected_predictions,
+        "require_scoreable_prediction": require_scoreable_prediction,
+    }
+
+
 def build_live_readiness_report(
     db_path: Path | str,
     *,
@@ -230,6 +266,7 @@ def build_live_readiness_report(
     amrg_model_assist_status: str | None = None,
     amrg_assist_requested_by_policy: bool | None = None,
     scae_evidence_delta_refs: list[str] | tuple[str, ...] | None = None,
+    strict_non_scoreable_canary_report: dict[str, Any] | None = None,
     require_fresh_storage_maintenance_plan: bool = False,
     include_operator_review: bool = False,
     operator_review_pipeline_run_id: str | None = None,
@@ -285,6 +322,9 @@ def build_live_readiness_report(
         model_assist_status=amrg_model_assist_status or "not_requested",
         assist_requested_by_policy=amrg_assist_requested_by_policy,
     )
+    strict_canary_signals = _strict_non_scoreable_canary_signal_report(
+        strict_non_scoreable_canary_report
+    )
 
     module_ref = _handler_module(handler_factory)
     issues: list[str] = []
@@ -322,6 +362,8 @@ def build_live_readiness_report(
         issues.append("amrg_assist_failed")
 
     if require_scoreable_live:
+        if not strict_canary_signals["ok"]:
+            issues.append(str(strict_canary_signals["issue"]))
         if module_ref == PRODUCTION_READINESS_HANDLER:
             issues.append("production_readiness_handler_is_non_scoreable")
         if resolved_scoreable_readiness_mode == TRUE_SCOREABLE_LIVE_READINESS:
@@ -354,8 +396,8 @@ def build_live_readiness_report(
         ):
             issues.append("calibration_debt_not_cleared")
         if allow_calibration_debt_scoreable_canary and resolved_scoreable_readiness_mode != TRUE_SCOREABLE_LIVE_READINESS:
-            if module_ref != PRODUCTION_PILOT_HANDLER:
-                issues.append("calibration_debt_scoreable_canary_requires_production_pilot_handler")
+            if module_ref != TRUE_PRODUCTION_HANDLER:
+                issues.append("calibration_debt_scoreable_canary_requires_true_production_handler")
             if requested_max_cases is None:
                 issues.append("calibration_debt_scoreable_canary_requires_max_cases")
             elif requested_max_cases < 1:
@@ -413,9 +455,11 @@ def build_live_readiness_report(
                 or scae_evidence_signals["accepted_supplied_ref_count"]
             ),
             "supplied_scae_evidence_delta_ref_count": len(scae_evidence_delta_refs or []),
+            "strict_non_scoreable_canary_status": strict_canary_signals["status"],
         },
         "amrg_dependency_readiness": amrg_dependency_readiness,
         "scae_evidence_signal_report": scae_evidence_signals,
+        "strict_non_scoreable_canary_signal_report": strict_canary_signals,
         "allow_canary_handler": allow_canary_handler,
         "allow_calibration_debt_scoreable_canary": allow_calibration_debt_scoreable_canary,
         "requested_max_cases": requested_max_cases,

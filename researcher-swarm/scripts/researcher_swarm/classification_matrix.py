@@ -638,6 +638,33 @@ def compute_materialized_classification_matrix_digest(
     )
 
 
+def _classification_output_sort_key(item: dict[str, Any]) -> tuple[str, ...]:
+    return (
+        str(item.get("sidecar_id") or ""),
+        str(item.get("leaf_id") or ""),
+        str(item.get("condition_scope") or ""),
+        str(item.get("evidence_ref") or ""),
+        str(item.get("source_family_id") or ""),
+        str(item.get("claim_family_id") or ""),
+        str(item.get("slice_id") or ""),
+        _canonical_json(item),
+    )
+
+
+def _provenance_output_sort_key(item: dict[str, Any]) -> tuple[str, ...]:
+    return (
+        str(item.get("sidecar_id") or ""),
+        str(item.get("leaf_id") or ""),
+        str(item.get("condition_scope") or ""),
+        str(item.get("evidence_ref") or ""),
+        str(item.get("source_family_id") or ""),
+        str(item.get("claim_family_id") or ""),
+        str(item.get("classification_slice_ref") or ""),
+        str(item.get("slice_id") or ""),
+        _canonical_json(item),
+    )
+
+
 def materialize_classification_matrix(
     sidecars: list[dict[str, Any]],
     qdt: dict[str, Any],
@@ -858,8 +885,8 @@ def materialize_classification_matrix(
                     provenance_slices.append(provenance_slice)
                     joined_supplemental_refs.add(supplemental_ref)
 
-    classification_slices.sort(key=lambda item: (str(item["slice_id"]), _canonical_json(item)))
-    provenance_slices.sort(key=lambda item: (str(item["slice_id"]), _canonical_json(item)))
+    classification_slices.sort(key=_classification_output_sort_key)
+    provenance_slices.sort(key=_provenance_output_sort_key)
     coverage_proof_slices.sort(key=lambda item: (str(item["slice_id"]), _canonical_json(item)))
     matrix_digest = compute_materialized_classification_matrix_digest(
         classification_slices,

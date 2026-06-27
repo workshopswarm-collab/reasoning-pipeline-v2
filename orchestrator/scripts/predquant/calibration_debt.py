@@ -46,6 +46,57 @@ CAL001_FORBIDDEN_USES = (
     "calibration_policy_promotion",
     "base_policy_rewrite",
 )
+CAL001_TRUE_RUNTIME_KIND = "true_production"
+CAL001_ALLOWED_PROBABILITY_SOURCES = (
+    "scae.production_forecast_prob",
+    "SCAE-012.production_forecast_prob",
+)
+CAL001_REQUIRED_RUNTIME_REF_ALIASES = {
+    "qdt_manifest_ref": (
+        "qdt_manifest_ref",
+        "question_decomposition_ref",
+        "question_decomposition_artifact_id",
+        "qdt_ref",
+    ),
+    "retrieval_packet_ref": (
+        "retrieval_packet_ref",
+        "retrieval_manifest_ref",
+        "retrieval_ref",
+    ),
+    "researcher_runtime_bundle_ref": (
+        "researcher_runtime_bundle_ref",
+        "researcher_bundle_ref",
+        "runtime_bundle_ref",
+    ),
+    "classification_verification_ref": (
+        "classification_verification_ref",
+        "verification_manifest_ref",
+        "verification_ref",
+    ),
+    "scae_ledger_ref": (
+        "scae_ledger_ref",
+        "scae_ledger_manifest_ref",
+        "scae_manifest_ref",
+        "scae_final_probability_ledger_ref",
+    ),
+    "forecast_decision_id": (
+        "forecast_decision_id",
+        "forecast_decision_ref",
+        "decision_ref",
+    ),
+    "trace_manifest_ref": (
+        "trace_manifest_ref",
+        "training_trace_manifest_ref",
+        "training_trace_ref",
+    ),
+    "replay_manifest_ref": (
+        "replay_manifest_ref",
+        "replay_record_ref",
+        "replay_ref",
+    ),
+}
+CAL001_PLACEHOLDER_REF_PREFIXES = ("cli:", "placeholder:", "supplied:", "manual:")
+CAL001_PLACEHOLDER_REF_TOKENS = ("placeholder", "cli_only", "cli-only")
 
 
 class CalibrationDebtClearanceError(ValueError):
@@ -124,6 +175,77 @@ def _json_object(value: str | None) -> dict[str, Any]:
     return parsed if isinstance(parsed, dict) else {}
 
 
+def _metadata_context(metadata: dict[str, Any]) -> dict[str, Any]:
+    context: dict[str, Any] = {}
+    prediction_metadata = metadata.get("prediction_metadata")
+    if isinstance(prediction_metadata, dict):
+        context.update(prediction_metadata)
+    scorecard_metadata = metadata.get("scorecard_metadata")
+    if isinstance(scorecard_metadata, dict):
+        context.update(scorecard_metadata)
+    context.update(metadata)
+    return context
+
+
+def _first_metadata_value(context: dict[str, Any], aliases: tuple[str, ...]) -> Any:
+    for alias in aliases:
+        value = context.get(alias)
+        if value not in (None, "", []):
+            return value
+    return None
+
+
+def _is_placeholder_ref(value: Any) -> bool:
+    if value in (None, ""):
+        return True
+    if isinstance(value, (list, tuple)):
+        return any(_is_placeholder_ref(item) for item in value) or not value
+    ref = str(value).strip()
+    if not ref:
+        return True
+    lowered = ref.lower()
+    return lowered.startswith(CAL001_PLACEHOLDER_REF_PREFIXES) or any(
+        token in lowered for token in CAL001_PLACEHOLDER_REF_TOKENS
+    )
+
+
+def _true_runtime_scorecard_reasons(metadata: dict[str, Any]) -> list[str]:
+    context = _metadata_context(metadata)
+    reasons: list[str] = []
+    runtime_kind = (
+        context.get("runtime_kind")
+        or context.get("ads_runtime_kind")
+        or context.get("prediction_runtime_kind")
+    )
+    if runtime_kind != CAL001_TRUE_RUNTIME_KIND:
+        reasons.append(f"metadata.runtime_kind must be {CAL001_TRUE_RUNTIME_KIND}")
+    probability_source = (
+        context.get("scoreable_prediction_source")
+        or context.get("scae_probability_source")
+        or context.get("probability_source")
+    )
+    if probability_source not in CAL001_ALLOWED_PROBABILITY_SOURCES:
+        reasons.append("metadata.scoreable_prediction_source must be scae.production_forecast_prob")
+    for flag in ("scoreable_pilot", "pilot_prediction", "clone_run", "clone_decision", "non_executing_canary"):
+        if context.get(flag) is True:
+            reasons.append(f"metadata.{flag} must be false")
+    for field in ("handler_scope", "handler_factory", "runner_mode", "runtime_environment"):
+        value = str(context.get(field) or "").lower()
+        if "pilot" in value:
+            reasons.append(f"metadata.{field} must not be pilot-scoped")
+        if "clone" in value:
+            reasons.append(f"metadata.{field} must not be clone-scoped")
+        if field == "runner_mode" and value == "non_executing_canary":
+            reasons.append("metadata.runner_mode must not be non_executing_canary")
+    for canonical_field, aliases in CAL001_REQUIRED_RUNTIME_REF_ALIASES.items():
+        value = _first_metadata_value(context, aliases)
+        if value in (None, "", []):
+            reasons.append(f"metadata.{canonical_field} missing")
+        elif _is_placeholder_ref(value):
+            reasons.append(f"metadata.{canonical_field} placeholder")
+    return reasons
+
+
 def _scorecard_evidence_gate(
     *,
     db_path: Path,
@@ -182,6 +304,7 @@ def _scorecard_evidence_gate(
         ):
             if forbidden not in forbidden_uses:
                 row_reasons.append(f"metadata.forbidden_uses missing {forbidden}")
+        row_reasons.extend(_true_runtime_scorecard_reasons(metadata))
         if row_reasons:
             invalid_reasons.append(f"{row['scorecard_id']}: " + ", ".join(row_reasons))
         else:
@@ -212,7 +335,7 @@ def _scorecard_evidence_gate(
     if scorecard_count < required_scorecards:
         reasons.append(f"scorecards {scorecard_count} < {required_scorecards}")
     if valid_scorecards < required_scorecards:
-        reasons.append(f"valid_scorecards {valid_scorecards} < {required_scorecards}")
+        reasons.append(f"true_runtime_valid_scorecards {valid_scorecards} < {required_scorecards}")
     if overall["avg_prediction_brier"] is None or overall["avg_market_brier"] is None:
         reasons.append("Brier report lacks prediction and market-baseline averages")
     reasons.extend(invalid_reasons)
@@ -222,6 +345,8 @@ def _scorecard_evidence_gate(
         "scored_predictions_with_market_baseline": scored_with_baseline,
         "scorecards": scorecard_count,
         "valid_scorecards": valid_scorecards,
+        "true_runtime_valid_scorecards": valid_scorecards,
+        "true_runtime_required_ref_fields": sorted(CAL001_REQUIRED_RUNTIME_REF_ALIASES),
         "scorecard_ids": [row["scorecard_id"] for row in scorecard_rows],
         "avg_prediction_brier": overall["avg_prediction_brier"],
         "avg_market_brier": overall["avg_market_brier"],

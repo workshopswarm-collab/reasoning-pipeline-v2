@@ -1883,6 +1883,7 @@ def _scorecard_values_from_prediction(
         "resolved_at": row["resolved_at"],
         "resolution_source": row["scoring_resolution_source"],
         "resolution_payload_hash": row["scoring_resolution_payload_hash"],
+        "prediction_metadata": prediction_metadata,
         "allowed_uses": [
             "calibration_debt_clearance_metric",
             "replay_scorecard_reference",

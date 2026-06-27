@@ -113,6 +113,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--regime-diagnostics-json", type=Path)
     parser.add_argument("--protected-component-diagnostics-json", type=Path)
     parser.add_argument("--pointer-stability-evidence-json", type=Path)
+    parser.add_argument("--strict-non-scoreable-canary-report-json", type=Path)
     parser.add_argument(
         "--require-real-runtime-canary-criteria",
         action="store_true",
@@ -201,6 +202,7 @@ def main() -> int:
                 regime_diagnostics=load_json(args.regime_diagnostics_json, None),
                 protected_component_diagnostics=load_json(args.protected_component_diagnostics_json, None),
                 pointer_stability_evidence=load_json(args.pointer_stability_evidence_json, None),
+                strict_non_scoreable_canary_report=load_json(args.strict_non_scoreable_canary_report_json, None),
             )
             if not readiness["ok"]:
                 record = {

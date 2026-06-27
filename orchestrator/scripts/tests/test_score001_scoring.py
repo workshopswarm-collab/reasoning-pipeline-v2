@@ -42,6 +42,18 @@ class Score001ScoringTest(unittest.TestCase):
         }
 
     def record_scae_prediction(self, external_market_id="market-1"):
+        prediction_metadata = {
+            "forecast_decision_id": f"decision-{external_market_id}",
+            "runtime_kind": "true_production",
+            "scoreable_prediction_source": "scae.production_forecast_prob",
+            "qdt_manifest_ref": f"artifact:qdt:{external_market_id}",
+            "retrieval_packet_ref": f"artifact:retrieval:{external_market_id}",
+            "researcher_runtime_bundle_ref": f"artifact:researcher-runtime:{external_market_id}",
+            "classification_verification_ref": f"artifact:classification-verification:{external_market_id}",
+            "scae_ledger_ref": f"artifact:scae-ledger:{external_market_id}",
+            "trace_manifest_ref": f"artifact:trace:{external_market_id}",
+            "replay_manifest_ref": f"artifact:replay:{external_market_id}",
+        }
         return record_prediction_with_snapshot(
             db_path=self.db_path,
             payload=self.payload(external_market_id),
@@ -59,7 +71,7 @@ class Score001ScoringTest(unittest.TestCase):
             input_artifact_sha256="sha256:ledger",
             prediction_artifact_path="artifacts/forecast-decision.json",
             prediction_artifact_sha256="sha256:decision",
-            metadata={"forecast_decision_id": f"decision-{external_market_id}"},
+            metadata=prediction_metadata,
         )
 
     def fetch_one(self, query, params=()):
@@ -113,6 +125,18 @@ class Score001ScoringTest(unittest.TestCase):
         self.assertFalse(metadata["production_forecast_write_authority"])
         self.assertFalse(metadata["scae_probability_rewrite_authority"])
         self.assertIn("calibration_policy_promotion", metadata["forbidden_uses"])
+        self.assertEqual(
+            metadata["prediction_metadata"]["scoreable_prediction_source"],
+            "scae.production_forecast_prob",
+        )
+        self.assertEqual(
+            metadata["prediction_metadata"]["retrieval_packet_ref"],
+            "artifact:retrieval:market-1",
+        )
+        self.assertEqual(
+            metadata["prediction_metadata"]["trace_manifest_ref"],
+            "artifact:trace:market-1",
+        )
 
         retry = write_evaluator_scorecard(self.db_path, prediction["prediction_id"])
         self.assertTrue(retry["idempotent"])

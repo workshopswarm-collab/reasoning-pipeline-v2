@@ -52,7 +52,26 @@ class Cal001CalibrationDebtTest(unittest.TestCase):
             },
         }
 
-    def record_prediction(self, external_market_id="market-cal001"):
+    def true_runtime_metadata(self, external_market_id="market-cal001"):
+        return {
+            "forecast_decision_id": f"decision-{external_market_id}",
+            "runtime_kind": "true_production",
+            "scoreable_prediction_source": "scae.production_forecast_prob",
+            "qdt_manifest_ref": f"artifact:qdt:{external_market_id}",
+            "retrieval_packet_ref": f"artifact:retrieval:{external_market_id}",
+            "researcher_runtime_bundle_ref": f"artifact:researcher-runtime:{external_market_id}",
+            "classification_verification_ref": f"artifact:classification-verification:{external_market_id}",
+            "scae_ledger_ref": f"artifact:scae-ledger:{external_market_id}",
+            "trace_manifest_ref": f"artifact:trace:{external_market_id}",
+            "replay_manifest_ref": f"artifact:replay:{external_market_id}",
+            "scoreable_pilot": False,
+            "clone_run": False,
+            "non_executing_canary": False,
+            "runner_mode": "calibration_debt_production",
+            "handler_scope": "true_production",
+        }
+
+    def record_prediction(self, external_market_id="market-cal001", metadata=None):
         return record_prediction_with_snapshot(
             db_path=self.db_path,
             payload=self.payload(external_market_id),
@@ -70,7 +89,7 @@ class Cal001CalibrationDebtTest(unittest.TestCase):
             input_artifact_sha256="sha256:ledger",
             prediction_artifact_path="artifacts/forecast-decision.json",
             prediction_artifact_sha256="sha256:decision",
-            metadata={"forecast_decision_id": f"decision-{external_market_id}"},
+            metadata=metadata or self.true_runtime_metadata(external_market_id),
         )
 
     def passing_tail(self):
@@ -189,6 +208,7 @@ class Cal001CalibrationDebtTest(unittest.TestCase):
         )
         self.assertEqual(scorecard_gate["evidence"]["resolved_cases"], 1)
         self.assertEqual(scorecard_gate["evidence"]["scorecards"], 1)
+        self.assertEqual(scorecard_gate["evidence"]["true_runtime_valid_scorecards"], 1)
         self.assertEqual(len(report["session6_handoff"]["scorecard_refs"]), 1)
         self.assertIn(
             "production_forecast_write",
@@ -232,6 +252,85 @@ class Cal001CalibrationDebtTest(unittest.TestCase):
         self.assertTrue(
             any("protected components degraded" in reason for reason in report["blocked_reasons"])
         )
+
+    def test_pilot_and_clone_scorecards_do_not_clear_cal001(self):
+        pilot_metadata = self.true_runtime_metadata("market-pilot")
+        pilot_metadata.update(
+            {
+                "forecast_decision_id": "decision-market-pilot",
+                "runtime_kind": "production_pilot",
+                "scoreable_pilot": True,
+                "handler_scope": "production_pilot",
+            }
+        )
+        clone_metadata = self.true_runtime_metadata("market-clone")
+        clone_metadata.update(
+            {
+                "forecast_decision_id": "decision-market-clone",
+                "clone_run": True,
+                "runtime_environment": "clone",
+            }
+        )
+        for external_market_id, metadata in (
+            ("market-pilot", pilot_metadata),
+            ("market-clone", clone_metadata),
+        ):
+            self.record_prediction(external_market_id, metadata=metadata)
+            write_resolution_score(
+                db_path=self.db_path,
+                external_market_id=external_market_id,
+                outcome=1.0,
+                resolved_at="2026-01-02T00:00:00+00:00",
+                resolution_source="polymarket-resolution-sync",
+                resolution_payload={"result": "yes", "source_id": external_market_id},
+                resolution_method="api",
+                prediction_source="ads_pipeline",
+                prediction_label="v2_scae",
+            )
+
+        kwargs = self.complete_report_kwargs()
+        kwargs["policy"] = CalibrationDebtClearancePolicy(
+            min_resolved_cases=2,
+            min_tail_slice_cases=1,
+            min_regime_slices=1,
+            min_protected_component_slices=1,
+            min_pointer_stability_windows=1,
+        )
+        report = build_calibration_debt_clearance_report(**kwargs)
+
+        self.assertEqual(report["status"], CAL001_STATUS_BLOCKED)
+        scorecard_gate = next(
+            gate for gate in report["gates"] if gate["gate_id"] == GATE_SCORECARD_BRIER_EVIDENCE
+        )
+        self.assertEqual(scorecard_gate["evidence"]["scorecards"], 2)
+        self.assertEqual(scorecard_gate["evidence"]["true_runtime_valid_scorecards"], 0)
+        self.assertIn("runtime_kind must be true_production", scorecard_gate["reason"])
+        self.assertIn("metadata.clone_run must be false", scorecard_gate["reason"])
+
+    def test_placeholder_runtime_refs_do_not_clear_cal001(self):
+        metadata = self.true_runtime_metadata()
+        metadata["retrieval_packet_ref"] = "cli:retrieval-placeholder"
+        self.record_prediction(metadata=metadata)
+        write_resolution_score(
+            db_path=self.db_path,
+            external_market_id="market-cal001",
+            outcome=1.0,
+            resolved_at="2026-01-02T00:00:00+00:00",
+            resolution_source="polymarket-resolution-sync",
+            resolution_payload={"result": "yes", "source_id": "resolution-fixture"},
+            resolution_method="api",
+            prediction_source="ads_pipeline",
+            prediction_label="v2_scae",
+        )
+
+        report = build_calibration_debt_clearance_report(**self.complete_report_kwargs())
+
+        self.assertEqual(report["status"], CAL001_STATUS_BLOCKED)
+        scorecard_gate = next(
+            gate for gate in report["gates"] if gate["gate_id"] == GATE_SCORECARD_BRIER_EVIDENCE
+        )
+        self.assertEqual(scorecard_gate["evidence"]["true_runtime_valid_scorecards"], 0)
+        self.assertIn("metadata.retrieval_packet_ref placeholder", scorecard_gate["reason"])
 
 
 if __name__ == "__main__":

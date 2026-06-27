@@ -54,6 +54,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pointer-stability-evidence-json", type=Path)
     parser.add_argument("--amrg-refresh-status")
     parser.add_argument("--scae-evidence-delta-ref", action="append", default=[])
+    parser.add_argument("--strict-non-scoreable-canary-report-json", type=Path)
     parser.add_argument("--require-fresh-storage-maintenance-plan", action="store_true")
     parser.add_argument("--operator-review", action="store_true", help="Include Phase 12 operator review for latest or selected run.")
     parser.add_argument("--operator-review-pipeline-run-id")
@@ -92,6 +93,7 @@ def main() -> int:
         pointer_stability_evidence=load_json(args.pointer_stability_evidence_json, None),
         amrg_refresh_status=args.amrg_refresh_status,
         scae_evidence_delta_refs=tuple(args.scae_evidence_delta_ref),
+        strict_non_scoreable_canary_report=load_json(args.strict_non_scoreable_canary_report_json, None),
         require_fresh_storage_maintenance_plan=args.require_fresh_storage_maintenance_plan,
         include_operator_review=args.operator_review,
         operator_review_pipeline_run_id=args.operator_review_pipeline_run_id,

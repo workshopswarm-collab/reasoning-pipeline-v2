@@ -1830,6 +1830,10 @@ Success criteria:
 - CAL-001 remains blocked until enough resolved/scored true-runtime evidence exists.
 - Test artifacts are deleted after every clone/canary run.
 
+2026-06-27 implementation status: completed under parent worker-block exception after Phase 7 worker `019f085a-a6d9-7df0-999d-a39fd613211e` was blocked by the local hook relay before implementation. CAL-001 now counts only scorecards whose source prediction metadata proves true-production runtime provenance, SCAE `production_forecast_prob`, and full QDT, retrieval, researcher, verification, SCAE, decision, trace, and replay refs; pilot, clone, non-executing, placeholder, CLI, and non-SCAE probability evidence is excluded. SCORE-001 scorecards now preserve prediction metadata so CAL-001 can audit runtime refs. Live readiness now requires a passed strict non-scoreable true-runtime canary report before any scoreable readiness path and bounded calibration-debt canaries require the true-production handler, not the production-pilot handler.
+
+Verification passed: focused CAL-001/SCORE-001/live-readiness tests, ADS tests (`110`), full Orchestrator tests (`240`), Decomposer tests (`64`), Researcher Swarm tests (`189`), SCAE tests (`105`), plan dependency tests (`16`), `compileall`, JSON validation, dependency gates, and `git diff --check`. A reproduced Researcher Swarm classification-matrix ordering failure was fixed by sorting output rows by semantic grain before digest fallback. Default `/tmp/ads-phase7.*` clone canary passed with strict runtime criteria not requiring researcher execution, `7` passed gates, `1` skipped gate, `0` market predictions, and cleanup confirmed clean. The strict release-gate clone with `--require-researcher-model-executed` still fails with `researcher_model_runtime_not_verified`; release remains blocked until the researcher OpenClaw runtime dispatch path produces verifiable model-executed leaf results in the true-production canary.
+
 ### End-To-End Release Gate
 
 After all phases, run the complete verification ladder:
