@@ -21,6 +21,7 @@ from .model_context import (
     DEFAULT_MODEL_LANE_POLICY_PATH,
     RESEARCHER_MODEL_ID,
     RESEARCHER_MODEL_LANE_ID,
+    RESEARCHER_PROVIDER_MODEL_KEY,
     resolve_researcher_leaf_nli_model_context,
     validate_researcher_model_execution_context,
 )
@@ -61,6 +62,18 @@ DEFAULT_BUDGET = {
     "max_output_tokens": 2500,
     "deadline_seconds": 900,
     "retry_budget": 1,
+    "follow_up_research": {
+        "max_direct_url_fetches": 5,
+        "max_native_candidate_urls": 4,
+        "max_supplemental_evidence_refs": 3,
+        "allowed_transports": [
+            "assigned_evidence_refs",
+            "direct_url_from_assigned_evidence",
+            "browser_retrieval",
+            "native_research_candidate_discovery",
+        ],
+        "supplemental_evidence_requires_deterministic_admission": True,
+    },
 }
 
 FORBIDDEN_ASSIGNMENT_FIELD_NAMES = {
@@ -311,6 +324,7 @@ def _compact_model_execution_context(context: dict[str, Any]) -> dict[str, Any]:
     return {
         "model_lane_id": context.get("model_lane_id"),
         "resolved_model_id": context.get("resolved_model_id"),
+        "provider_model_key": context.get("provider_model_key") or RESEARCHER_PROVIDER_MODEL_KEY,
         "model_policy_ref": context.get("model_policy_ref"),
         "model_policy_sha256": context.get("model_policy_sha256"),
         "model_context_digest": context.get("model_context_digest"),
@@ -537,6 +551,8 @@ def _validate_model_execution_context(value: Any, errors: list[str]) -> None:
     for field, expected_value in expected.items():
         if value.get(field) != expected_value:
             errors.append(f"model_execution_context.{field} must be {expected_value}")
+    if value.get("provider_model_key") != RESEARCHER_PROVIDER_MODEL_KEY:
+        errors.append(f"model_execution_context.provider_model_key must be {RESEARCHER_PROVIDER_MODEL_KEY}")
     for field in ("model_policy_ref", "model_policy_sha256", "model_context_digest"):
         if not _is_non_empty_string(value.get(field)):
             errors.append(f"model_execution_context.{field} is required")
@@ -554,6 +570,27 @@ def _validate_budget(value: Any, errors: list[str]) -> None:
             errors.append(f"budget.{field} must be a positive integer")
     if not isinstance(value.get("retry_budget"), int) or isinstance(value.get("retry_budget"), bool) or value.get("retry_budget") < 0:
         errors.append("budget.retry_budget must be a non-negative integer")
+    follow_up = value.get("follow_up_research")
+    if not isinstance(follow_up, dict):
+        errors.append("budget.follow_up_research must be an object")
+        return
+    for field in ("max_direct_url_fetches", "max_native_candidate_urls", "max_supplemental_evidence_refs"):
+        if (
+            not isinstance(follow_up.get(field), int)
+            or isinstance(follow_up.get(field), bool)
+            or follow_up.get(field) < 0
+        ):
+            errors.append(f"budget.follow_up_research.{field} must be a non-negative integer")
+    _validate_string_list(
+        follow_up.get("allowed_transports"),
+        errors,
+        "budget.follow_up_research.allowed_transports",
+        allow_empty=False,
+    )
+    if follow_up.get("supplemental_evidence_requires_deterministic_admission") is not True:
+        errors.append(
+            "budget.follow_up_research.supplemental_evidence_requires_deterministic_admission must be true"
+        )
 
 
 def _validate_artifact_outputs(value: Any, errors: list[str]) -> None:
@@ -666,7 +703,7 @@ def build_leaf_research_assignment(
     trigger_codes: list[str] | None = None,
     assigned_lens: str = "baseline",
     isolation_audit_ref: str | None = None,
-    budget: dict[str, int] | None = None,
+    budget: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build one compact leaf-research-assignment/v1 packet."""
 
@@ -761,7 +798,14 @@ def build_leaf_research_assignment(
             "forbidden_fields": list(FORBIDDEN_OUTPUT_FIELDS),
         },
         "model_execution_context": compact_model_context,
-        "budget": {**DEFAULT_BUDGET, **(budget or {})},
+        "budget": {
+            **DEFAULT_BUDGET,
+            **(budget or {}),
+            "follow_up_research": {
+                **DEFAULT_BUDGET["follow_up_research"],
+                **((budget or {}).get("follow_up_research", {}) if isinstance((budget or {}).get("follow_up_research"), dict) else {}),
+            },
+        },
         "artifact_outputs": artifact_outputs,
         "scope_boundaries": {
             "implements": ["CLS-006"],
@@ -795,7 +839,7 @@ def build_leaf_research_assignments(
     trigger_codes_by_leaf: dict[str, list[str]] | None = None,
     assigned_lens_by_leaf: dict[str, str] | None = None,
     isolation_audit_refs_by_leaf: dict[str, str] | None = None,
-    budget: dict[str, int] | None = None,
+    budget: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Build compact assignments for every RET-008 dispatchable QDT leaf."""
 

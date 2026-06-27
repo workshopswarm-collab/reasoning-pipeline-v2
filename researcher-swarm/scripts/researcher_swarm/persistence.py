@@ -57,6 +57,7 @@ from .retrieval import (
 )
 from .retrieval_quality import validate_retrieval_quality_slice
 from .supplemental import validate_normalized_supplemental_evidence
+from .subagents import validate_leaf_research_barrier
 
 
 MIG_004_RETRIEVAL_PERSISTENCE_MIGRATION = (
@@ -1620,6 +1621,45 @@ def write_researcher_context_isolation_audits(
     return written
 
 
+def write_leaf_research_barrier(
+    conn: sqlite3.Connection,
+    barrier: dict[str, Any],
+    *,
+    assignments: list[dict[str, Any]] | None = None,
+) -> str:
+    """Persist the compact leaf-research-barrier/v1 handoff artifact."""
+
+    ensure_researcher_verification_persistence_schema(conn)
+    validation = validate_leaf_research_barrier(barrier, assignments=assignments)
+    if not validation.valid:
+        raise ResearcherPersistenceError("leaf research barrier invalid: " + "; ".join(validation.errors))
+    _reject_forbidden_persistence_payload(barrier, "leaf_research_barrier")
+    case_id = None
+    dispatch_id = None
+    if assignments:
+        first = assignments[0]
+        case_id = first.get("case_id")
+        dispatch_id = first.get("dispatch_id")
+    row = {
+        "barrier_id": barrier["barrier_id"],
+        "schema_version": barrier["schema_version"],
+        "case_id": case_id,
+        "dispatch_id": dispatch_id,
+        "assignment_refs": _json(barrier.get("assignment_refs", [])),
+        "leaf_count": len(barrier.get("terminal_state_by_leaf", [])),
+        "terminal_state_by_leaf": _json(barrier.get("terminal_state_by_leaf", [])),
+        "all_leaves_terminal": _bool_int(barrier.get("all_leaves_terminal")),
+        "proceed_to_verification_scae": _bool_int(barrier.get("proceed_to_verification_scae")),
+        "blocker_reason_codes": _json(barrier.get("blocker_reason_codes", [])),
+        "result_validation_errors": _json(barrier.get("result_validation_errors", [])),
+        "true_production_mode": _bool_int(barrier.get("true_production_mode")),
+        "barrier_policy": _json(barrier.get("barrier_policy", {})),
+        "barrier_digest": barrier["barrier_digest"],
+    }
+    _upsert(conn, "leaf_research_barriers", row, ["barrier_id"])
+    return barrier["barrier_id"]
+
+
 def _rich_classification_row(record: dict[str, Any]) -> dict[str, Any]:
     return {
         "slice_id": record["slice_id"],
@@ -2267,6 +2307,7 @@ __all__ = [
     "write_evidence_provenance_slices",
     "write_evidence_quality_verification_slices",
     "write_leaf_research_assignments",
+    "write_leaf_research_barrier",
     "write_metadata_fill_diagnostics",
     "write_native_research_attempts",
     "write_negative_check_attempts",

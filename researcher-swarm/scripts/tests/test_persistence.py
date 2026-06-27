@@ -54,6 +54,7 @@ from researcher_swarm.persistence import (  # noqa: E402
     write_evidence_provenance_slices,
     write_evidence_quality_verification_slices,
     write_leaf_research_assignments,
+    write_leaf_research_barrier,
     write_metadata_fill_diagnostics,
     write_native_research_attempts,
     write_negative_check_attempts,
@@ -99,6 +100,7 @@ from researcher_swarm.retrieval import (  # noqa: E402
 )
 from researcher_swarm.retrieval_quality import build_retrieval_quality_report  # noqa: E402
 from researcher_swarm.supplemental import normalize_supplemental_evidence  # noqa: E402
+from researcher_swarm.subagents import build_leaf_research_barrier  # noqa: E402
 from ads_decomposer.handoff import (  # noqa: E402
     DECOMPOSER_MODEL_ID,
     DECOMPOSER_MODEL_LANE_ID,
@@ -500,6 +502,7 @@ class ResearcherPersistenceTest(unittest.TestCase):
             "model_execution_context": {
                 "model_lane_id": "researcher_leaf_nli_classification",
                 "resolved_model_id": "gpt-5.5-high",
+                "provider_model_key": "openai/gpt-5.5-high",
                 "model_policy_ref": "orchestrator/plans/autonomous-decomposition-swarm-model-lane-policy.json",
                 "model_policy_sha256": SHA,
                 "prompt_template_id": RESEARCHER_NLI_PROMPT_TEMPLATE_ID,
@@ -511,6 +514,17 @@ class ResearcherPersistenceTest(unittest.TestCase):
                 "max_output_tokens": 2500,
                 "deadline_seconds": 900,
                 "retry_budget": 1,
+                "follow_up_research": {
+                    "max_direct_url_fetches": 5,
+                    "max_native_candidate_urls": 4,
+                    "max_supplemental_evidence_refs": 3,
+                    "allowed_transports": [
+                        "assigned_evidence_refs",
+                        "direct_url_from_assigned_evidence",
+                        "browser_retrieval",
+                    ],
+                    "supplemental_evidence_requires_deterministic_admission": True,
+                },
             },
             "artifact_outputs": {
                 "assignment_artifact_ref": "artifact:leaf-research-assignment/leaf-assignment-fixture",
@@ -840,6 +854,8 @@ class ResearcherPersistenceTest(unittest.TestCase):
         self.assertEqual(prompt_id, "prompt-contract-1")
 
         self.assertEqual(write_leaf_research_assignments(self.conn, [assignment]), ["leaf-assignment-fixture"])
+        barrier = build_leaf_research_barrier([assignment])
+        self.assertEqual(write_leaf_research_barrier(self.conn, barrier, assignments=[assignment]), barrier["barrier_id"])
         self.assertEqual(
             write_researcher_context_isolation_audits(
                 self.conn,
@@ -888,6 +904,8 @@ class ResearcherPersistenceTest(unittest.TestCase):
         stored_evidence = json.loads(assignment_row["assigned_evidence_refs"])
         self.assertEqual(stored_evidence[0]["evidence_ref"], "evidence-1")
         self.assertNotIn("evidence_body", stored_evidence[0])
+        barrier_row = self.conn.execute("SELECT blocker_reason_codes FROM leaf_research_barriers").fetchone()
+        self.assertEqual(json.loads(barrier_row["blocker_reason_codes"]), ["missing_leaf_subagent_result"])
 
     def test_rejects_full_payloads_and_forbidden_authority_fields(self) -> None:
         bad_assignment = self._assignment()

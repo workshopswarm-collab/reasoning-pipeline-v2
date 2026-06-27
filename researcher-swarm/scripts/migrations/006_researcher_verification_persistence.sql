@@ -85,6 +85,28 @@ CREATE TABLE IF NOT EXISTS researcher_context_isolation_audits (
 CREATE INDEX IF NOT EXISTS idx_researcher_context_isolation_case
   ON researcher_context_isolation_audits(case_id, dispatch_id, leaf_id);
 
+CREATE TABLE IF NOT EXISTS leaf_research_barriers (
+  barrier_id TEXT PRIMARY KEY,
+  schema_version TEXT NOT NULL,
+  case_id TEXT,
+  dispatch_id TEXT,
+  assignment_refs TEXT NOT NULL DEFAULT '[]',
+  leaf_count INTEGER NOT NULL,
+  terminal_state_by_leaf TEXT NOT NULL DEFAULT '[]',
+  all_leaves_terminal INTEGER NOT NULL,
+  proceed_to_verification_scae INTEGER NOT NULL,
+  blocker_reason_codes TEXT NOT NULL DEFAULT '[]',
+  result_validation_errors TEXT NOT NULL DEFAULT '[]',
+  true_production_mode INTEGER NOT NULL,
+  barrier_policy TEXT NOT NULL DEFAULT '{}',
+  barrier_digest TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_leaf_research_barriers_case
+  ON leaf_research_barriers(case_id, dispatch_id);
+
 CREATE TABLE IF NOT EXISTS classification_lane_evidence_classification_slices (
   slice_id TEXT PRIMARY KEY,
   schema_version TEXT NOT NULL,

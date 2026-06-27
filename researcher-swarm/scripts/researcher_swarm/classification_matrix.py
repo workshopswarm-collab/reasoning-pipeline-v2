@@ -510,6 +510,11 @@ def _classification_slice(
         "impact_direction": classification.get("impact_direction"),
         "evidence_strength": classification.get("evidence_strength"),
         "classification_confidence": classification.get("classification_confidence"),
+        "classification_quality": classification.get("classification_quality"),
+        "classification_acceptance_status": classification.get("classification_acceptance_status"),
+        "evidence_delta_eligible_for_scae": bool(
+            classification.get("evidence_delta_eligible_for_scae") is True
+        ),
         "answer_value_extraction": copy.deepcopy(classification.get("answer_value_extraction")),
         "evidence_quality_dimensions": copy.deepcopy(classification.get("evidence_quality_dimensions")),
         "research_sufficiency_certificate_ref": classification.get("research_sufficiency_certificate_ref"),
@@ -520,7 +525,14 @@ def _classification_slice(
         or sidecar.get("model_execution_context_sha256"),
         "content_sha256": evidence.get("content_sha256"),
         "temporal_gate_status": evidence.get("temporal_gate_status"),
-        "ledger_ready": True,
+        "ledger_ready": (
+            classification.get("classification_acceptance_status") == "accepted_for_verification"
+            and classification.get("evidence_delta_eligible_for_scae") is True
+        ),
+        "included_for_scae": (
+            classification.get("classification_acceptance_status") == "accepted_for_verification"
+            and classification.get("evidence_delta_eligible_for_scae") is True
+        ),
         "authority_boundary": {
             "researcher_probability_authority": False,
             "researcher_forecast_authority": False,

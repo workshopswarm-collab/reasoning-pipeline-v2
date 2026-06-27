@@ -296,7 +296,7 @@ class ClassificationMatrixMaterializationTest(unittest.TestCase):
         sidecar["required_question_classifications"][0]["provenance_refs"] = []
         self._refresh_sidecar_digests(sidecar)
 
-        with self.assertRaisesRegex(ClassificationMatrixError, "provenance_refs are required"):
+        with self.assertRaisesRegex(ClassificationMatrixError, "accepted classifications require provenance_refs"):
             materialize_classification_matrix([sidecar], self.qdt, packet)
 
         sidecar = self._sidecar(packet)

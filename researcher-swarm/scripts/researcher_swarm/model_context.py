@@ -13,6 +13,7 @@ RESEARCHER_MODEL_CONTEXT_SCHEMA_VERSION = "researcher-model-execution-context/v1
 RESEARCHER_MODEL_CONTEXT_RESOLVER_VERSION = "ads-model-003-researcher-model-context/v1"
 RESEARCHER_MODEL_LANE_ID = "researcher_leaf_nli_classification"
 RESEARCHER_MODEL_ID = "gpt-5.5-high"
+RESEARCHER_PROVIDER_MODEL_KEY = "openai/gpt-5.5-high"
 RESEARCHER_PROMPT_TEMPLATE_ID = "researcher-leaf-nli/v1"
 RESEARCHER_SIDECAR_SCHEMA_VERSION = "researcher-sidecar/v2"
 RESEARCHER_CLASSIFICATION_OUTPUT_SCHEMA_VERSION = "researcher-classification/v1"

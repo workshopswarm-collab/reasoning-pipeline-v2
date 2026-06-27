@@ -32,7 +32,11 @@ from researcher_swarm.classification import (  # noqa: E402
     RESEARCHER_NLI_PROMPT_TEMPLATE_ID,
     RESEARCHER_NLI_PROMPT_TEMPLATE_SHA256,
 )
-from researcher_swarm.model_context import RESEARCHER_MODEL_ID, RESEARCHER_MODEL_LANE_ID  # noqa: E402
+from researcher_swarm.model_context import (  # noqa: E402
+    RESEARCHER_MODEL_ID,
+    RESEARCHER_MODEL_LANE_ID,
+    RESEARCHER_PROVIDER_MODEL_KEY,
+)
 from researcher_swarm.retrieval import (  # noqa: E402
     build_retrieval_evidence_item,
     build_retrieval_packet,
@@ -43,10 +47,12 @@ from researcher_swarm.subagents import (  # noqa: E402
     build_leaf_research_barrier,
     build_leaf_researcher_spawn_plan,
     build_leaf_subagent_result,
+    build_researcher_swarm_runtime_bundle,
     compute_leaf_subagent_result_digest,
     validate_leaf_research_barrier,
     validate_leaf_researcher_spawn_plan,
     validate_leaf_subagent_result,
+    validate_researcher_swarm_runtime_bundle,
 )
 
 
@@ -202,10 +208,17 @@ class LeafResearchAssignmentContractTest(unittest.TestCase):
             model_context = assignment["model_execution_context"]
             self.assertEqual(model_context["model_lane_id"], RESEARCHER_MODEL_LANE_ID)
             self.assertEqual(model_context["resolved_model_id"], RESEARCHER_MODEL_ID)
+            self.assertEqual(model_context["provider_model_key"], RESEARCHER_PROVIDER_MODEL_KEY)
             self.assertEqual(model_context["prompt_template_id"], RESEARCHER_NLI_PROMPT_TEMPLATE_ID)
             self.assertEqual(model_context["prompt_template_sha256"], RESEARCHER_NLI_PROMPT_TEMPLATE_SHA256)
             self.assertNotIn("authority_boundary", model_context)
             self.assertNotIn("forbidden_outputs", model_context)
+            self.assertIn("browser_retrieval", assignment["budget"]["follow_up_research"]["allowed_transports"])
+            self.assertTrue(
+                assignment["budget"]["follow_up_research"][
+                    "supplemental_evidence_requires_deterministic_admission"
+                ]
+            )
 
             self.assertFalse(_contains_key(assignment, "question_text"))
             self.assertFalse(_contains_key(assignment, "research_sufficiency_requirements"))
@@ -316,12 +329,16 @@ class LeafResearchAssignmentContractTest(unittest.TestCase):
         self.assertEqual(plan["runtime_owner"], "ADS Researcher Swarm")
         self.assertEqual(plan["launch_authority"], "control_plane_only")
         self.assertEqual(plan["execution_policy"]["max_concurrent_leaf_researchers_per_case"], 2)
+        self.assertEqual(plan["execution_policy"]["required_runtime_provider_model_id"], RESEARCHER_PROVIDER_MODEL_KEY)
         self.assertEqual(plan["spawn_count"], len(assignments))
         self.assertEqual(len(plan["launch_queue"]), len(assignments))
         self.assertEqual(
             [row["launch_allowed"] for row in plan["launch_queue"]],
             [True, True, False],
         )
+        self.assertEqual(plan["launch_queue"][0]["required_runtime_provider_model_id"], RESEARCHER_PROVIDER_MODEL_KEY)
+        self.assertEqual(plan["launch_queue"][0]["assignment_input_ref"], assignments[0]["assignment_id"])
+        self.assertIn("allowed_transports", plan["launch_queue"][0]["leaf_scoped_follow_up_research"])
         self.assertEqual(plan["queued_assignment_refs"], [assignments[2]["assignment_id"]])
         validation = validate_leaf_researcher_spawn_plan(plan, assignments)
         self.assertTrue(validation.valid, validation.errors)
@@ -360,7 +377,7 @@ class LeafResearchAssignmentContractTest(unittest.TestCase):
                 classification_refs=[f"classification:{assignment['leaf_id']}"],
                 runtime_provenance={
                     "model_executed": True,
-                    "resolved_model_id": "gpt-5.5-high",
+                    "resolved_model_id": RESEARCHER_PROVIDER_MODEL_KEY,
                     "runtime_call_ref": f"model-runtime-call:{idx}",
                 },
                 reason_codes=["classification_accepted"],
@@ -387,6 +404,38 @@ class LeafResearchAssignmentContractTest(unittest.TestCase):
         validation = validate_leaf_research_barrier(barrier, assignments=assignments, true_production_mode=True)
         self.assertTrue(validation.valid, validation.errors)
 
+    def test_runtime_bundle_requires_accepted_sidecar_coverage_before_downstream_advance(self) -> None:
+        assignments = build_leaf_research_assignments(qdt=self.qdt, retrieval_packet=self._certifiable_packet())
+        results = [
+            build_leaf_subagent_result(
+                assignment,
+                terminal_status="accepted_classification",
+                subagent_session_ref=f"session:{idx}",
+                sidecar_refs=[f"sidecar:{assignment['leaf_id']}"],
+                classification_refs=[f"classification:{assignment['leaf_id']}"],
+                runtime_provenance={
+                    "model_executed": True,
+                    "resolved_model_id": RESEARCHER_PROVIDER_MODEL_KEY,
+                    "runtime_call_ref": f"model-runtime-call:{idx}",
+                },
+            )
+            for idx, assignment in enumerate(assignments)
+        ]
+
+        bundle = build_researcher_swarm_runtime_bundle(
+            assignments,
+            qdt=self.qdt,
+            retrieval_packet=self._certifiable_packet(),
+            subagent_results=results,
+            true_production_mode=True,
+        )
+
+        self.assertFalse(bundle["proceed_to_verification_scae"])
+        self.assertFalse(bundle["all_leaves_have_assignment_and_resolution"])
+        self.assertTrue(all(row["reason_codes"] == ["leaf_unclassified"] for row in bundle["leaf_runtime_status"]))
+        validation = validate_researcher_swarm_runtime_bundle(bundle)
+        self.assertTrue(validation.valid, validation.errors)
+
     def test_leaf_research_barrier_rejects_non_executed_or_wrong_model_result(self) -> None:
         assignments = build_leaf_research_assignments(qdt=self.qdt, retrieval_packet=self._certifiable_packet())
         results = [
@@ -396,7 +445,7 @@ class LeafResearchAssignmentContractTest(unittest.TestCase):
                 subagent_session_ref=f"session:{idx}",
                 runtime_provenance={
                     "model_executed": idx != 0,
-                    "resolved_model_id": "gpt-5.4-high" if idx == 1 else "gpt-5.5-high",
+                    "resolved_model_id": "openai/gpt-5.4-high" if idx == 1 else RESEARCHER_PROVIDER_MODEL_KEY,
                 },
             )
             for idx, assignment in enumerate(assignments)
@@ -410,7 +459,7 @@ class LeafResearchAssignmentContractTest(unittest.TestCase):
 
         self.assertFalse(barrier["proceed_to_verification_scae"])
         self.assertIn("true_production_requires_model_executed", barrier["blocker_reason_codes"])
-        self.assertIn("true_production_requires_gpt_5_5_high", barrier["blocker_reason_codes"])
+        self.assertIn("true_production_requires_openai_gpt_5_5_high", barrier["blocker_reason_codes"])
 
     def test_leaf_subagent_result_validator_requires_session_sidecar_and_digest(self) -> None:
         assignment = build_leaf_research_assignments(qdt=self.qdt, retrieval_packet=self._certifiable_packet())[0]
@@ -420,7 +469,7 @@ class LeafResearchAssignmentContractTest(unittest.TestCase):
             subagent_session_ref="session:leaf-1",
             sidecar_refs=["sidecar:leaf-1"],
             classification_refs=["classification:leaf-1"],
-            runtime_provenance={"model_executed": True, "resolved_model_id": "gpt-5.5-high"},
+            runtime_provenance={"model_executed": True, "resolved_model_id": RESEARCHER_PROVIDER_MODEL_KEY},
         )
         self.assertTrue(validate_leaf_subagent_result(result, assignment=assignment, true_production_mode=True).valid)
 
@@ -443,7 +492,7 @@ class LeafResearchAssignmentContractTest(unittest.TestCase):
                         assignment,
                         terminal_status="contaminated",
                         subagent_session_ref=f"session:{idx}",
-                        runtime_provenance={"model_executed": True, "resolved_model_id": "gpt-5.5-high"},
+                        runtime_provenance={"model_executed": True, "resolved_model_id": RESEARCHER_PROVIDER_MODEL_KEY},
                         reason_codes=["isolation_contaminated"],
                     )
                 )
@@ -455,7 +504,7 @@ class LeafResearchAssignmentContractTest(unittest.TestCase):
                         subagent_session_ref=f"session:{idx}",
                         sidecar_refs=[f"sidecar:{assignment['leaf_id']}"],
                         classification_refs=[f"classification:{assignment['leaf_id']}"],
-                        runtime_provenance={"model_executed": True, "resolved_model_id": "gpt-5.5-high"},
+                        runtime_provenance={"model_executed": True, "resolved_model_id": RESEARCHER_PROVIDER_MODEL_KEY},
                     )
                 )
 
@@ -484,7 +533,7 @@ class LeafResearchAssignmentContractTest(unittest.TestCase):
                 subagent_session_ref=f"session:{idx}",
                 sidecar_refs=[f"sidecar:{assignment['leaf_id']}"],
                 classification_refs=[f"classification:{assignment['leaf_id']}"],
-                runtime_provenance={"model_executed": True, "resolved_model_id": "gpt-5.5-high"},
+                runtime_provenance={"model_executed": True, "resolved_model_id": RESEARCHER_PROVIDER_MODEL_KEY},
             )
             for idx, assignment in enumerate(assignments)
         ]

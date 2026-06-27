@@ -88,9 +88,12 @@ class ResearcherSidecarV2Test(unittest.TestCase):
         item.update(
             {
                 "supplemental_evidence_refs": [f"supplemental-evidence:{leaf_id}:gap-proof"],
-                "impact_direction": "neutral",
-                "evidence_strength": "unanswerable",
+                "impact_direction": "insufficient",
+                "evidence_strength": "none",
                 "classification_confidence": "medium",
+                "classification_quality": "medium",
+                "classification_acceptance_status": "blocked",
+                "evidence_delta_eligible_for_scae": False,
                 "answer_value_extraction": {
                     "field_name": "status",
                     "value": "",
@@ -291,7 +294,7 @@ class ResearcherSidecarV2Test(unittest.TestCase):
         self.assertFalse(result.valid)
         self.assertIn("research_sufficiency_certificate_ref is required", "; ".join(result.errors))
 
-    def test_unanswerable_classification_requires_rationale_provenance_and_neutral_direction(self) -> None:
+    def test_insufficient_classification_requires_rationale_provenance_and_insufficient_direction(self) -> None:
         valid = self._sidecar(unanswerable_leaf_2=True)
         valid_result = validate_researcher_sidecar_v2(valid, self.qdt)
         self.assertTrue(valid_result.valid, valid_result.errors)
@@ -308,7 +311,54 @@ class ResearcherSidecarV2Test(unittest.TestCase):
         self._refresh_digests(directional)
         result = validate_researcher_sidecar_v2(directional, self.qdt)
         self.assertFalse(result.valid)
-        self.assertIn("impact_direction must be neutral", "; ".join(result.errors))
+        self.assertIn("impact_direction must be insufficient", "; ".join(result.errors))
+
+    def test_phase8_acceptance_rules_reject_low_quality_accepted_rows(self) -> None:
+        sidecar = self._sidecar()
+        sidecar["required_question_classifications"][0]["classification_quality"] = "low"
+        sidecar["required_question_classifications"][0]["classification_acceptance_status"] = "accepted_for_verification"
+        self._refresh_digests(sidecar)
+
+        result = validate_researcher_sidecar_v2(sidecar, self.qdt)
+
+        self.assertFalse(result.valid)
+        self.assertIn("classification_quality cannot pass to verification", "; ".join(result.errors))
+
+    def test_mixed_classification_requires_supporting_and_opposing_evidence_refs(self) -> None:
+        sidecar = self._sidecar()
+        first = sidecar["required_question_classifications"][0]
+        first["impact_direction"] = "mixed"
+        first["evidence_refs"] = [self._evidence_ref("leaf-1"), "retrieval-evidence:leaf-1:opposing"]
+        first.pop("evidence_ref", None)
+        first["supporting_evidence_refs"] = [self._evidence_ref("leaf-1")]
+        first["opposing_evidence_refs"] = ["retrieval-evidence:leaf-1:opposing"]
+        sidecar["coverage_proofs"][0]["evidence_refs_assigned"].append("retrieval-evidence:leaf-1:opposing")
+        sidecar["coverage_proofs"][0]["evidence_refs_reviewed"].append("retrieval-evidence:leaf-1:opposing")
+        self._refresh_digests(sidecar)
+
+        result = validate_researcher_sidecar_v2(sidecar, self.qdt)
+        self.assertTrue(result.valid, result.errors)
+
+        broken = copy.deepcopy(sidecar)
+        broken["required_question_classifications"][0]["opposing_evidence_refs"] = []
+        self._refresh_digests(broken)
+        result = validate_researcher_sidecar_v2(broken, self.qdt)
+        self.assertFalse(result.valid)
+        self.assertIn("opposing_evidence_refs are required", "; ".join(result.errors))
+
+    def test_irrelevant_and_insufficient_rows_are_not_evidence_delta_eligible(self) -> None:
+        sidecar = self._sidecar()
+        first = sidecar["required_question_classifications"][0]
+        first["impact_direction"] = "irrelevant"
+        first["evidence_strength"] = "none"
+        first["classification_acceptance_status"] = "non_scoreable"
+        first["evidence_delta_eligible_for_scae"] = True
+        self._refresh_digests(sidecar)
+
+        result = validate_researcher_sidecar_v2(sidecar, self.qdt)
+
+        self.assertFalse(result.valid)
+        self.assertIn("evidence_delta_eligible_for_scae must be false for irrelevant", "; ".join(result.errors))
 
     def test_invalid_impact_direction_is_rejected(self) -> None:
         sidecar = self._sidecar()

@@ -13,12 +13,19 @@ from dataclasses import dataclass
 from typing import Any
 
 from .assignments import validate_leaf_research_assignment
-from .model_context import RESEARCHER_MODEL_ID
+from .classification import (
+    validate_researcher_sidecar_against_retrieval_packet,
+    validate_researcher_sidecar_v2,
+)
+from .isolation import validate_researcher_context_isolation_audit
+from .model_context import RESEARCHER_PROVIDER_MODEL_KEY
 
 LEAF_SUBAGENT_EXECUTION_POLICY_SCHEMA_VERSION = "leaf-subagent-execution-policy/v1"
 LEAF_SUBAGENT_RESULT_SCHEMA_VERSION = "leaf-subagent-result/v1"
 LEAF_RESEARCH_BARRIER_SCHEMA_VERSION = "leaf-research-barrier/v1"
+RESEARCHER_SWARM_RUNTIME_BUNDLE_SCHEMA_VERSION = "researcher-swarm-runtime-bundle/v1"
 LEAF_SUBAGENT_POLICY_ID = "ads-leaf-subagent-execution-policy/v1"
+LEAF_SUBAGENT_CONTROL_PLANE_ADAPTER_REF = "openclaw-control-plane-subagent-adapter/v1"
 LEAF_SUBAGENT_CONTRACT_VALIDATOR_VERSION = "ads-phase-2-leaf-subagent-contract/v1"
 
 TERMINAL_RESULT_STATUSES = {
@@ -145,6 +152,10 @@ def build_leaf_subagent_execution_policy(*, max_concurrent: int = 5) -> dict[str
         "transient_launch_retry_budget": 1,
         "never_retry_statuses": sorted(NEVER_RETRY_STATUSES),
         "launch_authority": "control_plane_only",
+        "control_plane_adapter_ref": LEAF_SUBAGENT_CONTROL_PLANE_ADAPTER_REF,
+        "required_runtime_provider_model_id": RESEARCHER_PROVIDER_MODEL_KEY,
+        "leaf_scoped_follow_up_research_allowed": True,
+        "supplemental_evidence_resolver_required": True,
     }
 
 
@@ -172,6 +183,14 @@ def validate_leaf_subagent_execution_policy(policy: Any) -> LeafSubagentContract
         errors.append("transient_launch_retry_budget must be 1")
     if policy.get("never_retry_statuses") != sorted(NEVER_RETRY_STATUSES):
         errors.append("never_retry_statuses does not match Phase 2 policy")
+    if policy.get("control_plane_adapter_ref") != LEAF_SUBAGENT_CONTROL_PLANE_ADAPTER_REF:
+        errors.append(f"control_plane_adapter_ref must be {LEAF_SUBAGENT_CONTROL_PLANE_ADAPTER_REF}")
+    if policy.get("required_runtime_provider_model_id") != RESEARCHER_PROVIDER_MODEL_KEY:
+        errors.append(f"required_runtime_provider_model_id must be {RESEARCHER_PROVIDER_MODEL_KEY}")
+    if policy.get("leaf_scoped_follow_up_research_allowed") is not True:
+        errors.append("leaf_scoped_follow_up_research_allowed must be true")
+    if policy.get("supplemental_evidence_resolver_required") is not True:
+        errors.append("supplemental_evidence_resolver_required must be true")
     return LeafSubagentContractValidationResult(not errors, tuple(errors))
 
 
@@ -202,6 +221,12 @@ def build_leaf_researcher_spawn_plan(assignments: list[dict[str, Any]], *, max_c
                 "queue_status": "ready_to_launch" if assignment_ref in running_refs else "queued_waiting_for_capacity",
                 "launch_block_reason_codes": [] if assignment_ref in running_refs else ["queued_waiting_for_capacity"],
                 "subagent_session_ref": None,
+                "control_plane_adapter_ref": LEAF_SUBAGENT_CONTROL_PLANE_ADAPTER_REF,
+                "required_runtime_provider_model_id": RESEARCHER_PROVIDER_MODEL_KEY,
+                "assignment_input_ref": assignment_ref,
+                "leaf_scoped_follow_up_research": copy.deepcopy(
+                    assignment.get("budget", {}).get("follow_up_research", {})
+                ),
                 "timeout_state": {
                     "max_wall_time_seconds": policy["max_wall_time_seconds_per_leaf"],
                     "heartbeat_poll_interval_seconds": policy["heartbeat_poll_interval_seconds"],
@@ -296,6 +321,18 @@ def validate_leaf_researcher_spawn_plan(
             errors.append(f"launch_queue[{idx}] must explain why launch is blocked")
         if row.get("subagent_session_ref") is not None:
             errors.append(f"launch_queue[{idx}].subagent_session_ref must be null before control-plane launch")
+        if row.get("control_plane_adapter_ref") != LEAF_SUBAGENT_CONTROL_PLANE_ADAPTER_REF:
+            errors.append(
+                f"launch_queue[{idx}].control_plane_adapter_ref must be {LEAF_SUBAGENT_CONTROL_PLANE_ADAPTER_REF}"
+            )
+        if row.get("required_runtime_provider_model_id") != RESEARCHER_PROVIDER_MODEL_KEY:
+            errors.append(
+                f"launch_queue[{idx}].required_runtime_provider_model_id must be {RESEARCHER_PROVIDER_MODEL_KEY}"
+            )
+        if row.get("assignment_input_ref") != expected_ref:
+            errors.append(f"launch_queue[{idx}].assignment_input_ref must match assignment_ref")
+        if not isinstance(row.get("leaf_scoped_follow_up_research"), dict):
+            errors.append(f"launch_queue[{idx}].leaf_scoped_follow_up_research must be an object")
         timeout_state = row.get("timeout_state")
         if not isinstance(timeout_state, dict):
             errors.append(f"launch_queue[{idx}].timeout_state must be an object")
@@ -466,8 +503,8 @@ def validate_leaf_subagent_result(
     if true_production_mode:
         if result.get("model_executed") is not True:
             errors.append("true production requires model_executed=true")
-        if result.get("resolved_model_id") != RESEARCHER_MODEL_ID:
-            errors.append(f"true production requires resolved_model_id={RESEARCHER_MODEL_ID}")
+        if result.get("resolved_model_id") != RESEARCHER_PROVIDER_MODEL_KEY:
+            errors.append(f"true production requires resolved_model_id={RESEARCHER_PROVIDER_MODEL_KEY}")
     retry_state = result.get("retry_state")
     if not isinstance(retry_state, dict):
         errors.append("retry_state must be an object")
@@ -589,9 +626,9 @@ def build_leaf_research_barrier(
                 if result.get("model_executed") is not True:
                     row_proceed = False
                     reasons.append("true_production_requires_model_executed")
-                if result.get("resolved_model_id") != RESEARCHER_MODEL_ID:
+                if result.get("resolved_model_id") != RESEARCHER_PROVIDER_MODEL_KEY:
                     row_proceed = False
-                    reasons.append("true_production_requires_gpt_5_5_high")
+                    reasons.append("true_production_requires_openai_gpt_5_5_high")
             result_validation = validate_leaf_subagent_result(
                 result,
                 assignment=assignment,
@@ -744,18 +781,295 @@ def validate_leaf_research_barrier(
     return LeafSubagentContractValidationResult(not errors, tuple(errors))
 
 
+def _runtime_bundle_digest_payload(bundle: dict[str, Any]) -> dict[str, Any]:
+    payload = copy.deepcopy(bundle)
+    payload.pop("runtime_bundle_digest", None)
+    payload.pop("runtime_bundle_validation", None)
+    return payload
+
+
+def compute_researcher_swarm_runtime_bundle_digest(bundle: dict[str, Any]) -> str:
+    return "sha256:" + hashlib.sha256(_canonical_json(_runtime_bundle_digest_payload(bundle)).encode("utf-8")).hexdigest()
+
+
+def _sidecar_id(sidecar: dict[str, Any], index: int) -> str:
+    return str(sidecar.get("sidecar_id") or f"sidecar-index:{index}")
+
+
+def build_researcher_swarm_runtime_bundle(
+    assignments: list[dict[str, Any]],
+    *,
+    qdt: dict[str, Any] | None = None,
+    retrieval_packet: dict[str, Any] | None = None,
+    sidecars: list[dict[str, Any]] | None = None,
+    isolation_audits: list[dict[str, Any]] | None = None,
+    subagent_results: list[dict[str, Any]] | None = None,
+    true_production_mode: bool = False,
+    max_concurrent: int = 5,
+) -> dict[str, Any]:
+    """Assemble Phase 8's validated researcher-swarm runtime handoff.
+
+    The bundle remains a contract artifact: Researcher Swarm records launch
+    requests, returned subagent result refs, sidecar/admission validation, and
+    the barrier. Actual OpenClaw session launch authority stays in the control
+    plane.
+    """
+
+    assignment_validations: list[dict[str, Any]] = []
+    assignments_by_id: dict[str, dict[str, Any]] = {}
+    for idx, assignment in enumerate(assignments):
+        validation = validate_leaf_research_assignment(assignment)
+        assignment_validations.append(
+            {
+                "assignment_index": idx,
+                "assignment_ref": assignment.get("assignment_id") if isinstance(assignment, dict) else None,
+                "leaf_id": assignment.get("leaf_id") if isinstance(assignment, dict) else None,
+                "validation": validation.to_dict(),
+            }
+        )
+        if isinstance(assignment, dict) and validation.valid:
+            assignments_by_id[str(assignment["assignment_id"])] = assignment
+
+    spawn_plan = build_leaf_researcher_spawn_plan(assignments, max_concurrent=max_concurrent) if assignments else None
+    barrier = build_leaf_research_barrier(
+        assignments,
+        subagent_results=subagent_results,
+        true_production_mode=true_production_mode,
+    ) if assignments else None
+
+    sidecar_validations: list[dict[str, Any]] = []
+    accepted_classification_leaf_ids: set[str] = set()
+    non_scoreable_leaf_ids: set[str] = set()
+    sidecar_inputs = sidecars or []
+    for idx, sidecar in enumerate(sidecar_inputs):
+        if not isinstance(sidecar, dict):
+            sidecar_validations.append(
+                {
+                    "sidecar_index": idx,
+                    "sidecar_id": None,
+                    "validation": {
+                        "valid": False,
+                        "errors": ["sidecar must be an object"],
+                        "warnings": [],
+                        "validator_version": LEAF_SUBAGENT_CONTRACT_VALIDATOR_VERSION,
+                    },
+                }
+            )
+            continue
+        if qdt is None:
+            validation = LeafSubagentContractValidationResult(False, ("qdt is required to validate sidecars",))
+            validation_dict = validation.to_dict()
+        elif retrieval_packet is not None:
+            validation_dict = validate_researcher_sidecar_against_retrieval_packet(
+                sidecar,
+                qdt,
+                retrieval_packet,
+            ).to_dict()
+        else:
+            validation_dict = validate_researcher_sidecar_v2(sidecar, qdt).to_dict()
+        sidecar_validations.append(
+            {
+                "sidecar_index": idx,
+                "sidecar_id": _sidecar_id(sidecar, idx),
+                "validation": validation_dict,
+            }
+        )
+        if validation_dict.get("valid") is True:
+            for classification in sidecar.get("required_question_classifications", []):
+                if not isinstance(classification, dict) or not _is_non_empty_string(classification.get("leaf_id")):
+                    continue
+                leaf_id = str(classification["leaf_id"])
+                if classification.get("classification_acceptance_status") == "accepted_for_verification":
+                    accepted_classification_leaf_ids.add(leaf_id)
+                elif classification.get("classification_acceptance_status") in {"non_scoreable", "blocked"}:
+                    non_scoreable_leaf_ids.add(leaf_id)
+
+    isolation_validations: list[dict[str, Any]] = []
+    for idx, audit in enumerate(isolation_audits or []):
+        assignment = assignments_by_id.get(str(audit.get("assignment_id"))) if isinstance(audit, dict) else None
+        validation = validate_researcher_context_isolation_audit(audit, assignment=assignment)
+        isolation_validations.append(
+            {
+                "audit_index": idx,
+                "isolation_audit_id": audit.get("isolation_audit_id") if isinstance(audit, dict) else None,
+                "assignment_ref": audit.get("assignment_id") if isinstance(audit, dict) else None,
+                "leaf_id": audit.get("leaf_id") if isinstance(audit, dict) else None,
+                "validation": validation.to_dict(),
+            }
+        )
+
+    barrier_rows_by_assignment = {
+        str(row.get("assignment_ref")): row
+        for row in (barrier or {}).get("terminal_state_by_leaf", [])
+        if isinstance(row, dict) and _is_non_empty_string(row.get("assignment_ref"))
+    }
+    leaf_runtime_status: list[dict[str, Any]] = []
+    for assignment in assignments:
+        assignment_ref = str(assignment.get("assignment_id"))
+        leaf_id = str(assignment.get("leaf_id"))
+        barrier_row = barrier_rows_by_assignment.get(assignment_ref, {})
+        accepted_coverage = leaf_id in accepted_classification_leaf_ids
+        blocker_recorded = (
+            leaf_id in non_scoreable_leaf_ids
+            or barrier_row.get("proceed") is False
+            or barrier_row.get("terminal_status") in BLOCKING_RESULT_STATUSES
+        )
+        reason_codes = set(_string_list(barrier_row.get("reason_codes")))
+        if not accepted_coverage and not blocker_recorded:
+            reason_codes.add("leaf_unclassified")
+        if accepted_coverage and blocker_recorded:
+            reason_codes.add("accepted_coverage_with_blocker")
+        leaf_runtime_status.append(
+            {
+                "assignment_ref": assignment_ref,
+                "leaf_id": leaf_id,
+                "terminal_status": barrier_row.get("terminal_status", "missing"),
+                "accepted_classification_coverage": accepted_coverage,
+                "blocker_recorded": blocker_recorded,
+                "ready_for_reconciliation": bool(accepted_coverage or blocker_recorded),
+                "reason_codes": sorted(reason_codes),
+            }
+        )
+
+    validation_errors = []
+    validation_errors.extend(
+        error
+        for item in assignment_validations
+        if item["validation"].get("valid") is not True
+        for error in item["validation"].get("errors", [])
+    )
+    validation_errors.extend(
+        error
+        for item in sidecar_validations
+        if item["validation"].get("valid") is not True
+        for error in item["validation"].get("errors", [])
+    )
+    validation_errors.extend(
+        error
+        for item in isolation_validations
+        if item["validation"].get("valid") is not True
+        for error in item["validation"].get("errors", [])
+    )
+    if barrier is not None:
+        barrier_validation = validate_leaf_research_barrier(
+            barrier,
+            assignments=assignments,
+            true_production_mode=true_production_mode,
+        ).to_dict()
+        if barrier_validation.get("valid") is not True:
+            validation_errors.extend(barrier_validation.get("errors", []))
+    else:
+        barrier_validation = None
+
+    bundle = {
+        "artifact_type": "researcher_swarm_runtime_bundle",
+        "schema_version": RESEARCHER_SWARM_RUNTIME_BUNDLE_SCHEMA_VERSION,
+        "runtime_owner": "ADS Researcher Swarm",
+        "launch_authority": "control_plane_only",
+        "control_plane_adapter_ref": LEAF_SUBAGENT_CONTROL_PLANE_ADAPTER_REF,
+        "required_runtime_provider_model_id": RESEARCHER_PROVIDER_MODEL_KEY,
+        "true_production_mode": bool(true_production_mode),
+        "assignment_validations": assignment_validations,
+        "spawn_plan": spawn_plan,
+        "sidecar_validations": sidecar_validations,
+        "isolation_audit_validations": isolation_validations,
+        "leaf_research_barrier": barrier,
+        "leaf_research_barrier_validation": barrier_validation,
+        "leaf_runtime_status": leaf_runtime_status,
+        "all_leaves_have_assignment_and_resolution": bool(assignments)
+        and all(row["ready_for_reconciliation"] for row in leaf_runtime_status),
+        "proceed_to_verification_scae": bool(
+            barrier
+            and barrier.get("proceed_to_verification_scae") is True
+            and not validation_errors
+            and all(row["accepted_classification_coverage"] for row in leaf_runtime_status)
+        ),
+        "validation_errors": sorted(set(str(error) for error in validation_errors)),
+        "authority_boundary": {
+            "orchestrator_state_machine_authority": False,
+            "selects_global_next_work": False,
+            "forecast_authority": False,
+            "probability_authority": False,
+            "scae_ledger_authority": False,
+        },
+    }
+    bundle["runtime_bundle_id"] = _sha_id(
+        "researcher-swarm-runtime-bundle",
+        {
+            "assignments": [assignment.get("assignment_id") for assignment in assignments],
+            "barrier_id": (barrier or {}).get("barrier_id"),
+            "true_production_mode": true_production_mode,
+        },
+    )
+    bundle["runtime_bundle_digest"] = compute_researcher_swarm_runtime_bundle_digest(bundle)
+    return bundle
+
+
+def validate_researcher_swarm_runtime_bundle(bundle: Any) -> LeafSubagentContractValidationResult:
+    errors: list[str] = []
+    if not isinstance(bundle, dict):
+        return LeafSubagentContractValidationResult(False, ("runtime bundle must be an object",))
+    if bundle.get("artifact_type") != "researcher_swarm_runtime_bundle":
+        errors.append("artifact_type must be researcher_swarm_runtime_bundle")
+    if bundle.get("schema_version") != RESEARCHER_SWARM_RUNTIME_BUNDLE_SCHEMA_VERSION:
+        errors.append(f"schema_version must be {RESEARCHER_SWARM_RUNTIME_BUNDLE_SCHEMA_VERSION}")
+    if bundle.get("launch_authority") != "control_plane_only":
+        errors.append("launch_authority must be control_plane_only")
+    if bundle.get("control_plane_adapter_ref") != LEAF_SUBAGENT_CONTROL_PLANE_ADAPTER_REF:
+        errors.append(f"control_plane_adapter_ref must be {LEAF_SUBAGENT_CONTROL_PLANE_ADAPTER_REF}")
+    if bundle.get("required_runtime_provider_model_id") != RESEARCHER_PROVIDER_MODEL_KEY:
+        errors.append(f"required_runtime_provider_model_id must be {RESEARCHER_PROVIDER_MODEL_KEY}")
+    authority = bundle.get("authority_boundary")
+    if not isinstance(authority, dict):
+        errors.append("authority_boundary must be an object")
+    else:
+        for field in (
+            "orchestrator_state_machine_authority",
+            "selects_global_next_work",
+            "forecast_authority",
+            "probability_authority",
+            "scae_ledger_authority",
+        ):
+            if authority.get(field) is not False:
+                errors.append(f"authority_boundary.{field} must be false")
+    for field in (
+        "assignment_validations",
+        "sidecar_validations",
+        "isolation_audit_validations",
+        "leaf_runtime_status",
+        "validation_errors",
+    ):
+        if not isinstance(bundle.get(field), list):
+            errors.append(f"{field} must be a list")
+    if bundle.get("all_leaves_have_assignment_and_resolution") is not True and bundle.get("all_leaves_have_assignment_and_resolution") is not False:
+        errors.append("all_leaves_have_assignment_and_resolution must be a boolean")
+    if bundle.get("proceed_to_verification_scae") is not True and bundle.get("proceed_to_verification_scae") is not False:
+        errors.append("proceed_to_verification_scae must be a boolean")
+    digest = bundle.get("runtime_bundle_digest")
+    if not _is_sha256_ref(digest):
+        errors.append("runtime_bundle_digest must be a sha256 ref")
+    elif digest != compute_researcher_swarm_runtime_bundle_digest(bundle):
+        errors.append("runtime_bundle_digest does not match bundle payload")
+    return LeafSubagentContractValidationResult(not errors, tuple(errors))
+
+
 __all__ = [
     "LEAF_RESEARCH_BARRIER_SCHEMA_VERSION",
     "LEAF_SUBAGENT_EXECUTION_POLICY_SCHEMA_VERSION",
     "LEAF_SUBAGENT_RESULT_SCHEMA_VERSION",
+    "LEAF_SUBAGENT_CONTROL_PLANE_ADAPTER_REF",
+    "RESEARCHER_SWARM_RUNTIME_BUNDLE_SCHEMA_VERSION",
     "compute_leaf_research_barrier_digest",
     "compute_leaf_subagent_result_digest",
+    "compute_researcher_swarm_runtime_bundle_digest",
     "build_leaf_research_barrier",
     "build_leaf_researcher_spawn_plan",
     "build_leaf_subagent_execution_policy",
     "build_leaf_subagent_result",
+    "build_researcher_swarm_runtime_bundle",
     "validate_leaf_research_barrier",
     "validate_leaf_researcher_spawn_plan",
     "validate_leaf_subagent_execution_policy",
     "validate_leaf_subagent_result",
+    "validate_researcher_swarm_runtime_bundle",
 ]

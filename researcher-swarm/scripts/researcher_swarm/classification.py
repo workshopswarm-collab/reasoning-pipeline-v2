@@ -88,9 +88,15 @@ ALLOWED_FALSE_AUTHORITY_BOUNDARY_FIELDS = {
     "model_outputs_may_author_probability",
     "probability_authority",
 }
-ALLOWED_IMPACT_DIRECTIONS = {"supports_yes", "supports_no", "neutral"}
-ALLOWED_EVIDENCE_STRENGTHS = {"definitive", "strong", "moderate", "weak", "none", "unanswerable"}
+ALLOWED_IMPACT_DIRECTIONS = {"supports_yes", "supports_no", "mixed", "neutral", "irrelevant", "insufficient"}
+ALLOWED_EVIDENCE_STRENGTHS = {"strong", "moderate", "weak", "none"}
 ALLOWED_CLASSIFICATION_CONFIDENCES = {"high", "medium", "low"}
+ALLOWED_CLASSIFICATION_QUALITIES = {"high", "medium", "low", "unusable"}
+ALLOWED_CLASSIFICATION_ACCEPTANCE_STATUSES = {
+    "accepted_for_verification",
+    "non_scoreable",
+    "blocked",
+}
 ALLOWED_LEAF_CONDITION_SCOPES = {
     "unconditional",
     "conditional",
@@ -119,6 +125,9 @@ Required output:
 - Produce only researcher-sidecar/v2 records containing researcher-classification/v1 rows and researcher-coverage-proof/v1 refs.
 - Every non-neutral classification must cite retrieval evidence refs and the relevant leaf sufficiency requirement refs.
 - Every gap must be reported as a structured insufficiency or structural-unanswerability observation, never as a forecast.
+- Use only direction labels supports_yes, supports_no, mixed, neutral, irrelevant, or insufficient.
+- Use only strength labels strong, moderate, weak, or none; confidence labels high, medium, or low; and quality labels high, medium, low, or unusable.
+- Mark rows accepted_for_verification only when evidence refs, confidence, and quality are sufficient; mark low-quality, unsupported, irrelevant, or insufficient rows non_scoreable or blocked.
 
 Forbidden output fields:
 - own_probability
@@ -637,7 +646,55 @@ def _classification_evidence_refs(classification: dict[str, Any]) -> list[str]:
         "evidence_refs",
         "retrieval_evidence_refs",
         "supplemental_evidence_refs",
+        "supporting_evidence_refs",
+        "opposing_evidence_refs",
     )
+
+
+def _classification_supporting_refs(classification: dict[str, Any]) -> list[str]:
+    return _string_refs_from(classification, "supporting_evidence_ref", "supporting_evidence_refs")
+
+
+def _classification_opposing_refs(classification: dict[str, Any]) -> list[str]:
+    return _string_refs_from(classification, "opposing_evidence_ref", "opposing_evidence_refs")
+
+
+def _default_classification_quality(classification: dict[str, Any]) -> str:
+    quality = classification.get("classification_quality")
+    if quality in ALLOWED_CLASSIFICATION_QUALITIES:
+        return str(quality)
+    dimensions = classification.get("evidence_quality_dimensions")
+    if not isinstance(dimensions, dict):
+        return "low"
+    if dimensions.get("source_authority") == "high" and dimensions.get("directness") == "direct":
+        if dimensions.get("recency") in {"fresh", "timeless"} and dimensions.get("specificity") == "specific":
+            return "high"
+        return "medium"
+    if dimensions.get("source_authority") in {"high", "medium"} and dimensions.get("directness") in {"direct", "indirect"}:
+        return "medium"
+    return "low"
+
+
+def _default_evidence_delta_eligible_for_scae(classification: dict[str, Any]) -> bool:
+    return classification.get("impact_direction") in {"supports_yes", "supports_no", "mixed"}
+
+
+def _default_classification_acceptance_status(classification: dict[str, Any]) -> str:
+    confidence = classification.get("classification_confidence")
+    quality = _default_classification_quality(classification)
+    direction = classification.get("impact_direction")
+    strength = classification.get("evidence_strength")
+    if (
+        confidence in {"high", "medium"}
+        and quality in {"high", "medium"}
+        and direction not in {"irrelevant", "insufficient"}
+        and strength != "none"
+        and bool(_classification_evidence_refs(classification))
+    ):
+        return "accepted_for_verification"
+    if direction == "insufficient":
+        return "blocked"
+    return "non_scoreable"
 
 
 def _unanswerability_block(classification: dict[str, Any]) -> dict[str, Any]:
@@ -908,8 +965,18 @@ def _validate_classification(
     evidence_strength = classification.get("evidence_strength")
     if evidence_strength not in ALLOWED_EVIDENCE_STRENGTHS:
         errors.append(f"{path}.evidence_strength is invalid")
-    if classification.get("classification_confidence") not in ALLOWED_CLASSIFICATION_CONFIDENCES:
+    classification_confidence = classification.get("classification_confidence")
+    if classification_confidence not in ALLOWED_CLASSIFICATION_CONFIDENCES:
         errors.append(f"{path}.classification_confidence is invalid")
+    classification_quality = classification.get("classification_quality")
+    if classification_quality not in ALLOWED_CLASSIFICATION_QUALITIES:
+        errors.append(f"{path}.classification_quality is invalid")
+    acceptance_status = classification.get("classification_acceptance_status")
+    if acceptance_status not in ALLOWED_CLASSIFICATION_ACCEPTANCE_STATUSES:
+        errors.append(f"{path}.classification_acceptance_status is invalid")
+    delta_eligible = classification.get("evidence_delta_eligible_for_scae")
+    if delta_eligible is not True and delta_eligible is not False:
+        errors.append(f"{path}.evidence_delta_eligible_for_scae must be a boolean")
 
     model_context_ref = classification.get("model_execution_context_ref", top_model_context_ref)
     if not _is_non_empty_string(model_context_ref):
@@ -927,8 +994,35 @@ def _validate_classification(
     )
 
     evidence_refs = _classification_evidence_refs(classification)
-    if not evidence_refs:
+    if not evidence_refs and impact_direction != "insufficient":
         errors.append(f"{path} must include retrieval evidence refs or supplemental evidence refs")
+    supporting_refs = _classification_supporting_refs(classification)
+    opposing_refs = _classification_opposing_refs(classification)
+    if impact_direction == "mixed":
+        if not supporting_refs:
+            errors.append(f"{path}.supporting_evidence_refs are required for mixed classifications")
+        if not opposing_refs:
+            errors.append(f"{path}.opposing_evidence_refs are required for mixed classifications")
+        missing_mixed_refs = sorted((set(supporting_refs) | set(opposing_refs)) - set(evidence_refs))
+        if missing_mixed_refs:
+            errors.append(f"{path}.mixed evidence refs must also appear in evidence refs: {', '.join(missing_mixed_refs)}")
+    if impact_direction in {"irrelevant", "insufficient"} and delta_eligible is not False:
+        errors.append(
+            f"{path}.evidence_delta_eligible_for_scae must be false for {impact_direction} classifications"
+        )
+    if acceptance_status == "accepted_for_verification":
+        if classification_confidence not in {"high", "medium"}:
+            errors.append(f"{path}.classification_confidence cannot pass to verification")
+        if classification_quality not in {"high", "medium"}:
+            errors.append(f"{path}.classification_quality cannot pass to verification")
+        if impact_direction in {"irrelevant", "insufficient"}:
+            errors.append(f"{path}.impact_direction cannot pass to verification")
+        if evidence_strength == "none":
+            errors.append(f"{path}.evidence_strength cannot pass to verification")
+        if not evidence_refs:
+            errors.append(f"{path} accepted classifications require evidence refs")
+        if not _string_refs_from(classification, "provenance_refs"):
+            errors.append(f"{path} accepted classifications require provenance_refs")
     _validate_answer_value_extraction(classification.get("answer_value_extraction"), errors, f"{path}.answer_value_extraction")
     _validate_evidence_quality_dimensions(
         classification.get("evidence_quality_dimensions"),
@@ -937,11 +1031,17 @@ def _validate_classification(
     )
     if not isinstance(classification.get("provenance_refs", []), list):
         errors.append(f"{path}.provenance_refs must be a list")
+    if not isinstance(classification.get("proposed_supplemental_evidence_refs", []), list):
+        errors.append(f"{path}.proposed_supplemental_evidence_refs must be a list")
 
-    is_unanswerable = evidence_strength == "unanswerable"
-    if is_unanswerable:
-        if impact_direction != "neutral":
-            errors.append(f"{path}.impact_direction must be neutral for unanswerable classifications")
+    is_insufficient = impact_direction == "insufficient"
+    if _unanswerability_block(classification) and not is_insufficient:
+        errors.append(f"{path}.impact_direction must be insufficient for structural unanswerability")
+    if is_insufficient:
+        if evidence_strength != "none":
+            errors.append(f"{path}.evidence_strength must be none for insufficient classifications")
+        if acceptance_status == "accepted_for_verification":
+            errors.append(f"{path}.classification_acceptance_status cannot pass insufficient classifications")
         if not _unanswerability_rationale(classification):
             errors.append(f"{path}.unanswerability.rationale is required")
         if not _unanswerability_provenance_refs(classification):
@@ -969,7 +1069,7 @@ def _validate_classification(
     missing_reviewed = sorted(set(evidence_refs) - reviewed_refs)
     if missing_reviewed:
         errors.append(f"{path}.coverage_proof_ref missing reviewed refs: {', '.join(missing_reviewed)}")
-    if is_unanswerable and proof.get("structural_unanswerability_acknowledged") is not True:
+    if is_insufficient and proof.get("structural_unanswerability_acknowledged") is not True:
         errors.append(f"{path}.coverage_proof_ref must acknowledge structural unanswerability")
     return leaf_id or None
 
@@ -995,6 +1095,16 @@ def build_researcher_sidecar_v2(
     for item in required_question_classifications:
         classification = copy.deepcopy(item)
         classification.setdefault("schema_version", RESEARCHER_CLASSIFICATION_SCHEMA_VERSION)
+        classification.setdefault("classification_quality", _default_classification_quality(classification))
+        classification.setdefault(
+            "classification_acceptance_status",
+            _default_classification_acceptance_status(classification),
+        )
+        classification.setdefault(
+            "evidence_delta_eligible_for_scae",
+            _default_evidence_delta_eligible_for_scae(classification),
+        )
+        classification.setdefault("proposed_supplemental_evidence_refs", [])
         classification.setdefault("model_execution_context_ref", model_execution_context_ref)
         classification.setdefault("model_execution_context_sha256", model_context_sha256)
         classification.setdefault("model_execution_context", copy.deepcopy(model_execution_context))
@@ -1115,6 +1225,8 @@ def validate_researcher_sidecar_v2(sidecar: Any, qdt: Any) -> ResearcherSidecarV
             "model_execution_context",
             expected_hash=str(model_context_hash),
         )
+    if not isinstance(sidecar.get("supplemental_evidence_refs", []), list):
+        errors.append("supplemental_evidence_refs must be a list")
 
     classifications = sidecar.get("required_question_classifications")
     if not isinstance(classifications, list) or not classifications:
