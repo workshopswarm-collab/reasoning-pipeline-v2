@@ -75,8 +75,10 @@ from researcher_swarm.retrieval import (  # noqa: E402
 )
 from researcher_swarm.assignments import build_leaf_research_assignments  # noqa: E402
 from researcher_swarm.subagents import build_leaf_research_barrier, build_leaf_researcher_spawn_plan  # noqa: E402
+from scae.evidence import build_evidence_delta_candidate_bundle  # noqa: E402
 from scae.intervals import build_pre_debt_ledger_output  # noqa: E402
 from scae.ledger import apply_research_sufficiency_guard, finalize_scae_probability_fields  # noqa: E402
+from scae.netting import build_leaf_cluster_netting_bundle  # noqa: E402
 from scae.persistence import write_scae_market_prediction  # noqa: E402
 from scae.prior import build_prior_context  # noqa: E402
 
@@ -577,6 +579,71 @@ def _certified_reconciliation_rows(
     return rows
 
 
+def _verified_evidence_delta_context(verification_payload: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(verification_payload, dict):
+        return None
+    classification_matrix = verification_payload.get("classification_matrix") or verification_payload.get("classification_slices")
+    direction_verification = (
+        verification_payload.get("direction_verification_slices")
+        or verification_payload.get("direction_verification_bundle")
+        or verification_payload.get("researcher_verification_bundle")
+    )
+    quality_verification = (
+        verification_payload.get("quality_verification_slices")
+        or verification_payload.get("quality_verification_bundle")
+        or verification_payload.get("researcher_verification_bundle")
+    )
+    present = [classification_matrix is not None, direction_verification is not None, quality_verification is not None]
+    if not any(present):
+        return None
+    if not all(present):
+        raise ValueError("verified SCAE evidence inputs are incomplete")
+
+    candidate_bundle = build_evidence_delta_candidate_bundle(
+        classification_matrix,
+        direction_verification_slices=direction_verification,
+        quality_verification_slices=quality_verification,
+        market_assimilation_contexts=verification_payload.get("market_assimilation_contexts"),
+        policy=verification_payload.get("scae_policy"),
+    )
+    netting_bundle = build_leaf_cluster_netting_bundle(
+        candidate_bundle,
+        policy=verification_payload.get("scae_policy"),
+    )
+    candidate_slices = candidate_bundle["candidate_slices"]
+    return {
+        "candidate_bundle": candidate_bundle,
+        "netting_bundle": netting_bundle,
+        "ledger_evidence_delta_slices": netting_bundle["cluster_slices"],
+        "candidate_slice_refs": sorted(
+            str(candidate["candidate_slice_id"])
+            for candidate in candidate_slices
+            if candidate.get("candidate_slice_id")
+        ),
+        "classification_slice_refs": sorted(
+            {
+                str(candidate["classification_slice_ref"])
+                for candidate in candidate_slices
+                if candidate.get("classification_slice_ref")
+            }
+        ),
+        "direction_verification_slice_refs": sorted(
+            {
+                str(candidate["direction_verification_slice_ref"])
+                for candidate in candidate_slices
+                if candidate.get("direction_verification_slice_ref")
+            }
+        ),
+        "quality_verification_slice_refs": sorted(
+            {
+                str(candidate["quality_verification_slice_ref"])
+                for candidate in candidate_slices
+                if candidate.get("quality_verification_slice_ref")
+            }
+        ),
+    }
+
+
 def _build_scae_ledger(
     *,
     lease: dict[str, Any],
@@ -585,6 +652,7 @@ def _build_scae_ledger(
     qdt: dict[str, Any],
     sufficiency_rows: list[dict[str, Any]],
     verification_manifest_id: str,
+    verification_payload: dict[str, Any] | None = None,
     forecast_timestamp: str,
     scoreable_pilot: bool = False,
 ) -> dict[str, Any]:
@@ -624,13 +692,61 @@ def _build_scae_ledger(
             "prior_context_ref": f"scae-prior-context:production-readiness:{contract_case_id}",
         }
     )
-    pre_debt = build_pre_debt_ledger_output(prior_context)
+    verified_evidence_context = _verified_evidence_delta_context(verification_payload)
+    pre_debt = build_pre_debt_ledger_output(
+        prior_context,
+        evidence_delta_slices=(
+            verified_evidence_context["ledger_evidence_delta_slices"]
+            if verified_evidence_context is not None
+            else None
+        ),
+    )
     pre_debt.update(
         {
             "case_key": contract_case_key,
             "run_id": context.pipeline_run_id,
             "forecast_timestamp": forecast_timestamp,
             "verification_manifest_ref": verification_manifest_id,
+            "scae_evidence_delta_candidate_bundle_digest": (
+                verified_evidence_context["candidate_bundle"]["candidate_bundle_digest"]
+                if verified_evidence_context is not None
+                else None
+            ),
+            "scae_evidence_delta_candidate_status_counts": (
+                verified_evidence_context["candidate_bundle"]["candidate_status_counts"]
+                if verified_evidence_context is not None
+                else {}
+            ),
+            "scae_leaf_cluster_netting_bundle_digest": (
+                verified_evidence_context["netting_bundle"]["netting_bundle_digest"]
+                if verified_evidence_context is not None
+                else None
+            ),
+            "scae_leaf_cluster_netting_cluster_count": (
+                verified_evidence_context["netting_bundle"]["cluster_count"]
+                if verified_evidence_context is not None
+                else 0
+            ),
+            "scae_evidence_delta_candidate_slice_refs": (
+                verified_evidence_context["candidate_slice_refs"]
+                if verified_evidence_context is not None
+                else []
+            ),
+            "scae_evidence_delta_classification_slice_refs": (
+                verified_evidence_context["classification_slice_refs"]
+                if verified_evidence_context is not None
+                else []
+            ),
+            "scae_evidence_delta_direction_verification_slice_refs": (
+                verified_evidence_context["direction_verification_slice_refs"]
+                if verified_evidence_context is not None
+                else []
+            ),
+            "scae_evidence_delta_quality_verification_slice_refs": (
+                verified_evidence_context["quality_verification_slice_refs"]
+                if verified_evidence_context is not None
+                else []
+            ),
             "adapter_mode": (
                 "structured_market_metadata_pilot_prior_only"
                 if scoreable_pilot
@@ -1468,6 +1584,7 @@ def build_stage_handlers(
             qdt=qdt,
             sufficiency_rows=verification_payload.get("research_sufficiency_reconciliation_slices") or [],
             verification_manifest_id=verification_manifest["artifact_id"],
+            verification_payload=verification_payload,
             forecast_timestamp=_forecast_timestamp(forecast_timestamp, lease),
             scoreable_pilot=scoreable_pilot,
         )

@@ -32,11 +32,19 @@ class ResearcherVerificationTest(unittest.TestCase):
         temporal_gate_status: str = "pass",
         evidence_strength: str = "strong",
         classification_confidence: str = "high",
+        classification_quality: str = "high",
         quality: dict[str, str] | None = None,
         ledger_ready: bool = True,
+        included_for_scae: bool | None = None,
+        classification_acceptance_status: str = "accepted_for_verification",
+        evidence_delta_eligible_for_scae: bool | None = None,
         source_family_id: str | None = None,
         claim_family_id: str | None = None,
     ) -> dict[str, Any]:
+        if included_for_scae is None:
+            included_for_scae = ledger_ready
+        if evidence_delta_eligible_for_scae is None:
+            evidence_delta_eligible_for_scae = impact_direction in {"supports_yes", "supports_no", "mixed"}
         return {
             "slice_id": slice_id,
             "classification_id": classification_id,
@@ -51,6 +59,9 @@ class ResearcherVerificationTest(unittest.TestCase):
             "impact_direction": impact_direction,
             "evidence_strength": evidence_strength,
             "classification_confidence": classification_confidence,
+            "classification_quality": classification_quality,
+            "classification_acceptance_status": classification_acceptance_status,
+            "evidence_delta_eligible_for_scae": evidence_delta_eligible_for_scae,
             "answer_value_extraction": {
                 "field_name": "outcome",
                 "value": value,
@@ -67,6 +78,7 @@ class ResearcherVerificationTest(unittest.TestCase):
             "research_sufficiency_certificate_ref": f"research-sufficiency:{leaf_id}",
             "coverage_proof_ref": f"coverage-proof:{leaf_id}",
             "ledger_ready": ledger_ready,
+            "included_for_scae": included_for_scae,
         }
 
     def _matrix(self, classifications: list[dict[str, Any]]) -> dict[str, Any]:
@@ -163,6 +175,10 @@ class ResearcherVerificationTest(unittest.TestCase):
                 self._classification(
                     impact_direction="neutral",
                     value="background",
+                    ledger_ready=False,
+                    included_for_scae=False,
+                    classification_acceptance_status="non_scoreable",
+                    evidence_delta_eligible_for_scae=False,
                 )
             ]
         )
@@ -174,6 +190,54 @@ class ResearcherVerificationTest(unittest.TestCase):
         self.assertEqual(row["method_status"], "verified")
         self.assertTrue(row["accepted_for_scae"])
         self.assertIn("neutral_passthrough", row["reason_codes"])
+
+    def test_mixed_direction_becomes_branch_netting_candidate(self) -> None:
+        row = self._classification(impact_direction="mixed")
+        row["evidence_refs"] = ["evidence-support", "evidence-oppose"]
+        row["supporting_evidence_refs"] = ["evidence-support"]
+        row["opposing_evidence_refs"] = ["evidence-oppose"]
+        matrix = self._matrix([row])
+
+        result = build_direction_verification_slices(matrix)
+
+        verified = result.direction_verification_slices[0]
+        self.assertEqual(verified["verified_direction"], "mixed")
+        self.assertEqual(verified["verification_status"], "accepted")
+        self.assertIn("mixed_branch_netting_candidate", verified["reason_codes"])
+
+    def test_mixed_direction_without_both_sides_is_quarantined(self) -> None:
+        row = self._classification(impact_direction="mixed")
+        row["evidence_refs"] = ["evidence-support"]
+        row["supporting_evidence_refs"] = ["evidence-support"]
+        matrix = self._matrix([row])
+
+        result = build_direction_verification_slices(matrix)
+
+        verified = result.direction_verification_slices[0]
+        self.assertEqual(verified["verified_direction"], "ambiguous")
+        self.assertEqual(verified["verification_status"], "quarantined")
+        self.assertIn("mixed_evidence_refs_missing", verified["reason_codes"])
+
+    def test_irrelevant_direction_is_verified_no_delta_passthrough(self) -> None:
+        matrix = self._matrix(
+            [
+                self._classification(
+                    impact_direction="irrelevant",
+                    evidence_strength="none",
+                    ledger_ready=False,
+                    included_for_scae=False,
+                    classification_acceptance_status="non_scoreable",
+                    evidence_delta_eligible_for_scae=False,
+                )
+            ]
+        )
+
+        result = build_direction_verification_slices(matrix)
+
+        row = result.direction_verification_slices[0]
+        self.assertEqual(row["verified_direction"], "irrelevant")
+        self.assertEqual(row["verification_status"], "accepted")
+        self.assertIn("irrelevant_no_delta_passthrough", row["reason_codes"])
 
     def test_side_map_contradiction_is_excluded(self) -> None:
         constraints = self._binary_constraints()
@@ -298,6 +362,11 @@ class ResearcherVerificationTest(unittest.TestCase):
             source_class="unknown",
             evidence_strength="none",
             classification_confidence="low",
+            classification_quality="low",
+            ledger_ready=False,
+            included_for_scae=False,
+            classification_acceptance_status="non_scoreable",
+            evidence_delta_eligible_for_scae=False,
             quality={
                 "source_authority": "unknown",
                 "directness": "unknown",
@@ -314,6 +383,19 @@ class ResearcherVerificationTest(unittest.TestCase):
         self.assertGreaterEqual(quality["raw_quality_multiplier"], 0.05)
         self.assertLessEqual(quality["raw_quality_multiplier"], 1.0)
         self.assertEqual(quality["final_quality_multiplier"], quality["raw_quality_multiplier"])
+
+    def test_low_confidence_quality_is_excluded_from_scae_quality(self) -> None:
+        row = self._classification(
+            classification_confidence="low",
+            classification_quality="high",
+            classification_acceptance_status="non_scoreable",
+        )
+
+        result = build_quality_verification_slices(self._matrix([row]))
+
+        quality = result.quality_verification_slices[0]
+        self.assertEqual(quality["quality_status"], "excluded")
+        self.assertIn("classification_confidence_low_no_scae_delta", quality["reason_codes"])
 
     def test_every_included_classification_receives_quality_verification(self) -> None:
         matrix = self._matrix(
@@ -379,6 +461,42 @@ class ResearcherVerificationTest(unittest.TestCase):
         self.assertIn("VER-004", payload["scope_boundaries"]["not_implemented"])
         self.assertFalse(payload["authority_boundary"]["writes_scae_ledger_rows"])
         self.assertEqual(payload["ready_classification_slice_refs"], [matrix["classification_slices"][0]["slice_id"]])
+
+    def test_scae_readiness_ignores_non_scoreable_no_delta_rows(self) -> None:
+        ready = self._classification(slice_id="classification-ready", classification_id="classification-ready")
+        irrelevant = self._classification(
+            slice_id="classification-irrelevant",
+            classification_id="classification-irrelevant",
+            impact_direction="irrelevant",
+            evidence_strength="none",
+            ledger_ready=False,
+            included_for_scae=False,
+            classification_acceptance_status="non_scoreable",
+            evidence_delta_eligible_for_scae=False,
+        )
+        matrix = self._matrix([ready, irrelevant])
+        direction = build_direction_verification_slices(
+            matrix,
+            market_reality_constraints=self._binary_constraints(),
+        )
+        quality = build_quality_verification_slices(matrix)
+
+        result = build_scae_readiness_reconciliation(
+            matrix,
+            direction,
+            quality,
+            qdt=self._qdt(),
+            coverage_proof_bundle=self._coverage_bundle(matrix),
+            sufficiency_reconciliation=self._sufficiency_reconciliation(),
+        )
+
+        self.assertTrue(result.ready_for_scae)
+        rows = {
+            row["classification_slice_ref"]: row
+            for row in result.readiness_reconciliation["readiness_rows"]
+        }
+        self.assertEqual(rows[irrelevant["slice_id"]]["readiness_status"], "not_scae_bound")
+        self.assertEqual(result.readiness_reconciliation["ready_classification_slice_refs"], [ready["slice_id"]])
 
     def test_scae_readiness_blocks_missing_direction_verification(self) -> None:
         matrix = self._matrix([self._classification()])

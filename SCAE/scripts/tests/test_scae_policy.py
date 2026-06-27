@@ -110,6 +110,11 @@ class ScaePolicyTest(unittest.TestCase):
         with self.assertRaisesRegex(ScaePolicyError, "correlated_quality_guard"):
             validate_scae_policy(unsafe_guard)
 
+        unsafe_strength = copy.deepcopy(policy)
+        unsafe_strength["evidence_delta_mapping"]["strength_log_odds"]["definitive"] = 0.45
+        with self.assertRaisesRegex(ScaePolicyError, "strength_log_odds"):
+            validate_scae_policy(unsafe_strength)
+
 
 if __name__ == "__main__":
     unittest.main()

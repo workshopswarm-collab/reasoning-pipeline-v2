@@ -14,6 +14,13 @@ sys.path.insert(0, str(ROOT))
 from researcher_swarm.verification import build_quality_verification_slices
 
 
+def _result_payload(result) -> dict:
+    return {
+        "quality_verification_slices": result.quality_verification_slices,
+        "quality_verification_digest": result.quality_verification_digest,
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--classification-matrix", required=True, type=Path)
@@ -23,7 +30,7 @@ def main() -> int:
         json.loads(args.classification_matrix.read_text(encoding="utf-8")),
         retrieval_packet=json.loads(args.retrieval_packet.read_text(encoding="utf-8")) if args.retrieval_packet else None,
     )
-    print(json.dumps(result.to_dict(), sort_keys=True))
+    print(json.dumps(_result_payload(result), sort_keys=True))
     return 0
 
 

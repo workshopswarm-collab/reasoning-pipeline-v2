@@ -74,18 +74,32 @@
   "evidence_delta_mapping": {
     "schema_version": "scae-evidence-delta-mapping-policy/v1",
     "strength_log_odds": {
-      "definitive": 0.45,
-      "strong": 0.3,
-      "moderate": 0.18,
+      "strong": 0.35,
+      "moderate": 0.2,
       "weak": 0.08,
-      "none": 0.0,
-      "unanswerable": 0.0
+      "none": 0.0
     },
     "direction_multipliers": {
       "supports_yes": 1.0,
       "supports_no": -1.0,
-      "neutral": 0.0
+      "mixed": 0.0,
+      "neutral": 0.0,
+      "irrelevant": 0.0,
+      "insufficient": 0.0
     },
+    "classification_confidence_discounts": {
+      "high": 1.0,
+      "medium": 0.6,
+      "low": 0.0
+    },
+    "classification_quality_discounts": {
+      "high": 1.0,
+      "medium": 0.7,
+      "low": 0.0,
+      "unusable": 0.0
+    },
+    "mixed_direction_behavior": "branch_netting_candidate_no_direct_delta",
+    "non_scoreable_behavior": "no_direct_delta_no_ledger_input",
     "quality_multiplier_source": "evidence_quality_verification_slices.final_quality_multiplier",
     "market_assimilation_multiplier_source": "market_assimilation_context.suggested_signed_delta_multiplier",
     "per_update_cap_source": "cap_stack.per_update_log_odds_cap",

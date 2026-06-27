@@ -19,7 +19,19 @@ class ScaeEvidenceDeltaTest(unittest.TestCase):
     def setUp(self):
         self.policy = default_scae_policy()
 
-    def classification(self, *, direction="supports_yes", strength="strong", slice_id="classification-slice-1"):
+    def classification(
+        self,
+        *,
+        direction="supports_yes",
+        strength="strong",
+        slice_id="classification-slice-1",
+        confidence="high",
+        quality="high",
+        acceptance_status="accepted_for_verification",
+        delta_eligible=None,
+    ):
+        if delta_eligible is None:
+            delta_eligible = direction in {"supports_yes", "supports_no", "mixed"}
         return {
             "slice_id": slice_id,
             "classification_id": f"classification-{slice_id}",
@@ -37,6 +49,12 @@ class ScaeEvidenceDeltaTest(unittest.TestCase):
             "research_sufficiency_certificate_ref": "certificate-1",
             "impact_direction": direction,
             "evidence_strength": strength,
+            "classification_confidence": confidence,
+            "classification_quality": quality,
+            "classification_acceptance_status": acceptance_status,
+            "evidence_delta_eligible_for_scae": delta_eligible,
+            "ledger_ready": acceptance_status == "accepted_for_verification" and delta_eligible is True,
+            "included_for_scae": acceptance_status == "accepted_for_verification" and delta_eligible is True,
         }
 
     def direction(self, classification, *, verified_direction=None, accepted=True):
@@ -60,6 +78,7 @@ class ScaeEvidenceDeltaTest(unittest.TestCase):
                 "recency": "fresh",
                 "specificity": "specific",
                 "classification_confidence": "high",
+                "classification_quality": "high",
             },
             "quality_correlation_groups": ["source_family:source-family-1", "claim_family:claim-family-1"],
             "raw_quality_multiplier": multiplier,
@@ -80,18 +99,21 @@ class ScaeEvidenceDeltaTest(unittest.TestCase):
         return result.candidate_slices[0]
 
     def test_verified_direction_strength_and_quality_map_to_bounded_candidate(self):
-        classification = self.classification(strength="definitive")
+        classification = self.classification(strength="strong")
 
         candidate = self.build_one(classification, quality=self.quality(classification, multiplier=1.0))
 
         self.assertEqual(candidate["candidate_status"], "accepted_candidate")
-        self.assertEqual(candidate["strength_log_odds"], self.policy["evidence_delta_mapping"]["strength_log_odds"]["definitive"])
-        self.assertEqual(candidate["pre_cap_signed_log_odds_delta"], 0.45)
+        self.assertEqual(candidate["strength_log_odds"], self.policy["evidence_delta_mapping"]["strength_log_odds"]["strong"])
+        self.assertEqual(candidate["pre_cap_signed_log_odds_delta"], 0.35)
         self.assertEqual(candidate["signed_log_odds_delta"], self.policy["cap_stack"]["per_update_log_odds_cap"])
-        self.assertTrue(candidate["bounded_by_per_update_cap"])
+        self.assertFalse(candidate["bounded_by_per_update_cap"])
         self.assertFalse(candidate["correlated_quality_guard_applied"])
         self.assertEqual(candidate["correlated_quality_guard_status"], "passed_no_repeated_quality_correlation_group")
         self.assertEqual(candidate["quality_multiplier_after_correlated_guard"], 1.0)
+        self.assertEqual(candidate["phase9_confidence_discount"], 1.0)
+        self.assertEqual(candidate["phase9_quality_discount"], 1.0)
+        self.assertEqual(candidate["effective_quality_multiplier_after_phase9_discounts"], 1.0)
         self.assertEqual(candidate["cap_stack"]["applied_stage"], "candidate_per_update_cap_only")
         self.assertEqual(
             candidate["cap_stack"]["per_cluster_log_odds_cap"],
@@ -127,7 +149,7 @@ class ScaeEvidenceDeltaTest(unittest.TestCase):
             self.assertEqual(candidate["correlated_quality_guard_status"], "capped_repeated_quality_correlation_group")
             self.assertIn("source_family:source-family-1", candidate["correlated_quality_guard_repeated_groups"])
             self.assertEqual(candidate["correlated_quality_group_counts"]["source_family:source-family-1"], 2)
-            self.assertEqual(candidate["pre_cap_signed_log_odds_delta"], round(0.3 * ceiling, 9))
+            self.assertEqual(candidate["pre_cap_signed_log_odds_delta"], round(0.35 * ceiling, 9))
             self.assertFalse(candidate["bounded_by_per_update_cap"])
 
     def test_verified_direction_controls_sign_after_claimed_impact(self):
@@ -174,13 +196,18 @@ class ScaeEvidenceDeltaTest(unittest.TestCase):
             )
 
     def test_neutral_verified_row_is_zero_delta_candidate(self):
-        classification = self.classification(direction="neutral", strength="unanswerable")
+        classification = self.classification(
+            direction="neutral",
+            strength="none",
+            acceptance_status="non_scoreable",
+            delta_eligible=False,
+        )
 
         candidate = self.build_one(classification)
 
-        self.assertEqual(candidate["candidate_status"], "neutral_zero_delta")
+        self.assertEqual(candidate["candidate_status"], "no_delta_classification")
         self.assertEqual(candidate["signed_log_odds_delta"], 0.0)
-        self.assertTrue(candidate["accepted_for_ledger_input"])
+        self.assertFalse(candidate["accepted_for_ledger_input"])
 
     def test_market_assimilation_zero_multiplier_preserves_zero_delta_context(self):
         classification = self.classification(direction="supports_yes", strength="strong")
@@ -198,6 +225,7 @@ class ScaeEvidenceDeltaTest(unittest.TestCase):
 
         self.assertEqual(candidate["candidate_status"], "zero_market_assimilation_delta")
         self.assertEqual(candidate["signed_log_odds_delta"], 0.0)
+        self.assertFalse(candidate["accepted_for_ledger_input"])
         self.assertIn("base_rate_overlap_zero_signed_delta", candidate["market_assimilation_reason_codes"])
 
     def test_quality_verification_rejection_yields_rejected_candidate(self):
@@ -206,6 +234,59 @@ class ScaeEvidenceDeltaTest(unittest.TestCase):
         candidate = self.build_one(classification, quality=self.quality(classification, accepted=False))
 
         self.assertEqual(candidate["candidate_status"], "rejected_quality_verification")
+        self.assertEqual(candidate["signed_log_odds_delta"], 0.0)
+        self.assertFalse(candidate["accepted_for_ledger_input"])
+
+    def test_medium_confidence_and_quality_apply_phase9_discounts(self):
+        classification = self.classification(confidence="medium", quality="medium")
+        quality = self.quality(classification, multiplier=1.0)
+        quality["accepted_quality_fields"]["classification_confidence"] = "medium"
+        quality["accepted_quality_fields"]["classification_quality"] = "medium"
+
+        candidate = self.build_one(classification, quality=quality)
+
+        self.assertEqual(candidate["candidate_status"], "accepted_candidate")
+        self.assertEqual(candidate["phase9_confidence_discount"], 0.6)
+        self.assertEqual(candidate["phase9_quality_discount"], 0.7)
+        self.assertEqual(candidate["pre_cap_signed_log_odds_delta"], 0.147)
+
+    def test_low_confidence_or_quality_is_not_scoreable(self):
+        classification = self.classification(confidence="low", quality="high")
+        quality = self.quality(classification, multiplier=1.0)
+        quality["accepted_quality_fields"]["classification_confidence"] = "low"
+
+        candidate = self.build_one(classification, quality=quality)
+
+        self.assertEqual(candidate["candidate_status"], "rejected_low_certainty_or_quality")
+        self.assertEqual(candidate["signed_log_odds_delta"], 0.0)
+        self.assertFalse(candidate["accepted_for_ledger_input"])
+
+    def test_mixed_classification_becomes_branch_netting_candidate_only(self):
+        classification = self.classification(direction="mixed")
+        classification["supporting_evidence_refs"] = ["evidence-support"]
+        classification["opposing_evidence_refs"] = ["evidence-oppose"]
+        direction = self.direction(classification, verified_direction="mixed", accepted=True)
+
+        candidate = self.build_one(classification, direction=direction, quality=self.quality(classification, multiplier=1.0))
+
+        self.assertEqual(candidate["candidate_status"], "mixed_branch_netting_candidate")
+        self.assertTrue(candidate["requires_branch_netting"])
+        self.assertFalse(candidate["direct_single_delta_eligible"])
+        self.assertEqual(candidate["signed_log_odds_delta"], 0.0)
+        self.assertFalse(candidate["accepted_for_ledger_input"])
+
+    def test_irrelevant_or_insufficient_rows_are_no_delta_watch_only(self):
+        classification = self.classification(
+            direction="irrelevant",
+            strength="none",
+            acceptance_status="non_scoreable",
+            delta_eligible=False,
+        )
+        direction = self.direction(classification, verified_direction="irrelevant", accepted=True)
+
+        candidate = self.build_one(classification, direction=direction, quality=self.quality(classification, accepted=False))
+
+        self.assertEqual(candidate["candidate_status"], "no_delta_classification")
         self.assertEqual(candidate["signed_log_odds_delta"], 0.0)
         self.assertFalse(candidate["accepted_for_ledger_input"])
 

@@ -17,10 +17,10 @@ from typing import Any
 from scae.policy import default_scae_policy
 
 
-SCAE_EVIDENCE_DELTA_CANDIDATE_SCHEMA_VERSION = "scae-log-odds-update-candidate-slice/v1"
+SCAE_EVIDENCE_DELTA_CANDIDATE_SCHEMA_VERSION = "scae-evidence-delta-candidate/v1"
 SCAE_EVIDENCE_DELTA_BUNDLE_SCHEMA_VERSION = "scae-evidence-delta-candidate-bundle/v1"
 SCAE_LOG_ODDS_UPDATE_SURFACE = "scae_log_odds_update_slices"
-SCAE_EVIDENCE_MAPPER_VERSION = "ads-scae-004-correlated-quality-cap-stack/v1"
+SCAE_EVIDENCE_MAPPER_VERSION = "ads-scae-004-phase9-verified-evidence-mapping/v1"
 NO_LIVE_AUTHORITY = "candidate_ledger_input_only_no_live_forecast_authority"
 CAP_STACK_FIELDS = [
     "per_update_log_odds_cap",
@@ -32,15 +32,17 @@ CAP_STACK_FIELDS = [
 
 ACCEPTED_CANDIDATE_STATUSES = {
     "accepted_candidate",
-    "neutral_zero_delta",
-    "zero_strength_delta",
-    "zero_market_assimilation_delta",
 }
 REJECTED_CANDIDATE_STATUSES = {
     "rejected_direction_verification",
     "rejected_quality_verification",
+    "rejected_classification_not_accepted",
+    "rejected_low_certainty_or_quality",
 }
 SIGNED_DIRECTIONS = {"supports_yes", "supports_no"}
+NO_DELTA_DIRECTIONS = {"neutral", "irrelevant", "insufficient"}
+BRANCH_NETTING_DIRECTIONS = {"mixed"}
+CLASSIFICATION_ACCEPTED_STATUS = "accepted_for_verification"
 
 
 class ScaeEvidenceDeltaError(ValueError):
@@ -256,25 +258,96 @@ def _cap_signed_delta(value: float, cap: float) -> tuple[float, bool]:
     return round(bounded, 9), bounded != value
 
 
+def _normalized_enum(value: Any, allowed: set[str], default: str) -> str:
+    if _is_non_empty_string(value):
+        text = str(value).strip().lower()
+        if text in allowed:
+            return text
+    return default
+
+
+def _discount_from_policy(mapping: dict[str, Any], key: str, field_name: str) -> float:
+    if key not in mapping:
+        raise ScaeEvidenceDeltaError(f"{field_name}.{key} is missing")
+    value = _numeric_multiplier(mapping[key], f"{field_name}.{key}")
+    if value > 1.0:
+        raise ScaeEvidenceDeltaError(f"{field_name}.{key} must be in [0, 1]")
+    return value
+
+
+def _classification_scoreability(classification: dict[str, Any]) -> tuple[bool, list[str]]:
+    reasons: list[str] = []
+    acceptance_status = classification.get("classification_acceptance_status")
+    if _is_non_empty_string(acceptance_status) and acceptance_status != CLASSIFICATION_ACCEPTED_STATUS:
+        reasons.append(f"classification_acceptance_status_{acceptance_status}")
+    if classification.get("evidence_delta_eligible_for_scae") is False:
+        reasons.append("evidence_delta_not_eligible_for_scae")
+    if classification.get("included_for_scae", classification.get("ledger_ready", True)) is not True:
+        reasons.append("classification_not_included_for_scae")
+    return not reasons, sorted(set(reasons))
+
+
+def _classification_confidence(
+    classification: dict[str, Any],
+    quality_row: dict[str, Any],
+) -> str:
+    accepted = quality_row.get("accepted_quality_fields") if isinstance(quality_row.get("accepted_quality_fields"), dict) else {}
+    return _normalized_enum(
+        classification.get("classification_confidence") or accepted.get("classification_confidence"),
+        {"high", "medium", "low"},
+        "low",
+    )
+
+
+def _classification_quality(
+    classification: dict[str, Any],
+    quality_row: dict[str, Any],
+) -> str:
+    accepted = quality_row.get("accepted_quality_fields") if isinstance(quality_row.get("accepted_quality_fields"), dict) else {}
+    return _normalized_enum(
+        classification.get("classification_quality") or accepted.get("classification_quality"),
+        {"high", "medium", "low", "unusable"},
+        "unusable",
+    )
+
+
 def _candidate_status(
     *,
     claimed_direction: str,
     verified_direction: str,
     direction_accepted: bool,
     quality_accepted: bool,
+    classification_scoreable: bool,
+    classification_reasons: list[str],
     strength_log_odds: float,
+    confidence_discount: float,
+    quality_discount: float,
     market_assimilation_multiplier: float,
 ) -> tuple[str, list[str]]:
     reasons: list[str] = []
+    if claimed_direction in NO_DELTA_DIRECTIONS or verified_direction in NO_DELTA_DIRECTIONS:
+        return "no_delta_classification", [f"{claimed_direction or verified_direction}_direction_no_delta"]
+    if claimed_direction in BRANCH_NETTING_DIRECTIONS or verified_direction in BRANCH_NETTING_DIRECTIONS:
+        if not classification_scoreable:
+            return "rejected_classification_not_accepted", classification_reasons
+        if not quality_accepted:
+            return "rejected_quality_verification", ["quality_verification_not_accepted"]
+        if not direction_accepted or verified_direction != "mixed":
+            return "rejected_direction_verification", ["mixed_direction_not_verified"]
+        if confidence_discount == 0.0 or quality_discount == 0.0:
+            return "rejected_low_certainty_or_quality", ["phase9_confidence_or_quality_discount_zero"]
+        return "mixed_branch_netting_candidate", ["mixed_direction_branch_netting_required"]
+    if not classification_scoreable:
+        return "rejected_classification_not_accepted", classification_reasons
     if not quality_accepted:
         return "rejected_quality_verification", ["quality_verification_not_accepted"]
-    if claimed_direction != "neutral" and (not direction_accepted or verified_direction not in SIGNED_DIRECTIONS):
+    if not direction_accepted or verified_direction not in SIGNED_DIRECTIONS:
         reasons.append("non_neutral_direction_not_verified")
         return "rejected_direction_verification", reasons
-    if claimed_direction == "neutral" or verified_direction == "neutral":
-        return "neutral_zero_delta", ["neutral_direction_zero_delta"]
     if strength_log_odds == 0.0:
         return "zero_strength_delta", ["evidence_strength_maps_to_zero"]
+    if confidence_discount == 0.0 or quality_discount == 0.0:
+        return "rejected_low_certainty_or_quality", ["phase9_confidence_or_quality_discount_zero"]
     if market_assimilation_multiplier == 0.0:
         return "zero_market_assimilation_delta", ["market_assimilation_zero_delta"]
     return "accepted_candidate", []
@@ -294,6 +367,8 @@ def build_evidence_delta_candidate_slices(
     delta_policy = active_policy["evidence_delta_mapping"]
     strength_map = delta_policy["strength_log_odds"]
     direction_multipliers = delta_policy["direction_multipliers"]
+    confidence_discounts = delta_policy["classification_confidence_discounts"]
+    quality_discounts = delta_policy["classification_quality_discounts"]
     cap_stack = active_policy["cap_stack"]
     cap_stack_context = _cap_stack_context(cap_stack)
     per_update_cap = cap_stack_context["per_update_log_odds_cap"]
@@ -325,6 +400,7 @@ def build_evidence_delta_candidate_slices(
         evidence_strength = str(classification.get("evidence_strength") or "")
         if evidence_strength not in strength_map:
             raise ScaeEvidenceDeltaError(f"unsupported evidence_strength {evidence_strength!r}")
+        classification_scoreable, classification_reasons = _classification_scoreability(classification)
         verified_direction = str(direction_row.get("verified_direction") or "")
         direction_accepted = (
             direction_row.get("accepted_for_scae") is True
@@ -361,12 +437,30 @@ def build_evidence_delta_candidate_slices(
             market_assimilation_multiplier = 1.0
 
         strength_log_odds = float(strength_map[evidence_strength])
+        classification_confidence = _classification_confidence(classification, quality_row)
+        classification_quality = _classification_quality(classification, quality_row)
+        confidence_discount = _discount_from_policy(
+            confidence_discounts,
+            classification_confidence,
+            "classification_confidence_discounts",
+        )
+        quality_discount = _discount_from_policy(
+            quality_discounts,
+            classification_quality,
+            "classification_quality_discounts",
+        )
+        phase9_discount_multiplier = round(confidence_discount * quality_discount, 9)
+        effective_quality_multiplier = round(guarded_quality_multiplier * phase9_discount_multiplier, 9)
         status, rejection_reason_codes = _candidate_status(
             claimed_direction=claimed_direction,
             verified_direction=verified_direction,
             direction_accepted=direction_accepted,
             quality_accepted=quality_accepted,
+            classification_scoreable=classification_scoreable,
+            classification_reasons=classification_reasons,
             strength_log_odds=strength_log_odds,
+            confidence_discount=confidence_discount,
+            quality_discount=quality_discount,
             market_assimilation_multiplier=market_assimilation_multiplier,
         )
         direction_multiplier = float(direction_multipliers.get(verified_direction, 0.0))
@@ -374,7 +468,7 @@ def build_evidence_delta_candidate_slices(
         bounded_delta = 0.0
         bounded_by_cap = False
         if status in ACCEPTED_CANDIDATE_STATUSES:
-            pre_cap_delta = strength_log_odds * direction_multiplier * guarded_quality_multiplier * market_assimilation_multiplier
+            pre_cap_delta = strength_log_odds * direction_multiplier * effective_quality_multiplier * market_assimilation_multiplier
             bounded_delta, bounded_by_cap = _cap_signed_delta(pre_cap_delta, per_update_cap)
 
         seed = {
@@ -383,13 +477,17 @@ def build_evidence_delta_candidate_slices(
             "quality_verification_ref": quality_row.get("quality_verification_slice_id"),
             "evidence_strength": evidence_strength,
             "verified_direction": verified_direction,
+            "classification_scoreable": classification_scoreable,
+            "classification_confidence": classification_confidence,
+            "classification_quality": classification_quality,
+            "phase9_discount_multiplier": phase9_discount_multiplier,
             "quality_multiplier_after_correlated_guard": guarded_quality_multiplier,
             "correlated_quality_guard_status": guard_result["status"],
             "correlated_quality_group_counts": guard_result["group_counts"],
             "candidate_status": status,
         }
         candidate = {
-            "artifact_type": "scae_log_odds_update_candidate_slice",
+            "artifact_type": "scae_evidence_delta_candidate",
             "schema_version": SCAE_EVIDENCE_DELTA_CANDIDATE_SCHEMA_VERSION,
             "surface_name": SCAE_LOG_ODDS_UPDATE_SURFACE,
             "feature_id": "SCAE-003",
@@ -410,11 +508,21 @@ def build_evidence_delta_candidate_slices(
             "research_sufficiency_certificate_ref": classification.get("research_sufficiency_certificate_ref"),
             "claimed_impact_direction": claimed_direction,
             "verified_direction": verified_direction,
+            "classification_acceptance_status": classification.get("classification_acceptance_status"),
+            "evidence_delta_eligible_for_scae": classification.get("evidence_delta_eligible_for_scae"),
+            "included_for_scae": classification.get("included_for_scae", classification.get("ledger_ready")),
+            "classification_scoreable_for_scae": classification_scoreable,
+            "classification_scoreability_reason_codes": classification_reasons,
             "direction_verification_slice_ref": direction_row.get("verification_slice_id"),
             "direction_verification_status": direction_row.get("verification_status"),
             "direction_multiplier": direction_multiplier,
             "evidence_strength": evidence_strength,
             "strength_log_odds": strength_log_odds,
+            "classification_confidence": classification_confidence,
+            "classification_quality": classification_quality,
+            "phase9_confidence_discount": confidence_discount,
+            "phase9_quality_discount": quality_discount,
+            "phase9_discount_multiplier": phase9_discount_multiplier,
             "quality_verification_slice_ref": quality_row.get("quality_verification_slice_id"),
             "quality_status": quality_row.get("quality_status"),
             "accepted_quality_fields": copy.deepcopy(quality_row.get("accepted_quality_fields") or {}),
@@ -423,6 +531,7 @@ def build_evidence_delta_candidate_slices(
             "verified_quality_multiplier": final_quality_multiplier,
             "quality_multiplier_before_correlated_guard": final_quality_multiplier,
             "quality_multiplier_after_correlated_guard": guarded_quality_multiplier,
+            "effective_quality_multiplier_after_phase9_discounts": effective_quality_multiplier,
             "correlated_quality_guard_applied": bool(guard_result["applied"]),
             "correlated_quality_guard_status": guard_result["status"],
             "correlated_quality_guard_repeated_groups": guard_result["repeated_groups"],
@@ -438,6 +547,10 @@ def build_evidence_delta_candidate_slices(
             "bounded_by_per_update_cap": bounded_by_cap,
             "candidate_status": status,
             "accepted_for_ledger_input": status in ACCEPTED_CANDIDATE_STATUSES,
+            "requires_branch_netting": status == "mixed_branch_netting_candidate",
+            "direct_single_delta_eligible": status in ACCEPTED_CANDIDATE_STATUSES,
+            "supporting_evidence_refs": copy.deepcopy(classification.get("supporting_evidence_refs") or []),
+            "opposing_evidence_refs": copy.deepcopy(classification.get("opposing_evidence_refs") or []),
             "rejection_reason_codes": rejection_reason_codes,
             "ledger_input_authority": NO_LIVE_AUTHORITY,
             "live_forecast_authority": False,

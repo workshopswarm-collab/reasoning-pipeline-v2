@@ -237,17 +237,16 @@ def validate_scae_policy(policy: dict[str, Any]) -> None:
     if evidence_delta_mapping.get("schema_version") != "scae-evidence-delta-mapping-policy/v1":
         raise ScaePolicyError("evidence delta mapping policy schema is invalid")
     strength_log_odds = evidence_delta_mapping.get("strength_log_odds")
-    required_strengths = {"definitive", "strong", "moderate", "weak", "none", "unanswerable"}
+    required_strengths = {"strong", "moderate", "weak", "none"}
     if not isinstance(strength_log_odds, dict) or set(strength_log_odds) != required_strengths:
         raise ScaePolicyError("evidence_delta_mapping.strength_log_odds is not canonical")
     for strength, value in strength_log_odds.items():
         if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0.0:
             raise ScaePolicyError(f"evidence_delta_mapping.strength_log_odds.{strength} must be non-negative")
-    if strength_log_odds["none"] != 0.0 or strength_log_odds["unanswerable"] != 0.0:
-        raise ScaePolicyError("none and unanswerable evidence strengths must map to zero")
+    if strength_log_odds["none"] != 0.0:
+        raise ScaePolicyError("none evidence strength must map to zero")
     if not (
-        strength_log_odds["definitive"]
-        >= strength_log_odds["strong"]
+        strength_log_odds["strong"]
         >= strength_log_odds["moderate"]
         >= strength_log_odds["weak"]
         >= strength_log_odds["none"]
@@ -255,8 +254,32 @@ def validate_scae_policy(policy: dict[str, Any]) -> None:
         raise ScaePolicyError("evidence strength log-odds mapping must be monotonic")
 
     direction_multipliers = evidence_delta_mapping.get("direction_multipliers")
-    if direction_multipliers != {"supports_yes": 1.0, "supports_no": -1.0, "neutral": 0.0}:
+    if direction_multipliers != {
+        "supports_yes": 1.0,
+        "supports_no": -1.0,
+        "mixed": 0.0,
+        "neutral": 0.0,
+        "irrelevant": 0.0,
+        "insufficient": 0.0,
+    }:
         raise ScaePolicyError("evidence_delta_mapping.direction_multipliers is not canonical")
+    if evidence_delta_mapping.get("classification_confidence_discounts") != {
+        "high": 1.0,
+        "medium": 0.6,
+        "low": 0.0,
+    }:
+        raise ScaePolicyError("classification confidence discounts are not canonical")
+    if evidence_delta_mapping.get("classification_quality_discounts") != {
+        "high": 1.0,
+        "medium": 0.7,
+        "low": 0.0,
+        "unusable": 0.0,
+    }:
+        raise ScaePolicyError("classification quality discounts are not canonical")
+    if evidence_delta_mapping.get("mixed_direction_behavior") != "branch_netting_candidate_no_direct_delta":
+        raise ScaePolicyError("mixed direction behavior must require branch/netting candidate handling")
+    if evidence_delta_mapping.get("non_scoreable_behavior") != "no_direct_delta_no_ledger_input":
+        raise ScaePolicyError("non-scoreable classifications must not become ledger inputs")
     if evidence_delta_mapping.get("quality_multiplier_source") != "evidence_quality_verification_slices.final_quality_multiplier":
         raise ScaePolicyError("quality multiplier source must be VER-002 final quality multiplier")
     if (

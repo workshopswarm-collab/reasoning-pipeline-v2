@@ -13,7 +13,10 @@ from predquant.ads_pipeline_runner import ADS_PIPELINE_STAGE_ORDER, PipelineRunn
 from predquant.ads_manifest_canary_handlers import build_stage_handlers as build_manifest_stage_handlers
 from predquant.ads_production_handlers import build_stage_handlers as build_true_production_handlers
 from predquant.ads_production_pilot_handlers import build_stage_handlers as build_production_pilot_handlers
-from predquant.ads_production_readiness_handlers import build_stage_handlers as build_production_readiness_handlers
+from predquant.ads_production_readiness_handlers import (
+    _verified_evidence_delta_context,
+    build_stage_handlers as build_production_readiness_handlers,
+)
 from predquant.ads_handoff_report import build_handoff_report
 from predquant.ads_scoreable_canary_handlers import build_stage_handlers
 from predquant.sqlite_store import SCHEMA
@@ -115,6 +118,66 @@ class AdsOperationalCanaryTest(unittest.TestCase):
             return handler
 
         return {stage: make_handler(stage) for stage in ADS_PIPELINE_STAGE_ORDER[1:]}
+
+    def test_verified_evidence_context_builds_netted_scae_inputs(self):
+        classification = {
+            "slice_id": "classification-slice-1",
+            "classification_id": "classification-1",
+            "case_id": "case-1",
+            "dispatch_id": "dispatch-1",
+            "leaf_id": "leaf-1",
+            "parent_branch_id": "branch-1",
+            "condition_scope": "unconditional",
+            "evidence_ref": "evidence-1",
+            "source_ref": "source-1",
+            "source_class": "official_or_primary",
+            "source_family_id": "source-family-1",
+            "claim_family_id": "claim-family-1",
+            "impact_direction": "supports_yes",
+            "evidence_strength": "strong",
+            "classification_confidence": "high",
+            "classification_quality": "high",
+            "classification_acceptance_status": "accepted_for_verification",
+            "evidence_delta_eligible_for_scae": True,
+            "ledger_ready": True,
+            "included_for_scae": True,
+        }
+        payload = {
+            "classification_matrix": {"classification_slices": [classification]},
+            "direction_verification_slices": [
+                {
+                    "verification_slice_id": "direction-1",
+                    "classification_slice_ref": "classification-slice-1",
+                    "verified_direction": "supports_yes",
+                    "verification_status": "accepted",
+                    "accepted_for_scae": True,
+                }
+            ],
+            "quality_verification_slices": [
+                {
+                    "quality_verification_slice_id": "quality-1",
+                    "classification_slice_ref": "classification-slice-1",
+                    "quality_status": "accepted",
+                    "accepted_for_scae": True,
+                    "accepted_quality_fields": {
+                        "classification_confidence": "high",
+                        "classification_quality": "high",
+                    },
+                    "quality_correlation_groups": ["source_family:source-family-1", "claim_family:claim-family-1"],
+                    "raw_quality_multiplier": 1.0,
+                    "final_quality_multiplier": 1.0,
+                }
+            ],
+        }
+
+        context = _verified_evidence_delta_context(payload)
+
+        self.assertIsNotNone(context)
+        self.assertEqual(context["netting_bundle"]["cluster_count"], 1)
+        self.assertEqual(context["classification_slice_refs"], ["classification-slice-1"])
+        self.assertEqual(context["direction_verification_slice_refs"], ["direction-1"])
+        self.assertEqual(context["quality_verification_slice_refs"], ["quality-1"])
+        self.assertEqual(len(context["ledger_evidence_delta_slices"]), 1)
 
     def _decomposer_live_response_path(self):
         path = Path(self.tempdir.name) / "decomposer-live-response.json"

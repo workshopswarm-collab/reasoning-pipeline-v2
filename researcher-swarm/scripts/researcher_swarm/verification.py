@@ -26,8 +26,8 @@ QUALITY_VERIFICATION_SURFACE = "evidence_quality_verification_slices"
 SCAE_READINESS_SURFACE = "scae_readiness_reconciliation"
 RESEARCH_SUFFICIENCY_RECONCILIATION_SURFACE = "research_sufficiency_reconciliation_slices"
 
-ALLOWED_IMPACT_DIRECTIONS = {"supports_yes", "supports_no", "neutral"}
-VERIFIED_DIRECTIONS = {"supports_yes", "supports_no", "neutral", "ambiguous", "excluded"}
+ALLOWED_IMPACT_DIRECTIONS = {"supports_yes", "supports_no", "mixed", "neutral", "irrelevant", "insufficient"}
+VERIFIED_DIRECTIONS = {"supports_yes", "supports_no", "mixed", "neutral", "irrelevant", "insufficient", "ambiguous", "excluded"}
 METHOD_STATUSES = {"verified", "ambiguous", "quarantined", "excluded"}
 
 QUALITY_FIELDS = (
@@ -36,6 +36,7 @@ QUALITY_FIELDS = (
     "recency",
     "specificity",
     "classification_confidence",
+    "classification_quality",
 )
 QUALITY_VALUE_ORDER = {
     "source_authority": ("unknown", "low", "medium", "high"),
@@ -43,6 +44,7 @@ QUALITY_VALUE_ORDER = {
     "recency": ("unknown", "stale", "timeless", "fresh"),
     "specificity": ("unknown", "ambiguous", "general", "specific"),
     "classification_confidence": ("unknown", "low", "medium", "high"),
+    "classification_quality": ("unknown", "unusable", "low", "medium", "high"),
 }
 QUALITY_MULTIPLIER_FACTORS = {
     "source_authority": {"high": 1.0, "medium": 0.82, "low": 0.55, "unknown": 0.35},
@@ -50,6 +52,7 @@ QUALITY_MULTIPLIER_FACTORS = {
     "recency": {"fresh": 1.0, "timeless": 0.9, "stale": 0.55, "unknown": 0.4},
     "specificity": {"specific": 1.0, "general": 0.75, "ambiguous": 0.45, "unknown": 0.35},
     "classification_confidence": {"high": 1.0, "medium": 0.75, "low": 0.45, "unknown": 0.35},
+    "classification_quality": {"high": 1.0, "medium": 0.7, "low": 0.0, "unusable": 0.0, "unknown": 0.0},
 }
 HIGH_AUTHORITY_SOURCE_CLASSES = {
     "official_or_primary",
@@ -334,6 +337,17 @@ def _extracted_direction(classification: dict[str, Any], side_mapping: dict[str,
     return None
 
 
+def _mixed_evidence_refs_present(classification: dict[str, Any]) -> bool:
+    supporting = _string_list(classification.get("supporting_evidence_refs"))
+    opposing = _string_list(classification.get("opposing_evidence_refs"))
+    evidence_refs = set(_string_list(classification.get("evidence_refs")))
+    if not supporting or not opposing:
+        return False
+    if evidence_refs and not (set(supporting) | set(opposing)) <= evidence_refs:
+        return False
+    return True
+
+
 def _direction_slice(
     *,
     classification: dict[str, Any],
@@ -425,20 +439,51 @@ def build_direction_verification_slices(
             )
             continue
 
-        if claimed_direction == "neutral":
-            reason_codes = ["neutral_passthrough"]
+        if claimed_direction in {"neutral", "irrelevant", "insufficient"}:
+            reason_codes = [f"{claimed_direction}_no_delta_passthrough"]
+            if claimed_direction == "neutral":
+                reason_codes.append("neutral_passthrough")
             rows.append(
                 _direction_slice(
                     classification=classification,
                     market_constraints_digest=constraints_digest,
                     side_mapping_digest=side_mapping_digest,
                     claimed_direction=claimed_direction,
-                    verified_direction="neutral",
+                    verified_direction=claimed_direction,
                     method_status="verified",
                     verification_status="accepted",
                     reason_codes=reason_codes,
                 )
             )
+            continue
+
+        if claimed_direction == "mixed":
+            if _mixed_evidence_refs_present(classification):
+                rows.append(
+                    _direction_slice(
+                        classification=classification,
+                        market_constraints_digest=constraints_digest,
+                        side_mapping_digest=side_mapping_digest,
+                        claimed_direction=claimed_direction,
+                        verified_direction="mixed",
+                        method_status="verified",
+                        verification_status="accepted",
+                        reason_codes=["mixed_branch_netting_candidate"],
+                    )
+                )
+            else:
+                rows.append(
+                    _direction_slice(
+                        classification=classification,
+                        market_constraints_digest=constraints_digest,
+                        side_mapping_digest=side_mapping_digest,
+                        claimed_direction=claimed_direction,
+                        verified_direction="ambiguous",
+                        method_status="quarantined",
+                        verification_status="quarantined",
+                        reason_codes=["mixed_evidence_refs_missing", "direction_ambiguous"],
+                    )
+                )
             continue
 
         if constraints_digest_mismatch:
@@ -608,6 +653,7 @@ def _claimed_quality_fields(classification: dict[str, Any]) -> dict[str, str]:
     dimensions = classification.get("evidence_quality_dimensions")
     claimed = copy.deepcopy(dimensions) if isinstance(dimensions, dict) else {}
     claimed["classification_confidence"] = classification.get("classification_confidence")
+    claimed["classification_quality"] = _classification_quality_from_dimensions(claimed)
     return {field: _normalize_quality_value(field, claimed.get(field)) for field in QUALITY_FIELDS}
 
 
@@ -632,14 +678,12 @@ def _directness_from_classification(classification: dict[str, Any], provenance: 
     strength = classification.get("evidence_strength")
     extraction = classification.get("answer_value_extraction")
     parsed_value = isinstance(extraction, dict) and extraction.get("normalization_status") == "parsed"
-    if strength in {"definitive", "strong"} and parsed_value:
+    if strength == "strong" and parsed_value:
         return "direct"
-    if strength in {"definitive", "strong", "moderate"}:
+    if strength in {"strong", "moderate"}:
         return "indirect"
     if strength in {"weak", "none"}:
         return "background"
-    if strength == "unanswerable":
-        return "unknown"
     if isinstance(provenance, dict) and _is_non_empty_string(provenance.get("claim_family_id")):
         return "indirect"
     return "unknown"
@@ -681,11 +725,32 @@ def _specificity_from_classification(classification: dict[str, Any], provenance:
 def _classification_confidence_from_classification(classification: dict[str, Any]) -> str:
     claimed = _normalize_quality_value("classification_confidence", classification.get("classification_confidence"))
     strength = classification.get("evidence_strength")
-    if strength in {"weak", "none", "unanswerable"}:
+    if strength in {"weak", "none"}:
         return "low"
     if strength == "moderate" and claimed == "high":
         return "medium"
     return claimed
+
+
+def _classification_quality_from_dimensions(fields: dict[str, Any]) -> str:
+    explicit = fields.get("classification_quality")
+    if _is_non_empty_string(explicit):
+        normalized = _normalize_quality_value("classification_quality", explicit)
+        if normalized != "unknown":
+            return normalized
+    source_authority = _normalize_quality_value("source_authority", fields.get("source_authority"))
+    directness = _normalize_quality_value("directness", fields.get("directness"))
+    recency = _normalize_quality_value("recency", fields.get("recency"))
+    specificity = _normalize_quality_value("specificity", fields.get("specificity"))
+    if source_authority == "high" and directness == "direct" and recency in {"fresh", "timeless"} and specificity == "specific":
+        return "high"
+    if source_authority in {"high", "medium"} and directness in {"direct", "indirect"}:
+        return "medium"
+    if {source_authority, directness, recency, specificity} == {"unknown"}:
+        return "unknown"
+    if source_authority == "unknown" and directness == "unknown" and recency == "unknown" and specificity == "unknown":
+        return "unknown"
+    return "low"
 
 
 def _machine_normalized_quality_fields(
@@ -694,13 +759,15 @@ def _machine_normalized_quality_fields(
     evidence: dict[str, Any] | None,
 ) -> dict[str, str]:
     source_class = classification.get("source_class") or (provenance or {}).get("source_class") or (evidence or {}).get("source_class")
-    return {
+    fields = {
         "source_authority": _source_authority_from_source_class(source_class),
         "directness": _directness_from_classification(classification, provenance),
         "recency": _recency_from_evidence(classification, evidence),
         "specificity": _specificity_from_classification(classification, provenance),
         "classification_confidence": _classification_confidence_from_classification(classification),
     }
+    fields["classification_quality"] = _classification_quality_from_dimensions(fields)
+    return fields
 
 
 def _quality_score(field: str, value: str) -> int:
@@ -836,9 +903,15 @@ def build_quality_verification_slices(
         accepted, reason_codes = _accepted_quality_fields(claimed, normalized)
         raw_multiplier, multiplier_inputs = _quality_multiplier(accepted)
         correlation_groups = _quality_correlation_groups(classification, provenance, evidence)
-        if not classification.get("ledger_ready", True):
+        if classification.get("included_for_scae", classification.get("ledger_ready", True)) is not True:
             quality_status = "excluded"
             reason_codes.append("classification_not_ledger_ready")
+        elif accepted.get("classification_confidence") == "low":
+            quality_status = "excluded"
+            reason_codes.append("classification_confidence_low_no_scae_delta")
+        elif accepted.get("classification_quality") in {"low", "unusable"}:
+            quality_status = "excluded"
+            reason_codes.append("classification_quality_low_no_scae_delta")
         elif all(accepted[field] == "unknown" for field in QUALITY_FIELDS):
             quality_status = "excluded"
             reason_codes.append("quality_all_unknown")
@@ -2027,8 +2100,9 @@ def build_scae_readiness_reconciliation(
             str(classification.get("classification_id") or "")
         )
         direction_excluded_deadlock_safe = False
+        explicitly_included = classification.get("included_for_scae", classification.get("ledger_ready", True)) is not False
         claimed_direction = str(classification.get("impact_direction") or "")
-        if claimed_direction != "neutral":
+        if explicitly_included and claimed_direction != "neutral":
             if not direction_row:
                 _append_blocker(row_blockers, "direction_verification_missing", classification=classification)
             elif direction_row.get("verification_status") == "accepted" and direction_row.get("accepted_for_scae") is not False:
@@ -2047,8 +2121,7 @@ def build_scae_readiness_reconciliation(
                     },
                 )
 
-        explicitly_included = classification.get("included_for_scae", classification.get("ledger_ready", True)) is not False
-        if classification.get("ledger_ready", True) is not True and not direction_excluded_deadlock_safe:
+        if explicitly_included and classification.get("ledger_ready", True) is not True and not direction_excluded_deadlock_safe:
             _append_blocker(row_blockers, "classification_not_ledger_ready", classification=classification)
 
         quality_row = quality_by_classification.get(classification_ref) or quality_by_classification.get(
