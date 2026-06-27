@@ -1703,6 +1703,16 @@ Success criteria:
 - No AMRG artifact writes SCAE deltas or imported market probabilities.
 - Any temp preflight outputs are deleted.
 
+2026-06-27 completion status:
+
+- `ADS Phase 5 AMRG Readiness Worker` (`019f0846-0e02-7441-86e1-efa33bfd97eb`) implemented explicit AMRG dependency readiness without making AMRG a probability source.
+- AMRG vector readiness now reports `vector_ready`, `vector_unavailable_allowed_weak_context`, or `vector_required_but_unavailable`, with Ollama route, BGE model, embedding dimension, pull policy, and diagnostics visible through the vector preflight report, operator report, artifact metadata, and live readiness.
+- AMRG assist readiness now reports `assist_not_requested_by_policy`, `assist_ready`, or `assist_failed`; default policy remains not-requested and documents that no shared AMRG runtime adapter is registered yet.
+- Model-only AMRG relationships remain weak context, forbidden AMRG assist outputs still reject probabilities/SCAE deltas, and AMRG artifacts remain non-authoritative for SCAE or forecast probabilities.
+- Parent verification passed: focused AMRG vector/context/live-readiness tests, ADS `test_ads_*.py` (`108`), full Orchestrator tests (`236`), `py_compile`, model-lane policy JSON validation, `git diff --check`, and `report_amrg_context.py --vector-preflight` smoke output showing optional vector outage as weak-context-only.
+- Default `/tmp/ads-phase5.*` clone scheduler canary passed with 13 stages, real-runtime criteria `ok=true`, issues/warnings empty, forecast decision delta `1`, market prediction delta `0`, SCAE ledger delta `0`, runtime bundle count `0`, and temp cleanup removed the clone directory.
+- Follow-up gap for later runtime work: AMRG model assist is policy-described and validator-backed, but remains not requested by default until a shared OpenClaw AMRG runtime adapter and MODEL-004 provenance lane are registered.
+
 ### Gap-Closure Phase 6 - Canary Ladder And Runtime Evidence Split
 
 Goal: make strict canaries the source of runtime truth and prevent contract-complete rows from implying runtime-ready status.

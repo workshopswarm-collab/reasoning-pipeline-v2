@@ -47,6 +47,7 @@ AMRG_MODEL_ASSIST_PACKET_SCHEMA_VERSION = "amrg-model-assist-packet/v1"
 AMRG_MODEL_ASSIST_OUTPUT_SCHEMA_VERSION = "amrg-model-assist-output/v1"
 AMRG_MODEL_ASSIST_PROVENANCE_SCHEMA_VERSION = "amrg-model-assist-provenance/v1"
 AMRG_OLLAMA_PREFLIGHT_SCHEMA_VERSION = "amrg-ollama-vector-preflight/v1"
+AMRG_DEPENDENCY_READINESS_SCHEMA_VERSION = "amrg-dependency-readiness/v1"
 AMRG_OPERATOR_REPORT_SCHEMA_VERSION = "amrg-operator-report/v1"
 AMRG_REFRESH_POLICY_SCHEMA_VERSION = "amrg-refresh-policy/v1"
 AMRG_REFRESH_LIFECYCLE_SCHEMA_VERSION = "amrg-refresh-lifecycle/v1"
@@ -128,6 +129,16 @@ MODEL_ASSIST_STATUSES = {
     "advisory_validated",
     "advisory_unavailable_non_blocking",
     "advisory_rejected_forbidden_output",
+}
+VECTOR_READINESS_STATUSES = {
+    "vector_ready",
+    "vector_unavailable_allowed_weak_context",
+    "vector_required_but_unavailable",
+}
+ASSIST_READINESS_STATUSES = {
+    "assist_not_requested_by_policy",
+    "assist_ready",
+    "assist_failed",
 }
 AMRG_ALLOWED_EFFECTS_BY_STATUS = {
     WEAK_CONTEXT_ONLY: ["decomposition_context_hint"],
@@ -382,6 +393,38 @@ def resolve_amrg_model_assist_lane(policy: dict[str, Any] | None = None) -> dict
     return dict(lane)
 
 
+def amrg_vector_pull_policy(lane: dict[str, Any]) -> dict[str, Any]:
+    configured = lane.get("pull_policy") if isinstance(lane.get("pull_policy"), dict) else {}
+    explicit_allowed = configured.get("explicit_preflight_pull_allowed")
+    if explicit_allowed is None:
+        explicit_allowed = bool(lane.get("download_required"))
+    return {
+        "download_required": bool(lane.get("download_required")),
+        "download_command_contract": lane["download_command_contract"],
+        "default_pull_allowed": bool(configured.get("default_pull_allowed", False)),
+        "explicit_preflight_pull_allowed": bool(explicit_allowed),
+        "default_tests_must_not_require_ollama": bool(
+            configured.get("default_tests_must_not_require_ollama", True)
+        ),
+    }
+
+
+def amrg_model_assist_runtime_policy(lane: dict[str, Any]) -> dict[str, Any]:
+    configured = lane.get("runtime_policy") if isinstance(lane.get("runtime_policy"), dict) else {}
+    blocker = configured.get("shared_runtime_blocker") or (
+        "AMRG assist has no registered shared runtime adapter in this phase; "
+        "the existing runtime path is decomposer/QDT-specific."
+    )
+    return {
+        "default_requested": bool(configured.get("default_requested", False)),
+        "shared_runtime_reuse_status": configured.get("shared_runtime_reuse_status", "blocked"),
+        "shared_runtime_blocker": str(blocker),
+        "oauth_route_required": bool(lane.get("oauth_route_required", False)),
+        "provider_route": lane.get("provider_route"),
+        "runtime_agent_id": lane.get("runtime_agent_id"),
+    }
+
+
 def ensure_amrg_vector_model(
     policy: dict[str, Any] | None = None,
     *,
@@ -554,6 +597,9 @@ def _preflight_failure(
     lane: dict[str, Any],
     client: Any,
     source_cutoff_timestamp: str | None,
+    pull_policy: dict[str, Any] | None = None,
+    allow_pull_requested: bool = False,
+    allow_pull_effective: bool = False,
     model_show_payload: dict[str, Any] | None = None,
     pull_attempted: bool = False,
     pull_succeeded: bool = False,
@@ -566,6 +612,9 @@ def _preflight_failure(
         "route_id": lane["route_id"],
         "resolved_model_id": lane["default_model_id"],
         "download_command_contract": lane["download_command_contract"],
+        "pull_policy": pull_policy or amrg_vector_pull_policy(lane),
+        "allow_pull_requested": allow_pull_requested,
+        "allow_pull_effective": allow_pull_effective,
         "ollama_base_url_redacted": redacted_ollama_base_url(getattr(client, "base_url", "")),
         "ollama_version": ollama_version,
         "model_digest": _model_digest_from_show_payload(model_show_payload) if model_show_payload else None,
@@ -583,6 +632,9 @@ def _preflight_failure(
                 "resolved_model_id": lane["default_model_id"],
                 "ollama_base_url_redacted": redacted_ollama_base_url(getattr(client, "base_url", "")),
                 "download_command_contract": lane["download_command_contract"],
+                "pull_policy": pull_policy or amrg_vector_pull_policy(lane),
+                "allow_pull_requested": allow_pull_requested,
+                "allow_pull_effective": allow_pull_effective,
             },
         ),
     }
@@ -596,6 +648,8 @@ def preflight_ollama_vector_embeddings(
     source_cutoff_timestamp: str | None = None,
 ) -> dict[str, Any]:
     lane = resolve_amrg_vector_embedding_lane(policy)
+    pull_policy = amrg_vector_pull_policy(lane)
+    allow_pull_effective = bool(allow_pull and pull_policy["explicit_preflight_pull_allowed"])
     client = client or OllamaEmbeddingClient()
     ollama_version = None
     try:
@@ -607,6 +661,9 @@ def preflight_ollama_vector_embeddings(
             lane=lane,
             client=client,
             source_cutoff_timestamp=source_cutoff_timestamp,
+            pull_policy=pull_policy,
+            allow_pull_requested=allow_pull,
+            allow_pull_effective=allow_pull_effective,
         )
 
     pull_attempted = False
@@ -614,12 +671,15 @@ def preflight_ollama_vector_embeddings(
     try:
         model_payload = client.show_model(lane["default_model_id"])
     except Exception:
-        if not allow_pull:
+        if not allow_pull_effective:
             return _preflight_failure(
                 "ollama_bge_model_unavailable",
                 lane=lane,
                 client=client,
                 source_cutoff_timestamp=source_cutoff_timestamp,
+                pull_policy=pull_policy,
+                allow_pull_requested=allow_pull,
+                allow_pull_effective=allow_pull_effective,
                 pull_attempted=False,
                 ollama_version=ollama_version,
             )
@@ -634,6 +694,9 @@ def preflight_ollama_vector_embeddings(
                 lane=lane,
                 client=client,
                 source_cutoff_timestamp=source_cutoff_timestamp,
+                pull_policy=pull_policy,
+                allow_pull_requested=allow_pull,
+                allow_pull_effective=allow_pull_effective,
                 pull_attempted=True,
                 pull_succeeded=False,
                 ollama_version=ollama_version,
@@ -652,6 +715,9 @@ def preflight_ollama_vector_embeddings(
             lane=lane,
             client=client,
             source_cutoff_timestamp=source_cutoff_timestamp,
+            pull_policy=pull_policy,
+            allow_pull_requested=allow_pull,
+            allow_pull_effective=allow_pull_effective,
             model_show_payload=model_payload,
             pull_attempted=pull_attempted,
             pull_succeeded=pull_succeeded,
@@ -665,6 +731,9 @@ def preflight_ollama_vector_embeddings(
         "route_id": lane["route_id"],
         "resolved_model_id": lane["default_model_id"],
         "download_command_contract": lane["download_command_contract"],
+        "pull_policy": pull_policy,
+        "allow_pull_requested": allow_pull,
+        "allow_pull_effective": allow_pull_effective,
         "ollama_base_url_redacted": redacted_ollama_base_url(getattr(client, "base_url", "")),
         "ollama_version": ollama_version,
         "model_digest": _model_digest_from_show_payload(model_payload),
@@ -674,6 +743,143 @@ def preflight_ollama_vector_embeddings(
         "embedding_dimension": AMRG_VECTOR_EMBEDDING_DIMENSION,
         "unavailable_reason": None,
         "diagnostic": None,
+    }
+
+
+def amrg_vector_readiness_status(
+    *,
+    preflight: dict[str, Any] | None = None,
+    vector_runtime_status: str | None = None,
+    vector_required: bool = False,
+) -> str:
+    ready = bool((preflight or {}).get("ok")) or vector_runtime_status == "ready"
+    if ready:
+        return "vector_ready"
+    if vector_required:
+        return "vector_required_but_unavailable"
+    return "vector_unavailable_allowed_weak_context"
+
+
+def amrg_assist_readiness_status(
+    *,
+    model_assist_status: str | None = None,
+    assist_requested_by_policy: bool = False,
+) -> str:
+    status = model_assist_status or "not_requested"
+    if status == "advisory_validated":
+        return "assist_ready"
+    if status in {
+        "not_invoked_missing_active_safe_manifest",
+        "advisory_unavailable_non_blocking",
+        "advisory_rejected_forbidden_output",
+    }:
+        return "assist_failed"
+    if status == "not_requested" and not assist_requested_by_policy:
+        return "assist_not_requested_by_policy"
+    if status == "not_requested" and assist_requested_by_policy:
+        return "assist_failed"
+    return "assist_failed"
+
+
+def build_amrg_dependency_readiness(
+    *,
+    policy: dict[str, Any] | None = None,
+    vector_preflight: dict[str, Any] | None = None,
+    vector_runtime: dict[str, Any] | None = None,
+    vector_required: bool = False,
+    model_assist_status: str | None = None,
+    assist_requested_by_policy: bool | None = None,
+) -> dict[str, Any]:
+    policy = policy or load_model_lane_policy(MODEL_LANE_POLICY_PATH)
+    vector_lane = resolve_amrg_vector_embedding_lane(policy)
+    assist_lane = resolve_amrg_model_assist_lane(policy)
+    vector_runtime = vector_runtime if isinstance(vector_runtime, dict) else {}
+    vector_preflight = vector_preflight if isinstance(vector_preflight, dict) else (vector_runtime.get("preflight") or {})
+    runtime_policy = amrg_model_assist_runtime_policy(assist_lane)
+    if assist_requested_by_policy is None:
+        assist_requested_by_policy = runtime_policy["default_requested"]
+    vector_status = amrg_vector_readiness_status(
+        preflight=vector_preflight,
+        vector_runtime_status=vector_runtime.get("status"),
+        vector_required=vector_required,
+    )
+    assist_status = amrg_assist_readiness_status(
+        model_assist_status=model_assist_status,
+        assist_requested_by_policy=bool(assist_requested_by_policy),
+    )
+    diagnostics = []
+    vector_diagnostic = vector_preflight.get("diagnostic") if isinstance(vector_preflight, dict) else None
+    if isinstance(vector_diagnostic, dict):
+        diagnostics.append(vector_diagnostic)
+    readiness = {
+        "schema_version": AMRG_DEPENDENCY_READINESS_SCHEMA_VERSION,
+        "vector_status": vector_status,
+        "vector_required": bool(vector_required),
+        "vector_ready": vector_status == "vector_ready",
+        "vector_diagnostics": diagnostics,
+        "ollama_route": {
+            "provider": vector_preflight.get("provider") or vector_lane["provider"],
+            "route_id": vector_preflight.get("route_id") or vector_lane["route_id"],
+            "resolved_model_id": vector_preflight.get("resolved_model_id") or vector_lane["default_model_id"],
+            "embedding_dimension": vector_preflight.get("embedding_dimension") or AMRG_VECTOR_EMBEDDING_DIMENSION,
+            "embed_endpoint": vector_preflight.get("embed_endpoint") or AMRG_VECTOR_EMBED_ENDPOINT,
+            "download_command_contract": vector_preflight.get("download_command_contract")
+            or vector_lane["download_command_contract"],
+            "pull_policy": vector_preflight.get("pull_policy") or amrg_vector_pull_policy(vector_lane),
+            "pull_attempted": bool(vector_preflight.get("pull_attempted")),
+            "pull_succeeded": bool(vector_preflight.get("pull_succeeded")),
+            "allow_pull_requested": bool(vector_preflight.get("allow_pull_requested")),
+            "allow_pull_effective": bool(vector_preflight.get("allow_pull_effective")),
+            "ollama_base_url_redacted": vector_preflight.get("ollama_base_url_redacted"),
+            "ollama_version": vector_preflight.get("ollama_version"),
+            "model_digest": vector_preflight.get("model_digest"),
+            "unavailable_reason": vector_preflight.get("unavailable_reason"),
+        },
+        "assist_status": assist_status,
+        "assist_requested_by_policy": bool(assist_requested_by_policy),
+        "model_assist_status": model_assist_status or "not_requested",
+        "model_assist": {
+            "model_lane_id": AMRG_MODEL_ASSIST_LANE_ID,
+            "resolved_model_id": assist_lane.get("default_model_id"),
+            "runtime_policy": runtime_policy,
+            "forbidden_outputs": sorted(assist_lane.get("forbidden_outputs", [])),
+            "authority": "advisory_only_no_promotion",
+        },
+        "authority": "dependency_readiness_only_no_probability_or_scae_authority",
+    }
+    ensure_no_raw_amrg_fields(readiness, "amrg_dependency_readiness")
+    return readiness
+
+
+def build_amrg_vector_preflight_report(
+    policy: dict[str, Any] | None = None,
+    *,
+    client: Any | None = None,
+    allow_pull: bool = False,
+    vector_required: bool = False,
+    source_cutoff_timestamp: str | None = None,
+) -> dict[str, Any]:
+    preflight = preflight_ollama_vector_embeddings(
+        policy,
+        client=client,
+        allow_pull=allow_pull,
+        source_cutoff_timestamp=source_cutoff_timestamp,
+    )
+    readiness = build_amrg_dependency_readiness(
+        policy=policy,
+        vector_preflight=preflight,
+        vector_required=vector_required,
+        model_assist_status="not_requested",
+    )
+    return {
+        "schema_version": AMRG_OLLAMA_PREFLIGHT_SCHEMA_VERSION,
+        "status": readiness["vector_status"],
+        "ok": preflight["ok"],
+        "blocking": readiness["vector_status"] == "vector_required_but_unavailable",
+        "preflight": preflight,
+        "dependency_readiness": readiness,
+        "diagnostics": readiness["vector_diagnostics"],
+        "authority": "vector_preflight_only_no_probability_or_scae_authority",
     }
 
 
@@ -3979,6 +4185,7 @@ def compact_vector_runtime_metadata(vector_runtime: dict[str, Any] | None) -> di
         return {
             "schema_version": "amrg-live-vector-runtime-summary/v1",
             "status": "not_requested",
+            "readiness_status": "vector_unavailable_allowed_weak_context",
             "vector_candidate_count": 0,
             "descriptor_count": 0,
         }
@@ -3988,6 +4195,11 @@ def compact_vector_runtime_metadata(vector_runtime: dict[str, Any] | None) -> di
     return {
         "schema_version": "amrg-live-vector-runtime-summary/v1",
         "status": vector_runtime.get("status"),
+        "readiness_status": amrg_vector_readiness_status(
+            preflight=preflight,
+            vector_runtime_status=vector_runtime.get("status"),
+            vector_required=False,
+        ),
         "preflight_status": "ok" if preflight.get("ok") else "unavailable",
         "provider": preflight.get("provider") or snapshot.get("provider"),
         "route_id": preflight.get("route_id") or snapshot.get("route_id"),
@@ -4060,6 +4272,13 @@ def build_amrg_operator_report(
         for ref in refs:
             consumed_by_ref.setdefault(ref, {"leaf_ids": [], "branch_ids": []})["branch_ids"].append(branch_id)
     vector_runtime = context.get("vector_runtime") if isinstance(context.get("vector_runtime"), dict) else {}
+    source_policy = context.get("source_policy") if isinstance(context.get("source_policy"), dict) else {}
+    vector_required = bool(source_policy.get("vector_source_required", False))
+    dependency_readiness = build_amrg_dependency_readiness(
+        vector_runtime=vector_runtime,
+        vector_required=vector_required,
+        model_assist_status=context.get("model_assist_status", "not_requested"),
+    )
     report = {
         "schema_version": AMRG_OPERATOR_REPORT_SCHEMA_VERSION,
         "candidate_set_id": context["candidate_set_id"],
@@ -4071,12 +4290,14 @@ def build_amrg_operator_report(
             for source in candidate.get("candidate_sources", [])
         )),
         "vector_status": vector_runtime.get("status", "not_requested"),
+        "vector_readiness_status": dependency_readiness["vector_status"],
         "ollama_route": {
             "provider": vector_runtime.get("provider"),
             "route_id": vector_runtime.get("route_id"),
             "resolved_model_id": vector_runtime.get("resolved_model_id"),
             "preflight_status": vector_runtime.get("preflight_status"),
             "pull_attempted": bool(vector_runtime.get("pull_attempted")),
+            "pull_policy": dependency_readiness["ollama_route"]["pull_policy"],
             "ollama_base_url_redacted": vector_runtime.get("ollama_base_url_redacted"),
         },
         "embedding": {
@@ -4087,6 +4308,8 @@ def build_amrg_operator_report(
             "index_status": vector_runtime.get("index_status"),
         },
         "model_assist_status": context.get("model_assist_status", "not_requested"),
+        "assist_readiness_status": dependency_readiness["assist_status"],
+        "dependency_readiness": dependency_readiness,
         "relationship_status_counts": dict(Counter(
             edge.get("relationship_status")
             for edge in context.get("relationship_edges", [])
@@ -4213,9 +4436,13 @@ def build_manifest_for_related_live_market_artifact(artifact: dict[str, Any], pa
                 else []
             ),
             "amrg_vector_status": (artifact.get("vector_runtime") or {}).get("status"),
+            "amrg_vector_readiness_status": artifact.get("vector_readiness_status")
+            or (artifact.get("dependency_readiness") or {}).get("vector_status"),
             "amrg_vector_preflight_status": (artifact.get("vector_runtime") or {}).get("preflight_status"),
             "amrg_vector_candidate_count": (artifact.get("vector_runtime") or {}).get("vector_candidate_count"),
             "amrg_model_assist_status": artifact.get("model_assist_status"),
+            "amrg_assist_readiness_status": artifact.get("assist_readiness_status")
+            or (artifact.get("dependency_readiness") or {}).get("assist_status"),
             "amrg_operator_report_schema_version": (
                 artifact.get("amrg_operator_report", {}).get("schema_version")
                 if isinstance(artifact.get("amrg_operator_report"), dict)
@@ -4297,6 +4524,17 @@ def materialize_related_live_market_context(
         **artifact,
         "vector_runtime": compact_vector_runtime_metadata(vector_runtime),
         "model_assist_status": model_assist_status,
+    }
+    dependency_readiness = build_amrg_dependency_readiness(
+        vector_runtime=artifact["vector_runtime"],
+        vector_required=bool((artifact.get("source_policy") or {}).get("vector_source_required", False)),
+        model_assist_status=model_assist_status,
+    )
+    artifact = {
+        **artifact,
+        "vector_readiness_status": dependency_readiness["vector_status"],
+        "assist_readiness_status": dependency_readiness["assist_status"],
+        "dependency_readiness": dependency_readiness,
     }
     artifact = attach_amrg_decomposer_context(artifact)
     artifact = {

@@ -10,7 +10,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from predquant.amrg import build_amrg_operator_report, canonical_json  # noqa: E402
+from predquant.amrg import (  # noqa: E402
+    OllamaEmbeddingClient,
+    build_amrg_operator_report,
+    build_amrg_vector_preflight_report,
+    canonical_json,
+)
 
 
 def attach_alerts(report: dict) -> dict:
@@ -19,13 +24,31 @@ def attach_alerts(report: dict) -> dict:
     report["refresh_status_counts"] = {
         str(key or "missing"): value for key, value in refresh_status_counts.items()
     }
-    if report.get("vector_status") == "unavailable":
+    if report.get("vector_readiness_status") == "vector_required_but_unavailable":
+        alerts.append(
+            {
+                "severity": "blocker",
+                "code": "amrg_vector_required_but_unavailable",
+                "message": "AMRG vector runtime is required but unavailable.",
+                "remediation": "Run AMRG vector preflight, install the configured model, or make the dependency optional.",
+            }
+        )
+    elif report.get("vector_readiness_status") == "vector_unavailable_allowed_weak_context":
         alerts.append(
             {
                 "severity": "warning",
-                "code": "amrg_vector_unavailable",
-                "message": "AMRG vector runtime is unavailable.",
+                "code": "amrg_vector_unavailable_allowed_weak_context",
+                "message": "AMRG vector runtime is unavailable and only weak-context operation is allowed.",
                 "remediation": "Run AMRG vector preflight or accept weak-context-only operation explicitly.",
+            }
+        )
+    if report.get("assist_readiness_status") == "assist_failed":
+        alerts.append(
+            {
+                "severity": "warning",
+                "code": "amrg_assist_failed",
+                "message": "AMRG model assist was requested but did not produce accepted advisory output.",
+                "remediation": "Inspect AMRG model-assist provenance and forbidden-output diagnostics.",
             }
         )
     weak_count = sum(
@@ -72,8 +95,13 @@ def attach_alerts(report: dict) -> dict:
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Build an AMRG operator report.")
-    parser.add_argument("related_market_context", type=Path)
+    parser.add_argument("related_market_context", type=Path, nargs="?")
     parser.add_argument("--question-decomposition", type=Path)
+    parser.add_argument("--vector-preflight", action="store_true")
+    parser.add_argument("--vector-required", action="store_true")
+    parser.add_argument("--allow-vector-pull", action="store_true")
+    parser.add_argument("--ollama-host")
+    parser.add_argument("--source-cutoff-timestamp")
     parser.add_argument("--include-alerts", action="store_true")
     parser.add_argument("--pretty", action="store_true")
     return parser
@@ -81,6 +109,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
+    if args.vector_preflight:
+        client = OllamaEmbeddingClient(args.ollama_host) if args.ollama_host else None
+        report = build_amrg_vector_preflight_report(
+            client=client,
+            allow_pull=args.allow_vector_pull,
+            vector_required=args.vector_required,
+            source_cutoff_timestamp=args.source_cutoff_timestamp,
+        )
+        if args.pretty:
+            print(json.dumps(report, indent=2, sort_keys=True))
+        else:
+            print(canonical_json(report))
+        return 0
+    if args.related_market_context is None:
+        raise SystemExit("related_market_context is required unless --vector-preflight is set")
     context = json.loads(args.related_market_context.read_text(encoding="utf-8"))
     qdt = (
         json.loads(args.question_decomposition.read_text(encoding="utf-8"))

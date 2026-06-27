@@ -82,6 +82,9 @@
     "amrg_model_assist": {
       "provider": "openai",
       "default_model_id": "gpt-5.4-high",
+      "provider_route": "openclaw_codex_oauth/amrg",
+      "oauth_route_required": true,
+      "runtime_agent_id": "amrg",
       "allowed_model_ids": [
         "gpt-5.4-high",
         "gpt-5.5-high"
@@ -109,7 +112,12 @@
         "concept_creation",
         "label_creation",
         "active_graph_promotion"
-      ]
+      ],
+      "runtime_policy": {
+        "default_requested": false,
+        "shared_runtime_reuse_status": "blocked",
+        "shared_runtime_blocker": "No shared AMRG runtime adapter is registered in this phase; the existing decomposer runtime is QDT-specific and MODEL-004 provenance trace currently accepts decomposer/researcher lanes only."
+      }
     },
         "native_research_candidate_discovery": {
             "provider": "openai",
@@ -219,6 +227,11 @@
       ],
       "download_required": true,
       "download_command_contract": "ollama pull BAAI/bge-base-en-v1.5",
+      "pull_policy": {
+        "default_pull_allowed": false,
+        "explicit_preflight_pull_allowed": true,
+        "default_tests_must_not_require_ollama": true
+      },
       "usage": "active_market_descriptor_embedding_for_amrg_candidate_neighbors",
       "non_blocking_runtime_behavior": "record_unavailable_diagnostic_and_continue_deterministic_candidate_sources",
       "required_artifact_fields": [

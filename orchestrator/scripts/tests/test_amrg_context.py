@@ -315,9 +315,13 @@ class AMRGContextTest(unittest.TestCase):
 
             artifact = result["artifact"]
             self.assertEqual(artifact["vector_runtime"]["status"], "ready")
+            self.assertEqual(artifact["vector_readiness_status"], "vector_ready")
             self.assertEqual(artifact["vector_runtime"]["preflight_status"], "ok")
             self.assertEqual(artifact["vector_runtime"]["model_digest"], "sha256:fixture-digest")
             self.assertEqual(artifact["model_assist_status"], "advisory_validated")
+            self.assertEqual(artifact["assist_readiness_status"], "assist_ready")
+            self.assertEqual(artifact["amrg_operator_report"]["vector_readiness_status"], "vector_ready")
+            self.assertEqual(artifact["amrg_operator_report"]["assist_readiness_status"], "assist_ready")
             self.assertEqual(artifact["refresh_policy"]["schema_version"], "amrg-refresh-policy/v1")
             self.assertEqual(artifact["refresh_policy"]["weak_relationship_context_ttl_seconds"], 24 * 60 * 60)
             self.assertTrue(result["vector_descriptor_ids"])
@@ -327,7 +331,9 @@ class AMRGContextTest(unittest.TestCase):
 
             manifest_metadata = result["manifest"]["metadata"]
             self.assertEqual(manifest_metadata["amrg_vector_status"], "ready")
+            self.assertEqual(manifest_metadata["amrg_vector_readiness_status"], "vector_ready")
             self.assertEqual(manifest_metadata["amrg_model_assist_status"], "advisory_validated")
+            self.assertEqual(manifest_metadata["amrg_assist_readiness_status"], "assist_ready")
             self.assertEqual(
                 manifest_metadata["amrg_operator_report_schema_version"],
                 "amrg-operator-report/v1",
@@ -721,6 +727,12 @@ class AMRGContextTest(unittest.TestCase):
         with self.assertRaisesRegex(Exception, "qdt_repair"):
             validate_amrg_model_assist_output(qdt_repair_output)
 
+        scae_delta_output = json.loads(json.dumps(output))
+        scae_delta_output["edge_annotations"][0].pop("probability")
+        scae_delta_output["edge_annotations"][0]["scae_delta"] = {"direction": "up"}
+        with self.assertRaisesRegex(Exception, "scae_delta"):
+            validate_amrg_model_assist_output(scae_delta_output)
+
     def test_model_assist_remains_advisory_and_model_only_candidate_stays_weak(self):
         artifact = self.build_artifact(
             [
@@ -763,6 +775,7 @@ class AMRGContextTest(unittest.TestCase):
         edge = enriched["relationship_edges"][0]
         self.assertEqual(edge["relationship_status"], "model_assisted_weak_context_only")
         self.assertEqual(edge["allowed_effects"], ["decomposition_context_hint"])
+        self.assertEqual(edge["model_assist_status"], "advisory_validated")
         self.assertIn("edge_promotion", edge["forbidden_effects"])
 
         degraded = model_assist_downgrade_for_missing_manifest({**artifact, "input_manifest_hash": None})

@@ -319,9 +319,69 @@ class AdsLiveReadinessTest(unittest.TestCase):
                 "researcher_runtime_mode": "metadata_only",
                 "research_input_mode": "structured_market_metadata_certified",
                 "amrg_refresh_status": None,
+                "amrg_vector_status": "vector_unavailable_allowed_weak_context",
+                "amrg_assist_status": "assist_not_requested_by_policy",
                 "scae_evidence_delta_ref_count": 0,
                 "supplied_scae_evidence_delta_ref_count": 0,
             },
+        )
+
+    def test_amrg_vector_optional_unavailable_is_non_blocking_readiness_signal(self):
+        report = build_live_readiness_report(
+            self.db_path,
+            runner_mode="calibration_debt_production",
+            handler_factory="predquant.ads_production_readiness_handlers:build_stage_handlers",
+            amrg_vector_preflight={
+                "ok": False,
+                "provider": "ollama",
+                "route_id": "ollama/local",
+                "resolved_model_id": "BAAI/bge-base-en-v1.5",
+                "embedding_dimension": 768,
+                "unavailable_reason": "ollama_route_unavailable",
+                "diagnostic": {
+                    "schema_version": "amrg-vector-candidate-source-diagnostic/v1",
+                    "reason_code": "amrg_vector_candidate_source_unavailable",
+                    "unavailable_reason": "ollama_route_unavailable",
+                    "candidate_source": "local_bge_vector_neighbor",
+                    "non_blocking": True,
+                    "does_not_block": ["QDT", "retrieval", "SCAE", "decision"],
+                    "source_cutoff_timestamp": None,
+                    "metadata": {},
+                },
+            },
+        )
+
+        self.assertTrue(report["ok"], report["issues"])
+        self.assertEqual(
+            report["amrg_dependency_readiness"]["vector_status"],
+            "vector_unavailable_allowed_weak_context",
+        )
+        self.assertEqual(
+            report["reported_runtime_signals"]["amrg_assist_status"],
+            "assist_not_requested_by_policy",
+        )
+
+    def test_amrg_vector_required_unavailable_blocks_readiness(self):
+        report = build_live_readiness_report(
+            self.db_path,
+            runner_mode="calibration_debt_production",
+            handler_factory="predquant.ads_production_readiness_handlers:build_stage_handlers",
+            amrg_vector_required=True,
+            amrg_vector_preflight={
+                "ok": False,
+                "provider": "ollama",
+                "route_id": "ollama/local",
+                "resolved_model_id": "BAAI/bge-base-en-v1.5",
+                "embedding_dimension": 768,
+                "unavailable_reason": "ollama_route_unavailable",
+            },
+        )
+
+        self.assertFalse(report["ok"])
+        self.assertIn("amrg_vector_required_but_unavailable", report["issues"])
+        self.assertEqual(
+            report["amrg_dependency_readiness"]["vector_status"],
+            "vector_required_but_unavailable",
         )
 
     def test_true_live_readiness_rejects_placeholder_scae_delta_refs(self):

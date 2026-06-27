@@ -14,6 +14,7 @@ from predquant.amrg import (
     AMRG_VECTOR_ROUTE_ID,
     PullResult,
     build_active_market_descriptor,
+    build_amrg_vector_preflight_report,
     build_live_amrg_vector_runtime,
     build_ready_vector_index,
     build_unavailable_vector_source_diagnostic,
@@ -197,7 +198,49 @@ class AMRGVectorTest(unittest.TestCase):
         self.assertEqual(preflight["route_id"], AMRG_VECTOR_ROUTE_ID)
         self.assertEqual(preflight["resolved_model_id"], AMRG_VECTOR_MODEL_ID)
         self.assertEqual(preflight["model_digest"], "sha256:fixture-digest")
+        self.assertFalse(preflight["pull_policy"]["default_pull_allowed"])
+        self.assertTrue(preflight["pull_policy"]["explicit_preflight_pull_allowed"])
         self.assertFalse(client.embed_calls[0]["truncate"])
+
+    def test_vector_preflight_unavailable_optional_is_non_blocking_readiness(self):
+        class UnavailableOllama:
+            base_url = "http://localhost:11434"
+
+            def version(self):
+                raise RuntimeError("ollama offline")
+
+        report = build_amrg_vector_preflight_report(
+            self.policy,
+            client=UnavailableOllama(),
+            vector_required=False,
+            source_cutoff_timestamp=self.source_cutoff,
+        )
+
+        self.assertFalse(report["ok"])
+        self.assertFalse(report["blocking"])
+        self.assertEqual(report["status"], "vector_unavailable_allowed_weak_context")
+        self.assertEqual(report["preflight"]["unavailable_reason"], "ollama_route_unavailable")
+        self.assertEqual(report["dependency_readiness"]["ollama_route"]["resolved_model_id"], AMRG_VECTOR_MODEL_ID)
+        self.assertEqual(report["dependency_readiness"]["ollama_route"]["embedding_dimension"], AMRG_VECTOR_EMBEDDING_DIMENSION)
+        self.assertEqual(report["diagnostics"][0]["reason_code"], "amrg_vector_candidate_source_unavailable")
+
+    def test_vector_preflight_required_unavailable_is_blocking_readiness(self):
+        class UnavailableOllama:
+            base_url = "http://localhost:11434"
+
+            def version(self):
+                raise RuntimeError("ollama offline")
+
+        report = build_amrg_vector_preflight_report(
+            self.policy,
+            client=UnavailableOllama(),
+            vector_required=True,
+            source_cutoff_timestamp=self.source_cutoff,
+        )
+
+        self.assertFalse(report["ok"])
+        self.assertTrue(report["blocking"])
+        self.assertEqual(report["status"], "vector_required_but_unavailable")
 
     def test_ollama_embedding_parser_rejects_wrong_dimension_and_non_finite_values(self):
         with self.assertRaisesRegex(AMRGError, "dimension"):

@@ -15,6 +15,7 @@ from predquant.ads_operational_canary import active_work_counts
 from predquant.ads_operator_review import build_ads_operator_review_report
 from predquant.ads_pipeline_runner import PIPELINE_RUN_TABLE, ensure_pipeline_runner_schema, read_pipeline_control_state
 from predquant.ads_storage_maintenance import build_storage_maintenance_plan
+from predquant.amrg import build_amrg_dependency_readiness
 from predquant.calibration_debt import build_calibration_debt_clearance_report
 from predquant.sqlite_store import ensure_schema, initialize_database
 
@@ -224,6 +225,10 @@ def build_live_readiness_report(
     protected_component_diagnostics: list[dict[str, Any]] | tuple[dict[str, Any], ...] | None = None,
     pointer_stability_evidence: dict[str, Any] | None = None,
     amrg_refresh_status: str | None = None,
+    amrg_vector_required: bool = False,
+    amrg_vector_preflight: dict[str, Any] | None = None,
+    amrg_model_assist_status: str | None = None,
+    amrg_assist_requested_by_policy: bool | None = None,
     scae_evidence_delta_refs: list[str] | tuple[str, ...] | None = None,
     require_fresh_storage_maintenance_plan: bool = False,
     include_operator_review: bool = False,
@@ -274,6 +279,12 @@ def build_live_readiness_report(
         prediction_label=prediction_label,
         evaluation_cluster_id=evaluation_cluster_id,
     )
+    amrg_dependency_readiness = build_amrg_dependency_readiness(
+        vector_preflight=amrg_vector_preflight,
+        vector_required=amrg_vector_required,
+        model_assist_status=amrg_model_assist_status or "not_requested",
+        assist_requested_by_policy=amrg_assist_requested_by_policy,
+    )
 
     module_ref = _handler_module(handler_factory)
     issues: list[str] = []
@@ -302,6 +313,13 @@ def build_live_readiness_report(
         )
     if resolved_scoreable_readiness_mode not in {None, PILOT_SCOREABLE_READINESS, TRUE_SCOREABLE_LIVE_READINESS}:
         issues.append("unknown_scoreable_readiness_mode")
+    if amrg_dependency_readiness["vector_status"] == "vector_required_but_unavailable":
+        issues.append("amrg_vector_required_but_unavailable")
+    if (
+        amrg_dependency_readiness["assist_status"] == "assist_failed"
+        and (amrg_model_assist_status is not None or amrg_dependency_readiness["assist_requested_by_policy"])
+    ):
+        issues.append("amrg_assist_failed")
 
     if require_scoreable_live:
         if module_ref == PRODUCTION_READINESS_HANDLER:
@@ -388,12 +406,15 @@ def build_live_readiness_report(
             "researcher_runtime_mode": researcher_runtime_mode,
             "research_input_mode": research_input_mode,
             "amrg_refresh_status": amrg_refresh_status,
+            "amrg_vector_status": amrg_dependency_readiness["vector_status"],
+            "amrg_assist_status": amrg_dependency_readiness["assist_status"],
             "scae_evidence_delta_ref_count": (
                 scae_evidence_signals["manifest_scae_evidence_delta_ref_count"]
                 or scae_evidence_signals["accepted_supplied_ref_count"]
             ),
             "supplied_scae_evidence_delta_ref_count": len(scae_evidence_delta_refs or []),
         },
+        "amrg_dependency_readiness": amrg_dependency_readiness,
         "scae_evidence_signal_report": scae_evidence_signals,
         "allow_canary_handler": allow_canary_handler,
         "allow_calibration_debt_scoreable_canary": allow_calibration_debt_scoreable_canary,
