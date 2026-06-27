@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from predquant.ads_operational_canary import active_work_counts
+from predquant.ads_operator_review import build_ads_operator_review_report
 from predquant.ads_pipeline_runner import ensure_pipeline_runner_schema, read_pipeline_control_state
 from predquant.ads_storage_maintenance import build_storage_maintenance_plan
 from predquant.calibration_debt import build_calibration_debt_clearance_report
@@ -91,6 +92,11 @@ def build_live_readiness_report(
     regime_diagnostics: list[dict[str, Any]] | tuple[dict[str, Any], ...] | None = None,
     protected_component_diagnostics: list[dict[str, Any]] | tuple[dict[str, Any], ...] | None = None,
     pointer_stability_evidence: dict[str, Any] | None = None,
+    amrg_refresh_status: str | None = None,
+    scae_evidence_delta_refs: list[str] | tuple[str, ...] | None = None,
+    require_fresh_storage_maintenance_plan: bool = False,
+    include_operator_review: bool = False,
+    operator_review_pipeline_run_id: str | None = None,
     max_market_snapshot_age_seconds: float = 3600.0,
     max_brier_age_seconds: float = 172800.0,
     max_resolution_sync_age_seconds: float = 5400.0,
@@ -172,10 +178,16 @@ def build_live_readiness_report(
                 issues.append("true_scoreable_live_readiness_rejects_calibration_debt_canary_bypass")
             if qdt_adapter_mode in PILOT_QDT_ADAPTER_MODES:
                 issues.append("true_scoreable_live_readiness_rejects_pilot_qdt_adapter_mode")
+                issues.append("true_production_deterministic_qdt")
             if researcher_runtime_mode == "metadata_only":
                 issues.append("true_scoreable_live_readiness_rejects_metadata_only_researcher_context")
+                issues.append("true_production_metadata_only_researcher")
             if research_input_mode in PILOT_RESEARCH_INPUT_MODES:
                 issues.append("true_scoreable_live_readiness_rejects_structured_market_metadata_only_research_input")
+            if not amrg_refresh_status:
+                issues.append("missing_amrg_refresh_status_for_promoted_effects")
+            if not scae_evidence_delta_refs:
+                issues.append("missing_scae_evidence_delta_refs")
         if (
             not calibration.get("clears_calibration_debt")
             and not allow_calibration_debt_scoreable_canary
@@ -198,6 +210,26 @@ def build_live_readiness_report(
         )
         if candidate_rows > max_storage_retention_candidate_rows:
             issues.append("storage_retention_candidates_exceed_limit")
+    candidate_rows = sum(
+        int(item.get("candidate_rows", 0))
+        for item in storage.get("retention_candidates", [])
+        if item.get("exists")
+    )
+    if require_fresh_storage_maintenance_plan and candidate_rows > 0:
+        issues.append("stale_storage_maintenance_plan")
+
+    operator_review = None
+    if include_operator_review:
+        operator_review = build_ads_operator_review_report(
+            path,
+            pipeline_run_id=operator_review_pipeline_run_id,
+            max_market_snapshot_age_seconds=max_market_snapshot_age_seconds,
+            max_resolution_sync_age_seconds=max_resolution_sync_age_seconds,
+            storage_retention_days=storage_retention_days,
+            prediction_source=prediction_source,
+            prediction_label=prediction_label,
+            evaluation_cluster_id=evaluation_cluster_id,
+        )
 
     return {
         "schema_version": LIVE_READINESS_SCHEMA_VERSION,
@@ -213,6 +245,8 @@ def build_live_readiness_report(
             "qdt_adapter_mode": qdt_adapter_mode,
             "researcher_runtime_mode": researcher_runtime_mode,
             "research_input_mode": research_input_mode,
+            "amrg_refresh_status": amrg_refresh_status,
+            "scae_evidence_delta_ref_count": len(scae_evidence_delta_refs or []),
         },
         "allow_canary_handler": allow_canary_handler,
         "allow_calibration_debt_scoreable_canary": allow_calibration_debt_scoreable_canary,
@@ -223,6 +257,7 @@ def build_live_readiness_report(
         "pipeline_control": control,
         "storage_maintenance_plan": storage,
         "calibration_debt_report": calibration,
+        "operator_review_report": operator_review,
     }
 
 

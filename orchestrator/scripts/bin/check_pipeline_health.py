@@ -42,6 +42,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--decided-market-watcher-heartbeat-file")
     parser.add_argument("--market-checker-env-file")
     parser.add_argument("--market-checker-psql")
+    parser.add_argument("--ads-operator-review", action="store_true", help="Include Phase 12 ADS operator review.")
+    parser.add_argument("--ads-pipeline-run-id")
+    parser.add_argument("--ads-storage-retention-days", type=int, default=90)
     parser.add_argument("--pretty", action="store_true")
     return parser.parse_args()
 
@@ -147,6 +150,30 @@ def build_report(db_path: Path, args: argparse.Namespace) -> dict:
             issues.append("brier_scores_stale")
         if resolution_age is not None and resolution_age > args.max_resolution_sync_age_seconds:
             issues.append("resolution_sync_stale")
+        alerts = []
+        severity_by_issue = {
+            "no_markets_loaded": "blocker",
+            "market_snapshots_stale": "blocker",
+            "resolution_sync_stale": "blocker",
+            "resolved_predictions_missing_brier": "warning",
+            "brier_scores_stale": "warning",
+        }
+        remediation_by_issue = {
+            "no_markets_loaded": "Run the market intake before pipeline operation.",
+            "market_snapshots_stale": "Refresh market snapshots before scheduler continuation.",
+            "resolution_sync_stale": "Run or repair the resolution sync.",
+            "resolved_predictions_missing_brier": "Run the scoring/calibration loop.",
+            "brier_scores_stale": "Run report_brier_scores.py --write-scorecards or the scoring loop.",
+        }
+        for issue in issues:
+            alerts.append(
+                {
+                    "severity": severity_by_issue.get(issue, "warning"),
+                    "code": issue,
+                    "message": issue.replace("_", " "),
+                    "remediation": remediation_by_issue.get(issue, "Inspect the pipeline health report."),
+                }
+            )
 
         return {
             "runner": "check_pipeline_health",
@@ -154,6 +181,11 @@ def build_report(db_path: Path, args: argparse.Namespace) -> dict:
             "ok": not issues,
             "status": "ok" if not issues else "warning",
             "issues": issues,
+            "alerts": alerts,
+            "alert_counts_by_severity": {
+                severity: sum(1 for alert in alerts if alert["severity"] == severity)
+                for severity in ("blocker", "warning", "info")
+            },
             "db_path": str(db_path),
             "counts": counts,
             "latest_snapshot_at": latest_snapshot_at,
@@ -184,6 +216,21 @@ def main() -> int:
             "db_path": str(db_path),
             "updated_at": utc_now(),
         }
+    if getattr(args, "ads_operator_review", False):
+        from predquant.ads_operator_review import build_ads_operator_review_report
+
+        operator_review = build_ads_operator_review_report(
+            db_path,
+            pipeline_run_id=args.ads_pipeline_run_id,
+            max_market_snapshot_age_seconds=args.max_market_snapshot_age_seconds,
+            max_resolution_sync_age_seconds=args.max_resolution_sync_age_seconds,
+            storage_retention_days=args.ads_storage_retention_days,
+        )
+        report["ads_operator_review_report"] = operator_review
+        if not operator_review.get("ok"):
+            report["ok"] = False
+            report["status"] = "warning"
+            report.setdefault("issues", []).append("ads_operator_review_blockers")
     write_json(args.report_file, report, args.pretty)
     write_json(args.heartbeat_file, report, args.pretty)
     print(json.dumps(report, indent=2 if args.pretty else None, sort_keys=args.pretty))

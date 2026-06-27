@@ -12,6 +12,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from predquant.ads_storage_maintenance import apply_storage_maintenance, build_storage_maintenance_plan  # noqa: E402
+from predquant.ads_operator_review import build_ads_operator_review_report  # noqa: E402
 from predquant.sqlite_store import DEFAULT_DB_PATH  # noqa: E402
 
 
@@ -25,6 +26,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--retention-days", type=int, default=90)
     parser.add_argument("--vacuum", action="store_true", help="Run VACUUM after pruning.")
     parser.add_argument("--apply", action="store_true", help="Apply deletes/checkpoint instead of dry-run planning.")
+    parser.add_argument("--operator-review", action="store_true", help="Include Phase 12 operator review.")
+    parser.add_argument("--pipeline-run-id")
     parser.add_argument("--pretty", action="store_true")
     return parser.parse_args()
 
@@ -43,6 +46,12 @@ def main() -> int:
     else:
         result = build_storage_maintenance_plan(Path(args.db_path), retention_days=args.retention_days)
         result["dry_run"] = True
+    if args.operator_review:
+        result["operator_review_report"] = build_ads_operator_review_report(
+            Path(args.db_path),
+            pipeline_run_id=args.pipeline_run_id,
+            storage_retention_days=args.retention_days,
+        )
     print(json.dumps(result, indent=2 if args.pretty else None, sort_keys=True))
     return 0
 

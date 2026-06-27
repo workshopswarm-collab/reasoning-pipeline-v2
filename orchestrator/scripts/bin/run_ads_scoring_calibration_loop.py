@@ -11,6 +11,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from predquant.ads_operator_review import build_ads_operator_review_report  # noqa: E402
 from predquant.calibration_debt import build_calibration_debt_clearance_report  # noqa: E402
 from predquant.sqlite_store import (  # noqa: E402
     DEFAULT_DB_PATH,
@@ -43,6 +44,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--regime-diagnostics-json", type=Path)
     parser.add_argument("--protected-component-diagnostics-json", type=Path)
     parser.add_argument("--pointer-stability-evidence-json", type=Path)
+    parser.add_argument("--operator-review", action="store_true", help="Include Phase 12 operator review.")
+    parser.add_argument("--pipeline-run-id")
     parser.add_argument("--pretty", action="store_true")
     return parser.parse_args()
 
@@ -78,6 +81,14 @@ def main() -> int:
             regime_diagnostics=load_json(args.regime_diagnostics_json, []),
             protected_component_diagnostics=load_json(args.protected_component_diagnostics_json, []),
             pointer_stability_evidence=load_json(args.pointer_stability_evidence_json, {}),
+            prediction_source=args.prediction_source,
+            prediction_label=args.prediction_label,
+            evaluation_cluster_id=args.evaluation_cluster_id,
+        )
+    if args.operator_review:
+        result["operator_review_report"] = build_ads_operator_review_report(
+            db_path,
+            pipeline_run_id=args.pipeline_run_id,
             prediction_source=args.prediction_source,
             prediction_label=args.prediction_label,
             evaluation_cluster_id=args.evaluation_cluster_id,

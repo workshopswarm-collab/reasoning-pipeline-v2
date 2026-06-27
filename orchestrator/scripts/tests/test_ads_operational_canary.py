@@ -22,6 +22,7 @@ from predquant.ads_production_readiness_handlers import (
     build_stage_handlers as build_production_readiness_handlers,
 )
 from predquant.ads_handoff_report import build_handoff_report
+from predquant.ads_operator_review import build_ads_operator_review_report
 from predquant.ads_real_runtime_canary import build_real_runtime_canary_report
 from predquant.ads_scoreable_canary_handlers import build_stage_handlers
 from predquant.sqlite_store import SCHEMA
@@ -456,6 +457,31 @@ class AdsOperationalCanaryTest(unittest.TestCase):
             standalone_report["prediction_delta_evidence"]["delta_source"],
             "pipeline_run_records",
         )
+        operator_report = build_ads_operator_review_report(
+            self.db_path,
+            pipeline_run_id=result["result"]["pipeline_run_id"],
+            max_market_snapshot_age_seconds=10_000_000_000,
+            max_resolution_sync_age_seconds=10_000_000_000,
+        )
+        self.assertTrue(operator_report["ok"], operator_report["alerts"])
+        self.assertTrue(operator_report["scheduler_may_continue"])
+        self.assertEqual(operator_report["run_kind"], "true_production")
+        self.assertEqual(operator_report["alert_counts_by_severity"]["blocker"], 0)
+        self.assertEqual(len(operator_report["cases"]), 1)
+        operator_case = operator_report["cases"][0]
+        self.assertEqual(operator_case["qdt_model_provenance"]["resolved_model_id"], "gpt-5.5-high")
+        self.assertTrue(operator_case["qdt_model_provenance"]["question_specific"])
+        self.assertTrue(operator_case["researcher_model_provenance"]["blocked_non_scoreable"])
+        self.assertEqual(
+            operator_case["scae_readiness"]["forecast_validity_status"],
+            "invalid_for_forecast",
+        )
+        self.assertEqual(
+            len(operator_case["decision_and_prediction"]["forecast_decision_records"]),
+            1,
+        )
+        self.assertTrue(operator_case["trace_replay_refs"]["trace_artifact_refs"])
+        self.assertTrue(operator_case["trace_replay_refs"]["replay_artifact_refs"])
         self.assertEqual(result["result"]["completed_stage_count"], len(ADS_PIPELINE_STAGE_ORDER))
         self.assertEqual(result["protected_count_deltas"]["forecast_decision_records"], 1)
         self.assertEqual(result["protected_count_deltas"]["market_predictions"], 0)
@@ -628,6 +654,41 @@ class AdsOperationalCanaryTest(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertIn("real_runtime_canary:researcher_model_runtime_not_verified", result["errors"])
         self.assertIn("researcher_model_runtime_not_verified", result["real_runtime_canary_report"]["issues"])
+
+    def test_operator_review_blocks_non_scae_probability_authority(self):
+        config = self.config(
+            require_scoreable_prediction=False,
+            require_manifest_handoffs=True,
+            require_real_runtime_canary_criteria=True,
+        )
+        handlers = build_true_production_handlers(
+            db_path=config.db_path,
+            runner_mode=config.runner_mode,
+            forecast_timestamp=config.forecast_timestamp,
+            max_cases=config.max_cases,
+            metadata=config.metadata,
+            decomposer_runtime_transport_response_path=self._decomposer_live_response_path(),
+        )
+        result = run_one_case_canary(config, handlers)
+        self.assertTrue(result["ok"], result["errors"])
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "UPDATE forecast_decision_records SET probability_source = ?",
+                ("manual_override",),
+            )
+            conn.commit()
+
+        report = build_ads_operator_review_report(
+            self.db_path,
+            pipeline_run_id=result["result"]["pipeline_run_id"],
+            max_market_snapshot_age_seconds=10_000_000_000,
+            max_resolution_sync_age_seconds=10_000_000_000,
+        )
+
+        self.assertFalse(report["ok"])
+        self.assertFalse(report["scheduler_may_continue"])
+        self.assertEqual(report["alert_counts_by_severity"]["blocker"], 1)
+        self.assertIn("non_scae_probability_authority", {alert["code"] for alert in report["alerts"]})
 
     def test_production_pilot_factory_writes_scoreable_prediction_with_manifest_handoffs(self):
         config = self.config(require_scoreable_prediction=True, require_manifest_handoffs=True)

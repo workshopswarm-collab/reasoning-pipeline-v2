@@ -257,6 +257,10 @@ class AdsLiveReadinessTest(unittest.TestCase):
         self.assertFalse(report["ok"])
         self.assertIn("true_scoreable_live_readiness_rejects_pilot_qdt_adapter_mode", report["issues"])
         self.assertIn("true_scoreable_live_readiness_rejects_metadata_only_researcher_context", report["issues"])
+        self.assertIn("true_production_deterministic_qdt", report["issues"])
+        self.assertIn("true_production_metadata_only_researcher", report["issues"])
+        self.assertIn("missing_amrg_refresh_status_for_promoted_effects", report["issues"])
+        self.assertIn("missing_scae_evidence_delta_refs", report["issues"])
         self.assertIn(
             "true_scoreable_live_readiness_rejects_structured_market_metadata_only_research_input",
             report["issues"],
@@ -267,6 +271,8 @@ class AdsLiveReadinessTest(unittest.TestCase):
                 "qdt_adapter_mode": "pilot_fixture_decomposer_contract_adapter",
                 "researcher_runtime_mode": "metadata_only",
                 "research_input_mode": "structured_market_metadata_certified",
+                "amrg_refresh_status": None,
+                "scae_evidence_delta_ref_count": 0,
             },
         )
 
@@ -282,6 +288,8 @@ class AdsLiveReadinessTest(unittest.TestCase):
             qdt_adapter_mode="decomposer_model_runtime_live",
             researcher_runtime_mode="model_executed",
             research_input_mode="verified_researcher_scae_evidence",
+            amrg_refresh_status="fresh_no_refresh_needed",
+            scae_evidence_delta_refs=("classification-slice-1",),
             first100_trace_complete=True,
             trace_manifest_count=100,
             tail_slice_diagnostics=self._passing_tail_diagnostics(),

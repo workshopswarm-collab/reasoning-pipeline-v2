@@ -52,6 +52,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--regime-diagnostics-json", type=Path)
     parser.add_argument("--protected-component-diagnostics-json", type=Path)
     parser.add_argument("--pointer-stability-evidence-json", type=Path)
+    parser.add_argument("--amrg-refresh-status")
+    parser.add_argument("--scae-evidence-delta-ref", action="append", default=[])
+    parser.add_argument("--require-fresh-storage-maintenance-plan", action="store_true")
+    parser.add_argument("--operator-review", action="store_true", help="Include Phase 12 operator review for latest or selected run.")
+    parser.add_argument("--operator-review-pipeline-run-id")
     parser.add_argument("--max-market-snapshot-age-seconds", type=float, default=3600.0)
     parser.add_argument("--max-brier-age-seconds", type=float, default=172800.0)
     parser.add_argument("--max-resolution-sync-age-seconds", type=float, default=5400.0)
@@ -85,6 +90,11 @@ def main() -> int:
         regime_diagnostics=load_json(args.regime_diagnostics_json, None),
         protected_component_diagnostics=load_json(args.protected_component_diagnostics_json, None),
         pointer_stability_evidence=load_json(args.pointer_stability_evidence_json, None),
+        amrg_refresh_status=args.amrg_refresh_status,
+        scae_evidence_delta_refs=tuple(args.scae_evidence_delta_ref),
+        require_fresh_storage_maintenance_plan=args.require_fresh_storage_maintenance_plan,
+        include_operator_review=args.operator_review,
+        operator_review_pipeline_run_id=args.operator_review_pipeline_run_id,
         max_market_snapshot_age_seconds=args.max_market_snapshot_age_seconds,
         max_brier_age_seconds=args.max_brier_age_seconds,
         max_resolution_sync_age_seconds=args.max_resolution_sync_age_seconds,
