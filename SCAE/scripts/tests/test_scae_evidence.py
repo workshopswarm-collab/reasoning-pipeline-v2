@@ -124,6 +124,22 @@ class ScaeEvidenceDeltaTest(unittest.TestCase):
         self.assertFalse(candidate["writes_scae_ledger"])
         self.assertFalse(candidate["writes_production_forecast"])
 
+    def test_runtime_sidecar_materialized_row_creates_candidate_with_no_probability_authority(self):
+        classification = self.classification(strength="moderate")
+        classification["sidecar_id"] = "researcher-sidecar-runtime-1"
+        classification["sidecar_digest"] = "sha256:" + "5" * 64
+        classification["runtime_bundle_ref"] = "artifact:runtime-bundle-1"
+
+        candidate = self.build_one(classification, quality=self.quality(classification, multiplier=1.0))
+
+        self.assertEqual(candidate["candidate_status"], "accepted_candidate")
+        self.assertEqual(candidate["sidecar_id"], "researcher-sidecar-runtime-1")
+        self.assertEqual(candidate["sidecar_digest"], "sha256:" + "5" * 64)
+        self.assertEqual(candidate["runtime_bundle_ref"], "artifact:runtime-bundle-1")
+        self.assertEqual(candidate["ledger_input_authority"], NO_LIVE_AUTHORITY)
+        self.assertFalse(candidate["live_forecast_authority"])
+        self.assertFalse(candidate["writes_production_forecast"])
+
     def test_correlated_quality_guard_lowers_repeated_group_multiplier(self):
         first = self.classification(strength="strong", slice_id="classification-slice-1")
         second = self.classification(strength="strong", slice_id="classification-slice-2")

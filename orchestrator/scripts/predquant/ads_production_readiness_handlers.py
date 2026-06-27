@@ -79,6 +79,8 @@ from researcher_swarm.retrieval import (  # noqa: E402
     finalize_retrieval_packet_for_dispatch,
 )
 from researcher_swarm.assignments import build_leaf_research_assignments  # noqa: E402
+from researcher_swarm.classification_matrix import materialize_classification_matrix  # noqa: E402
+from researcher_swarm.coverage import build_researcher_evidence_review_coverage_proof_bundle  # noqa: E402
 from researcher_swarm.openclaw_runtime import (  # noqa: E402
     OpenClawResearcherRuntimeError,
     run_openclaw_researcher_swarm_runtime,
@@ -87,6 +89,12 @@ from researcher_swarm.subagents import (  # noqa: E402
     build_leaf_research_barrier,
     build_leaf_researcher_spawn_plan,
     validate_researcher_swarm_runtime_bundle,
+)
+from researcher_swarm.verification import (  # noqa: E402
+    build_direction_verification_slices,
+    build_quality_verification_slices,
+    build_research_sufficiency_reconciliation,
+    build_scae_readiness_reconciliation,
 )
 from scae.evidence import build_evidence_delta_candidate_bundle  # noqa: E402
 from scae.intervals import build_pre_debt_ledger_output  # noqa: E402
@@ -620,6 +628,121 @@ def _certified_reconciliation_rows(
     return rows
 
 
+def _runtime_bundle_verification_payload(
+    *,
+    lease: dict[str, Any],
+    context: Any,
+    qdt: dict[str, Any],
+    evidence_packet: dict[str, Any],
+    retrieval_packet: dict[str, Any],
+    classification_payload: dict[str, Any],
+    qdt_manifest_id: str,
+    retrieval_manifest_id: str,
+    classification_manifest_id: str,
+    forecast_timestamp: str,
+) -> dict[str, Any]:
+    sidecars = classification_payload.get("sidecars")
+    if not isinstance(sidecars, list) or not sidecars:
+        raise ValueError("runtime bundle sidecars missing")
+    isolation_audits = classification_payload.get("isolation_audits")
+    if not isinstance(isolation_audits, list):
+        raise ValueError("runtime bundle isolation audits missing")
+
+    assignments = build_leaf_research_assignments(qdt=qdt, retrieval_packet=retrieval_packet)
+    classification_matrix = materialize_classification_matrix(
+        sidecars,
+        qdt,
+        retrieval_packet,
+        composite_claim_policy="split",
+    )
+    coverage_proof_bundle = build_researcher_evidence_review_coverage_proof_bundle(
+        qdt=qdt,
+        sidecars=sidecars,
+        classification_matrix=classification_matrix,
+        assignments=assignments,
+        isolation_audits=isolation_audits,
+        retrieval_packet=retrieval_packet,
+    )
+    direction = build_direction_verification_slices(
+        classification_matrix,
+        qdt=qdt,
+        evidence_packet=evidence_packet,
+    )
+    quality = build_quality_verification_slices(
+        classification_matrix,
+        retrieval_packet=retrieval_packet,
+    )
+    sufficiency = build_research_sufficiency_reconciliation(
+        qdt=qdt,
+        retrieval_packet=retrieval_packet,
+        coverage_proof_bundle=coverage_proof_bundle,
+        classification_matrix=classification_matrix,
+    )
+    readiness = build_scae_readiness_reconciliation(
+        classification_matrix,
+        direction,
+        quality,
+        qdt=qdt,
+        coverage_proof_bundle=coverage_proof_bundle,
+        sufficiency_reconciliation=sufficiency.reconciliation_bundle,
+    )
+    verification_status = (
+        "runtime_bundle_scae_ready"
+        if readiness.ready_for_scae
+        else "runtime_bundle_verification_blocked"
+    )
+    reason_codes = (
+        ["runtime_bundle_verified_for_scae_delta_intake"]
+        if readiness.ready_for_scae
+        else ["runtime_bundle_not_scae_ready", *readiness.readiness_reconciliation.get("blocker_codes", [])]
+    )
+    return {
+        "artifact_type": "classification_verification_runtime_bundle",
+        "schema_version": STAGE_SCHEMA_VERSIONS["classification_verification"],
+        "case_id": lease["case_id"],
+        "case_key": lease["case_key"],
+        "dispatch_id": lease["dispatch_id"],
+        "run_id": context.pipeline_run_id,
+        "forecast_timestamp": forecast_timestamp,
+        "qdt_ref": qdt_manifest_id,
+        "retrieval_packet_ref": retrieval_manifest_id,
+        "classification_ref": classification_manifest_id,
+        "runtime_bundle_ref": classification_manifest_id,
+        "runtime_bundle_id": classification_payload.get("runtime_bundle_id"),
+        "verification_status": verification_status,
+        "classification_matrix": classification_matrix,
+        "coverage_proof_bundle": coverage_proof_bundle,
+        "direction_verification_slices": direction.direction_verification_slices,
+        "direction_verification_digest": direction.direction_verification_digest,
+        "quality_verification_slices": quality.quality_verification_slices,
+        "quality_verification_digest": quality.quality_verification_digest,
+        "research_sufficiency_reconciliation_bundle": sufficiency.reconciliation_bundle,
+        "research_sufficiency_reconciliation_slices": sufficiency.research_sufficiency_reconciliation_slices,
+        "scae_readiness_reconciliation": readiness.readiness_reconciliation,
+        "scae_ready_classification_slice_refs": readiness.readiness_reconciliation.get(
+            "ready_classification_slice_refs",
+            [],
+        ),
+        "reason_codes": sorted(set(reason_codes)),
+        "writes_scae_delta": readiness.ready_for_scae,
+        "authority_boundary": {
+            "researcher_probability_authority": False,
+            "scae_probability_authority": False,
+            "writes_production_forecast": False,
+        },
+        "artifact_flow_refs": {
+            "classification_matrix_ref": classification_matrix.get("matrix_id"),
+            "coverage_proof_bundle_ref": coverage_proof_bundle.get("bundle_id"),
+            "direction_verification_digest": direction.direction_verification_digest,
+            "quality_verification_digest": quality.quality_verification_digest,
+            "research_sufficiency_reconciliation_ref": sufficiency.reconciliation_bundle.get(
+                "reconciliation_bundle_id"
+            ),
+            "scae_readiness_reconciliation_ref": readiness.readiness_reconciliation.get("reconciliation_id"),
+        },
+    }
+
+
 def _verified_evidence_delta_context(verification_payload: dict[str, Any] | None) -> dict[str, Any] | None:
     if not isinstance(verification_payload, dict):
         return None
@@ -639,6 +762,34 @@ def _verified_evidence_delta_context(verification_payload: dict[str, Any] | None
         return None
     if not all(present):
         raise ValueError("verified SCAE evidence inputs are incomplete")
+
+    scae_readiness = verification_payload.get("scae_readiness_reconciliation")
+    ready_refs = None
+    if isinstance(scae_readiness, dict):
+        ready_refs = {
+            str(ref)
+            for ref in scae_readiness.get("ready_classification_slice_refs", [])
+            if isinstance(ref, str) and ref.strip()
+        }
+        if scae_readiness.get("ready_for_scae") is not True:
+            ready_refs = set()
+    if ready_refs is not None:
+        if isinstance(classification_matrix, dict):
+            filtered_matrix = dict(classification_matrix)
+            filtered_matrix["classification_slices"] = [
+                row
+                for row in classification_matrix.get("classification_slices", [])
+                if isinstance(row, dict)
+                and str(row.get("slice_id") or row.get("classification_id") or "") in ready_refs
+            ]
+            classification_matrix = filtered_matrix
+        else:
+            classification_matrix = [
+                row
+                for row in classification_matrix
+                if isinstance(row, dict)
+                and str(row.get("slice_id") or row.get("classification_id") or "") in ready_refs
+            ]
 
     candidate_bundle = build_evidence_delta_candidate_bundle(
         classification_matrix,
@@ -1650,9 +1801,11 @@ def build_stage_handlers(
         context = kwargs["context"]
         lease = kwargs["lease"]
         stage_outputs = kwargs["stage_outputs"]
+        evidence_manifest = resolve_stage_output_manifest(conn, stage_outputs, "evidence_packet")
         qdt_manifest = resolve_stage_output_manifest(conn, stage_outputs, "decomposition")
         retrieval_manifest = resolve_stage_output_manifest(conn, stage_outputs, "retrieval")
         classification_manifest = resolve_stage_output_manifest(conn, stage_outputs, "researcher_classification")
+        evidence_payload = load_manifest_payload(evidence_manifest)
         qdt = load_manifest_payload(qdt_manifest)
         retrieval_packet = load_manifest_payload(retrieval_manifest)
         classification_payload = load_manifest_payload(classification_manifest)
@@ -1661,7 +1814,43 @@ def build_stage_handlers(
             and classification_payload.get("artifact_type") == "researcher_swarm_runtime_bundle"
             and classification_payload.get("proceed_to_verification_scae") is True
         )
-        if scoreable_pilot or runtime_bundle_ready:
+        if runtime_bundle_ready:
+            try:
+                payload = _runtime_bundle_verification_payload(
+                    lease=lease,
+                    context=context,
+                    qdt=qdt,
+                    evidence_packet=evidence_payload,
+                    retrieval_packet=retrieval_packet,
+                    classification_payload=classification_payload,
+                    qdt_manifest_id=qdt_manifest["artifact_id"],
+                    retrieval_manifest_id=retrieval_manifest["artifact_id"],
+                    classification_manifest_id=classification_manifest["artifact_id"],
+                    forecast_timestamp=_forecast_timestamp(forecast_timestamp, lease),
+                )
+            except ValueError as exc:
+                rows = _blocked_reconciliation_rows(qdt, "classification-verification-runtime-bundle")
+                payload = {
+                    "artifact_type": "classification_verification_runtime_bundle_block",
+                    "schema_version": STAGE_SCHEMA_VERSIONS["classification_verification"],
+                    "case_id": lease["case_id"],
+                    "case_key": lease["case_key"],
+                    "dispatch_id": lease["dispatch_id"],
+                    "run_id": context.pipeline_run_id,
+                    "forecast_timestamp": _forecast_timestamp(forecast_timestamp, lease),
+                    "qdt_ref": qdt_manifest["artifact_id"],
+                    "retrieval_packet_ref": retrieval_manifest["artifact_id"],
+                    "classification_ref": classification_manifest["artifact_id"],
+                    "runtime_bundle_ref": classification_manifest["artifact_id"],
+                    "verification_status": "runtime_bundle_verification_blocked",
+                    "research_sufficiency_reconciliation_slices": rows,
+                    "reason_codes": ["runtime_bundle_verification_failed", str(exc)[:160]],
+                    "writes_scae_delta": False,
+                }
+            verification_status = str(payload["verification_status"])
+            reason_codes = list(payload.get("reason_codes") or [])
+            file_name = "classification-verification-runtime-bundle.json"
+        elif scoreable_pilot:
             verification_ref = "classification-verification-production-pilot"
             rows = _certified_reconciliation_rows(qdt, retrieval_packet, verification_ref)
             verification_status = (
@@ -1669,45 +1858,49 @@ def build_stage_handlers(
                 if rows and all(row.get("reconciled_status") == "scae_ready_high_certainty" for row in rows)
                 else "blocked_insufficient_research"
             )
-            if runtime_bundle_ready:
-                reason_codes = (
-                    ["researcher_swarm_runtime_bundle_reconciliation_certified"]
-                    if verification_status == "structured_market_metadata_certified"
-                    else ["researcher_swarm_runtime_bundle_reconciliation_blocked"]
-                )
-                file_name = "classification-verification-runtime-bundle.json"
-            else:
-                reason_codes = (
-                    ["structured_market_metadata_reconciliation_certified"]
-                    if verification_status == "structured_market_metadata_certified"
-                    else ["structured_market_metadata_reconciliation_blocked"]
-                )
-                file_name = "classification-verification-production-pilot.json"
+            reason_codes = (
+                ["structured_market_metadata_reconciliation_certified"]
+                if verification_status == "structured_market_metadata_certified"
+                else ["structured_market_metadata_reconciliation_blocked"]
+            )
+            file_name = "classification-verification-production-pilot.json"
+            payload = {
+                "artifact_type": "classification_verification_production_pilot",
+                "schema_version": STAGE_SCHEMA_VERSIONS["classification_verification"],
+                "case_id": lease["case_id"],
+                "case_key": lease["case_key"],
+                "dispatch_id": lease["dispatch_id"],
+                "run_id": context.pipeline_run_id,
+                "forecast_timestamp": _forecast_timestamp(forecast_timestamp, lease),
+                "qdt_ref": qdt_manifest["artifact_id"],
+                "retrieval_packet_ref": retrieval_manifest["artifact_id"],
+                "classification_ref": classification_manifest["artifact_id"],
+                "verification_status": verification_status,
+                "research_sufficiency_reconciliation_slices": rows,
+                "reason_codes": reason_codes,
+                "writes_scae_delta": False,
+            }
         else:
             rows = _blocked_reconciliation_rows(qdt, "classification-verification-production-readiness")
             verification_status = "blocked_no_researcher_classifications"
             reason_codes = ["classification_dispatch_blocked"]
             file_name = "classification-verification-readiness-block.json"
-        payload = {
-            "artifact_type": (
-                "classification_verification_production_pilot"
-                if scoreable_pilot
-                else "classification_verification_readiness_block"
-            ),
-            "schema_version": STAGE_SCHEMA_VERSIONS["classification_verification"],
-            "case_id": lease["case_id"],
-            "case_key": lease["case_key"],
-            "dispatch_id": lease["dispatch_id"],
-            "run_id": context.pipeline_run_id,
-            "forecast_timestamp": _forecast_timestamp(forecast_timestamp, lease),
-            "qdt_ref": qdt_manifest["artifact_id"],
-            "retrieval_packet_ref": retrieval_manifest["artifact_id"],
-            "classification_ref": classification_manifest["artifact_id"],
-            "verification_status": verification_status,
-            "research_sufficiency_reconciliation_slices": rows,
-            "reason_codes": reason_codes,
-            "writes_scae_delta": False,
-        }
+            payload = {
+                "artifact_type": "classification_verification_readiness_block",
+                "schema_version": STAGE_SCHEMA_VERSIONS["classification_verification"],
+                "case_id": lease["case_id"],
+                "case_key": lease["case_key"],
+                "dispatch_id": lease["dispatch_id"],
+                "run_id": context.pipeline_run_id,
+                "forecast_timestamp": _forecast_timestamp(forecast_timestamp, lease),
+                "qdt_ref": qdt_manifest["artifact_id"],
+                "retrieval_packet_ref": retrieval_manifest["artifact_id"],
+                "classification_ref": classification_manifest["artifact_id"],
+                "verification_status": verification_status,
+                "research_sufficiency_reconciliation_slices": rows,
+                "reason_codes": reason_codes,
+                "writes_scae_delta": False,
+            }
         manifest, validation_id = _write_payload_manifest(
             conn,
             context=context,
@@ -1720,6 +1913,7 @@ def build_stage_handlers(
             artifact_schema_version=STAGE_SCHEMA_VERSIONS["classification_verification"],
             forecast_timestamp=forecast_timestamp,
             input_manifest_ids=[
+                evidence_manifest["artifact_id"],
                 qdt_manifest["artifact_id"],
                 retrieval_manifest["artifact_id"],
                 classification_manifest["artifact_id"],

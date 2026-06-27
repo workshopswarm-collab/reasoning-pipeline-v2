@@ -17,9 +17,48 @@ from researcher_swarm.verification import (  # noqa: E402
     build_researcher_verification_bundle,
     build_scae_readiness_reconciliation,
 )
+from researcher_swarm.classification import validate_researcher_sidecar_v2  # noqa: E402
 
 
 class ResearcherVerificationTest(unittest.TestCase):
+    def test_probability_bearing_sidecar_is_rejected_before_scae(self) -> None:
+        sidecar = {
+            "artifact_type": "researcher_sidecar",
+            "schema_version": "researcher-sidecar/v2",
+            "sidecar_contract_ref": "schema:researcher-sidecar/v2",
+            "classification_contract_ref": "schema:researcher-classification/v1",
+            "coverage_contract_ref": "schema:researcher-coverage-proof/v1",
+            "sidecar_id": "sidecar-probability",
+            "case_id": "case-1",
+            "dispatch_id": "dispatch-1",
+            "market_constraints_digest": "sha256:" + "1" * 64,
+            "model_execution_context_ref": "artifact:model-context",
+            "model_execution_context_sha256": "sha256:" + "2" * 64,
+            "required_question_classifications": [
+                {
+                    "schema_version": "researcher-classification/v1",
+                    "classification_id": "classification-probability",
+                    "leaf_id": "leaf-1",
+                    "probability": 0.73,
+                }
+            ],
+            "coverage_proofs": [{"coverage_proof_id": "coverage-proof:leaf-1", "leaf_id": "leaf-1"}],
+            "classification_matrix_digest": "sha256:" + "3" * 64,
+            "sidecar_digest": "sha256:" + "4" * 64,
+        }
+        qdt = {
+            "schema_version": "question-decomposition/v1",
+            "case_id": "case-1",
+            "dispatch_id": "dispatch-1",
+            "market_reality_constraints_digest": "sha256:" + "1" * 64,
+            "required_leaf_questions": [{"leaf_id": "leaf-1"}],
+        }
+
+        result = validate_researcher_sidecar_v2(sidecar, qdt)
+
+        self.assertFalse(result.valid)
+        self.assertTrue(any("probability is forbidden" in error for error in result.errors))
+
     def _classification(
         self,
         *,

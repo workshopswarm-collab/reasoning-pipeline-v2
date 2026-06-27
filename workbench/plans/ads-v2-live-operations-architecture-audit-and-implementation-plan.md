@@ -1640,6 +1640,16 @@ Success criteria:
 - Decision still writes no scoreable prediction in non-executing canary mode.
 - Temporary artifacts are deleted.
 
+2026-06-27 completion status:
+
+- `ADS Phase 4 Verification Intake Worker` (`019f083a-162a-7491-a1bd-6960f6ab716e`) implemented runtime-sidecar intake into classification verification and SCAE evidence delta candidates.
+- True-production classification now materializes runtime bundle sidecars into CLS-003 classification matrices, CLS-005 coverage bundles, VER direction and quality slices, VER-004 sufficiency reconciliation, and VER-003 SCAE readiness before SCAE delta intake.
+- SCAE delta intake now filters through readiness-approved classification refs and preserves sidecar provenance fields (`sidecar_id`, `sidecar_digest`, `runtime_bundle_ref`) on candidate rows while keeping SCAE as the only numeric probability authority.
+- Parent verification passed: full SCAE tests (`105`), full Researcher Swarm tests (`189`), ADS Orchestrator `test_ads_*.py` tests (`106`), focused Phase 4 tests, `py_compile` for changed modules/tests, and `git diff --check`.
+- Default `/tmp/ads-phase4.*` clone scheduler canary passed with 13 stages, real-runtime criteria `ok=true`, issues/warnings empty, forecast decision delta `1`, market prediction delta `0`, SCAE ledger delta `0`, runtime bundle count `0`, and temp cleanup removed the clone directory.
+- Positive runtime fixture coverage proves accepted runtime sidecars feed nonzero verified SCAE evidence delta refs without allowing researcher-authored probabilities.
+- Remaining runtime evidence: the default environment still blocks before certified retrieval and therefore does not execute researcher sidecars or produce SCAE deltas without the certified-retrieval fixture.
+
 ### Gap-Closure Phase 5 - AMRG Operational Readiness
 
 Goal: make AMRG dependency readiness explicit without making AMRG a probability source.

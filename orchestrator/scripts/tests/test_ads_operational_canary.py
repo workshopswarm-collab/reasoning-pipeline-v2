@@ -84,8 +84,8 @@ def _runtime_classification(
         "evidence_strength": "strong",
         "classification_confidence": "high",
         "answer_value_extraction": {
-            "field_name": "status",
-            "value": "confirmed",
+            "field_name": "outcome",
+            "value": "market_resolves_yes",
             "normalization_status": "parsed",
         },
         "evidence_quality_dimensions": {
@@ -136,6 +136,7 @@ def _fake_researcher_runtime_bundle(
     retrieval_packet: dict[str, Any],
     true_production_mode: bool,
     max_concurrent: int,
+    block_first_leaf: bool = True,
 ) -> dict[str, Any]:
     model_context = resolve_researcher_leaf_nli_model_context()
     assignments_by_leaf = {assignment["leaf_id"]: assignment for assignment in assignments}
@@ -159,7 +160,7 @@ def _fake_researcher_runtime_bundle(
     ]
     results = []
     for idx, assignment in enumerate(assignments):
-        status = "launch_blocked" if idx == 0 else "accepted_classification"
+        status = "launch_blocked" if block_first_leaf and idx == 0 else "accepted_classification"
         results.append(
             build_leaf_subagent_result(
                 assignment,
@@ -188,6 +189,10 @@ def _fake_researcher_runtime_bundle(
         true_production_mode=true_production_mode,
         max_concurrent=max_concurrent,
     )
+
+
+def _fake_researcher_runtime_bundle_all_accepted(**kwargs) -> dict[str, Any]:
+    return _fake_researcher_runtime_bundle(**kwargs, block_first_leaf=False)
 
 
 class AdsOperationalCanaryTest(unittest.TestCase):
@@ -862,6 +867,88 @@ class AdsOperationalCanaryTest(unittest.TestCase):
         self.assertEqual(metadata["runtime_sidecar_count"], 1)
         self.assertGreater(metadata["runtime_model_executed_count"], 0)
         self.assertFalse(payload["proceed_to_verification_scae"])
+        self.assertEqual(prediction_count, 0)
+
+    def test_phase4_runtime_sidecars_feed_verified_scae_evidence_delta_refs(self):
+        config = self.config(require_scoreable_prediction=False, require_manifest_handoffs=True)
+        handlers = build_production_readiness_handlers(
+            db_path=config.db_path,
+            runner_mode=config.runner_mode,
+            forecast_timestamp=config.forecast_timestamp,
+            max_cases=config.max_cases,
+            metadata=config.metadata,
+            live_fixture_retrieval=True,
+            block_at_leaf_research_barrier=True,
+            researcher_swarm_runtime_runner=_fake_researcher_runtime_bundle_all_accepted,
+        )
+        market = self.conn.execute(
+            "SELECT id, platform, external_market_id FROM markets WHERE external_market_id = ?",
+            ("operational-canary",),
+        ).fetchone()
+        snapshot = self.conn.execute(
+            "SELECT id, observed_at FROM market_snapshots WHERE market_id = ?",
+            (market[0],),
+        ).fetchone()
+        lease = {
+            "case_id": "case-phase4-runtime",
+            "case_key": f"{market[1]}:{market[2]}",
+            "dispatch_id": "dispatch-phase4-runtime",
+            "market_id": market[0],
+            "selected_snapshot_id": snapshot[0],
+            "selected_snapshot_observed_at": snapshot[1],
+            "forecast_timestamp": config.forecast_timestamp,
+        }
+        context = SimpleNamespace(pipeline_run_id="pipeline-run-phase4-runtime")
+        stage_outputs = {}
+        for stage in (
+            "evidence_packet",
+            "policy_context",
+            "related_market_context",
+            "decomposition",
+            "retrieval",
+            "researcher_classification",
+            "classification_verification",
+            "scae",
+        ):
+            stage_outputs[stage] = handlers[stage](
+                conn=self.conn,
+                context=context,
+                lease=lease,
+                stage_outputs=stage_outputs,
+            )
+
+        verification_row = self.conn.execute(
+            """
+            SELECT artifact_path
+            FROM case_artifact_manifest
+            WHERE stage = 'classification_verification'
+            ORDER BY id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+        scae_row = self.conn.execute(
+            """
+            SELECT artifact_path
+            FROM case_artifact_manifest
+            WHERE stage = 'scae'
+            ORDER BY id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+        prediction_count = self.conn.execute("SELECT COUNT(*) FROM market_predictions").fetchone()[0]
+
+        verification = json.loads(Path(verification_row["artifact_path"]).read_text(encoding="utf-8"))
+        scae = json.loads(Path(scae_row["artifact_path"]).read_text(encoding="utf-8"))
+        self.assertEqual(verification["artifact_type"], "classification_verification_runtime_bundle")
+        self.assertEqual(verification["verification_status"], "runtime_bundle_scae_ready")
+        self.assertGreater(len(verification["classification_matrix"]["classification_slices"]), 0)
+        self.assertGreater(len(verification["direction_verification_slices"]), 0)
+        self.assertGreater(len(verification["quality_verification_slices"]), 0)
+        self.assertGreater(len(verification["research_sufficiency_reconciliation_slices"]), 0)
+        self.assertTrue(verification["scae_readiness_reconciliation"]["ready_for_scae"])
+        self.assertGreater(len(scae["scae_evidence_delta_candidate_slice_refs"]), 0)
+        self.assertGreater(scae["scae_leaf_cluster_netting_cluster_count"], 0)
+        self.assertEqual(scae["scoreable_forecast_output"], 0)
         self.assertEqual(prediction_count, 0)
 
     def test_phase3_failed_researcher_transport_is_retryable_and_writes_no_scae_ready_output(self):
