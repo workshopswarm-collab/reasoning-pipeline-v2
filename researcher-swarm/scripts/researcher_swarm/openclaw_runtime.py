@@ -19,6 +19,7 @@ from .subagents import validate_researcher_swarm_runtime_bundle
 
 OPENCLAW_RESEARCHER_SWARM_AGENT_ID = "researcher-swarm"
 OPENCLAW_RESEARCHER_SWARM_PROVIDER_ROUTE = "openclaw_codex_oauth/researcher-swarm"
+LEAF_RUNTIME_REQUEST_SCHEMA_VERSION = "researcher-swarm-leaf-runtime-request/v1"
 
 
 class OpenClawResearcherRuntimeError(RuntimeError):
@@ -79,6 +80,65 @@ def _extract_reply_text(value: Any) -> str | None:
     return _extract_reply_text(value.get("result"))
 
 
+def build_leaf_scoped_runtime_requests(assignments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Build the only payloads intended for isolated leaf researcher sessions."""
+
+    requests: list[dict[str, Any]] = []
+    for assignment in assignments:
+        if not isinstance(assignment, dict):
+            continue
+        assigned_refs = assignment.get("assigned_evidence_refs")
+        if not isinstance(assigned_refs, list):
+            assigned_refs = []
+        model_context = assignment.get("model_execution_context")
+        if not isinstance(model_context, dict):
+            model_context = {}
+        output_contract = assignment.get("output_contract")
+        if not isinstance(output_contract, dict):
+            output_contract = {}
+        requests.append(
+            {
+                "schema_version": LEAF_RUNTIME_REQUEST_SCHEMA_VERSION,
+                "assignment_ref": assignment.get("assignment_id"),
+                "leaf_id": assignment.get("leaf_id"),
+                "child_session_input": {
+                    "assignment": copy.deepcopy(assignment),
+                    "allowed_evidence_refs": [
+                        item.get("evidence_ref")
+                        for item in assigned_refs
+                        if isinstance(item, dict) and item.get("evidence_ref")
+                    ],
+                    "allowed_snippet_refs": [
+                        item.get("snippet_ref")
+                        for item in assigned_refs
+                        if isinstance(item, dict) and item.get("snippet_ref")
+                    ],
+                    "schema_refs": [
+                        "schema:researcher-sidecar/v2",
+                        "schema:researcher-classification/v1",
+                        "schema:researcher-coverage-proof/v1",
+                    ],
+                    "prompt_refs": [
+                        f"prompt-template:{model_context.get('prompt_template_id')}"
+                    ]
+                    if model_context.get("prompt_template_id")
+                    else [],
+                    "output_contract": copy.deepcopy(output_contract),
+                },
+                "forbidden_context": {
+                    "sibling_assignments": False,
+                    "sibling_outputs": False,
+                    "scae_refs": False,
+                    "replay_outcomes": False,
+                    "scoring_data": False,
+                    "market_predictions": False,
+                    "probability_context": False,
+                },
+            }
+        )
+    return requests
+
+
 def parse_openclaw_researcher_swarm_stdout(stdout: str) -> dict[str, Any]:
     try:
         parsed = json.loads(stdout)
@@ -113,15 +173,17 @@ def build_researcher_swarm_openclaw_prompt(
         "true_production_mode": bool(true_production_mode),
         "max_concurrent": int(max_concurrent),
         "assignments": copy.deepcopy(assignments),
+        "leaf_runtime_requests": build_leaf_scoped_runtime_requests(assignments),
         "qdt": copy.deepcopy(qdt),
         "retrieval_packet": copy.deepcopy(retrieval_packet),
     }
     return (
         "You are ADS Researcher Swarm executing a certified leaf-research dispatch.\n\n"
         "Use fresh isolated, impermanent leaf subagent sessions for the dispatchable "
-        "leaf assignments. Each leaf subagent may see only its own assignment, "
-        "allowed artifact refs, and admitted evidence refs. Do not expose sibling "
-        "assignments, peer outputs, aggregate summaries, SCAE refs, forecasts, "
+        "leaf assignments. For each child session, use only the matching "
+        "leaf_runtime_requests[].child_session_input. Each leaf subagent may see "
+        "only its own assignment, allowed artifact refs, and admitted evidence refs. "
+        "Do not expose sibling assignments, peer outputs, aggregate summaries, SCAE refs, forecasts, "
         "decisions, scoring, replay, or outcomes. Clean up leaf sessions after "
         "their handoff where the runtime supports cleanup.\n\n"
         "Return exactly one JSON object and no Markdown: a valid "
@@ -217,6 +279,8 @@ __all__ = [
     "OPENCLAW_RESEARCHER_SWARM_AGENT_ID",
     "OPENCLAW_RESEARCHER_SWARM_PROVIDER_ROUTE",
     "OpenClawResearcherRuntimeError",
+    "LEAF_RUNTIME_REQUEST_SCHEMA_VERSION",
+    "build_leaf_scoped_runtime_requests",
     "build_researcher_swarm_openclaw_prompt",
     "parse_openclaw_researcher_swarm_stdout",
     "run_openclaw_researcher_swarm_runtime",

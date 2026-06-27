@@ -1541,12 +1541,29 @@ python3 orchestrator/scripts/bin/run_ads_operational_scheduler.py \
   --pretty
 ```
 
+Parent amendment, 2026-06-27:
+
+- Phase 2 clone evidence still shows default true-production retrieval is fail-closed when browser/native providers are unavailable, so the default clone canary may remain blocked before researcher dispatch.
+- Phase 3 positive proof should use a certified retrieval fixture or injected runtime bundle/fake runtime to prove the allowed path from retrieval sufficiency to assignments, isolated runtime collection, bundle validation, and manifest persistence.
+- Do not weaken fail-closed retrieval behavior to satisfy researcher-runtime criteria. Treat `--require-researcher-model-executed` on an uncertified default clone as a dependency signal for the retrieval/source-metadata admission phases, not as a Phase 3 failure by itself.
+
 Success criteria:
 
-- Strict canary no longer fails with `researcher_model_runtime_not_verified`.
+- Certified-retrieval fixture/canary path no longer fails with `researcher_model_runtime_not_verified`.
 - Researcher runtime bundle count and sidecar count are greater than zero when retrieval certifies dispatch.
+- Default clone canary still produces no researcher runtime launch when retrieval sufficiency is blocked.
 - Researcher artifacts remain non-authoritative for probabilities.
 - Test artifacts are deleted after each run.
+
+Phase 3 completion note, 2026-06-27:
+
+- `ADS Phase 3 Researcher Runtime Worker` implemented the runtime dispatch boundary while preserving default blocked-retrieval behavior.
+- True-production classification now launches or consumes a Researcher Swarm runtime bundle only after certified retrieval dispatch; blocked retrieval still writes the existing readiness block and performs no researcher launch.
+- Runtime bundles now carry sidecars, isolation audits, subagent results, leaf runtime status, and stricter nested validation. The OpenClaw prompt includes per-leaf `leaf_runtime_requests` so child sessions receive only their own assignment, allowed evidence/snippet refs, schemas, prompt refs, and output contract.
+- Parent verification passed: full Researcher Swarm tests (`188`), ADS Orchestrator tests (`105`), focused Phase 3 tests, `py_compile` for changed modules/tests, and `git diff --check`.
+- Default `/tmp/ads-phase3.*` clone scheduler canary passed with 13/13 stages, real-runtime criteria `ok=true`, active runs/leases 0/0, `blocked_until_certified_retrieval`, runtime bundle/sidecar/model execution counts all `0`, forecast decision delta `1`, market prediction delta `0`, and temp cleanup removed the clone directory.
+- Positive certified-retrieval fixture coverage proves assignment construction, fake runtime bundle acceptance/manifest writing, sidecar/model-execution metadata, probability non-authority, and retryable fail-closed behavior on researcher transport failure.
+- Remaining runtime evidence: a strict default clone with `--require-researcher-model-executed` still depends on later deterministic retrieval/source-metadata admission work because default retrieval is not yet certified.
 
 ### Gap-Closure Phase 4 - Verification To SCAE Evidence Delta Intake
 

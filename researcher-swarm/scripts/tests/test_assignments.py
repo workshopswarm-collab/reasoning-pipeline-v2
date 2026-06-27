@@ -447,6 +447,28 @@ class LeafResearchAssignmentContractTest(unittest.TestCase):
         validation = validate_researcher_swarm_runtime_bundle(bundle)
         self.assertTrue(validation.valid, validation.errors)
 
+    def test_runtime_bundle_validation_rejects_probability_bearing_sidecars(self) -> None:
+        assignments = build_leaf_research_assignments(qdt=self.qdt, retrieval_packet=self._certifiable_packet())
+        bundle = build_researcher_swarm_runtime_bundle(
+            assignments,
+            qdt=self.qdt,
+            retrieval_packet=self._certifiable_packet(),
+            sidecars=[
+                {
+                    "artifact_type": "researcher_sidecar",
+                    "schema_version": "researcher-sidecar/v2",
+                    "sidecar_id": "researcher-sidecar:probability-bearing",
+                    "probability": 0.62,
+                }
+            ],
+            true_production_mode=True,
+        )
+
+        validation = validate_researcher_swarm_runtime_bundle(bundle)
+
+        self.assertFalse(validation.valid)
+        self.assertIn("probability", "; ".join(validation.errors))
+
     def test_openclaw_runtime_parser_accepts_gateway_reply_bundle(self) -> None:
         assignments = build_leaf_research_assignments(qdt=self.qdt, retrieval_packet=self._certifiable_packet())
         results = [

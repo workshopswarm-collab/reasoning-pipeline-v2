@@ -980,8 +980,11 @@ def build_researcher_swarm_runtime_bundle(
         "true_production_mode": bool(true_production_mode),
         "assignment_validations": assignment_validations,
         "spawn_plan": spawn_plan,
+        "sidecars": copy.deepcopy(sidecars or []),
         "sidecar_validations": sidecar_validations,
+        "isolation_audits": copy.deepcopy(isolation_audits or []),
         "isolation_audit_validations": isolation_validations,
+        "subagent_results": copy.deepcopy(subagent_results or []),
         "leaf_research_barrier": barrier,
         "leaf_research_barrier_validation": barrier_validation,
         "leaf_runtime_status": leaf_runtime_status,
@@ -1043,13 +1046,36 @@ def validate_researcher_swarm_runtime_bundle(bundle: Any) -> LeafSubagentContrac
                 errors.append(f"authority_boundary.{field} must be false")
     for field in (
         "assignment_validations",
+        "sidecars",
         "sidecar_validations",
+        "isolation_audits",
         "isolation_audit_validations",
+        "subagent_results",
         "leaf_runtime_status",
         "validation_errors",
     ):
         if not isinstance(bundle.get(field), list):
             errors.append(f"{field} must be a list")
+    for field in ("assignment_validations", "sidecar_validations", "isolation_audit_validations"):
+        rows = bundle.get(field)
+        if not isinstance(rows, list):
+            continue
+        for idx, row in enumerate(rows):
+            validation = row.get("validation") if isinstance(row, dict) else None
+            if not isinstance(validation, dict):
+                errors.append(f"{field}[{idx}].validation must be an object")
+            elif validation.get("valid") is not True:
+                nested_errors = validation.get("errors") if isinstance(validation.get("errors"), list) else []
+                detail = "; ".join(str(error) for error in nested_errors) or "invalid nested artifact"
+                errors.append(f"{field}[{idx}] invalid: {detail}")
+    if isinstance(bundle.get("leaf_research_barrier_validation"), dict):
+        barrier_validation = bundle["leaf_research_barrier_validation"]
+        if barrier_validation.get("valid") is not True:
+            nested_errors = barrier_validation.get("errors") if isinstance(barrier_validation.get("errors"), list) else []
+            detail = "; ".join(str(error) for error in nested_errors) or "invalid leaf research barrier"
+            errors.append("leaf_research_barrier_validation invalid: " + detail)
+    if isinstance(bundle.get("validation_errors"), list) and bundle["validation_errors"]:
+        errors.append("validation_errors must be empty for accepted runtime bundles")
     if bundle.get("all_leaves_have_assignment_and_resolution") is not True and bundle.get("all_leaves_have_assignment_and_resolution") is not False:
         errors.append("all_leaves_have_assignment_and_resolution must be a boolean")
     if bundle.get("proceed_to_verification_scae") is not True and bundle.get("proceed_to_verification_scae") is not False:

@@ -5,6 +5,8 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -15,6 +17,7 @@ from predquant.ads_production_handlers import (
     ADS_PRODUCTION_STAGE_FAILURE_POLICY_ID,
     ADS_PRODUCTION_STAGE_FAILURE_POLICY_SCHEMA_VERSION,
     build_stage_handlers as build_true_production_handlers,
+    wrap_production_stage_handler,
 )
 from predquant.ads_production_pilot_handlers import build_stage_handlers as build_production_pilot_handlers
 from predquant.ads_production_readiness_handlers import (
@@ -26,6 +29,165 @@ from predquant.ads_operator_review import build_ads_operator_review_report
 from predquant.ads_real_runtime_canary import build_real_runtime_canary_report
 from predquant.ads_scoreable_canary_handlers import build_stage_handlers
 from predquant.sqlite_store import SCHEMA
+from researcher_swarm.classification import build_researcher_sidecar_v2
+from researcher_swarm.isolation import build_researcher_context_isolation_audit
+from researcher_swarm.model_context import RESEARCHER_PROVIDER_MODEL_KEY, resolve_researcher_leaf_nli_model_context
+from researcher_swarm.subagents import build_leaf_subagent_result, build_researcher_swarm_runtime_bundle
+
+
+def _provenance_by_evidence_ref(packet: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    rows: dict[str, dict[str, Any]] = {}
+    for item in [
+        *packet.get("retrieval_provenance_records", []),
+        *packet.get("retrieval_evidence_provenance_slices", []),
+    ]:
+        if isinstance(item, dict) and item.get("evidence_ref"):
+            rows[str(item["evidence_ref"])] = item
+    return rows
+
+
+def _first_assignment_evidence(
+    packet: dict[str, Any],
+    assignment: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    evidence_ref = assignment["assigned_evidence_refs"][0]["evidence_ref"]
+    provenance = _provenance_by_evidence_ref(packet)[evidence_ref]
+    for result in packet.get("leaf_retrieval_results", []):
+        if not isinstance(result, dict):
+            continue
+        for evidence in result.get("selected_evidence", []):
+            if isinstance(evidence, dict) and evidence.get("evidence_ref") == evidence_ref:
+                return evidence, provenance
+    raise AssertionError(f"missing evidence fixture {evidence_ref}")
+
+
+def _runtime_classification(
+    qdt: dict[str, Any],
+    packet: dict[str, Any],
+    assignment: dict[str, Any],
+) -> dict[str, Any]:
+    leaves = {
+        str(leaf["leaf_id"]): leaf
+        for leaf in qdt.get("required_leaf_questions", [])
+        if isinstance(leaf, dict) and leaf.get("leaf_id")
+    }
+    evidence, provenance = _first_assignment_evidence(packet, assignment)
+    leaf = leaves[assignment["leaf_id"]]
+    return {
+        "leaf_id": assignment["leaf_id"],
+        "parent_branch_id": assignment["parent_branch_id"],
+        "leaf_condition_scope": leaf.get("leaf_condition_scope", "unconditional"),
+        "evidence_ref": evidence["evidence_ref"],
+        "research_sufficiency_certificate_ref": assignment["research_sufficiency_certificate_ref"],
+        "coverage_proof_ref": assignment["artifact_outputs"]["coverage_proof_ref"],
+        "impact_direction": "supports_yes",
+        "evidence_strength": "strong",
+        "classification_confidence": "high",
+        "answer_value_extraction": {
+            "field_name": "status",
+            "value": "confirmed",
+            "normalization_status": "parsed",
+        },
+        "evidence_quality_dimensions": {
+            "source_authority": "high",
+            "directness": "direct",
+            "recency": "fresh",
+            "specificity": "specific",
+        },
+        "provenance_refs": [provenance["provenance_id"]],
+    }
+
+
+def _runtime_coverage(assignment: dict[str, Any]) -> dict[str, Any]:
+    evidence_refs = [item["evidence_ref"] for item in assignment["assigned_evidence_refs"]]
+    return {
+        "coverage_proof_id": assignment["artifact_outputs"]["coverage_proof_ref"],
+        "leaf_id": assignment["leaf_id"],
+        "research_sufficiency_certificate_ref": assignment["research_sufficiency_certificate_ref"],
+        "retrieval_breadth_coverage_ref": assignment["retrieval_breadth_coverage_ref"],
+        "evidence_refs_assigned": list(evidence_refs),
+        "evidence_refs_reviewed": list(evidence_refs),
+        "source_class_ids_reviewed": sorted({item["source_class"] for item in assignment["assigned_evidence_refs"]}),
+        "claim_family_ids_reviewed": sorted(
+            {
+                item["claim_family_id"]
+                for item in assignment["assigned_evidence_refs"]
+                if item.get("claim_family_id")
+            }
+        ),
+        "source_family_ids_reviewed": sorted(
+            {item["source_family_id"] for item in assignment["assigned_evidence_refs"]}
+        ),
+        "requirements_reviewed": list(assignment["sufficiency_requirement_refs"]),
+        "requirements_answered": list(assignment["sufficiency_requirement_refs"]),
+        "requirements_unanswered": [],
+        "required_value_fields_extracted": list(assignment["required_value_field_ids"]),
+        "required_negative_checks_completed": list(assignment["required_negative_check_ids"]),
+        "source_gap_flags": [],
+        "structural_unanswerability_acknowledged": False,
+        "machine_readability_status": "schema_valid",
+    }
+
+
+def _fake_researcher_runtime_bundle(
+    *,
+    assignments: list[dict[str, Any]],
+    qdt: dict[str, Any],
+    retrieval_packet: dict[str, Any],
+    true_production_mode: bool,
+    max_concurrent: int,
+) -> dict[str, Any]:
+    model_context = resolve_researcher_leaf_nli_model_context()
+    assignments_by_leaf = {assignment["leaf_id"]: assignment for assignment in assignments}
+    leaf_ids = [leaf["leaf_id"] for leaf in qdt["required_leaf_questions"]]
+    sidecar = build_researcher_sidecar_v2(
+        qdt=qdt,
+        required_question_classifications=[
+            _runtime_classification(qdt, retrieval_packet, assignments_by_leaf[leaf_id])
+            for leaf_id in leaf_ids
+        ],
+        coverage_proofs=[_runtime_coverage(assignments_by_leaf[leaf_id]) for leaf_id in leaf_ids],
+        model_execution_context_ref="artifact:model-execution-context:researcher-leaf-nli",
+        model_execution_context=model_context,
+    )
+    audits = [
+        build_researcher_context_isolation_audit(
+            assignment,
+            subagent_session_ref=f"openclaw-session:{idx}",
+        )
+        for idx, assignment in enumerate(assignments)
+    ]
+    results = []
+    for idx, assignment in enumerate(assignments):
+        status = "launch_blocked" if idx == 0 else "accepted_classification"
+        results.append(
+            build_leaf_subagent_result(
+                assignment,
+                terminal_status=status,
+                subagent_session_ref=f"openclaw-session:{idx}",
+                sidecar_refs=[sidecar["sidecar_id"]] if status == "accepted_classification" else [],
+                classification_refs=[f"classification:{assignment['leaf_id']}"]
+                if status == "accepted_classification"
+                else [],
+                isolation_audit_ref=assignment["context_isolation"]["isolation_audit_ref"],
+                runtime_provenance={
+                    "model_executed": True,
+                    "resolved_model_id": RESEARCHER_PROVIDER_MODEL_KEY,
+                    "runtime_call_ref": f"model-runtime-call:researcher:{idx}",
+                },
+                reason_codes=[status],
+            )
+        )
+    return build_researcher_swarm_runtime_bundle(
+        assignments,
+        qdt=qdt,
+        retrieval_packet=retrieval_packet,
+        sidecars=[sidecar],
+        isolation_audits=audits,
+        subagent_results=results,
+        true_production_mode=true_production_mode,
+        max_concurrent=max_concurrent,
+    )
 
 
 class AdsOperationalCanaryTest(unittest.TestCase):
@@ -634,6 +796,141 @@ class AdsOperationalCanaryTest(unittest.TestCase):
 
         report = build_handoff_report(self.db_path)
         self.assertTrue(report["ok"], report["unresolved_output_manifest_refs"])
+
+    def test_phase3_fixture_certified_retrieval_writes_runtime_bundle_manifest(self):
+        config = self.config(require_scoreable_prediction=False, require_manifest_handoffs=True)
+        handlers = build_production_readiness_handlers(
+            db_path=config.db_path,
+            runner_mode=config.runner_mode,
+            forecast_timestamp=config.forecast_timestamp,
+            max_cases=config.max_cases,
+            metadata=config.metadata,
+            live_fixture_retrieval=True,
+            block_at_leaf_research_barrier=True,
+            researcher_swarm_runtime_runner=_fake_researcher_runtime_bundle,
+        )
+        market = self.conn.execute(
+            "SELECT id, platform, external_market_id FROM markets WHERE external_market_id = ?",
+            ("operational-canary",),
+        ).fetchone()
+        snapshot = self.conn.execute(
+            "SELECT id, observed_at FROM market_snapshots WHERE market_id = ?",
+            (market[0],),
+        ).fetchone()
+        lease = {
+            "case_id": "case-phase3-runtime",
+            "case_key": f"{market[1]}:{market[2]}",
+            "dispatch_id": "dispatch-phase3-runtime",
+            "market_id": market[0],
+            "selected_snapshot_id": snapshot[0],
+            "selected_snapshot_observed_at": snapshot[1],
+            "forecast_timestamp": config.forecast_timestamp,
+        }
+        context = SimpleNamespace(pipeline_run_id="pipeline-run-phase3-runtime")
+        stage_outputs = {}
+        for stage in (
+            "evidence_packet",
+            "policy_context",
+            "related_market_context",
+            "decomposition",
+            "retrieval",
+            "researcher_classification",
+        ):
+            stage_outputs[stage] = handlers[stage](
+                conn=self.conn,
+                context=context,
+                lease=lease,
+                stage_outputs=stage_outputs,
+            )
+
+        row = self.conn.execute(
+            """
+            SELECT artifact_path, metadata
+            FROM case_artifact_manifest
+            WHERE artifact_type = 'researcher-swarm-runtime-bundle'
+            ORDER BY id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+        prediction_count = self.conn.execute("SELECT COUNT(*) FROM market_predictions").fetchone()[0]
+
+        self.assertIsNotNone(row)
+        payload = json.loads(Path(row["artifact_path"]).read_text(encoding="utf-8"))
+        metadata = json.loads(row["metadata"])
+        self.assertEqual(payload["artifact_type"], "researcher_swarm_runtime_bundle")
+        self.assertEqual(metadata["runtime_bundle_count"], 1)
+        self.assertEqual(metadata["runtime_sidecar_count"], 1)
+        self.assertGreater(metadata["runtime_model_executed_count"], 0)
+        self.assertFalse(payload["proceed_to_verification_scae"])
+        self.assertEqual(prediction_count, 0)
+
+    def test_phase3_failed_researcher_transport_is_retryable_and_writes_no_scae_ready_output(self):
+        def failing_runtime(**_kwargs):
+            raise RuntimeError("researcher model runtime failed: fake transport timeout")
+
+        config = self.config(
+            require_scoreable_prediction=False,
+            require_manifest_handoffs=True,
+        )
+        handlers = build_production_readiness_handlers(
+            db_path=config.db_path,
+            runner_mode=config.runner_mode,
+            forecast_timestamp=config.forecast_timestamp,
+            max_cases=config.max_cases,
+            metadata=config.metadata,
+            live_fixture_retrieval=True,
+            block_at_leaf_research_barrier=True,
+            researcher_swarm_runtime_runner=failing_runtime,
+        )
+        handlers["researcher_classification"] = wrap_production_stage_handler(
+            "researcher_classification",
+            handlers["researcher_classification"],
+        )
+
+        result = run_one_case_canary(config, handlers)
+
+        self.assertFalse(result["ok"])
+        self.assertIn("terminal_status was 'auto004_retry_scheduled'", result["errors"])
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            status = conn.execute(
+                """
+                SELECT status, reason_codes, metadata
+                FROM v2_stage_status_snapshots
+                WHERE stage = 'researcher_classification'
+                ORDER BY id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+            retry_event = conn.execute(
+                """
+                SELECT event_type, failure_class, safe_exception_class, safe_metadata
+                FROM v2_stage_execution_events
+                WHERE stage = 'researcher_classification'
+                ORDER BY id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+            runtime_bundle_count = conn.execute(
+                "SELECT COUNT(*) FROM case_artifact_manifest WHERE artifact_type = 'researcher-swarm-runtime-bundle'"
+            ).fetchone()[0]
+            scae_count = conn.execute(
+                "SELECT COUNT(*) FROM case_artifact_manifest WHERE stage = 'scae'"
+            ).fetchone()[0]
+            prediction_count = conn.execute("SELECT COUNT(*) FROM market_predictions").fetchone()[0]
+
+        self.assertIsNotNone(status)
+        self.assertIsNotNone(retry_event)
+        status_metadata = json.loads(status["metadata"])
+        self.assertEqual(status["status"], "blocked")
+        self.assertEqual(json.loads(status["reason_codes"]), ["ads_production_retryable_model_transport"])
+        self.assertEqual(status_metadata["safe_reason_code"], "ads_production_retryable_model_transport")
+        self.assertEqual(retry_event["event_type"], "retry_scheduled")
+        self.assertEqual(retry_event["failure_class"], "retryable_model_transport")
+        self.assertEqual(retry_event["safe_exception_class"], "RetryableStageError")
+        self.assertEqual(runtime_bundle_count, 0)
+        self.assertEqual(scae_count, 0)
+        self.assertEqual(prediction_count, 0)
 
     def test_real_runtime_criteria_requires_researcher_model_execution_when_requested(self):
         config = self.config(

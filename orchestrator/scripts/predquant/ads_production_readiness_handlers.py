@@ -79,7 +79,10 @@ from researcher_swarm.retrieval import (  # noqa: E402
     finalize_retrieval_packet_for_dispatch,
 )
 from researcher_swarm.assignments import build_leaf_research_assignments  # noqa: E402
-from researcher_swarm.openclaw_runtime import run_openclaw_researcher_swarm_runtime  # noqa: E402
+from researcher_swarm.openclaw_runtime import (  # noqa: E402
+    OpenClawResearcherRuntimeError,
+    run_openclaw_researcher_swarm_runtime,
+)
 from researcher_swarm.subagents import (  # noqa: E402
     build_leaf_research_barrier,
     build_leaf_researcher_spawn_plan,
@@ -948,6 +951,7 @@ def build_stage_handlers(
     block_at_leaf_research_barrier: bool = False,
     researcher_swarm_openclaw_runtime: bool = False,
     researcher_swarm_runtime_bundle_response_path: str | Path | None = None,
+    researcher_swarm_runtime_runner: Callable[..., dict[str, Any]] | None = None,
     amrg_vector_runtime: bool = False,
     amrg_vector_allow_pull: bool = False,
     amrg_model_assist_output_path: str | Path | None = None,
@@ -985,6 +989,7 @@ def build_stage_handlers(
         "block_at_leaf_research_barrier": bool(block_at_leaf_research_barrier),
         "researcher_swarm_openclaw_runtime": bool(researcher_swarm_openclaw_runtime),
         "researcher_swarm_runtime_bundle_response_configured": researcher_swarm_runtime_bundle_response_path is not None,
+        "researcher_swarm_runtime_runner_configured": researcher_swarm_runtime_runner is not None,
         "amrg_vector_runtime": bool(amrg_vector_runtime),
         "amrg_vector_allow_pull": bool(amrg_vector_allow_pull),
         "amrg_model_assist_configured": amrg_model_assist_output_path is not None,
@@ -1454,14 +1459,25 @@ def build_stage_handlers(
             spawn_plan = build_leaf_researcher_spawn_plan(assignments)
             if researcher_swarm_runtime_bundle_response_path is not None:
                 payload = json.loads(Path(researcher_swarm_runtime_bundle_response_path).read_text(encoding="utf-8"))
-            elif researcher_swarm_openclaw_runtime:
-                payload = run_openclaw_researcher_swarm_runtime(
+            elif researcher_swarm_runtime_runner is not None:
+                payload = researcher_swarm_runtime_runner(
                     assignments=assignments,
                     qdt=qdt_payload,
                     retrieval_packet=packet,
                     true_production_mode=True,
                     max_concurrent=5,
                 )
+            elif researcher_swarm_openclaw_runtime:
+                try:
+                    payload = run_openclaw_researcher_swarm_runtime(
+                        assignments=assignments,
+                        qdt=qdt_payload,
+                        retrieval_packet=packet,
+                        true_production_mode=True,
+                        max_concurrent=5,
+                    )
+                except OpenClawResearcherRuntimeError as exc:
+                    raise RuntimeError(f"researcher model runtime failed: {exc}") from exc
             else:
                 payload = None
             if payload is not None:
@@ -1483,11 +1499,39 @@ def build_stage_handlers(
                 file_name = "researcher-swarm-runtime-bundle.json"
                 manifest_artifact_type = "researcher-swarm-runtime-bundle"
                 manifest_schema_version = "researcher-swarm-runtime-bundle/v1"
+                sidecar_validations = payload.get("sidecar_validations")
+                leaf_runtime_status = payload.get("leaf_runtime_status")
+                runtime_manifest_metadata = {
+                    "runtime_bundle_count": 1,
+                    "runtime_bundle_id": payload.get("runtime_bundle_id"),
+                    "runtime_sidecar_validation_count": len(sidecar_validations)
+                    if isinstance(sidecar_validations, list)
+                    else 0,
+                    "runtime_sidecar_count": len(payload.get("sidecars"))
+                    if isinstance(payload.get("sidecars"), list)
+                    else 0,
+                    "runtime_leaf_count": len(leaf_runtime_status)
+                    if isinstance(leaf_runtime_status, list)
+                    else 0,
+                    "runtime_model_executed_count": sum(
+                        1
+                        for row in (leaf_runtime_status if isinstance(leaf_runtime_status, list) else [])
+                        if isinstance(row, dict) and row.get("model_executed") is True
+                    ),
+                    "runtime_proceed_to_verification_scae": payload.get("proceed_to_verification_scae") is True,
+                }
             else:
                 barrier = build_leaf_research_barrier(assignments, true_production_mode=True)
                 classification_status = "blocked_leaf_research_barrier"
                 reason_codes = barrier.get("blocker_reason_codes") or ["leaf_research_barrier_not_terminal"]
                 file_name = "leaf-research-barrier.json"
+                runtime_manifest_metadata = {
+                    "runtime_bundle_count": 0,
+                    "runtime_sidecar_count": 0,
+                    "runtime_leaf_count": len(assignments),
+                    "runtime_model_executed_count": 0,
+                    "runtime_proceed_to_verification_scae": False,
+                }
                 payload = {
                     "artifact_type": "leaf_research_barrier",
                     "schema_version": "leaf-research-barrier/v1",
@@ -1520,6 +1564,13 @@ def build_stage_handlers(
             reason_codes = ["structured_market_metadata_retrieval_certified"]
             file_name = "researcher-classification-production-pilot.json"
             payload = None
+            runtime_manifest_metadata = {
+                "runtime_bundle_count": 0,
+                "runtime_sidecar_count": 0,
+                "runtime_leaf_count": 0,
+                "runtime_model_executed_count": 0,
+                "runtime_proceed_to_verification_scae": False,
+            }
             manifest_artifact_type = STAGE_ARTIFACT_TYPES["researcher_classification"]
             manifest_schema_version = STAGE_SCHEMA_VERSIONS["researcher_classification"]
         else:
@@ -1527,6 +1578,13 @@ def build_stage_handlers(
             reason_codes = ["retrieval_sufficiency_not_certified"]
             file_name = "researcher-classification-readiness-block.json"
             payload = None
+            runtime_manifest_metadata = {
+                "runtime_bundle_count": 0,
+                "runtime_sidecar_count": 0,
+                "runtime_leaf_count": 0,
+                "runtime_model_executed_count": 0,
+                "runtime_proceed_to_verification_scae": False,
+            }
             manifest_artifact_type = STAGE_ARTIFACT_TYPES["researcher_classification"]
             manifest_schema_version = STAGE_SCHEMA_VERSIONS["researcher_classification"]
         if payload is None:
@@ -1577,14 +1635,14 @@ def build_stage_handlers(
                     else "classification_block_valid"
                 )
             ],
-            metadata=factory_metadata,
+            metadata={**factory_metadata, **runtime_manifest_metadata},
         )
         return _result(
             "researcher_classification",
             [manifest["artifact_id"]],
             [validation_id],
             lease,
-            {**factory_metadata, "classification_status": classification_status},
+            {**factory_metadata, **runtime_manifest_metadata, "classification_status": classification_status},
         )
 
     def classification_verification(**kwargs: Any) -> dict[str, Any]:
