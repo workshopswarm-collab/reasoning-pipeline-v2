@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import importlib
+import importlib.util
 import json
 import os
 import sqlite3
@@ -47,6 +49,40 @@ def load_json(path: Path | None, default):
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def load_object_factory(spec: str, *, default_attr: str = "build_provider"):
+    module_ref, _, attr = spec.partition(":")
+    if not module_ref:
+        raise argparse.ArgumentTypeError("factory module is required")
+    attr = attr or default_attr
+    if module_ref.endswith(".py") or "/" in module_ref:
+        path = Path(module_ref).expanduser().resolve()
+        module_spec = importlib.util.spec_from_file_location(path.stem, path)
+        if module_spec is None or module_spec.loader is None:
+            raise argparse.ArgumentTypeError(f"cannot load factory module: {path}")
+        module = importlib.util.module_from_spec(module_spec)
+        module_spec.loader.exec_module(module)
+    else:
+        module = importlib.import_module(module_ref)
+    factory = getattr(module, attr, None)
+    if not callable(factory):
+        raise argparse.ArgumentTypeError(f"factory is not callable: {spec}")
+    return factory
+
+
+def build_handler_factory_kwargs(args: argparse.Namespace) -> dict:
+    kwargs = {}
+    if args.decomposer_runtime_transport_response is not None:
+        kwargs["decomposer_runtime_transport_response_path"] = args.decomposer_runtime_transport_response
+    if args.researcher_swarm_runtime_bundle_response is not None:
+        kwargs["researcher_swarm_runtime_bundle_response_path"] = args.researcher_swarm_runtime_bundle_response
+    if getattr(args, "retrieval_browser_provider_factory", None):
+        kwargs["retrieval_browser_provider"] = load_object_factory(
+            args.retrieval_browser_provider_factory,
+            default_attr="build_provider",
+        )()
+    return kwargs
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -65,6 +101,13 @@ def parse_args() -> argparse.Namespace:
         "--researcher-swarm-runtime-bundle-response",
         type=Path,
         help="Optional researcher-swarm-runtime-bundle JSON passed to production handler factories.",
+    )
+    parser.add_argument(
+        "--retrieval-browser-provider-factory",
+        help=(
+            "Dotted module/path plus optional :factory returning a browser/search provider object. "
+            "The provider is passed to retrieval_browser_provider and remains URL/search transport only."
+        ),
     )
     parser.add_argument("--forecast-timestamp", help="Forecast timestamp passed to handler factory/case policy.")
     parser.add_argument("--max-cases", type=int, default=1, help="Maximum cases for this bounded scheduler run.")
@@ -133,11 +176,7 @@ def main() -> int:
     args = parse_args()
     db_path = Path(args.db_path)
     metadata = args.metadata_json or {}
-    handler_factory_kwargs = {}
-    if args.decomposer_runtime_transport_response is not None:
-        handler_factory_kwargs["decomposer_runtime_transport_response_path"] = args.decomposer_runtime_transport_response
-    if args.researcher_swarm_runtime_bundle_response is not None:
-        handler_factory_kwargs["researcher_swarm_runtime_bundle_response_path"] = args.researcher_swarm_runtime_bundle_response
+    handler_factory_kwargs = build_handler_factory_kwargs(args)
     handlers = None
     if args.handler_factory:
         config = OperationalCanaryConfig(

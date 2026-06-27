@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
+import importlib.util
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -16,6 +19,13 @@ from predquant.ads_production_handlers import (
     classify_stage_failure,
     wrap_production_stage_handler,
 )
+
+
+SCHEDULER_PATH = Path(__file__).resolve().parents[1] / "bin" / "run_ads_operational_scheduler.py"
+SCHEDULER_SPEC = importlib.util.spec_from_file_location("run_ads_operational_scheduler", SCHEDULER_PATH)
+assert SCHEDULER_SPEC is not None and SCHEDULER_SPEC.loader is not None
+run_ads_operational_scheduler = importlib.util.module_from_spec(SCHEDULER_SPEC)
+SCHEDULER_SPEC.loader.exec_module(run_ads_operational_scheduler)
 
 
 class AdsProductionHandlersTest(unittest.TestCase):
@@ -100,6 +110,38 @@ class AdsProductionHandlersTest(unittest.TestCase):
             classify_stage_failure("verification", ValueError("forbidden output contamination")),
             "policy_violation_quarantine",
         )
+
+    def test_scheduler_can_pass_explicit_retrieval_browser_provider_factory(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            provider_module = Path(tempdir) / "provider_factory.py"
+            provider_module.write_text(
+                "\n".join(
+                    [
+                        "class Provider:",
+                        "    def __init__(self):",
+                        "        self.provider_id = 'test-provider'",
+                        "    def fetch_url(self, url):",
+                        "        return {'url': url, 'extraction_status': 'rejected'}",
+                        "    def search_candidate_urls(self, query_context, query_variant, *, searched_at=None):",
+                        "        return []",
+                        "def build_provider():",
+                        "    return Provider()",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            args = SimpleNamespace(
+                decomposer_runtime_transport_response=None,
+                researcher_swarm_runtime_bundle_response=None,
+                retrieval_browser_provider_factory=str(provider_module),
+            )
+
+            kwargs = run_ads_operational_scheduler.build_handler_factory_kwargs(args)
+
+        provider = kwargs["retrieval_browser_provider"]
+        self.assertEqual(provider.provider_id, "test-provider")
+        self.assertTrue(callable(provider.fetch_url))
+        self.assertTrue(callable(provider.search_candidate_urls))
 
 
 if __name__ == "__main__":
