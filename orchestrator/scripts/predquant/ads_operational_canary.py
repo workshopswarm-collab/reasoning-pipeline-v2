@@ -24,6 +24,7 @@ from predquant.ads_pipeline_runner import (
     validate_auto003_policy,
     validate_auto005_policy,
 )
+from predquant.ads_real_runtime_canary import build_real_runtime_canary_report
 
 DEFAULT_PROTECTED_TABLES = (
     "market_predictions",
@@ -48,6 +49,10 @@ class OperationalCanaryConfig:
     protected_tables: tuple[str, ...] = DEFAULT_PROTECTED_TABLES
     metadata: dict[str, Any] = field(default_factory=dict)
     handler_factory_kwargs: dict[str, Any] = field(default_factory=dict)
+    require_real_runtime_canary_criteria: bool = False
+    require_qdt_model_executed: bool = True
+    require_researcher_model_executed: bool = False
+    allowed_stage_failure_classes: tuple[str, ...] = ()
 
 
 def table_exists(conn: sqlite3.Connection, table: str) -> bool:
@@ -277,7 +282,7 @@ def run_one_case_canary(
     if disable_error:
         errors.append(f"failed to disable pipeline in finally block: {disable_error}")
 
-    return {
+    record = {
         "ok": not errors,
         "phase": "postflight",
         "errors": errors,
@@ -288,6 +293,21 @@ def run_one_case_canary(
         "active_after": active_after,
         "control_after": control_after,
     }
+    criteria_report = build_real_runtime_canary_report(
+        config.db_path,
+        canary_result=record,
+        expected_cases=config.max_cases,
+        require_scoreable_prediction=config.require_scoreable_prediction,
+        require_qdt_model_executed=config.require_qdt_model_executed,
+        require_researcher_model_executed=config.require_researcher_model_executed,
+        allowed_stage_failure_classes=config.allowed_stage_failure_classes,
+    )
+    record["real_runtime_canary_report"] = criteria_report
+    if config.require_real_runtime_canary_criteria and not criteria_report["ok"]:
+        errors.extend(f"real_runtime_canary:{issue}" for issue in criteria_report["issues"])
+        record["ok"] = False
+        record["errors"] = errors
+    return record
 
 
 def load_handler_factory(spec: str) -> Callable[..., dict[str, Callable[..., Any]]]:

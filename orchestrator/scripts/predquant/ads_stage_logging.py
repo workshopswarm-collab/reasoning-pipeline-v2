@@ -85,6 +85,12 @@ FAILURE_CLASSES = (
     "amrg_anchor_required_unrepairable",
     "scae_probability_authority_violation",
     "decision_probability_override_attempt",
+    "retryable_transport",
+    "retryable_model_transport",
+    "invalid_artifact_terminal",
+    "thin_evidence_watch_only",
+    "policy_violation_quarantine",
+    "fatal_operational",
 )
 RETRYABILITIES = ("retryable", "terminal", "blocked", "waived")
 UNSAFE_SECRET_EXCLUSION_STATUSES = ("passed", "blocked")

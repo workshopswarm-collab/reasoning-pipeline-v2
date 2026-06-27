@@ -16,7 +16,9 @@ from predquant.ads_operational_canary import (  # noqa: E402
     OperationalCanaryConfig,
     build_handlers_from_factory,
     build_operational_case_selection_policy,
+    count_deltas,
     load_handler_factory,
+    protected_counts,
 )
 from predquant.ads_live_readiness import build_live_readiness_report  # noqa: E402
 from predquant.ads_pipeline_control import set_pipeline_enabled  # noqa: E402
@@ -26,6 +28,7 @@ from predquant.ads_pipeline_runner import (  # noqa: E402
     PipelineRunnerPolicy,
     run_ads_pipeline_loop,
 )
+from predquant.ads_real_runtime_canary import build_real_runtime_canary_report  # noqa: E402
 from predquant.sqlite_store import DEFAULT_DB_PATH  # noqa: E402
 
 
@@ -105,6 +108,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--regime-diagnostics-json", type=Path)
     parser.add_argument("--protected-component-diagnostics-json", type=Path)
     parser.add_argument("--pointer-stability-evidence-json", type=Path)
+    parser.add_argument(
+        "--require-real-runtime-canary-criteria",
+        action="store_true",
+        help="Fail unless ads-real-runtime-canary-criteria/v1 passes after the run.",
+    )
+    parser.add_argument("--skip-qdt-model-executed-check", action="store_true")
+    parser.add_argument("--require-researcher-model-executed", action="store_true")
+    parser.add_argument("--allow-stage-failure-class", action="append", default=[])
     parser.add_argument("--updated-by", default="ads-operational-scheduler")
     parser.add_argument("--reason", default="bounded ADS operational scheduler run")
     parser.add_argument("--metadata-json", type=parse_metadata)
@@ -133,6 +144,10 @@ def main() -> int:
             skip_existing_ads_predictions=args.skip_existing_ads_predictions,
             metadata=metadata,
             handler_factory_kwargs=handler_factory_kwargs,
+            require_real_runtime_canary_criteria=args.require_real_runtime_canary_criteria,
+            require_qdt_model_executed=not args.skip_qdt_model_executed_check,
+            require_researcher_model_executed=args.require_researcher_model_executed,
+            allowed_stage_failure_classes=tuple(args.allow_stage_failure_class),
         )
         handlers = build_handlers_from_factory(load_handler_factory(args.handler_factory), config)
     else:
@@ -148,11 +163,16 @@ def main() -> int:
             skip_existing_ads_predictions=args.skip_existing_ads_predictions,
             metadata=metadata,
             handler_factory_kwargs=handler_factory_kwargs,
+            require_real_runtime_canary_criteria=args.require_real_runtime_canary_criteria,
+            require_qdt_model_executed=not args.skip_qdt_model_executed_check,
+            require_researcher_model_executed=args.require_researcher_model_executed,
+            allowed_stage_failure_classes=tuple(args.allow_stage_failure_class),
         )
 
     conn = sqlite3.connect(db_path, isolation_level=None)
     conn.row_factory = sqlite3.Row
     try:
+        protected_before = protected_counts(conn)
         readiness = None
         if args.require_live_readiness:
             readiness = build_live_readiness_report(
@@ -209,6 +229,17 @@ def main() -> int:
             case_selection_policy=build_operational_case_selection_policy(config),
         )
         record = result.to_record()
+        protected_after = protected_counts(conn)
+        criteria_input = {
+            "ok": True,
+            "result": record,
+            "protected_counts_before": protected_before,
+            "protected_counts_after": protected_after,
+            "protected_count_deltas": count_deltas(protected_before, protected_after),
+        }
+        record["protected_counts_before"] = protected_before
+        record["protected_counts_after"] = protected_after
+        record["protected_count_deltas"] = criteria_input["protected_count_deltas"]
         if readiness is not None:
             record["live_readiness_report"] = readiness
         if args.disable_after_run:
@@ -221,6 +252,27 @@ def main() -> int:
                 default_disable_action="no_new_leases",
                 metadata={"purpose": "bounded_scheduler_disable", **metadata},
             )
+        if args.require_real_runtime_canary_criteria:
+            criteria_report = build_real_runtime_canary_report(
+                db_path,
+                canary_result=criteria_input,
+                expected_cases=args.max_cases,
+                require_scoreable_prediction=args.require_scoreable_live,
+                require_qdt_model_executed=not args.skip_qdt_model_executed_check,
+                require_researcher_model_executed=args.require_researcher_model_executed,
+                allowed_stage_failure_classes=tuple(args.allow_stage_failure_class),
+                first100_trace_complete=args.first100_trace_complete,
+                trace_manifest_count=args.trace_manifest_count,
+                tail_slice_diagnostics=load_json(args.tail_slice_diagnostics_json, None),
+                regime_diagnostics=load_json(args.regime_diagnostics_json, None),
+                protected_component_diagnostics=load_json(args.protected_component_diagnostics_json, None),
+                pointer_stability_evidence=load_json(args.pointer_stability_evidence_json, None),
+            )
+            record["real_runtime_canary_report"] = criteria_report
+            if not criteria_report["ok"]:
+                record["ok"] = False
+                record["status"] = "real_runtime_canary_criteria_failed"
+                record["errors"] = [f"real_runtime_canary:{issue}" for issue in criteria_report["issues"]]
     except PipelineRunnerContractError as exc:
         record = {"ok": False, "status": "contract_error", "error": str(exc)}
     finally:

@@ -6,6 +6,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from predquant.ads_pipeline_runner import NonRetryableStageError, RetryableStageError
+from predquant.ads_stage_logging import validate_failure_class
 from predquant.ads_production_handlers import (
     ADS_PRODUCTION_FAILURE_CLASSES,
     ADS_PRODUCTION_STAGE_FAILURE_POLICY_ID,
@@ -24,6 +25,8 @@ class AdsProductionHandlersTest(unittest.TestCase):
         self.assertEqual(policy["schema_version"], ADS_PRODUCTION_STAGE_FAILURE_POLICY_SCHEMA_VERSION)
         self.assertEqual(policy["policy_id"], ADS_PRODUCTION_STAGE_FAILURE_POLICY_ID)
         self.assertEqual(tuple(policy["failure_classes"]), ADS_PRODUCTION_FAILURE_CLASSES)
+        for failure_class in ADS_PRODUCTION_FAILURE_CLASSES:
+            self.assertEqual(validate_failure_class(failure_class), failure_class)
         self.assertEqual(policy["retry_rules"]["retryable_transport"]["max_retries"], 1)
         self.assertEqual(policy["retry_rules"]["retryable_model_transport"]["max_retries"], 1)
         self.assertEqual(policy["retry_rules"]["invalid_artifact_terminal"]["max_retries"], 0)

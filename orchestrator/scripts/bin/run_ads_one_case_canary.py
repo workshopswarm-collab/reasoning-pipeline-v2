@@ -79,6 +79,27 @@ def parse_args() -> argparse.Namespace:
         help="Require every downstream stage output ref to resolve to a persisted artifact manifest.",
     )
     parser.add_argument(
+        "--require-real-runtime-canary-criteria",
+        action="store_true",
+        help="Fail unless ads-real-runtime-canary-criteria/v1 passes after the run.",
+    )
+    parser.add_argument(
+        "--skip-qdt-model-executed-check",
+        action="store_true",
+        help="Do not require live GPT 5.5 High QDT runtime evidence in the real-runtime criteria report.",
+    )
+    parser.add_argument(
+        "--require-researcher-model-executed",
+        action="store_true",
+        help="Require model-executed GPT 5.5 High researcher sidecars/runtime bundles in the criteria report.",
+    )
+    parser.add_argument(
+        "--allow-stage-failure-class",
+        action="append",
+        default=[],
+        help="Expected failure class permitted by the criteria report for failure-injection runs.",
+    )
+    parser.add_argument(
         "--skip-existing-ads-predictions",
         action="store_true",
         help="Skip markets that already have ads_pipeline/v2_scae market_predictions rows.",
@@ -109,6 +130,10 @@ def main() -> int:
         skip_existing_ads_predictions=args.skip_existing_ads_predictions,
         metadata=args.metadata_json or {},
         handler_factory_kwargs=handler_factory_kwargs,
+        require_real_runtime_canary_criteria=args.require_real_runtime_canary_criteria,
+        require_qdt_model_executed=not args.skip_qdt_model_executed_check,
+        require_researcher_model_executed=args.require_researcher_model_executed,
+        allowed_stage_failure_classes=tuple(args.allow_stage_failure_class),
     )
     if not args.handler_factory:
         print(
