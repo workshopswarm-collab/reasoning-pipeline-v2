@@ -122,6 +122,24 @@ class DependencyGateTests(unittest.TestCase):
         self.assertEqual(failures, [])
         self.assertNotIn("PERSIST-002 status=not_started", failures)
 
+    def test_contract_status_and_runtime_evidence_status_are_reported_separately(self) -> None:
+        inv = load_inventory()
+        rows = rows_by_id(inv)
+        self.assertEqual(gates.row_contract_status(rows["RET-008"]), "done")
+        self.assertEqual(gates.row_runtime_evidence_status(rows["RET-008"]), "runtime_blocked")
+        self.assertEqual(gates.row_contract_status(rows["MODEL-002"]), "done")
+        self.assertEqual(gates.row_runtime_evidence_status(rows["MODEL-002"]), "runtime_passed")
+        self.assertIn("contract_status=done", gates.row_status_summary(rows["RET-008"]))
+        self.assertIn("runtime_evidence_status=runtime_blocked", gates.row_status_summary(rows["RET-008"]))
+
+    def test_invalid_runtime_evidence_status_is_rejected(self) -> None:
+        inv = load_inventory()
+        broken = copy.deepcopy(inv)
+        rows = {row["id"]: row for row in broken["features"]}
+        rows["RET-008"]["runtime_evidence_status"] = "done"
+        errors = gates.validate_inventory(broken)
+        self.assertTrue(any("RET-008: invalid runtime_evidence_status done" in error for error in errors))
+
     def test_fixture_mode_allows_start_even_when_runtime_is_blocked(self) -> None:
         inv = load_inventory()
         rows = rows_by_id(inv)

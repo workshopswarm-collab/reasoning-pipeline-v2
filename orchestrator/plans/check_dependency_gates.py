@@ -22,6 +22,12 @@ EVIDENCE_REQUIRED_STATUSES = {"ready_for_integration", "done"}
 WAIVER_REQUIRED_FIELDS = ["dependency_id", "target_id", "owner", "reason", "expires_on"]
 MIGRATION_SURFACE_KINDS = {"table", "existing_table", "external_artifact_contract", "view"}
 MIGRATION_CONTRACT_STATUSES = {"ready_for_component_implementation"}
+RUNTIME_EVIDENCE_STATUSES = {
+    "runtime_not_applicable",
+    "runtime_not_evaluated",
+    "runtime_blocked",
+    "runtime_passed",
+}
 
 
 def load_inventory(path: Path) -> dict:
@@ -84,15 +90,30 @@ def validate_waivers(waivers: list[dict], rows: dict[str, dict]) -> list[str]:
     return errors
 
 
+def row_contract_status(row: dict) -> str | None:
+    return row.get("contract_status") or row.get("status")
+
+
+def row_runtime_evidence_status(row: dict) -> str:
+    return str(row.get("runtime_evidence_status") or "runtime_not_evaluated")
+
+
+def row_status_summary(row: dict) -> str:
+    return (
+        f"contract_status={row_contract_status(row)} "
+        f"runtime_evidence_status={row_runtime_evidence_status(row)}"
+    )
+
+
 def dependency_ready(dep_id: str, target_id: str, rows: dict[str, dict], ready: set[str], waivers: list[dict]) -> tuple[bool, str]:
     dep = rows.get(dep_id)
     if dep is None:
         return False, f"missing dependency {dep_id}"
-    if dep.get("status") in ready:
+    if row_contract_status(dep) in ready:
         return True, "ready"
     if any(waiver_is_valid(waiver, dep_id, target_id) for waiver in waivers):
         return True, "waived"
-    return False, f"{dep_id} status={dep.get('status')}"
+    return False, f"{dep_id} contract_status={row_contract_status(dep)}"
 
 
 def can_start(row: dict, rows: dict[str, dict], ready: set[str], waivers: list[dict], mode: str) -> list[str]:
@@ -150,6 +171,10 @@ def validate_inventory(inv: dict) -> list[str]:
     for feature_id, feature in features.items():
         if feature.get("status") not in status_values:
             errors.append(f"{feature_id}: invalid status {feature.get('status')}")
+        if row_contract_status(feature) not in status_values:
+            errors.append(f"{feature_id}: invalid contract_status {row_contract_status(feature)}")
+        if row_runtime_evidence_status(feature) not in RUNTIME_EVIDENCE_STATUSES:
+            errors.append(f"{feature_id}: invalid runtime_evidence_status {row_runtime_evidence_status(feature)}")
         if not feature.get("owner"):
             errors.append(f"{feature_id}: missing owner")
         for dep_id in feature.get("dependencies", []):
@@ -162,6 +187,10 @@ def validate_inventory(inv: dict) -> list[str]:
     for migration_id, migration in migrations.items():
         if migration.get("status") not in status_values:
             errors.append(f"{migration_id}: invalid status {migration.get('status')}")
+        if row_contract_status(migration) not in status_values:
+            errors.append(f"{migration_id}: invalid contract_status {row_contract_status(migration)}")
+        if row_runtime_evidence_status(migration) not in RUNTIME_EVIDENCE_STATUSES:
+            errors.append(f"{migration_id}: invalid runtime_evidence_status {row_runtime_evidence_status(migration)}")
         if not migration.get("owner"):
             errors.append(f"{migration_id}: missing owner")
         if not migration.get("write_paths"):
@@ -267,7 +296,13 @@ def selected_rows(inv: dict, args: argparse.Namespace) -> list[dict]:
         if args.migration_id not in migrations:
             raise SystemExit(f"unknown migration: {args.migration_id}")
         migration = migrations[args.migration_id]
-        return [{"id": migration["id"], "dependencies": migration.get("dependencies", []), "status": migration.get("status")}]
+        return [{
+            "id": migration["id"],
+            "dependencies": migration.get("dependencies", []),
+            "status": migration.get("status"),
+            "contract_status": row_contract_status(migration),
+            "runtime_evidence_status": row_runtime_evidence_status(migration),
+        }]
     if args.all:
         return list(features.values())
     return []
@@ -310,9 +345,9 @@ def main() -> int:
         failures = can_start(row, combined, ready, waivers, args.mode)
         if failures:
             failed = True
-            print(f"BLOCKED {row['id']}: " + "; ".join(failures))
+            print(f"BLOCKED {row['id']} {row_status_summary(row)}: " + "; ".join(failures))
         else:
-            print(f"OK {row['id']} mode={args.mode}")
+            print(f"OK {row['id']} mode={args.mode} {row_status_summary(row)}")
     return 0 if args.report_only or not failed else 1
 
 

@@ -1771,6 +1771,17 @@ Success criteria:
 - Feature inventory no longer looks green merely because schemas/contracts exist.
 - Generated clone DBs/reports are deleted after verification.
 
+2026-06-27 completion status:
+
+- `ADS Phase 6 Canary Evidence Worker` (`019f0851-203a-72a3-a7e5-abb4472b823d`) was blocked before file reads by `Native hook relay unavailable`; the parent implemented the phase under the worker-block exception with no worker changes to merge.
+- Real-runtime canary reports now include explicit runtime gates for QDT model execution, source-populated retrieval or structural unanswerability, researcher execution when dispatch is allowed, SCAE delta refs for valid forecasts, zero scoreable writes in non-executing mode, clean drain, resolved manifests, and allowed stage errors.
+- Canary JSON now exposes `first_failing_gate` and a compact criteria summary so operators can see the first intended-shape failure without scanning all evidence sections.
+- The canary report now derives retrieval runtime evidence and SCAE runtime evidence from manifests in addition to the existing QDT/researcher/prediction evidence.
+- Feature inventory/dependency gates now distinguish `contract_status` from `runtime_evidence_status`; high-signal cutover rows show contract completion separately from runtime-passed/runtime-blocked state, and dependency gate output prints both statuses.
+- Parent verification passed: ADS `test_ads_*.py` (`109`), full Orchestrator tests (`237`), dependency-gate plan tests (`16`), focused canary/dependency tests, `py_compile`, feature-inventory JSON validation, `check_dependency_gates.py --all --report-only`, and `git diff --check`.
+- Default `/tmp/ads-phase6.*` clone scheduler canary passed with 13 stages, criteria `ok=true`, first failing gate `null`, gate summary `7` passed / `1` skipped / `0` failed, retrieval source-populated count `1`, researcher dispatch not allowed, forecast decision delta `1`, market prediction delta `0`, SCAE ledger delta `0`, and temp cleanup removed the clone directory.
+- Remaining runtime evidence: researcher execution and SCAE delta evidence remain skipped/not required on the default clone until retrieval dispatch is certified; fixture coverage continues to prove those downstream paths.
+
 ### Gap-Closure Phase 7 - Controlled Scoreable Expansion And CAL-001
 
 Goal: only after Phases 1-6 pass, collect scoreable evidence toward calibration-debt clearance without weakening the SCAE authority model.

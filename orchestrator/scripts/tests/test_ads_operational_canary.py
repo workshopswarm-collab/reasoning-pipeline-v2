@@ -26,7 +26,11 @@ from predquant.ads_production_readiness_handlers import (
 )
 from predquant.ads_handoff_report import build_handoff_report
 from predquant.ads_operator_review import build_ads_operator_review_report
-from predquant.ads_real_runtime_canary import build_real_runtime_canary_report
+from predquant.ads_real_runtime_canary import (
+    _build_runtime_criteria,
+    _first_failing_gate,
+    build_real_runtime_canary_report,
+)
 from predquant.ads_scoreable_canary_handlers import build_stage_handlers
 from predquant.sqlite_store import SCHEMA
 from researcher_swarm.classification import build_researcher_sidecar_v2
@@ -611,6 +615,21 @@ class AdsOperationalCanaryTest(unittest.TestCase):
         self.assertEqual(criteria_report["active_work"], {"active_runs": 0, "active_leases": 0})
         self.assertEqual(criteria_report["prediction_delta_evidence"]["expected_market_predictions"], 0)
         self.assertEqual(criteria_report["model_runtime_evidence"]["qdt_model_executed_count"], 1)
+        self.assertIsNone(criteria_report["first_failing_gate"])
+        self.assertIn("retrieval_runtime_evidence", criteria_report)
+        self.assertGreaterEqual(criteria_report["retrieval_runtime_evidence"]["source_populated_count"], 1)
+        runtime_gate_statuses = {
+            item["gate"]: item["status"]
+            for item in criteria_report["criteria"]["runtime_gates"]
+        }
+        self.assertEqual(
+            runtime_gate_statuses["retrieval_source_populated_or_structural_unanswerability"],
+            "passed",
+        )
+        self.assertEqual(
+            runtime_gate_statuses["researcher_model_executed_if_dispatch_allowed"],
+            "skipped",
+        )
         self.assertTrue(criteria_report["researcher_runtime_evidence"]["blocked_non_scoreable"])
         standalone_report = build_real_runtime_canary_report(
             self.db_path,
@@ -624,6 +643,7 @@ class AdsOperationalCanaryTest(unittest.TestCase):
             standalone_report["prediction_delta_evidence"]["delta_source"],
             "pipeline_run_records",
         )
+        self.assertIsNone(standalone_report["criteria"]["first_failing_gate"])
         operator_report = build_ads_operator_review_report(
             self.db_path,
             pipeline_run_id=result["result"]["pipeline_run_id"],
@@ -801,6 +821,76 @@ class AdsOperationalCanaryTest(unittest.TestCase):
 
         report = build_handoff_report(self.db_path)
         self.assertTrue(report["ok"], report["unresolved_output_manifest_refs"])
+
+    def test_phase6_runtime_criteria_reports_first_failing_gate(self):
+        base = {
+            "require_qdt_model_executed": True,
+            "require_researcher_model_executed": False,
+            "require_scoreable_prediction": False,
+            "qdt_evidence": {"ok": True, "qdt_model_executed_count": 1, "runtime_call_model_executed_count": 1},
+            "retrieval_evidence": {
+                "ok": True,
+                "retrieval_packet_count": 1,
+                "source_populated_count": 1,
+                "classification_dispatch_allowed": False,
+            },
+            "researcher_evidence": {"ok": False, "model_executed_count": 0, "runtime_bundle_count": 0},
+            "scae_evidence": {"ok": True, "valid_forecast_count": 0, "delta_ref_count": 0},
+            "prediction_deltas": {"expected_market_predictions": 0, "market_predictions_delta": 0},
+            "active": {"active_runs": 0, "active_leases": 0},
+            "handoff_report": {"ok": True, "unresolved_output_manifest_refs": []},
+            "errors": {"unexpected_count": 0, "allowed_failure_classes": []},
+        }
+
+        retrieval_failed = _build_runtime_criteria(
+            **{
+                **base,
+                "retrieval_evidence": {
+                    "ok": False,
+                    "retrieval_packet_count": 1,
+                    "source_populated_count": 0,
+                    "classification_dispatch_allowed": False,
+                },
+            }
+        )
+        self.assertEqual(
+            _first_failing_gate(retrieval_failed),
+            "retrieval_source_populated_or_structural_unanswerability",
+        )
+
+        researcher_failed = _build_runtime_criteria(
+            **{
+                **base,
+                "retrieval_evidence": {
+                    "ok": True,
+                    "retrieval_packet_count": 1,
+                    "source_populated_count": 1,
+                    "classification_dispatch_allowed": True,
+                },
+            }
+        )
+        self.assertEqual(
+            _first_failing_gate(researcher_failed),
+            "researcher_model_executed_if_dispatch_allowed",
+        )
+
+        scae_failed = _build_runtime_criteria(
+            **{
+                **base,
+                "researcher_evidence": {"ok": True, "model_executed_count": 1, "runtime_bundle_count": 1},
+                "scae_evidence": {"ok": False, "valid_forecast_count": 1, "delta_ref_count": 0},
+            }
+        )
+        self.assertEqual(_first_failing_gate(scae_failed), "scae_delta_refs_if_valid_forecast")
+
+        fully_certified = _build_runtime_criteria(
+            **{
+                **base,
+                "researcher_evidence": {"ok": True, "model_executed_count": 1, "runtime_bundle_count": 1},
+                "scae_evidence": {"ok": True, "valid_forecast_count": 1, "delta_ref_count": 2},
+            }
+        )
+        self.assertIsNone(_first_failing_gate(fully_certified))
 
     def test_phase3_fixture_certified_retrieval_writes_runtime_bundle_manifest(self):
         config = self.config(require_scoreable_prediction=False, require_manifest_handoffs=True)

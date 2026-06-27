@@ -320,6 +320,121 @@ def _researcher_runtime_evidence(manifests: list[dict[str, Any]]) -> dict[str, A
     }
 
 
+def _retrieval_runtime_evidence(manifests: list[dict[str, Any]]) -> dict[str, Any]:
+    retrieval_packets = []
+    for manifest in manifests:
+        if manifest.get("artifact_type") != "retrieval-packet":
+            continue
+        payload = _load_manifest_payload(manifest) or {}
+        runtime_summary = payload.get("retrieval_runtime_summary") if isinstance(payload.get("retrieval_runtime_summary"), dict) else {}
+        transport = (
+            payload.get("ads_retrieval_transport_diagnostics")
+            if isinstance(payload.get("ads_retrieval_transport_diagnostics"), dict)
+            else {}
+        )
+        sufficiency = (
+            payload.get("research_sufficiency_summary")
+            if isinstance(payload.get("research_sufficiency_summary"), dict)
+            else {}
+        )
+        leaf_results = payload.get("leaf_retrieval_results") if isinstance(payload.get("leaf_retrieval_results"), list) else []
+        certificates = (
+            payload.get("leaf_research_sufficiency_certificates")
+            if isinstance(payload.get("leaf_research_sufficiency_certificates"), list)
+            else []
+        )
+        direct_url_candidates = payload.get("ads_retrieval_direct_url_candidates")
+        if not isinstance(direct_url_candidates, list):
+            direct_url_candidates = []
+        source_attempt_count = sum(
+            int(runtime_summary.get(field) or 0)
+            for field in (
+                "direct_url_attempt_count",
+                "browser_attempt_count",
+                "native_attempt_count",
+                "structured_feed_attempt_count",
+            )
+        )
+        source_attempt_count += int(transport.get("direct_url_candidate_count") or 0)
+        source_attempt_count += len(direct_url_candidates)
+        admitted_ref_count = sum(
+            len(row.get("admitted_evidence_refs") or [])
+            for row in leaf_results
+            if isinstance(row, dict) and isinstance(row.get("admitted_evidence_refs"), list)
+        )
+        structural_unanswerable_count = sum(
+            1
+            for row in [*leaf_results, *certificates]
+            if isinstance(row, dict)
+            and (
+                bool(row.get("structural_unanswerability_acknowledged"))
+                or bool(row.get("structural_unanswerability_proof_ref"))
+                or row.get("certificate_status") == "structurally_unanswerable_certified"
+            )
+        )
+        source_populated = source_attempt_count > 0 or admitted_ref_count > 0
+        structural_unanswerability_certified = (
+            bool(leaf_results or certificates)
+            and structural_unanswerable_count >= max(1, len(leaf_results))
+        )
+        dispatch_allowed = sufficiency.get("classification_dispatch_status") == "allowed"
+        retrieval_packets.append(
+            {
+                "artifact_id": manifest.get("artifact_id"),
+                "adapter_mode": payload.get("adapter_mode"),
+                "runtime_mode": runtime_summary.get("runtime_mode"),
+                "classification_dispatch_status": sufficiency.get("classification_dispatch_status"),
+                "source_attempt_count": source_attempt_count,
+                "admitted_evidence_ref_count": admitted_ref_count,
+                "structural_unanswerability_certified": structural_unanswerability_certified,
+                "classification_dispatch_allowed": dispatch_allowed,
+                "source_populated_or_structural_unanswerability": (
+                    source_populated or structural_unanswerability_certified
+                ),
+            }
+        )
+    return {
+        "retrieval_packet_count": len(retrieval_packets),
+        "source_populated_count": sum(
+            1 for item in retrieval_packets if item["source_populated_or_structural_unanswerability"]
+        ),
+        "classification_dispatch_allowed": any(item["classification_dispatch_allowed"] for item in retrieval_packets),
+        "retrieval_packets": retrieval_packets,
+        "ok": bool(retrieval_packets)
+        and all(item["source_populated_or_structural_unanswerability"] for item in retrieval_packets),
+    }
+
+
+def _scae_runtime_evidence(manifests: list[dict[str, Any]]) -> dict[str, Any]:
+    ledgers = []
+    for manifest in manifests:
+        if manifest.get("artifact_type") != "scae-final-ledger":
+            continue
+        payload = _load_manifest_payload(manifest) or {}
+        delta_refs = payload.get("scae_evidence_delta_candidate_slice_refs")
+        if not isinstance(delta_refs, list):
+            delta_refs = []
+        forecast_validity = str(payload.get("forecast_validity_status") or "unknown")
+        valid_forecast = forecast_validity != "invalid_for_forecast"
+        ledgers.append(
+            {
+                "artifact_id": manifest.get("artifact_id"),
+                "forecast_validity_status": forecast_validity,
+                "scoreable_forecast_output": bool(payload.get("scoreable_forecast_output")),
+                "scae_evidence_delta_ref_count": len(delta_refs),
+                "valid_forecast_requires_delta_refs": valid_forecast,
+                "ok": (not valid_forecast) or bool(delta_refs),
+            }
+        )
+    return {
+        "ledger_count": len(ledgers),
+        "valid_forecast_count": sum(1 for item in ledgers if item["valid_forecast_requires_delta_refs"]),
+        "delta_ref_count": sum(int(item["scae_evidence_delta_ref_count"]) for item in ledgers),
+        "ledgers": ledgers,
+        "ok": all(item["ok"] for item in ledgers),
+    }
+
+
 def _forecast_decisions_for_run(conn: sqlite3.Connection, pipeline_run_id: str | None) -> list[dict[str, Any]]:
     if not pipeline_run_id or not _table_exists(conn, "forecast_decision_records"):
         return []
@@ -478,6 +593,111 @@ def _calibration_report(
     )
 
 
+def _criterion(gate: str, ok: bool, *, required: bool = True, detail: dict[str, Any] | None = None) -> dict[str, Any]:
+    status = "passed" if ok else ("failed" if required else "skipped")
+    return {
+        "gate": gate,
+        "required": required,
+        "status": status,
+        "ok": bool(ok or not required),
+        "detail": detail or {},
+    }
+
+
+def _first_failing_gate(criteria: list[dict[str, Any]]) -> str | None:
+    for item in criteria:
+        if item.get("required") and not item.get("ok"):
+            return str(item.get("gate"))
+    return None
+
+
+def _build_runtime_criteria(
+    *,
+    require_qdt_model_executed: bool,
+    require_researcher_model_executed: bool,
+    require_scoreable_prediction: bool,
+    qdt_evidence: dict[str, Any],
+    retrieval_evidence: dict[str, Any],
+    researcher_evidence: dict[str, Any],
+    scae_evidence: dict[str, Any],
+    prediction_deltas: dict[str, Any],
+    active: dict[str, int],
+    handoff_report: dict[str, Any],
+    errors: dict[str, Any],
+) -> list[dict[str, Any]]:
+    researcher_required = bool(
+        require_researcher_model_executed or retrieval_evidence.get("classification_dispatch_allowed")
+    )
+    expected_market_predictions = prediction_deltas.get("expected_market_predictions")
+    non_executing_expected = expected_market_predictions == 0 and not require_scoreable_prediction
+    return [
+        _criterion(
+            "qdt_model_executed",
+            bool(qdt_evidence.get("ok")),
+            required=require_qdt_model_executed,
+            detail={
+                "qdt_model_executed_count": qdt_evidence.get("qdt_model_executed_count", 0),
+                "runtime_call_model_executed_count": qdt_evidence.get("runtime_call_model_executed_count", 0),
+            },
+        ),
+        _criterion(
+            "retrieval_source_populated_or_structural_unanswerability",
+            bool(retrieval_evidence.get("ok")),
+            detail={
+                "retrieval_packet_count": retrieval_evidence.get("retrieval_packet_count", 0),
+                "source_populated_count": retrieval_evidence.get("source_populated_count", 0),
+            },
+        ),
+        _criterion(
+            "researcher_model_executed_if_dispatch_allowed",
+            bool(researcher_evidence.get("ok")),
+            required=researcher_required,
+            detail={
+                "classification_dispatch_allowed": bool(retrieval_evidence.get("classification_dispatch_allowed")),
+                "model_executed_count": researcher_evidence.get("model_executed_count", 0),
+                "runtime_bundle_count": researcher_evidence.get("runtime_bundle_count", 0),
+            },
+        ),
+        _criterion(
+            "scae_delta_refs_if_valid_forecast",
+            bool(scae_evidence.get("ok")),
+            detail={
+                "valid_forecast_count": scae_evidence.get("valid_forecast_count", 0),
+                "delta_ref_count": scae_evidence.get("delta_ref_count", 0),
+            },
+        ),
+        _criterion(
+            "no_scoreable_prediction_in_non_executing_mode",
+            prediction_deltas.get("market_predictions_delta") == 0,
+            required=non_executing_expected,
+            detail={
+                "expected_market_predictions": expected_market_predictions,
+                "market_predictions_delta": prediction_deltas.get("market_predictions_delta"),
+            },
+        ),
+        _criterion(
+            "clean_drain",
+            not active.get("active_runs") and not active.get("active_leases"),
+            detail=dict(active),
+        ),
+        _criterion(
+            "manifest_handoffs_resolved",
+            bool(handoff_report.get("ok")),
+            detail={
+                "unresolved_output_manifest_refs": handoff_report.get("unresolved_output_manifest_refs", []),
+            },
+        ),
+        _criterion(
+            "stage_errors_allowed",
+            int(errors.get("unexpected_count") or 0) == 0,
+            detail={
+                "unexpected_count": errors.get("unexpected_count", 0),
+                "allowed_failure_classes": errors.get("allowed_failure_classes", []),
+            },
+        ),
+    ]
+
+
 def build_real_runtime_canary_report(
     db_path: Path | str,
     *,
@@ -540,7 +760,9 @@ def build_real_runtime_canary_report(
     handoff_report = build_handoff_report(path, pipeline_run_id=resolved_run_id) if resolved_run_id else {"ok": False, "error": "no_pipeline_run_id"}
     manifests = _manifest_items(handoff_report)
     qdt_evidence = _model_runtime_evidence(manifests)
+    retrieval_evidence = _retrieval_runtime_evidence(manifests)
     researcher_evidence = _researcher_runtime_evidence(manifests)
+    scae_evidence = _scae_runtime_evidence(manifests)
     storage = build_storage_maintenance_plan(path, retention_days=storage_retention_days)
     scoring = brier_score_report(path, prediction_source=prediction_source, prediction_label=prediction_label, evaluation_cluster_id=evaluation_cluster_id)
     calibration = _calibration_report(
@@ -572,8 +794,14 @@ def build_real_runtime_canary_report(
         issues.append("unexpected_stage_error_events")
     if require_qdt_model_executed and not qdt_evidence["ok"]:
         issues.append("qdt_model_runtime_not_verified")
-    if require_researcher_model_executed and not researcher_evidence["ok"]:
+    if not retrieval_evidence["ok"]:
+        issues.append("retrieval_runtime_not_source_populated_or_structurally_unanswerable")
+    if (
+        require_researcher_model_executed or retrieval_evidence["classification_dispatch_allowed"]
+    ) and not researcher_evidence["ok"]:
         issues.append("researcher_model_runtime_not_verified")
+    if not scae_evidence["ok"]:
+        issues.append("scae_valid_forecast_missing_evidence_delta_refs")
     _check_prediction_deltas(prediction_deltas, issues)
     _check_resource_gates(
         storage,
@@ -585,11 +813,33 @@ def build_real_runtime_canary_report(
         case_wall_time_warning_seconds=case_wall_time_warning_seconds,
         case_wall_time_block_seconds=case_wall_time_block_seconds,
     )
+    runtime_criteria = _build_runtime_criteria(
+        require_qdt_model_executed=require_qdt_model_executed,
+        require_researcher_model_executed=require_researcher_model_executed,
+        require_scoreable_prediction=require_scoreable_prediction,
+        qdt_evidence=qdt_evidence,
+        retrieval_evidence=retrieval_evidence,
+        researcher_evidence=researcher_evidence,
+        scae_evidence=scae_evidence,
+        prediction_deltas=prediction_deltas,
+        active=active,
+        handoff_report=handoff_report,
+        errors=errors,
+    )
+    first_failing_gate = _first_failing_gate(runtime_criteria)
+    criteria_summary = {
+        "first_failing_gate": first_failing_gate,
+        "passed_count": sum(1 for item in runtime_criteria if item.get("status") == "passed"),
+        "failed_count": sum(1 for item in runtime_criteria if item.get("status") == "failed"),
+        "skipped_count": sum(1 for item in runtime_criteria if item.get("status") == "skipped"),
+        "gate_order": [str(item.get("gate")) for item in runtime_criteria],
+    }
     return {
         "schema_version": REAL_RUNTIME_CANARY_REPORT_SCHEMA_VERSION,
         "criteria_schema_version": REAL_RUNTIME_CANARY_CRITERIA_SCHEMA_VERSION,
         "ok": not issues,
         "issues": issues,
+        "first_failing_gate": first_failing_gate,
         "warnings": warnings,
         "db_path": str(path),
         "pipeline_run_id": resolved_run_id,
@@ -605,6 +855,9 @@ def build_real_runtime_canary_report(
             "wal_block_bytes": wal_block_bytes,
             "case_wall_time_warning_seconds": case_wall_time_warning_seconds,
             "case_wall_time_block_seconds": case_wall_time_block_seconds,
+            "runtime_gates": runtime_criteria,
+            "first_failing_gate": first_failing_gate,
+            "summary": criteria_summary,
         },
         "run": run,
         "run_duration_seconds": run_duration,
@@ -614,7 +867,9 @@ def build_real_runtime_canary_report(
         "handoff_report": handoff_report,
         "amrg_reports": _amrg_reports(manifests),
         "model_runtime_evidence": qdt_evidence,
+        "retrieval_runtime_evidence": retrieval_evidence,
         "researcher_runtime_evidence": researcher_evidence,
+        "scae_runtime_evidence": scae_evidence,
         "prediction_delta_evidence": prediction_deltas,
         "storage_maintenance_plan": storage,
         "brier_score_report": scoring,
