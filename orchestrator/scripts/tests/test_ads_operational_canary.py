@@ -609,10 +609,12 @@ class AdsOperationalCanaryTest(unittest.TestCase):
         self.assertEqual(qdt_run_count, 1)
         self.assertEqual(qdt_leaf_count, len(qdt["required_leaf_questions"]))
         self.assertEqual(qdt_sufficiency_count, len(qdt["required_leaf_questions"]))
-        self.assertEqual(retrieval["adapter_mode"], "real_retrieval_runtime_blocked_until_transport_evidence")
+        self.assertEqual(retrieval["adapter_mode"], "source_populated_live_retrieval_runtime")
         self.assertEqual(retrieval["retrieval_runtime_summary"]["runtime_mode"], "live_retrieval_runtime")
+        self.assertGreater(retrieval["retrieval_runtime_summary"]["direct_url_attempt_count"], 0)
+        self.assertGreater(retrieval["ads_retrieval_transport_diagnostics"]["direct_url_candidate_count"], 0)
         self.assertTrue(retrieval["leaf_evidence_dockets"])
-        self.assertFalse(retrieval["browser_retrieval_attempts"])
+        self.assertTrue(retrieval["browser_retrieval_attempts"])
         self.assertFalse(all(docket["admitted_evidence_refs"] for docket in retrieval["leaf_evidence_dockets"]))
         self.assertEqual(
             retrieval["research_sufficiency_summary"]["classification_dispatch_status"],

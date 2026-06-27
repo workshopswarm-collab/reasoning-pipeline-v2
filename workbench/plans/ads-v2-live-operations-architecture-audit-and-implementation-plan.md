@@ -1444,6 +1444,7 @@ Tests:
 - Unit: native GPT candidate output cannot provide final source class, claim family, temporal safety, or sufficiency.
 - Integration: fake browser provider returns one official/primary and one independent secondary source; retrieval packet reaches `RET-008` sufficiency for at least one leaf.
 - Integration: fake browser provider returns no admissible evidence; retrieval records bounded expansion and structural unanswerability or blocked insufficiency, not a clean certification.
+- Parent verification note, 2026-06-27: update the true-production operational canary assertion from the old empty-transport marker to the new source-populated adapter mode. The canary should expect nonzero attempted browser/direct URL records and continued fail-closed retrieval sufficiency when no deterministic metadata/content authority is available.
 
 Verification commands:
 
@@ -1473,6 +1474,14 @@ Success criteria:
 - Retrieval packet has admitted evidence refs or a policy-valid structural unanswerability proof after bounded expansion.
 - Classification remains blocked only when `RET-008` legitimately fails.
 - All temp DB clones and generated artifact dirs are deleted.
+
+Phase 2 completion note, 2026-06-27:
+
+- `ADS Phase 2 Retrieval Worker` implemented the Orchestrator-owned retrieval transport adapter and parent review completed the adjacent operational canary assertion update after the worker hit a local hook outage.
+- True-production retrieval now calls `collect_live_retrieval_candidates()` instead of passing empty candidate arrays, records direct URL candidates, browser/provider availability diagnostics, native candidate proposal diagnostics, and uses adapter mode `source_populated_live_retrieval_runtime`.
+- Verification passed: `python3 -m unittest scripts.tests.test_ads_retrieval_transport scripts.tests.test_ads_production_handlers scripts.tests.test_ads_operational_canary -v`, `python3 -m unittest discover -s scripts/tests -p 'test_retrieval*.py' -v` from `researcher-swarm`, `python3 -m py_compile` for changed Orchestrator modules/tests, and `git diff --check`.
+- Clone scheduler canary passed on `/tmp/ads-phase2.*`: 13/13 stages complete, real-runtime canary `ok=true`, no active runs or leases, 14 valid output manifests, one non-scoreable forecast decision record, zero market prediction writes, and temp cleanup removed the clone directory.
+- Remaining runtime evidence: in this environment `retrieval_browser_provider_configured=false` and `native_candidate_provider_configured=false`, so retrieval produced nonzero source-populated attempts but still failed closed with `retrieval_sufficiency_not_certified`. Researcher dispatch remains blocked until deterministic source metadata/content admission can certify retrieval or prove structural unanswerability.
 
 ### Gap-Closure Phase 3 - Researcher Swarm Runtime Dispatch
 

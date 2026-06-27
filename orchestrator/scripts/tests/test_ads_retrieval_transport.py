@@ -1,0 +1,406 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import copy
+import sys
+import unittest
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(ROOT / "orchestrator" / "scripts"))
+sys.path.insert(0, str(ROOT / "researcher-swarm" / "scripts"))
+sys.path.insert(0, str(ROOT / "decomposer" / "scripts"))
+
+from ads_decomposer.handoff import (  # noqa: E402
+    DECOMPOSER_MODEL_ID,
+    DECOMPOSER_MODEL_LANE_ID,
+    DECOMPOSER_PROMPT_TEMPLATE_ID,
+)
+from ads_decomposer.qdt import build_fixture_qdt_candidate, select_qdt_candidate  # noqa: E402
+from predquant.ads_retrieval_transport import (  # noqa: E402
+    RetrievalProviderPolicy,
+    collect_live_retrieval_candidates,
+)
+from researcher_swarm.retrieval import (  # noqa: E402
+    build_live_retrieval_packet_from_candidates,
+)
+
+
+FORECAST_AT = "2026-06-24T12:00:00+00:00"
+CUTOFF_AT = "2026-06-24T11:59:00+00:00"
+SOURCE_AT = "2026-06-24T11:30:00+00:00"
+
+
+class FakeBrowserProvider:
+    def __init__(self, *, fetch_payloads: dict[str, dict] | None = None, search_results: list[dict] | None = None):
+        self.fetch_payloads = fetch_payloads or {}
+        self.search_results = search_results or []
+        self.events: list[tuple[str, str]] = []
+
+    def fetch_url(self, url: str) -> dict:
+        self.events.append(("fetch", url))
+        payload = copy.deepcopy(self.fetch_payloads.get(url, {}))
+        payload.setdefault("url", url)
+        payload.setdefault("final_url", url)
+        payload.setdefault("extraction_status", "accepted")
+        payload.setdefault("source_published_at", SOURCE_AT)
+        payload.setdefault("content", f"Fetched content for {url}")
+        return payload
+
+    def search_candidate_urls(self, query_context: dict, query_variant: dict, *, searched_at: str | None = None) -> list[dict]:
+        self.events.append(("search", str(query_context["leaf_id"])))
+        records = []
+        for index, result in enumerate(self.search_results, start=1):
+            records.append(
+                {
+                    "leaf_id": query_context["leaf_id"],
+                    "query_variant_id": query_variant["query_variant_id"],
+                    "query_role": query_variant.get("query_role") or "primary_leaf_retrieval",
+                    "rank": result.get("rank") or index,
+                    "url": result.get("url"),
+                    "title": result.get("title") or "fake search result",
+                    "snippet": result.get("snippet") or "",
+                    "searched_at": searched_at,
+                }
+            )
+        return records
+
+
+class AdsRetrievalTransportTest(unittest.TestCase):
+    def setUp(self) -> None:
+        handoff = {
+            "artifact_type": "decomposer_handoff",
+            "schema_version": "decomposer-handoff/v1",
+            "case_id": "case-1",
+            "case_key": "polymarket:market-1",
+            "dispatch_id": "dispatch-1",
+            "macro_question": "Will example happen?",
+            "market_context": {
+                "market_id": "market-1",
+                "market_reality_constraints_digest": "sha256:" + "0" * 64,
+            },
+            "artifact_refs": {
+                "related_market_context": {
+                    "artifact_id": "artifact:amrg-1",
+                    "artifact_type": "related-live-market-context",
+                },
+            },
+            "model_execution_context": {
+                "model_lane_id": DECOMPOSER_MODEL_LANE_ID,
+                "resolved_model_id": DECOMPOSER_MODEL_ID,
+                "model_policy_ref": "orchestrator/plans/autonomous-decomposition-swarm-model-lane-policy.json",
+                "prompt_template_id": DECOMPOSER_PROMPT_TEMPLATE_ID,
+                "prompt_template_sha256": "sha256:" + "1" * 64,
+                "input_manifest_ids": ["artifact:case", "artifact:evidence", "artifact:profile", "artifact:amrg"],
+                "output_schema_version": "question-decomposition/v1",
+            },
+        }
+        self.qdt = select_qdt_candidate([build_fixture_qdt_candidate(handoff)])
+        self.evidence_packet = {
+            "artifact_type": "evidence_packet",
+            "schema_version": "evidence-packet/v2",
+            "case_id": "case-1",
+            "dispatch_id": "dispatch-1",
+            "forecast_timestamp": FORECAST_AT,
+            "source_cutoff_timestamp": CUTOFF_AT,
+            "market_rules": {"resolution_url": "https://rules.example/resolution"},
+            "official_source_hints": ["https://official.example/source-of-truth"],
+            "market_reality_constraints": {
+                "source_of_truth_hints": ["https://protected.example/primary"],
+            },
+        }
+        self.case_contract = {
+            "case_id": "case-1",
+            "dispatch_id": "dispatch-1",
+            "market_identity": {
+                "platform": "polymarket",
+                "internal_market_id": "market-1",
+                "external_market_id": "market-1",
+                "slug": "example-market",
+            },
+        }
+
+    def _resolution_mechanics_qdt(self) -> dict:
+        qdt = copy.deepcopy(self.qdt)
+        qdt["required_leaf_questions"] = [
+            leaf for leaf in qdt["required_leaf_questions"] if leaf["leaf_id"] == "leaf-resolution-mechanics"
+        ]
+        qdt["branches"] = [
+            branch
+            for branch in qdt["branches"]
+            if "leaf-resolution-mechanics" in branch.get("leaf_ids", [])
+        ]
+        return qdt
+
+    def test_direct_url_collection_prioritizes_source_truth_before_broad_search(self) -> None:
+        provider = FakeBrowserProvider(search_results=[{"url": "https://secondary.example/report"}])
+
+        transport = collect_live_retrieval_candidates(
+            qdt=self._resolution_mechanics_qdt(),
+            evidence_packet=self.evidence_packet,
+            case_contract=self.case_contract,
+            amrg_context={
+                "candidate_edges": [
+                    {
+                        "allowed_effects": ["retrieval_query_hint"],
+                        "source_url": "https://amrg.example/source-hint",
+                    }
+                ]
+            },
+            source_cutoff_timestamp=CUTOFF_AT,
+            forecast_timestamp=FORECAST_AT,
+            provider_policy=RetrievalProviderPolicy(max_direct_urls=8, max_search_results_per_variant=1),
+            browser_provider=provider,
+        )
+
+        self.assertEqual(transport.direct_url_candidates[0]["source_ref"], "case_contract.market_url")
+        self.assertIn("source_of_truth_hints", transport.direct_url_candidates[2]["source_ref"])
+        first_search_index = next(index for index, event in enumerate(provider.events) if event[0] == "search")
+        self.assertTrue(all(event[0] == "fetch" for event in provider.events[:first_search_index]))
+        self.assertGreater(len(transport.fetched_candidates), len(transport.search_candidate_urls))
+
+    def test_bad_post_cutoff_duplicate_and_disallowed_urls_flow_to_rejections(self) -> None:
+        provider = FakeBrowserProvider(
+            fetch_payloads={
+                "https://late.example/source": {"source_published_at": "2026-06-24T12:00:01+00:00"},
+            },
+            search_results=[
+                {"url": "https://official.example/source-of-truth"},
+                {"url": "not-a-url"},
+                {"url": "ftp://bad.example/source"},
+                {"url": "https://late.example/source"},
+            ],
+        )
+
+        transport = collect_live_retrieval_candidates(
+            qdt=self._resolution_mechanics_qdt(),
+            evidence_packet=self.evidence_packet,
+            case_contract=self.case_contract,
+            amrg_context=None,
+            source_cutoff_timestamp=CUTOFF_AT,
+            forecast_timestamp=FORECAST_AT,
+            provider_policy=RetrievalProviderPolicy(max_direct_urls=2, max_search_results_per_variant=4),
+            browser_provider=provider,
+        )
+        packet = build_live_retrieval_packet_from_candidates(
+            self._resolution_mechanics_qdt(),
+            evidence_packet=self.evidence_packet,
+            fetched_candidates=transport.fetched_candidates,
+            search_candidate_urls=transport.search_candidate_urls,
+            forecast_timestamp=FORECAST_AT,
+            source_cutoff_timestamp=CUTOFF_AT,
+            live_policy_overlay=True,
+        )
+        omitted_reasons = [
+            reason
+            for item in packet["omitted_candidates"]
+            for reason in item.get("omission_reason_codes", [])
+        ]
+
+        self.assertIn("malformed_url", omitted_reasons)
+        self.assertIn("post_cutoff_source_time", omitted_reasons)
+        self.assertIn("duplicate_canonical_url", omitted_reasons)
+        self.assertGreaterEqual(packet["retrieval_runtime_summary"]["omitted_or_rejected_candidate_count"], 3)
+
+    def test_browser_fetch_authority_fields_are_stripped_and_fail_closed(self) -> None:
+        provider = FakeBrowserProvider(
+            search_results=[{"url": "https://secondary.example/report"}],
+            fetch_payloads={
+                "https://secondary.example/report": {
+                    "source_published_at": SOURCE_AT,
+                    "source_class": "official_or_primary",
+                    "claim_family_id": "claim-family:provider-final",
+                    "temporal_gate_status": "pass",
+                    "research_sufficiency_certification": "allowed",
+                    "content": "Provider tried to certify source metadata.",
+                }
+            },
+        )
+
+        transport = collect_live_retrieval_candidates(
+            qdt=self._resolution_mechanics_qdt(),
+            evidence_packet={**self.evidence_packet, "official_source_hints": []},
+            case_contract=self.case_contract,
+            amrg_context=None,
+            source_cutoff_timestamp=CUTOFF_AT,
+            forecast_timestamp=FORECAST_AT,
+            provider_policy=RetrievalProviderPolicy(max_direct_urls=0, max_search_results_per_variant=1),
+            browser_provider=provider,
+        )
+        self.assertNotIn("source_class", transport.fetched_candidates[0])
+        self.assertNotIn("claim_family_id", transport.fetched_candidates[0])
+
+        packet = build_live_retrieval_packet_from_candidates(
+            self._resolution_mechanics_qdt(),
+            evidence_packet=self.evidence_packet,
+            fetched_candidates=transport.fetched_candidates,
+            search_candidate_urls=transport.search_candidate_urls,
+            forecast_timestamp=FORECAST_AT,
+            source_cutoff_timestamp=CUTOFF_AT,
+            live_policy_overlay=True,
+        )
+
+        self.assertEqual(
+            packet["research_sufficiency_summary"]["classification_dispatch_status"],
+            "blocked_insufficient_research",
+        )
+        self.assertFalse(packet["retrieval_evidence_provenance_slices"][0]["counts_toward_breadth"])
+
+    def test_native_candidate_output_is_url_proposal_only(self) -> None:
+        def native_provider(_context: dict, _variant: dict) -> list[dict]:
+            return [
+                {
+                    "url": "https://native.example/source",
+                    "source_label": "Native candidate",
+                    "candidate_claim_text": "Candidate claim only.",
+                    "source_class": "official_or_primary",
+                    "claim_family_id": "claim-family:native-final",
+                    "temporal_safety_final_authority": "pass",
+                    "research_sufficiency": "allowed",
+                }
+            ]
+
+        transport = collect_live_retrieval_candidates(
+            qdt=self._resolution_mechanics_qdt(),
+            evidence_packet=self.evidence_packet,
+            case_contract=self.case_contract,
+            amrg_context=None,
+            source_cutoff_timestamp=CUTOFF_AT,
+            forecast_timestamp=FORECAST_AT,
+            provider_policy=RetrievalProviderPolicy(max_direct_urls=0, broad_search_enabled=False, native_enabled=True),
+            browser_provider=None,
+            native_candidate_provider=native_provider,
+        )
+        native_candidate = transport.native_research_candidates[0]["candidate_urls"][0]
+
+        self.assertEqual(native_candidate["url"], "https://native.example/source")
+        self.assertNotIn("source_class", native_candidate)
+        self.assertNotIn("claim_family_id", native_candidate)
+        self.assertNotIn("temporal_safety_final_authority", native_candidate)
+        self.assertNotIn("research_sufficiency", native_candidate)
+
+        packet = build_live_retrieval_packet_from_candidates(
+            self._resolution_mechanics_qdt(),
+            evidence_packet=self.evidence_packet,
+            fetched_candidates=transport.fetched_candidates,
+            search_candidate_urls=transport.search_candidate_urls,
+            native_research_candidates=transport.native_research_candidates,
+            forecast_timestamp=FORECAST_AT,
+            source_cutoff_timestamp=CUTOFF_AT,
+            live_policy_overlay=True,
+        )
+        discovery = packet["native_research_candidate_discoveries"][0]
+        self.assertFalse(discovery["authority_boundary"]["research_sufficiency_authority"])
+        self.assertTrue(discovery["fetch_required_before_admission"])
+
+    def test_source_populated_attempts_fail_closed_when_secondary_class_is_not_deterministic(self) -> None:
+        provider = FakeBrowserProvider(search_results=[{"url": "https://secondary.example/report"}])
+        transport = collect_live_retrieval_candidates(
+            qdt=self._resolution_mechanics_qdt(),
+            evidence_packet=self.evidence_packet,
+            case_contract=self.case_contract,
+            amrg_context=None,
+            source_cutoff_timestamp=CUTOFF_AT,
+            forecast_timestamp=FORECAST_AT,
+            provider_policy=RetrievalProviderPolicy(max_direct_urls=1, max_search_results_per_variant=1),
+            browser_provider=provider,
+        )
+
+        packet = build_live_retrieval_packet_from_candidates(
+            self._resolution_mechanics_qdt(),
+            evidence_packet=self.evidence_packet,
+            fetched_candidates=transport.fetched_candidates,
+            search_candidate_urls=transport.search_candidate_urls,
+            forecast_timestamp=FORECAST_AT,
+            source_cutoff_timestamp=CUTOFF_AT,
+            live_policy_overlay=True,
+        )
+
+        self.assertGreater(packet["retrieval_runtime_summary"]["direct_url_attempt_count"], 0)
+        self.assertGreater(packet["retrieval_runtime_summary"]["web_search_attempt_count"], 0)
+        self.assertEqual(
+            packet["research_sufficiency_summary"]["classification_dispatch_status"],
+            "blocked_insufficient_research",
+        )
+
+    def test_no_admissible_evidence_records_bounded_failure_not_certification(self) -> None:
+        provider = FakeBrowserProvider(
+            fetch_payloads={
+                "https://polymarket.com/event/example-market": {
+                    "extraction_status": "blocked",
+                    "reason_codes": ["protected_primary_blocked"],
+                },
+                "https://official.example/source-of-truth": {
+                    "extraction_status": "blocked",
+                    "reason_codes": ["protected_primary_blocked"],
+                },
+            },
+        )
+        transport = collect_live_retrieval_candidates(
+            qdt=self._resolution_mechanics_qdt(),
+            evidence_packet=self.evidence_packet,
+            case_contract=self.case_contract,
+            amrg_context=None,
+            source_cutoff_timestamp=CUTOFF_AT,
+            forecast_timestamp=FORECAST_AT,
+            provider_policy=RetrievalProviderPolicy(max_direct_urls=2, broad_search_enabled=False),
+            browser_provider=provider,
+        )
+        packet = build_live_retrieval_packet_from_candidates(
+            self._resolution_mechanics_qdt(),
+            evidence_packet=self.evidence_packet,
+            fetched_candidates=transport.fetched_candidates,
+            search_candidate_urls=transport.search_candidate_urls,
+            forecast_timestamp=FORECAST_AT,
+            source_cutoff_timestamp=CUTOFF_AT,
+            live_policy_overlay=True,
+        )
+
+        self.assertFalse(packet["leaf_evidence_dockets"][0]["admitted_evidence_refs"])
+        self.assertEqual(
+            packet["research_sufficiency_summary"]["classification_dispatch_status"],
+            "blocked_insufficient_research",
+        )
+        self.assertIn("protected_primary_blocked", packet["omitted_candidates"][0]["omission_reason_codes"])
+
+    def test_missing_browser_provider_reports_unavailable_without_certifying(self) -> None:
+        transport = collect_live_retrieval_candidates(
+            qdt=self._resolution_mechanics_qdt(),
+            evidence_packet=self.evidence_packet,
+            case_contract=self.case_contract,
+            amrg_context=None,
+            source_cutoff_timestamp=CUTOFF_AT,
+            forecast_timestamp=FORECAST_AT,
+            provider_policy=RetrievalProviderPolicy(max_direct_urls=1, broad_search_enabled=False),
+            browser_provider=None,
+        )
+
+        self.assertEqual(transport.transport_diagnostics["browser_provider_status"], "unavailable")
+        self.assertEqual(
+            transport.transport_diagnostics["browser_provider_unavailable_reason"],
+            "browser_provider_not_configured",
+        )
+        self.assertEqual(transport.fetched_candidates[0]["admission_status"], "rejected")
+        self.assertIn("browser_provider_not_configured", transport.fetched_candidates[0]["omission_reason_codes"])
+
+        packet = build_live_retrieval_packet_from_candidates(
+            self._resolution_mechanics_qdt(),
+            evidence_packet=self.evidence_packet,
+            fetched_candidates=transport.fetched_candidates,
+            search_candidate_urls=transport.search_candidate_urls,
+            forecast_timestamp=FORECAST_AT,
+            source_cutoff_timestamp=CUTOFF_AT,
+            live_policy_overlay=True,
+        )
+
+        self.assertFalse(packet["leaf_evidence_dockets"][0]["admitted_evidence_refs"])
+        self.assertEqual(
+            packet["research_sufficiency_summary"]["classification_dispatch_status"],
+            "blocked_insufficient_research",
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

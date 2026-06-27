@@ -33,6 +33,10 @@ from predquant.ads_handoff_resolver import (
 )
 from predquant.ads_manifest_canary_handlers import _active_market_index
 from predquant.ads_pipeline_runner import ADS_PIPELINE_STAGE_ORDER, StageHandlerResult, utc_now_iso
+from predquant.ads_retrieval_transport import (
+    RetrievalProviderPolicy,
+    collect_live_retrieval_candidates,
+)
 from predquant.amrg import materialize_related_live_market_context
 from predquant.evidence_packet import materialize_evidence_packet_v2
 from predquant.tuning_profile import materialize_effective_profile_context
@@ -65,6 +69,7 @@ from researcher_swarm.retrieval import (  # noqa: E402
     RETRIEVAL_PACKET_MANIFEST_ARTIFACT_TYPE,
     RETRIEVAL_PACKET_SCHEMA_VERSION,
     attach_native_research_transport_diagnostics,
+    build_browser_search_provider_diagnostic,
     build_live_retrieval_packet_from_candidates,
     build_retrieval_evidence_item,
     build_retrieval_packet,
@@ -320,6 +325,34 @@ def _market_url(case_contract: dict[str, Any]) -> str:
     if slug:
         return f"https://polymarket.com/event/{slug}"
     return f"https://polymarket.com/market/{external}"
+
+
+def _attach_live_retrieval_transport_metadata(
+    packet: dict[str, Any],
+    *,
+    transport_diagnostics: dict[str, Any],
+    direct_url_candidates: list[dict[str, Any]],
+    checked_at: str,
+) -> dict[str, Any]:
+    packet["ads_retrieval_transport_diagnostics"] = transport_diagnostics
+    packet["ads_retrieval_direct_url_candidates"] = direct_url_candidates
+    if transport_diagnostics.get("browser_provider_status") == "unavailable":
+        reason = str(
+            transport_diagnostics.get("browser_provider_unavailable_reason")
+            or "browser_provider_not_configured"
+        )
+        packet["browser_search_provider_diagnostics"] = [
+            build_browser_search_provider_diagnostic(
+                availability_status="unavailable",
+                checked_at=checked_at,
+                unavailable_reason=reason,
+            )
+        ]
+        for attempt in packet.get("browser_retrieval_attempts", []):
+            if isinstance(attempt, dict):
+                attempt["provider_availability_status"] = "unavailable"
+                attempt["provider_unavailable_reason"] = reason
+    return packet
 
 
 def _structured_market_metadata_evidence(
@@ -918,6 +951,9 @@ def build_stage_handlers(
     amrg_vector_runtime: bool = False,
     amrg_vector_allow_pull: bool = False,
     amrg_model_assist_output_path: str | Path | None = None,
+    retrieval_provider_policy: RetrievalProviderPolicy | None = None,
+    retrieval_browser_provider: Any | None = None,
+    native_candidate_provider: Callable[[dict[str, Any], dict[str, Any]], Any] | None = None,
 ) -> dict[str, Callable[..., Any]]:
     resolved_factory_ref = handler_factory_ref or HANDLER_FACTORY_REF
     resolved_handler_scope = handler_scope or HANDLER_SCOPE
@@ -952,6 +988,8 @@ def build_stage_handlers(
         "amrg_vector_runtime": bool(amrg_vector_runtime),
         "amrg_vector_allow_pull": bool(amrg_vector_allow_pull),
         "amrg_model_assist_configured": amrg_model_assist_output_path is not None,
+        "retrieval_browser_provider_configured": retrieval_browser_provider is not None,
+        "native_candidate_provider_configured": native_candidate_provider is not None,
         **(metadata or {}),
     }
 
@@ -1253,16 +1291,31 @@ def build_stage_handlers(
                 runtime_mode="live_fixture_candidate_retrieval_runtime",
             )
         elif live_retrieval_runtime:
+            evidence_payload = load_manifest_payload(evidence_manifest)
+            related_payload = load_manifest_payload(related_manifest)
+            forecast_at = _forecast_timestamp(forecast_timestamp, lease)
+            transport = collect_live_retrieval_candidates(
+                qdt=qdt_payload,
+                evidence_packet=evidence_payload,
+                case_contract=case_contract,
+                amrg_context=related_payload,
+                source_cutoff_timestamp=source_cutoff,
+                forecast_timestamp=forecast_at,
+                provider_policy=retrieval_provider_policy,
+                browser_provider=retrieval_browser_provider,
+                native_candidate_provider=native_candidate_provider,
+            )
             packet = build_live_retrieval_packet_from_candidates(
                 qdt_payload,
-                evidence_packet=load_manifest_payload(evidence_manifest),
-                amrg_context=load_manifest_payload(related_manifest),
-                fetched_candidates=[],
-                search_candidate_urls=[],
-                native_research_candidates=[],
+                evidence_packet=evidence_payload,
+                amrg_context=related_payload,
+                fetched_candidates=transport.fetched_candidates,
+                search_candidate_urls=transport.search_candidate_urls,
+                native_research_candidates=transport.native_research_candidates,
+                supplemental_candidates=transport.supplemental_candidates,
                 question_decomposition_artifact_id=qdt_manifest["artifact_id"],
                 policy_context_ref=profile_manifest["artifact_id"],
-                forecast_timestamp=_forecast_timestamp(forecast_timestamp, lease),
+                forecast_timestamp=forecast_at,
                 source_cutoff_timestamp=source_cutoff,
                 pre_dispatch_input_whitelist_refs=[
                     qdt_manifest["artifact_id"],
@@ -1274,11 +1327,18 @@ def build_stage_handlers(
                 live_policy_overlay=live_policy_overlay,
                 runtime_mode="live_retrieval_runtime",
             )
-            packet = attach_native_research_transport_diagnostics(
+            packet = _attach_live_retrieval_transport_metadata(
                 packet,
-                availability_status="unavailable",
-                unavailable_reason="native_research_transport_not_configured",
+                transport_diagnostics=transport.transport_diagnostics,
+                direct_url_candidates=transport.direct_url_candidates,
+                checked_at=forecast_at,
             )
+            if not transport.native_research_candidates:
+                packet = attach_native_research_transport_diagnostics(
+                    packet,
+                    availability_status="unavailable",
+                    unavailable_reason="native_research_transport_not_configured",
+                )
         elif scoreable_pilot:
             selected_evidence = _structured_market_metadata_evidence(
                 qdt=qdt_payload,
@@ -1327,7 +1387,7 @@ def build_stage_handlers(
         if live_fixture_retrieval:
             packet["adapter_mode"] = "live_candidate_fixture_retrieval_runtime"
         elif live_retrieval_runtime:
-            packet["adapter_mode"] = "real_retrieval_runtime_blocked_until_transport_evidence"
+            packet["adapter_mode"] = "source_populated_live_retrieval_runtime"
         elif scoreable_pilot:
             packet["adapter_mode"] = "structured_market_metadata_pilot_retrieval"
         else:
