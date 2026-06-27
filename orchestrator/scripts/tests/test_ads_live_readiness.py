@@ -8,7 +8,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from predquant.ads_handoff import ArtifactManifestContext, build_artifact_manifest, ensure_artifact_manifest_schema, write_artifact_manifest
 from predquant.ads_live_readiness import build_live_readiness_report
+from predquant.ads_pipeline_runner import PipelineRunnerPolicy, build_pipeline_run, ensure_pipeline_runner_schema, write_pipeline_run
 from predquant.sqlite_store import SCHEMA, record_prediction_with_snapshot, write_resolution_score
 
 
@@ -164,6 +166,51 @@ class AdsLiveReadinessTest(unittest.TestCase):
             "window_completed_at": "2100-01-08T00:00:00+00:00",
         }
 
+    def _seed_scae_ledger_manifest(self, *, pipeline_run_id: str = "run:true-live-readiness") -> str:
+        ensure_pipeline_runner_schema(self.conn)
+        ensure_artifact_manifest_schema(self.conn)
+        write_pipeline_run(
+            self.conn,
+            build_pipeline_run(
+                policy=PipelineRunnerPolicy(runner_mode="calibration_debt_production", max_cases=1),
+                pipeline_run_id=pipeline_run_id,
+                started_at="2100-01-01T00:00:00+00:00",
+                stopped_at="2100-01-01T00:01:00+00:00",
+                metadata={"handler_factory": "predquant.ads_production_handlers"},
+            ),
+        )
+        payload = {
+            "artifact_type": "scae-final-probability-ledger",
+            "schema_version": "scae-final-probability-ledger/v1",
+            "forecast_validity_status": "valid_for_forecast",
+            "scoreable_forecast_output": True,
+            "scae_evidence_delta_candidate_slice_refs": ["scae-candidate-slice:1"],
+            "scae_evidence_delta_classification_slice_refs": ["classification-slice:1"],
+            "scae_evidence_delta_direction_verification_slice_refs": ["direction-slice:1"],
+            "scae_evidence_delta_quality_verification_slice_refs": ["quality-slice:1"],
+        }
+        artifact_path = Path(self.tempdir.name) / "scae-final-probability-ledger.json"
+        artifact_path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+        manifest = build_artifact_manifest(
+            context=ArtifactManifestContext(
+                case_id="case:true-live-readiness",
+                case_key="polymarket:true-live-readiness",
+                dispatch_id="dispatch:true-live-readiness",
+                stage="scae",
+                producer="unit-test",
+                pipeline_run_id=pipeline_run_id,
+                forecast_timestamp="2100-01-01T00:00:00+00:00",
+                source_cutoff_timestamp="2100-01-01T00:00:00+00:00",
+            ),
+            artifact_type="scae-final-probability-ledger",
+            artifact_schema_version="scae-final-probability-ledger/v1",
+            path=artifact_path,
+            validation_status="valid",
+        )
+        artifact_id = write_artifact_manifest(self.conn, manifest)
+        self.conn.commit()
+        return artifact_id
+
     def test_production_readiness_handler_passes_non_scoreable_gate(self):
         report = build_live_readiness_report(
             self.db_path,
@@ -273,10 +320,11 @@ class AdsLiveReadinessTest(unittest.TestCase):
                 "research_input_mode": "structured_market_metadata_certified",
                 "amrg_refresh_status": None,
                 "scae_evidence_delta_ref_count": 0,
+                "supplied_scae_evidence_delta_ref_count": 0,
             },
         )
 
-    def test_true_live_readiness_accepts_true_production_handler_with_cal001_inputs(self):
+    def test_true_live_readiness_rejects_placeholder_scae_delta_refs(self):
         self._seed_calibration_debt_clearance_evidence()
 
         report = build_live_readiness_report(
@@ -298,15 +346,56 @@ class AdsLiveReadinessTest(unittest.TestCase):
             pointer_stability_evidence=self._passing_pointer_stability(),
         )
 
+        self.assertFalse(report["ok"])
+        self.assertIn("invalid_scae_evidence_delta_refs", report["issues"])
+        self.assertIn("missing_scae_evidence_delta_refs", report["issues"])
+        self.assertEqual(report["scae_evidence_signal_report"]["rejected_supplied_refs"], ["classification-slice-1"])
+
+    def test_true_live_readiness_accepts_true_production_handler_with_manifest_scae_inputs(self):
+        self._seed_calibration_debt_clearance_evidence()
+        scae_manifest_ref = self._seed_scae_ledger_manifest()
+
+        report = build_live_readiness_report(
+            self.db_path,
+            runner_mode="calibration_debt_production",
+            handler_factory="predquant.ads_production_handlers:build_stage_handlers",
+            require_scoreable_live=True,
+            scoreable_readiness_mode="true_scoreable_live_readiness",
+            qdt_adapter_mode="decomposer_model_runtime_live",
+            researcher_runtime_mode="model_executed",
+            research_input_mode="verified_researcher_scae_evidence",
+            amrg_refresh_status="fresh_no_refresh_needed",
+            scae_evidence_delta_refs=(scae_manifest_ref,),
+            first100_trace_complete=True,
+            trace_manifest_count=100,
+            tail_slice_diagnostics=self._passing_tail_diagnostics(),
+            regime_diagnostics=self._passing_regime_diagnostics(),
+            protected_component_diagnostics=self._passing_protected_component_diagnostics(),
+            pointer_stability_evidence=self._passing_pointer_stability(),
+        )
+
         self.assertTrue(report["ok"], report["issues"])
         self.assertEqual(report["status"], "ready")
         self.assertTrue(report["require_scoreable_live"])
         self.assertEqual(report["scoreable_readiness_mode"], "true_scoreable_live_readiness")
+        self.assertEqual(report["scae_evidence_signal_report"]["accepted_supplied_refs"], [scae_manifest_ref])
+        self.assertEqual(report["reported_runtime_signals"]["scae_evidence_delta_ref_count"], 4)
         self.assertTrue(report["calibration_debt_report"]["clears_calibration_debt"])
         self.assertEqual(
             report["calibration_debt_report"]["brier_score_report"]["scorecards"]["scorecards"],
             100,
         )
+
+    def test_readiness_operator_review_without_run_returns_structured_report(self):
+        report = build_live_readiness_report(
+            self.db_path,
+            handler_factory="predquant.ads_production_handlers:build_stage_handlers",
+            include_operator_review=True,
+        )
+
+        self.assertIn("operator_review_report", report)
+        self.assertIsInstance(report["operator_review_report"], dict)
+        self.assertIn("alerts", report["operator_review_report"])
 
     def test_scoreable_gate_blocks_overlarge_debt_canary_batch(self):
         report = build_live_readiness_report(

@@ -41,6 +41,16 @@ WEAK_AMRG_STATUSES = {
     "timing_mismatch_weak_context_only",
     "model_assisted_weak_context_only",
 }
+RESEARCH_SUFFICIENCY_BLOCKED_CODES = {
+    "research_sufficiency_not_certified",
+    "retrieval_sufficiency_not_certified",
+    "blocked_insufficient_research",
+    "blocked_until_certified_retrieval",
+}
+
+
+def _as_list(value: Any) -> list[Any]:
+    return value if isinstance(value, list) else []
 
 
 def _decode_json(value: Any, fallback: Any) -> Any:
@@ -445,24 +455,26 @@ def _amrg_summaries(manifests: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def _retrieval_summary(manifests: list[dict[str, Any]]) -> dict[str, Any]:
     manifest, payload = _latest_payload_by_stage(manifests, "retrieval")
-    summary = payload.get("research_sufficiency_summary") if isinstance(payload, dict) else {}
-    native = payload.get("native_research_transport_diagnostics") if isinstance(payload, dict) else []
-    browser = payload.get("browser_retrieval_attempts") if isinstance(payload, dict) else []
-    dockets = payload.get("leaf_evidence_dockets") if isinstance(payload, dict) else []
+    payload = payload if isinstance(payload, dict) else {}
+    summary = payload.get("research_sufficiency_summary")
+    summary = summary if isinstance(summary, dict) else {}
+    native = _as_list(payload.get("native_research_transport_diagnostics"))
+    browser = _as_list(payload.get("browser_retrieval_attempts"))
+    dockets = _as_list(payload.get("leaf_evidence_dockets"))
     admitted = sum(
-        len(docket.get("admitted_evidence_refs", []))
+        len(_as_list(docket.get("admitted_evidence_refs")))
         for docket in dockets
         if isinstance(docket, dict)
     )
     return {
         "artifact_id": manifest.get("artifact_id") if manifest else None,
-        "adapter_mode": payload.get("adapter_mode") if isinstance(payload, dict) else None,
-        "classification_dispatch_status": summary.get("classification_dispatch_status") if isinstance(summary, dict) else None,
-        "all_required_leaves_certified": bool(summary.get("all_required_leaves_certified")) if isinstance(summary, dict) else False,
-        "leaf_certificate_refs": list(summary.get("leaf_certificate_refs") or []) if isinstance(summary, dict) else [],
-        "native_research_transport_diagnostics": native if isinstance(native, list) else [],
-        "browser_retrieval_attempt_count": len(browser) if isinstance(browser, list) else 0,
-        "leaf_evidence_docket_count": len(dockets) if isinstance(dockets, list) else 0,
+        "adapter_mode": payload.get("adapter_mode"),
+        "classification_dispatch_status": summary.get("classification_dispatch_status"),
+        "all_required_leaves_certified": bool(summary.get("all_required_leaves_certified")),
+        "leaf_certificate_refs": _as_list(summary.get("leaf_certificate_refs")),
+        "native_research_transport_diagnostics": native,
+        "browser_retrieval_attempt_count": len(browser),
+        "leaf_evidence_docket_count": len(dockets),
         "admitted_evidence_ref_count": admitted,
     }
 
@@ -549,11 +561,17 @@ def _researcher_summary(manifests: list[dict[str, Any]]) -> dict[str, Any]:
 def _verification_summary(manifests: list[dict[str, Any]]) -> dict[str, Any]:
     manifest, payload = _latest_payload_by_stage(manifests, "classification_verification")
     rows = payload.get("research_sufficiency_reconciliation_slices") if isinstance(payload, dict) else []
+    rows = _as_list(rows)
     return {
         "artifact_id": manifest.get("artifact_id") if manifest else None,
         "verification_status": payload.get("verification_status") if isinstance(payload, dict) else None,
         "reason_codes": list(payload.get("reason_codes") or []) if isinstance(payload, dict) else [],
-        "reconciliation_slice_count": len(rows) if isinstance(rows, list) else 0,
+        "reconciliation_slice_count": len(rows),
+        "reconciliation_statuses": [
+            str(row.get("research_sufficiency_reconciliation_status"))
+            for row in rows
+            if isinstance(row, dict) and row.get("research_sufficiency_reconciliation_status")
+        ],
     }
 
 
@@ -567,7 +585,7 @@ def _scae_summary(manifests: list[dict[str, Any]]) -> dict[str, Any]:
         "scae_evidence_delta_direction_verification_slice_refs",
         "scae_evidence_delta_quality_verification_slice_refs",
     ):
-        evidence_refs.extend(str(ref) for ref in payload.get(field, []) if ref)
+        evidence_refs.extend(str(ref) for ref in _as_list(payload.get(field)) if ref)
     interval = (
         payload.get("probability_interval")
         or payload.get("confidence_interval")
@@ -584,6 +602,12 @@ def _scae_summary(manifests: list[dict[str, Any]]) -> dict[str, Any]:
         "scoreable_forecast_output": bool(payload.get("scoreable_forecast_output")),
         "evidence_delta_ref_count": len(evidence_refs),
         "evidence_delta_refs": sorted(set(evidence_refs)),
+        "reason_codes": _as_list(payload.get("reason_codes")),
+        "research_sufficiency_context": (
+            payload.get("research_sufficiency_context")
+            if isinstance(payload.get("research_sufficiency_context"), dict)
+            else {}
+        ),
         "candidate_bundle_digest": payload.get("scae_evidence_delta_candidate_bundle_digest"),
         "netting_bundle_digest": payload.get("scae_leaf_cluster_netting_bundle_digest"),
     }
@@ -762,6 +786,37 @@ def _alert_counts(alerts: list[dict[str, Any]]) -> dict[str, int]:
     }
 
 
+def _strict_true_production_alert_severity(run: dict[str, Any] | None) -> str:
+    metadata = run.get("metadata") if isinstance(run, dict) and isinstance(run.get("metadata"), dict) else {}
+    marker_text = " ".join(str(value).lower() for value in metadata.values())
+    runner_mode = str((run or {}).get("runner_mode") or "")
+    strict = (
+        runner_mode == "calibration_debt_production"
+        or "release" in marker_text
+        or "cutover" in marker_text
+        or "scoreable" in marker_text
+    )
+    return "blocker" if strict else "warning"
+
+
+def _scae_invalid_research_sufficiency_blocked(
+    scae: dict[str, Any],
+    verification: dict[str, Any],
+) -> bool:
+    if scae.get("forecast_validity_status") != "invalid_for_forecast":
+        return False
+    reason_codes = set(str(code) for code in _as_list(scae.get("reason_codes")))
+    reason_codes.update(str(code) for code in _as_list(verification.get("reason_codes")))
+    statuses = set(str(status) for status in _as_list(verification.get("reconciliation_statuses")))
+    context = scae.get("research_sufficiency_context")
+    if isinstance(context, dict):
+        reason_codes.update(str(code) for code in _as_list(context.get("blocking_reason_codes")))
+        statuses.add(str(context.get("status") or ""))
+    return bool(reason_codes & RESEARCH_SUFFICIENCY_BLOCKED_CODES) or bool(
+        statuses & {"blocked_insufficient_research", "research_sufficiency_not_certified"}
+    )
+
+
 def _build_alerts(
     *,
     pipeline_run_id: str | None,
@@ -769,6 +824,7 @@ def _build_alerts(
     active_runs: list[dict[str, Any]],
     active_leases: list[dict[str, Any]],
     handoff_report: dict[str, Any],
+    run: dict[str, Any] | None,
     storage: dict[str, Any],
     freshness: dict[str, Any],
     cases: list[dict[str, Any]],
@@ -941,6 +997,22 @@ def _build_alerts(
                 remediation="Require model-executed researcher sidecars/runtime bundles before scoreable expansion.",
                 **refs,
             ))
+        true_production_issue_severity = _strict_true_production_alert_severity(run)
+        if run_kind == "true_production" and int(researcher.get("model_executed_count") or 0) == 0:
+            alerts.append(_alert(
+                true_production_issue_severity,
+                "true_production_researcher_runtime_missing",
+                "True-production run has no verified researcher model executions.",
+                refs=[
+                    item.get("artifact_id")
+                    for item in researcher.get("classification_artifacts", [])
+                    if item.get("artifact_id")
+                ],
+                value=researcher.get("model_executed_count") or 0,
+                threshold=">=1",
+                remediation="Require model-executed researcher sidecars/runtime bundles before release or cutover.",
+                **refs,
+            ))
         for amrg in case.get("amrg_consumed_hints", []):
             if amrg.get("vector_status") == "unavailable":
                 alerts.append(_alert(
@@ -977,6 +1049,43 @@ def _build_alerts(
             isinstance(item, dict) and item.get("availability_status") == "unavailable"
             for item in retrieval.get("native_research_transport_diagnostics", [])
         )
+        if run_kind == "true_production" and not retrieval.get("all_required_leaves_certified"):
+            alerts.append(_alert(
+                true_production_issue_severity,
+                "true_production_retrieval_not_certified",
+                "True-production retrieval did not certify all required leaves.",
+                refs=[retrieval.get("artifact_id")] if retrieval.get("artifact_id") else [],
+                value=retrieval.get("all_required_leaves_certified"),
+                threshold=True,
+                remediation="Repair retrieval sufficiency before release or cutover.",
+                **refs,
+            ))
+        if run_kind == "true_production" and int(retrieval.get("admitted_evidence_ref_count") or 0) == 0:
+            alerts.append(_alert(
+                true_production_issue_severity,
+                "true_production_zero_admitted_evidence_refs",
+                "True-production retrieval admitted zero evidence refs.",
+                refs=[retrieval.get("artifact_id")] if retrieval.get("artifact_id") else [],
+                value=retrieval.get("admitted_evidence_ref_count") or 0,
+                threshold=">=1",
+                remediation="Populate certified retrieval evidence before release or cutover.",
+                **refs,
+            ))
+        if (
+            run_kind == "true_production"
+            and int(retrieval.get("browser_retrieval_attempt_count") or 0) == 0
+            and native_unavailable
+        ):
+            alerts.append(_alert(
+                true_production_issue_severity,
+                "true_production_browser_retrieval_missing_native_unavailable",
+                "True-production retrieval had no browser attempts while native discovery was unavailable.",
+                refs=[retrieval.get("artifact_id")] if retrieval.get("artifact_id") else [],
+                value=retrieval.get("browser_retrieval_attempt_count") or 0,
+                threshold=">=1",
+                remediation="Enable browser retrieval fallback or restore native discovery before release or cutover.",
+                **refs,
+            ))
         if native_unavailable and retrieval.get("all_required_leaves_certified"):
             alerts.append(_alert(
                 "warning",
@@ -987,6 +1096,18 @@ def _build_alerts(
                 **refs,
             ))
         scae = case.get("scae_readiness") or {}
+        verification = case.get("verification_readiness") or {}
+        if run_kind == "true_production" and _scae_invalid_research_sufficiency_blocked(scae, verification):
+            alerts.append(_alert(
+                true_production_issue_severity,
+                "true_production_scae_invalid_research_sufficiency_blocked",
+                "True-production SCAE output is invalid for forecast because research sufficiency is blocked.",
+                refs=[scae.get("artifact_id")] if scae.get("artifact_id") else [],
+                value=scae.get("forecast_validity_status"),
+                threshold="valid_for_forecast",
+                remediation="Resolve research sufficiency blockers before release or cutover.",
+                **refs,
+            ))
         if scae.get("scoreable_forecast_output") and not scae.get("evidence_delta_ref_count"):
             alerts.append(_alert(
                 "blocker",
@@ -1093,6 +1214,7 @@ def build_ads_operator_review_report(
         active_runs=active_runs,
         active_leases=active_leases,
         handoff_report=handoff,
+        run=run,
         storage=storage,
         freshness=freshness,
         cases=cases,

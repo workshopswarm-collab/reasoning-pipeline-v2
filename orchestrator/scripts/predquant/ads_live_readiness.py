@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 import argparse
+import json
 import importlib.util
 import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+from predquant.ads_handoff import ensure_artifact_manifest_schema
 from predquant.ads_operational_canary import active_work_counts
 from predquant.ads_operator_review import build_ads_operator_review_report
-from predquant.ads_pipeline_runner import ensure_pipeline_runner_schema, read_pipeline_control_state
+from predquant.ads_pipeline_runner import PIPELINE_RUN_TABLE, ensure_pipeline_runner_schema, read_pipeline_control_state
 from predquant.ads_storage_maintenance import build_storage_maintenance_plan
 from predquant.calibration_debt import build_calibration_debt_clearance_report
 from predquant.sqlite_store import ensure_schema, initialize_database
@@ -37,6 +39,14 @@ CANARY_HANDLER_MARKERS = (
     "ads_manifest_canary_handlers",
 )
 DEFAULT_MAX_CALIBRATION_DEBT_CANARY_CASES = 2
+SCAE_LEDGER_ARTIFACT_TYPE = "scae-final-probability-ledger"
+SCAE_LEDGER_SCHEMA_VERSION = "scae-final-probability-ledger/v1"
+SCAE_EVIDENCE_REF_FIELDS = (
+    "scae_evidence_delta_candidate_slice_refs",
+    "scae_evidence_delta_classification_slice_refs",
+    "scae_evidence_delta_direction_verification_slice_refs",
+    "scae_evidence_delta_quality_verification_slice_refs",
+)
 
 
 def _load_health_module() -> Any:
@@ -67,6 +77,127 @@ def _handler_module(handler_factory: str | None) -> str | None:
         return None
     module_ref, _, _attr = handler_factory.partition(":")
     return module_ref
+
+
+def _as_list(value: Any) -> list[Any]:
+    return value if isinstance(value, list) else []
+
+
+def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    return (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1",
+            (table,),
+        ).fetchone()
+        is not None
+    )
+
+
+def _latest_pipeline_run_id(conn: sqlite3.Connection) -> str | None:
+    if not _table_exists(conn, PIPELINE_RUN_TABLE):
+        return None
+    row = conn.execute(
+        f"""
+        SELECT pipeline_run_id
+        FROM {PIPELINE_RUN_TABLE}
+        ORDER BY COALESCE(stopped_at, started_at) DESC, rowid DESC
+        LIMIT 1
+        """
+    ).fetchone()
+    return str(row["pipeline_run_id"]) if row else None
+
+
+def _scae_delta_refs(payload: dict[str, Any]) -> list[str]:
+    refs = []
+    for field in SCAE_EVIDENCE_REF_FIELDS:
+        refs.extend(str(ref) for ref in _as_list(payload.get(field)) if ref)
+    return sorted(set(refs))
+
+
+def _load_manifest_payload(row: sqlite3.Row) -> dict[str, Any]:
+    path = row["artifact_path"] if "artifact_path" in row.keys() else None
+    if not path and "path" in row.keys():
+        path = row["path"]
+    if not path:
+        return {}
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _valid_scae_manifest(row: sqlite3.Row) -> bool:
+    artifact_schema_version = (
+        row["artifact_schema_version"]
+        if "artifact_schema_version" in row.keys()
+        else row["schema_version"] if "schema_version" in row.keys() else None
+    )
+    return (
+        row["artifact_type"] == SCAE_LEDGER_ARTIFACT_TYPE
+        and artifact_schema_version == SCAE_LEDGER_SCHEMA_VERSION
+    )
+
+
+def _scae_evidence_signal_report(
+    conn: sqlite3.Connection,
+    *,
+    pipeline_run_id: str | None,
+    supplied_refs: list[str] | tuple[str, ...] | None,
+) -> dict[str, Any]:
+    refs = tuple(str(ref) for ref in (supplied_refs or []) if ref)
+    if not pipeline_run_id or not _table_exists(conn, "case_artifact_manifest"):
+        return {
+            "pipeline_run_id": pipeline_run_id,
+            "manifest_ref_count": 0,
+            "manifest_scae_evidence_delta_ref_count": 0,
+            "accepted_supplied_ref_count": 0,
+            "rejected_supplied_refs": list(refs),
+            "accepted_supplied_refs": [],
+            "current_run_scae_manifest_refs": [],
+        }
+    rows = conn.execute(
+        """
+        SELECT *
+        FROM case_artifact_manifest
+        WHERE pipeline_run_id = ?
+        ORDER BY created_at, id
+        """,
+        (pipeline_run_id,),
+    ).fetchall()
+    current_by_id = {str(row["artifact_id"]): row for row in rows if row["artifact_id"]}
+    scae_rows = [row for row in rows if _valid_scae_manifest(row)]
+    manifest_delta_refs: list[str] = []
+    scae_manifest_refs = []
+    for row in scae_rows:
+        payload = _load_manifest_payload(row)
+        delta_refs = _scae_delta_refs(payload)
+        if delta_refs:
+            scae_manifest_refs.append(str(row["artifact_id"]))
+            manifest_delta_refs.extend(delta_refs)
+
+    accepted_supplied = []
+    rejected_supplied = []
+    for ref in refs:
+        row = current_by_id.get(ref)
+        if row is None or not _valid_scae_manifest(row):
+            rejected_supplied.append(ref)
+            continue
+        payload = _load_manifest_payload(row)
+        if not _scae_delta_refs(payload):
+            rejected_supplied.append(ref)
+            continue
+        accepted_supplied.append(ref)
+
+    return {
+        "pipeline_run_id": pipeline_run_id,
+        "manifest_ref_count": len(scae_manifest_refs),
+        "manifest_scae_evidence_delta_ref_count": len(set(manifest_delta_refs)),
+        "accepted_supplied_ref_count": len(accepted_supplied),
+        "rejected_supplied_refs": rejected_supplied,
+        "accepted_supplied_refs": accepted_supplied,
+        "current_run_scae_manifest_refs": scae_manifest_refs,
+    }
 
 
 def build_live_readiness_report(
@@ -119,8 +250,14 @@ def build_live_readiness_report(
     try:
         ensure_schema(conn)
         ensure_pipeline_runner_schema(conn)
+        ensure_artifact_manifest_schema(conn)
         active = active_work_counts(conn)
         control = read_pipeline_control_state(conn)
+        scae_evidence_signals = _scae_evidence_signal_report(
+            conn,
+            pipeline_run_id=operator_review_pipeline_run_id or _latest_pipeline_run_id(conn),
+            supplied_refs=scae_evidence_delta_refs,
+        )
     finally:
         conn.close()
 
@@ -186,7 +323,12 @@ def build_live_readiness_report(
                 issues.append("true_scoreable_live_readiness_rejects_structured_market_metadata_only_research_input")
             if not amrg_refresh_status:
                 issues.append("missing_amrg_refresh_status_for_promoted_effects")
-            if not scae_evidence_delta_refs:
+            if scae_evidence_signals["rejected_supplied_refs"]:
+                issues.append("invalid_scae_evidence_delta_refs")
+            if (
+                not scae_evidence_signals["manifest_scae_evidence_delta_ref_count"]
+                and not scae_evidence_signals["accepted_supplied_ref_count"]
+            ):
                 issues.append("missing_scae_evidence_delta_refs")
         if (
             not calibration.get("clears_calibration_debt")
@@ -246,8 +388,13 @@ def build_live_readiness_report(
             "researcher_runtime_mode": researcher_runtime_mode,
             "research_input_mode": research_input_mode,
             "amrg_refresh_status": amrg_refresh_status,
-            "scae_evidence_delta_ref_count": len(scae_evidence_delta_refs or []),
+            "scae_evidence_delta_ref_count": (
+                scae_evidence_signals["manifest_scae_evidence_delta_ref_count"]
+                or scae_evidence_signals["accepted_supplied_ref_count"]
+            ),
+            "supplied_scae_evidence_delta_ref_count": len(scae_evidence_delta_refs or []),
         },
+        "scae_evidence_signal_report": scae_evidence_signals,
         "allow_canary_handler": allow_canary_handler,
         "allow_calibration_debt_scoreable_canary": allow_calibration_debt_scoreable_canary,
         "requested_max_cases": requested_max_cases,
