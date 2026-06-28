@@ -669,6 +669,10 @@ class AdsRetrievalTransportTest(unittest.TestCase):
             "source_time_unknown_not_admitted_by_transport_adapter",
             transport.fetched_candidates[0]["omission_reason_codes"],
         )
+        self.assertIn(
+            "source_time_unknown_with_fetched_content",
+            transport.fetched_candidates[0]["omission_reason_codes"],
+        )
 
     def test_bounded_search_caps_materialize_fail_closed_packet(self) -> None:
         provider = FakeBrowserProvider(

@@ -4270,7 +4270,7 @@ def _candidate_text(candidate: dict[str, Any]) -> str:
         or candidate.get("rendered_text")
         or candidate.get("markdown")
         or "",
-        max_chars=1200,
+        max_chars=4000,
     )
 
 

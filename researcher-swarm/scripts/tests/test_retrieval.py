@@ -1696,6 +1696,57 @@ class RetrievalPacketContractTest(unittest.TestCase):
         self.assertEqual(unsupported["claim_family_ids"], [])
         self.assertIn("claim_family_unknown_not_counted", unsupported["unknown_reason_codes"])
 
+    def test_tesla_delivery_claim_family_can_use_later_fetched_text_span(self) -> None:
+        qdt = copy.deepcopy(self.qdt)
+        qdt["required_leaf_questions"] = [qdt["required_leaf_questions"][0]]
+        context = build_retrieval_query_contexts(qdt, evidence_packet=self.evidence_packet)[0]
+        content = (
+            "Skip to main content Tesla homepage Investor Relations "
+            + ("Q2 2026 Delivery Consensus details. " * 30)
+            + "Continue Reading Tesla First Quarter 2026 Production, Deliveries & Deployments "
+            "BUSINESS WIRE Apr 2, 2026 AUSTIN, Texas, April 2, 2026 - In the first quarter, "
+            "we produced over 408,000 vehicles, delivered over 358,000 vehicles and deployed "
+            "8.8 GWh of energy storage products."
+        )
+        self.assertGreater(content.find("produced over 408,000 vehicles"), 1200)
+        candidate = {
+            "leaf_id": context["leaf_id"],
+            "parent_branch_id": context["parent_branch_id"],
+            "retrieval_transport": "browser",
+            "navigation_mode": "direct_url",
+            "requested_url": "https://ir.tesla.com/press",
+            "final_url": "https://ir.tesla.com/press",
+            "canonical_url": "https://ir.tesla.com/press",
+            "source_class": "official_or_primary",
+            "source_published_at": "2026-04-02T12:00:00+00:00",
+            "source_observed_at": "2026-06-24T11:58:59+00:00",
+            "captured_at": "2026-06-24T11:58:59+00:00",
+            "deterministic_source_class_proof": True,
+            "source_class_resolution_method": "deterministic_url_registry",
+            "temporal_gate_status": "pass",
+            "admission_status": "admitted",
+            "extraction_status": "accepted",
+            "result_rank": 1,
+            "content": content,
+        }
+
+        packet = build_live_retrieval_packet_from_candidates(
+            qdt,
+            evidence_packet=self.evidence_packet,
+            fetched_candidates=[candidate],
+            search_candidate_urls=[],
+            question_decomposition_artifact_id="artifact:qdt-1",
+            policy_context_ref="artifact:profile-1",
+        )
+        provenance = packet["retrieval_evidence_provenance_slices"][0]
+        chunk = packet["evidence_chunks"][0]
+
+        self.assertTrue(provenance["claim_family_ids"])
+        self.assertNotIn("claim_family_unknown_not_counted", provenance["unknown_reason_codes"])
+        self.assertGreater(chunk["excerpt_char_count"], 1200)
+        self.assertEqual(chunk["excerpt_policy"], "hash_only")
+        self.assertNotIn("text", chunk)
+
     def test_phase7_direct_url_priority_search_candidate_caps_and_dedupe(self) -> None:
         qdt = copy.deepcopy(self.qdt)
         qdt["required_leaf_questions"] = [qdt["required_leaf_questions"][0]]
@@ -2281,6 +2332,7 @@ class RetrievalPacketContractTest(unittest.TestCase):
             return {
                 "final_url": "https://source.example/final",
                 "body_text": "Rendered protected page text from the requested URL only.",
+                "head_html": '<meta property="article:published_time" content="2026-06-24T11:25:00Z">',
                 "source_class": "official_or_primary",
                 "claim_family_id": "claim-family-forbidden",
             }
@@ -2302,6 +2354,7 @@ class RetrievalPacketContractTest(unittest.TestCase):
         self.assertEqual(fetched["extraction_status"], "accepted")
         self.assertEqual(fetched["extraction_method"], "local_rendered_fetch_fallback")
         self.assertEqual(fetched["web_fetch_role"], "url_fetch_extraction_only")
+        self.assertEqual(fetched["source_published_at"], "2026-06-24T11:25:00+00:00")
         self.assertIn("Rendered protected page text", fetched["content"])
         self.assertEqual(
             fetched["rendered_fetch_diagnostic"]["capture_boundary"],
@@ -2395,6 +2448,7 @@ class RetrievalPacketContractTest(unittest.TestCase):
                                 "final_url": "https://source.example/final",
                                 "title": "Rendered page",
                                 "body_text": "Rendered page text.",
+                                "head_html": '<meta property="article:published_time" content="2026-06-24T11:26:00Z">',
                                 "source_class": "official_or_primary",
                             }
                         }
@@ -2420,6 +2474,7 @@ class RetrievalPacketContractTest(unittest.TestCase):
         self.assertEqual(fetched["extraction_status"], "accepted")
         self.assertEqual(fetched["final_url"], "https://source.example/final")
         self.assertEqual(fetched["content"], "Rendered page text.")
+        self.assertEqual(fetched["source_published_at"], "2026-06-24T11:26:00+00:00")
         self.assertEqual(fetched["rendered_fetch_diagnostic"]["backend"], "openclaw_browser_cli")
         self.assertNotIn("source_class", fetched)
         command_names = [

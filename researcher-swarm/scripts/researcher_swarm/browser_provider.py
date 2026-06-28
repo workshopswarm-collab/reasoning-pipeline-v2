@@ -650,7 +650,8 @@ def _openclaw_browser_cli_rendered_fetch(
             "() => ({"
             "final_url: window.location.href,"
             "title: document.title || '',"
-            "body_text: document.body ? document.body.innerText : ''"
+            "body_text: document.body ? document.body.innerText : '',"
+            "head_html: document.head ? document.head.innerHTML : ''"
             "})"
         )
         evaluate_completed = subprocess_run(
@@ -677,6 +678,7 @@ def _openclaw_browser_cli_rendered_fetch(
             "final_url": str(payload.get("final_url") or payload.get("href") or payload.get("url") or url),
             "title": str(payload.get("title") or ""),
             "body_text": _squash_text(payload.get("body_text") or payload.get("text") or "", max_chars),
+            "head_html": _squash_text(payload.get("head_html") or "", max_chars),
         }
     except ValueError as exc:
         return {
@@ -727,7 +729,8 @@ def _python_playwright_rendered_fetch(url: str, timeout_seconds: float, max_char
                 """() => ({
                     final_url: window.location.href,
                     title: document.title || "",
-                    body_text: document.body ? document.body.innerText : ""
+                    body_text: document.body ? document.body.innerText : "",
+                    head_html: document.head ? document.head.innerHTML : ""
                 })"""
             )
         finally:
@@ -738,6 +741,7 @@ def _python_playwright_rendered_fetch(url: str, timeout_seconds: float, max_char
             "reason_codes": ["rendered_fetch_returned_non_object"],
         }
     payload["body_text"] = _squash_text(payload.get("body_text"), max_chars)
+    payload["head_html"] = _squash_text(payload.get("head_html"), max_chars)
     return payload
 
 
@@ -1156,6 +1160,14 @@ class ConfiguredBrowserProvider(BrowserProviderAdapter):
             or payload.get("text"),
             self.max_fetch_chars,
         )
+        html_metadata = _html_page_datetimes(
+            str(
+                payload.get("html")
+                or payload.get("document_html")
+                or payload.get("head_html")
+                or ""
+            )
+        )
         final_url = str(payload.get("final_url") or payload.get("url") or url)
         if not content:
             self.last_rendered_fetch_error = "rendered_fetch_empty_content"
@@ -1171,15 +1183,18 @@ class ConfiguredBrowserProvider(BrowserProviderAdapter):
                 "rendered_fetch_diagnostic": diagnostic,
             }
         diagnostic.update({"status": "accepted", "reason_codes": []})
-        return {
+        fetched = {
             "url": url,
             "final_url": final_url,
             "extraction_status": "accepted",
             "content": content,
+            "source_published_at": html_metadata.get("source_published_at"),
+            "source_updated_at": html_metadata.get("source_updated_at"),
             "web_fetch_role": "url_fetch_extraction_only",
             "extraction_method": "local_rendered_fetch_fallback",
             "rendered_fetch_diagnostic": diagnostic,
         }
+        return {key: value for key, value in fetched.items() if value not in (None, "")}
 
     def provider_diagnostics(self) -> dict[str, Any]:
         return {

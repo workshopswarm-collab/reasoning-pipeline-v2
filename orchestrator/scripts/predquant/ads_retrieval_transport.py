@@ -539,6 +539,7 @@ def _fetch_candidate(
     if extraction_status not in {"accepted", "rejected", "paywalled", "blocked", "duplicate", "temporal_fail"}:
         extraction_status = "rejected"
     final_url = _canonicalize_url(fetched.get("final_url"), fetched.get("url"), canonical_url) or canonical_url
+    fetched_content = _content_from_fetch(fetched)
     source_time = _source_timestamp(fetched)
     published_at = _first_source_timestamp(fetched, ("source_published_at", "published_at"))
     observed_at = _first_source_timestamp(fetched, ("source_observed_at",))
@@ -556,6 +557,8 @@ def _fetch_candidate(
         else:
             extraction_status = "rejected"
             reason_codes.append("source_time_unknown_not_admitted_by_transport_adapter")
+            if fetched_content:
+                reason_codes.append("source_time_unknown_with_fetched_content")
     if extraction_status == "accepted" and _timestamp_at_or_after(source_time, source_cutoff_timestamp):
         extraction_status = "temporal_fail"
         reason_codes.append("post_cutoff_source_time")
@@ -568,9 +571,9 @@ def _fetch_candidate(
         "source_observed_at": observed_at or inferred_observed_at,
         "source_updated_at": fetched.get("source_updated_at"),
         "captured_at": fetched.get("captured_at") or _iso_before(source_cutoff_timestamp),
-        "content": _content_from_fetch(fetched),
+        "content": fetched_content,
         "content_artifact_ref": fetched.get("content_artifact_ref"),
-        "content_sha256": fetched.get("content_sha256") or _content_sha256(_content_from_fetch(fetched)),
+        "content_sha256": fetched.get("content_sha256") or _content_sha256(fetched_content),
         "retrieval_score": float(fetched.get("retrieval_score") or 1.0),
         "transport_authority_boundary": {
             "browser_fetch_certifies_source_class": False,
