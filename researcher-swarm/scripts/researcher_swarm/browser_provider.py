@@ -413,7 +413,8 @@ class ConfiguredBrowserProvider(BrowserProviderAdapter):
         openclaw_session_key_prefix: str = "ads-browser-search",
         search_limit: int = 5,
         fetch_timeout_seconds: float = 20.0,
-        search_timeout_seconds: float = 120.0,
+        search_timeout_seconds: float = 45.0,
+        search_subprocess_grace_seconds: float = 10.0,
         max_fetch_chars: int = 16_000,
         user_agent: str = "OpenClaw ADS retrieval transport/1.0",
         opener: Callable[..., Any] = urlopen,
@@ -433,7 +434,8 @@ class ConfiguredBrowserProvider(BrowserProviderAdapter):
         self.openclaw_session_key_prefix = openclaw_session_key_prefix
         self.search_limit = max(1, min(10, int(search_limit or 5)))
         self.fetch_timeout_seconds = max(1.0, float(fetch_timeout_seconds or 20.0))
-        self.search_timeout_seconds = max(1.0, float(search_timeout_seconds or 120.0))
+        self.search_timeout_seconds = max(1.0, float(search_timeout_seconds or 45.0))
+        self.search_subprocess_grace_seconds = max(1.0, float(search_subprocess_grace_seconds or 10.0))
         self.max_fetch_chars = max(1000, int(max_fetch_chars or 16_000))
         self.user_agent = user_agent
         self.opener = opener
@@ -574,7 +576,7 @@ class ConfiguredBrowserProvider(BrowserProviderAdapter):
                 check=False,
                 capture_output=True,
                 text=True,
-                timeout=self.search_timeout_seconds + 30,
+                timeout=self.search_timeout_seconds + self.search_subprocess_grace_seconds,
             )
         except Exception as exc:
             self.last_search_error = str(exc)[:500] or exc.__class__.__name__
@@ -723,6 +725,9 @@ class ConfiguredBrowserProvider(BrowserProviderAdapter):
             else None,
             "search_configured": self._search_configured(),
             "fetch_configured": True,
+            "search_limit": self.search_limit,
+            "search_timeout_seconds": self.search_timeout_seconds,
+            "search_subprocess_grace_seconds": self.search_subprocess_grace_seconds,
             "last_search_error": self.last_search_error,
             "last_fetch_error": self.last_fetch_error,
             "web_fetch_role": "url_fetch_extraction_only",
@@ -741,6 +746,7 @@ def build_provider() -> ConfiguredBrowserProvider:
     """Build the scheduler-loadable configured browser/search provider."""
 
     search_backend = os.getenv("ADS_BROWSER_SEARCH_BACKEND", "openclaw_oauth_web_search")
+    default_search_limit = "2" if search_backend == "openclaw_oauth_web_search" else "5"
     return ConfiguredBrowserProvider(
         search_backend=search_backend,
         openai_api_key=os.getenv("OPENAI_API_KEY") or os.getenv("ADS_OPENAI_API_KEY"),
@@ -755,9 +761,10 @@ def build_provider() -> ConfiguredBrowserProvider:
         openclaw_agent_id=os.getenv("ADS_BROWSER_SEARCH_OPENCLAW_AGENT_ID", "researcher-swarm"),
         openclaw_model=os.getenv("ADS_BROWSER_SEARCH_OPENCLAW_MODEL"),
         openclaw_session_key_prefix=os.getenv("ADS_BROWSER_SEARCH_OPENCLAW_SESSION_KEY_PREFIX", "ads-browser-search"),
-        search_limit=int(os.getenv("ADS_BROWSER_SEARCH_LIMIT", "5")),
+        search_limit=int(os.getenv("ADS_BROWSER_SEARCH_LIMIT", default_search_limit)),
         fetch_timeout_seconds=float(os.getenv("ADS_BROWSER_FETCH_TIMEOUT_SECONDS", "20")),
-        search_timeout_seconds=float(os.getenv("ADS_BROWSER_SEARCH_TIMEOUT_SECONDS", "120")),
+        search_timeout_seconds=float(os.getenv("ADS_BROWSER_SEARCH_TIMEOUT_SECONDS", "45")),
+        search_subprocess_grace_seconds=float(os.getenv("ADS_BROWSER_SEARCH_SUBPROCESS_GRACE_SECONDS", "10")),
         max_fetch_chars=int(os.getenv("ADS_BROWSER_FETCH_MAX_CHARS", "16000")),
         user_agent=os.getenv("ADS_BROWSER_PROVIDER_USER_AGENT", "OpenClaw ADS retrieval transport/1.0"),
     )

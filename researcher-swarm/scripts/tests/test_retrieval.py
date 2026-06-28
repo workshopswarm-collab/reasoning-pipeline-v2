@@ -1649,13 +1649,17 @@ class RetrievalPacketContractTest(unittest.TestCase):
         self.assertIn("--message", command)
         self.assertIn("--model", command)
         self.assertIn("gpt-5.5", command)
+        self.assertEqual(command[command.index("--timeout") + 1], "45")
         self.assertNotIn("--local", command)
         self.assertEqual(kwargs["capture_output"], True)
+        self.assertEqual(kwargs["timeout"], 55.0)
         self.assertIn("Return exactly one JSON object", command[command.index("--message") + 1])
         diagnostics = provider.provider_diagnostics()
         self.assertEqual(diagnostics["search_provider"], "openclaw_oauth_web_search")
         self.assertEqual(diagnostics["openclaw_agent_id"], "workbench")
         self.assertTrue(diagnostics["search_configured"])
+        self.assertEqual(diagnostics["search_timeout_seconds"], 45.0)
+        self.assertEqual(diagnostics["search_subprocess_grace_seconds"], 10.0)
         self.assertFalse(diagnostics["authority_boundary"]["certifies_research_sufficiency"])
 
     def test_configured_browser_provider_openclaw_oauth_fails_closed_without_cli(self) -> None:
@@ -1687,6 +1691,29 @@ class RetrievalPacketContractTest(unittest.TestCase):
 
         self.assertEqual(records, [])
         self.assertTrue(provider.last_search_error)
+
+    def test_configured_browser_provider_openclaw_oauth_timeout_fails_closed(self) -> None:
+        context = build_retrieval_query_contexts(self.qdt, evidence_packet=self.evidence_packet)[0]
+
+        def subprocess_run(_command, **_kwargs):
+            raise subprocess.TimeoutExpired(cmd="openclaw agent", timeout=8)
+
+        provider = ConfiguredBrowserProvider(
+            search_backend="openclaw_oauth_web_search",
+            openclaw_cli="/usr/local/bin/openclaw",
+            search_timeout_seconds=5,
+            search_subprocess_grace_seconds=3,
+            subprocess_run=subprocess_run,
+        )
+
+        records = provider.search_candidate_urls(context, context["query_variants"][0])
+        diagnostics = provider.provider_diagnostics()
+
+        self.assertEqual(records, [])
+        self.assertIn("timed out", provider.last_search_error)
+        self.assertEqual(diagnostics["search_timeout_seconds"], 5.0)
+        self.assertEqual(diagnostics["search_subprocess_grace_seconds"], 3.0)
+        self.assertEqual(diagnostics["last_search_error"], provider.last_search_error)
 
     def test_configured_browser_provider_openai_without_citations_fails_closed(self) -> None:
         provider = ConfiguredBrowserProvider(responses_client=lambda _payload: {"output": [{"type": "message", "content": []}]})
@@ -1782,6 +1809,8 @@ class RetrievalPacketContractTest(unittest.TestCase):
         self.assertTrue(provider.provider_diagnostics()["search_configured"])
         self.assertEqual(provider.provider_diagnostics()["search_provider"], "openclaw_oauth_web_search")
         self.assertEqual(provider.provider_diagnostics()["openclaw_agent_id"], "researcher-swarm")
+        self.assertEqual(provider.provider_diagnostics()["search_limit"], 2)
+        self.assertEqual(provider.provider_diagnostics()["search_timeout_seconds"], 45.0)
 
     def test_phase7_native_candidate_caps_forbidden_fields_and_nonblocking_unavailability(self) -> None:
         context = build_retrieval_query_contexts(self.qdt, evidence_packet=self.evidence_packet)[0]

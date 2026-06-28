@@ -80,6 +80,31 @@ class DiagnosticsBrowserProvider(FakeBrowserProvider):
             "search_configured": self.search_configured,
             "fetch_configured": self.fetch_configured,
             "web_fetch_must_not_be_used_as_search": True,
+            "authority_boundary": {
+                "certifies_source_class": False,
+                "certifies_research_sufficiency": False,
+                "certifies_probability": False,
+            },
+        }
+
+
+class TimeoutSearchBrowserProvider(FakeBrowserProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self.last_search_error: str | None = None
+
+    def search_candidate_urls(self, query_context: dict, query_variant: dict, *, searched_at: str | None = None) -> list[dict]:
+        self.events.append(("search", str(query_context["leaf_id"])))
+        self.last_search_error = "simulated_search_timeout"
+        raise TimeoutError("simulated search timeout")
+
+    def provider_diagnostics(self) -> dict:
+        return {
+            "provider_id": "timeout-search-provider",
+            "search_configured": True,
+            "fetch_configured": True,
+            "last_search_error": self.last_search_error,
+            "web_fetch_must_not_be_used_as_search": True,
         }
 
 
@@ -221,6 +246,11 @@ class AdsRetrievalTransportTest(unittest.TestCase):
         self.assertTrue(diagnostics["browser_fetch_configured"])
         self.assertFalse(diagnostics["browser_search_configured"])
         self.assertEqual(diagnostics["browser_provider_diagnostics"]["provider_id"], "diagnostics-provider")
+        self.assertEqual(
+            diagnostics["browser_provider_diagnostics"]["provider_authority_status"],
+            "non_authoritative_transport_only",
+        )
+        self.assertNotIn("authority_boundary", diagnostics["browser_provider_diagnostics"])
 
     def test_bad_post_cutoff_duplicate_and_disallowed_urls_flow_to_rejections(self) -> None:
         provider = FakeBrowserProvider(
@@ -385,6 +415,118 @@ class AdsRetrievalTransportTest(unittest.TestCase):
             packet["research_sufficiency_summary"]["classification_dispatch_status"],
             "blocked_insufficient_research",
         )
+
+    def test_bounded_search_caps_materialize_fail_closed_packet(self) -> None:
+        provider = FakeBrowserProvider(
+            search_results=[
+                {"url": "https://secondary.example/report-a"},
+                {"url": "https://secondary.example/report-b"},
+            ]
+        )
+
+        transport = collect_live_retrieval_candidates(
+            qdt=self.qdt,
+            evidence_packet=self.evidence_packet,
+            case_contract=self.case_contract,
+            amrg_context=None,
+            source_cutoff_timestamp=CUTOFF_AT,
+            forecast_timestamp=FORECAST_AT,
+            provider_policy=RetrievalProviderPolicy(
+                max_direct_urls=2,
+                max_total_direct_fetches=1,
+                max_search_results_per_variant=2,
+                max_total_search_calls=1,
+                max_total_search_result_fetches=1,
+            ),
+            browser_provider=provider,
+        )
+
+        diagnostics = transport.transport_diagnostics
+        self.assertEqual(diagnostics["direct_url_fetch_attempt_count"], 1)
+        self.assertEqual(diagnostics["search_call_count"], 1)
+        self.assertEqual(diagnostics["search_result_fetch_attempt_count"], 1)
+        self.assertGreater(diagnostics["direct_url_fetch_skipped_count"], 0)
+        self.assertGreater(diagnostics["search_call_skipped_count"], 0)
+        self.assertGreater(diagnostics["search_result_fetch_skipped_count"], 0)
+        self.assertIn("direct_url_fetch_limit_reached", diagnostics["bounded_retrieval_reason_codes"])
+        self.assertIn("search_call_limit_reached", diagnostics["bounded_retrieval_reason_codes"])
+        self.assertIn("search_result_fetch_limit_reached", diagnostics["bounded_retrieval_reason_codes"])
+        self.assertEqual(len([event for event in provider.events if event[0] == "search"]), 1)
+
+        packet = build_live_retrieval_packet_from_candidates(
+            self.qdt,
+            evidence_packet=self.evidence_packet,
+            fetched_candidates=transport.fetched_candidates,
+            search_candidate_urls=transport.search_candidate_urls,
+            forecast_timestamp=FORECAST_AT,
+            source_cutoff_timestamp=CUTOFF_AT,
+            live_policy_overlay=True,
+        )
+
+        self.assertEqual(
+            packet["research_sufficiency_summary"]["classification_dispatch_status"],
+            "blocked_insufficient_research",
+        )
+
+    def test_broad_search_is_capped_across_leaves_with_diagnostics(self) -> None:
+        provider = FakeBrowserProvider(search_results=[{"url": "https://secondary.example/report"}])
+
+        transport = collect_live_retrieval_candidates(
+            qdt=self.qdt,
+            evidence_packet={**self.evidence_packet, "official_source_hints": []},
+            case_contract=self.case_contract,
+            amrg_context=None,
+            source_cutoff_timestamp=CUTOFF_AT,
+            forecast_timestamp=FORECAST_AT,
+            provider_policy=RetrievalProviderPolicy(
+                max_direct_urls=0,
+                max_total_search_calls=1,
+                max_total_search_result_fetches=1,
+                max_search_results_per_variant=1,
+            ),
+            browser_provider=provider,
+        )
+
+        self.assertEqual([event[0] for event in provider.events].count("search"), 1)
+        self.assertEqual(transport.transport_diagnostics["search_call_count"], 1)
+        self.assertGreater(transport.transport_diagnostics["search_call_skipped_count"], 0)
+        self.assertIn("search_call_limit_reached", transport.transport_diagnostics["bounded_retrieval_reason_codes"])
+        self.assertEqual(
+            transport.transport_diagnostics["search_skipped_diagnostics"][0]["reason_code"],
+            "search_call_limit_reached",
+        )
+
+    def test_search_timeout_materializes_fail_closed_packet(self) -> None:
+        provider = TimeoutSearchBrowserProvider()
+
+        transport = collect_live_retrieval_candidates(
+            qdt=self._resolution_mechanics_qdt(),
+            evidence_packet={**self.evidence_packet, "official_source_hints": []},
+            case_contract=self.case_contract,
+            amrg_context=None,
+            source_cutoff_timestamp=CUTOFF_AT,
+            forecast_timestamp=FORECAST_AT,
+            provider_policy=RetrievalProviderPolicy(max_direct_urls=0, max_total_search_calls=1),
+            browser_provider=provider,
+        )
+        packet = build_live_retrieval_packet_from_candidates(
+            self._resolution_mechanics_qdt(),
+            evidence_packet=self.evidence_packet,
+            fetched_candidates=transport.fetched_candidates,
+            search_candidate_urls=transport.search_candidate_urls,
+            forecast_timestamp=FORECAST_AT,
+            source_cutoff_timestamp=CUTOFF_AT,
+            live_policy_overlay=True,
+        )
+
+        self.assertEqual(transport.transport_diagnostics["search_failure_count"], 1)
+        self.assertIn("search_provider_failure_recorded", transport.transport_diagnostics["bounded_retrieval_reason_codes"])
+        self.assertEqual(transport.transport_diagnostics["search_failure_diagnostics"][0]["reason_code"], "browser_provider_search_exception")
+        self.assertEqual(
+            packet["research_sufficiency_summary"]["classification_dispatch_status"],
+            "blocked_insufficient_research",
+        )
+        self.assertFalse(packet["leaf_evidence_dockets"][0]["admitted_evidence_refs"])
 
     def test_no_admissible_evidence_records_bounded_failure_not_certification(self) -> None:
         provider = FakeBrowserProvider(

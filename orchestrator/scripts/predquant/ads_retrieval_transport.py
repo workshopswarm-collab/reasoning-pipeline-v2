@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
@@ -51,12 +52,39 @@ AMRG_RETRIEVAL_EFFECTS = {
     "shared_retrieval_classification_cache_reuse",
 }
 
+RETRIEVAL_DIAGNOSTIC_FORBIDDEN_KEY_FRAGMENTS = (
+    "probability",
+    "forecast_probability",
+    "production_forecast_prob",
+    "fair_value",
+    "scae_delta",
+    "log_odds",
+    "synthesis_conclusion",
+    "decision_instruction",
+    "replay_result",
+    "replay_manifest",
+    "replay_artifact",
+    "outcome_scoring",
+    "outcome_score",
+    "resolved_outcome",
+    "resolution_outcome",
+    "market_prediction",
+    "forecast_result",
+    "raw_forecast_result",
+    "prediction_result",
+    "scorecard",
+)
+
 
 @dataclass(frozen=True)
 class RetrievalProviderPolicy:
-    max_direct_urls: int = 12
+    max_direct_urls: int = 6
+    max_total_direct_fetches: int = 6
     max_search_variants_per_leaf: int = 1
     max_search_results_per_variant: int = 5
+    max_total_search_calls: int = 2
+    max_total_search_elapsed_seconds: float = 90.0
+    max_total_search_result_fetches: int = 4
     broad_search_enabled: bool = True
     native_enabled: bool = False
     deterministic_direct_url_source_classes: bool = True
@@ -112,9 +140,24 @@ def collect_live_retrieval_candidates(
     )
     direct_urls = _collect_direct_url_hints(case_contract, evidence_packet, amrg_context)[: policy.max_direct_urls]
     result = RetrievalTransportResult(direct_url_candidates=direct_urls)
+    direct_fetch_count = 0
+    direct_fetch_skipped_count = 0
+    search_call_count = 0
+    search_call_skipped_count = 0
+    search_failure_diagnostics: list[dict[str, Any]] = []
+    search_skipped_diagnostics: list[dict[str, Any]] = []
+    search_result_fetch_count = 0
+    search_result_fetch_skipped_count = 0
+    max_total_search_elapsed_seconds = max(0.0, float(policy.max_total_search_elapsed_seconds or 0.0))
+    search_started_at = time.monotonic()
+    search_deadline = search_started_at + max_total_search_elapsed_seconds if max_total_search_elapsed_seconds else None
 
     for context in contexts:
         for rank, hint in enumerate(direct_urls, start=1):
+            if direct_fetch_count >= max(0, policy.max_total_direct_fetches):
+                direct_fetch_skipped_count += 1
+                continue
+            direct_fetch_count += 1
             result.fetched_candidates.append(
                 _fetch_candidate(
                     context=context,
@@ -132,14 +175,56 @@ def collect_live_retrieval_candidates(
         for context in contexts:
             variants = context.get("query_variants") if isinstance(context.get("query_variants"), list) else []
             for variant in variants[: policy.max_search_variants_per_leaf]:
-                search_records = _search_candidate_urls(
-                    browser_provider,
-                    context,
-                    variant,
-                    searched_at=forecast_timestamp,
-                )[: policy.max_search_results_per_variant]
+                skip_reason = _search_skip_reason(
+                    search_call_count=search_call_count,
+                    max_total_search_calls=max(0, policy.max_total_search_calls),
+                    search_deadline=search_deadline,
+                )
+                if skip_reason:
+                    search_call_skipped_count += 1
+                    search_skipped_diagnostics.append(
+                        _search_query_diagnostic(context, variant, reason_code=skip_reason)
+                    )
+                    continue
+                search_call_count += 1
+                call_started_at = time.monotonic()
+                search_exception_recorded = False
+                try:
+                    search_records = _search_candidate_urls(
+                        browser_provider,
+                        context,
+                        variant,
+                        searched_at=forecast_timestamp,
+                    )[: policy.max_search_results_per_variant]
+                except Exception as exc:
+                    search_records = []
+                    search_failure_diagnostics.append(
+                        _search_query_diagnostic(
+                            context,
+                            variant,
+                            reason_code="browser_provider_search_exception",
+                            detail=str(exc)[:500] or exc.__class__.__name__,
+                        )
+                    )
+                    search_exception_recorded = True
+                elapsed_seconds = max(0.0, time.monotonic() - call_started_at)
+                provider_error = _provider_last_search_error(browser_provider)
+                if provider_error and not search_records and not search_exception_recorded:
+                    search_failure_diagnostics.append(
+                        _search_query_diagnostic(
+                            context,
+                            variant,
+                            reason_code="browser_provider_search_failed",
+                            detail=provider_error,
+                            elapsed_seconds=elapsed_seconds,
+                        )
+                    )
                 result.search_candidate_urls.extend(search_records)
                 for search_rank, record in enumerate(search_records, start=1):
+                    if search_result_fetch_count >= max(0, policy.max_total_search_result_fetches):
+                        search_result_fetch_skipped_count += 1
+                        continue
+                    search_result_fetch_count += 1
                     hint = {
                         "url": record.get("url") or record.get("canonical_url"),
                         "source_ref": record.get("candidate_url_ref"),
@@ -185,6 +270,10 @@ def collect_live_retrieval_candidates(
         or candidate.get("admission_status") in {"omitted", "rejected"}
         or candidate.get("extraction_status") != "accepted"
     ]
+    final_browser_provider_diagnostics = _provider_diagnostics(browser_provider)
+    packet_safe_browser_provider_diagnostics = _packet_safe_provider_diagnostics(
+        final_browser_provider_diagnostics
+    )
     result.transport_diagnostics = {
         "schema_version": "ads-retrieval-transport-diagnostics/v1",
         "browser_provider_status": "available"
@@ -200,12 +289,77 @@ def collect_live_retrieval_candidates(
         "omitted_candidate_count": len(result.omitted_candidates),
         "search_candidate_url_count": len(result.search_candidate_urls),
         "native_research_candidate_count": len(result.native_research_candidates),
+        "bounded_retrieval_policy": {
+            "max_direct_urls": policy.max_direct_urls,
+            "max_total_direct_fetches": policy.max_total_direct_fetches,
+            "max_search_variants_per_leaf": policy.max_search_variants_per_leaf,
+            "max_search_results_per_variant": policy.max_search_results_per_variant,
+            "max_total_search_calls": policy.max_total_search_calls,
+            "max_total_search_elapsed_seconds": max_total_search_elapsed_seconds,
+            "max_total_search_result_fetches": policy.max_total_search_result_fetches,
+        },
+        "direct_url_fetch_attempt_count": direct_fetch_count,
+        "direct_url_fetch_skipped_count": direct_fetch_skipped_count,
+        "search_call_count": search_call_count,
+        "search_call_skipped_count": search_call_skipped_count,
+        "search_elapsed_seconds": round(max(0.0, time.monotonic() - search_started_at), 3),
+        "search_failure_count": len(search_failure_diagnostics),
+        "search_failure_diagnostics": search_failure_diagnostics,
+        "search_skipped_diagnostics": search_skipped_diagnostics,
+        "search_result_fetch_attempt_count": search_result_fetch_count,
+        "search_result_fetch_skipped_count": search_result_fetch_skipped_count,
+        "bounded_retrieval_reason_codes": _bounded_reason_codes(
+            direct_fetch_skipped_count=direct_fetch_skipped_count,
+            search_call_skipped_count=search_call_skipped_count,
+            search_failure_count=len(search_failure_diagnostics),
+            search_result_fetch_skipped_count=search_result_fetch_skipped_count,
+            browser_provider_diagnostics=final_browser_provider_diagnostics,
+        ),
         "browser_fetch_authority": "url_fetch_extraction_only",
         "deterministic_admission_authority": "build_live_retrieval_packet_from_candidates",
     }
-    if browser_provider_diagnostics:
-        result.transport_diagnostics["browser_provider_diagnostics"] = browser_provider_diagnostics
+    if packet_safe_browser_provider_diagnostics:
+        result.transport_diagnostics["browser_provider_diagnostics"] = packet_safe_browser_provider_diagnostics
     return result
+
+
+def _bounded_reason_codes(
+    *,
+    direct_fetch_skipped_count: int,
+    search_call_skipped_count: int,
+    search_failure_count: int,
+    search_result_fetch_skipped_count: int,
+    browser_provider_diagnostics: dict[str, Any],
+) -> list[str]:
+    reasons: list[str] = []
+    if direct_fetch_skipped_count:
+        reasons.append("direct_url_fetch_limit_reached")
+    if search_call_skipped_count:
+        reasons.append("search_call_limit_reached")
+    if search_failure_count:
+        reasons.append("search_provider_failure_recorded")
+    if search_result_fetch_skipped_count:
+        reasons.append("search_result_fetch_limit_reached")
+    if browser_provider_diagnostics.get("last_search_error"):
+        reasons.append("search_provider_error_recorded")
+    if browser_provider_diagnostics.get("last_fetch_error"):
+        reasons.append("fetch_provider_error_recorded")
+    return reasons
+
+
+def _packet_safe_provider_diagnostics(diagnostics: dict[str, Any]) -> dict[str, Any]:
+    """Keep provider diagnostics in RET packets free of authority assertions."""
+
+    safe: dict[str, Any] = {}
+    for key, value in diagnostics.items():
+        if key == "authority_boundary":
+            safe["provider_authority_status"] = "non_authoritative_transport_only"
+            continue
+        lowered = key.lower()
+        if any(fragment in lowered for fragment in ("authority", "certifies_", "probability", "scae_delta")):
+            continue
+        safe[key] = value
+    return safe
 
 
 def _collect_direct_url_hints(
@@ -391,7 +545,21 @@ def _provider_diagnostics(browser_provider: Any | None) -> dict[str, Any]:
     if browser_provider is None or not hasattr(browser_provider, "provider_diagnostics"):
         return {}
     diagnostics = browser_provider.provider_diagnostics()
-    return diagnostics if isinstance(diagnostics, dict) else {}
+    return _sanitize_provider_diagnostics(diagnostics) if isinstance(diagnostics, dict) else {}
+
+
+def _sanitize_provider_diagnostics(value: Any) -> Any:
+    if isinstance(value, dict):
+        sanitized: dict[str, Any] = {}
+        for key, child in value.items():
+            normalized = str(key).lower()
+            if any(fragment in normalized for fragment in RETRIEVAL_DIAGNOSTIC_FORBIDDEN_KEY_FRAGMENTS):
+                continue
+            sanitized[key] = _sanitize_provider_diagnostics(child)
+        return sanitized
+    if isinstance(value, list):
+        return [_sanitize_provider_diagnostics(item) for item in value]
+    return value
 
 
 def _provider_capability_configured(
@@ -407,10 +575,58 @@ def _provider_capability_configured(
     return True
 
 
+def _provider_last_search_error(browser_provider: Any | None) -> str | None:
+    diagnostics = _provider_diagnostics(browser_provider)
+    error = diagnostics.get("last_search_error")
+    if error is None:
+        error = getattr(browser_provider, "last_search_error", None)
+    text = str(error or "").strip()
+    return text[:500] if text else None
+
+
+def _search_skip_reason(
+    *,
+    search_call_count: int,
+    max_total_search_calls: int,
+    search_deadline: float | None,
+) -> str | None:
+    if max_total_search_calls <= 0:
+        return "search_call_cap_zero"
+    if search_call_count >= max_total_search_calls:
+        return "search_call_limit_reached"
+    if search_deadline is not None and time.monotonic() >= search_deadline:
+        return "search_elapsed_budget_exhausted"
+    return None
+
+
+def _search_query_diagnostic(
+    context: dict[str, Any],
+    variant: dict[str, Any],
+    *,
+    reason_code: str,
+    detail: str | None = None,
+    elapsed_seconds: float | None = None,
+) -> dict[str, Any]:
+    diagnostic = {
+        "leaf_id": context.get("leaf_id"),
+        "parent_branch_id": context.get("parent_branch_id"),
+        "query_variant_id": variant.get("query_variant_id"),
+        "query_role": variant.get("query_role"),
+        "reason_code": reason_code,
+    }
+    if detail:
+        diagnostic["detail"] = detail[:500]
+    if elapsed_seconds is not None:
+        diagnostic["elapsed_seconds"] = round(float(elapsed_seconds), 3)
+    return diagnostic
+
+
 def _search_candidate_urls(browser_provider: Any | None, context: dict[str, Any], variant: dict[str, Any], *, searched_at: str) -> list[dict[str, Any]]:
     if browser_provider is None or not hasattr(browser_provider, "search_candidate_urls"):
         return []
     records = browser_provider.search_candidate_urls(context, variant, searched_at=searched_at)
+    if not isinstance(records, list):
+        return []
     return [record for record in records if isinstance(record, dict)]
 
 
