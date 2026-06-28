@@ -3116,7 +3116,12 @@ def _fresh_source_count(selected: list[dict[str, Any]], profile: dict[str, Any],
     for item in selected:
         if item.get("temporal_gate_status") != "pass":
             continue
-        published = _parse_timestamp(item.get("source_published_at") or item.get("published_at"))
+        published = _parse_timestamp(
+            item.get("source_published_at")
+            or item.get("published_at")
+            or item.get("source_updated_at")
+            or item.get("source_observed_at")
+        )
         if published is not None and threshold <= published <= cutoff:
             count += 1
     return count
@@ -4298,7 +4303,7 @@ def _materialize_candidate_evidence(
         source_class=source_class,
         independence_status=str(candidate.get("independence_status") or "independent"),
         temporal_gate_status=str(candidate.get("temporal_gate_status") or "pass"),
-        source_published_at=str(candidate.get("source_published_at") or candidate.get("published_at") or _iso_before_cutoff(source_cutoff_timestamp)),
+        source_published_at=candidate.get("source_published_at") or candidate.get("published_at"),
         source_updated_at=candidate.get("source_updated_at"),
         source_observed_at=candidate.get("source_observed_at") or candidate.get("captured_at"),
         captured_at=candidate.get("captured_at") or _iso_before_cutoff(source_cutoff_timestamp),

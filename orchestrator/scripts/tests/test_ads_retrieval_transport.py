@@ -108,6 +108,17 @@ class TimeoutSearchBrowserProvider(FakeBrowserProvider):
         }
 
 
+class NoTimestampBrowserProvider(FakeBrowserProvider):
+    def fetch_url(self, url: str) -> dict:
+        self.events.append(("fetch", url))
+        return {
+            "url": url,
+            "final_url": url,
+            "extraction_status": "accepted",
+            "content": f"Fetched undated direct content for {url}",
+        }
+
+
 class AdsRetrievalTransportTest(unittest.TestCase):
     def setUp(self) -> None:
         handoff = {
@@ -414,6 +425,77 @@ class AdsRetrievalTransportTest(unittest.TestCase):
         self.assertEqual(
             packet["research_sufficiency_summary"]["classification_dispatch_status"],
             "blocked_insufficient_research",
+        )
+
+    def test_direct_official_urls_without_http_date_use_pre_dispatch_observation_time(self) -> None:
+        provider = NoTimestampBrowserProvider()
+        transport = collect_live_retrieval_candidates(
+            qdt=self._resolution_mechanics_qdt(),
+            evidence_packet=self.evidence_packet,
+            case_contract=self.case_contract,
+            amrg_context=None,
+            source_cutoff_timestamp=CUTOFF_AT,
+            forecast_timestamp=FORECAST_AT,
+            provider_policy=RetrievalProviderPolicy(max_direct_urls=4, broad_search_enabled=False),
+            browser_provider=provider,
+        )
+
+        self.assertTrue(transport.fetched_candidates)
+        self.assertTrue(
+            all(candidate["extraction_status"] == "accepted" for candidate in transport.fetched_candidates)
+        )
+        self.assertTrue(
+            all(candidate["admission_status"] == "admitted" for candidate in transport.fetched_candidates)
+        )
+        self.assertTrue(
+            all(candidate.get("source_observed_at") == "2026-06-24T11:58:59+00:00" for candidate in transport.fetched_candidates)
+        )
+        self.assertIn(
+            "pre_dispatch_direct_url_source_time_inferred",
+            transport.fetched_candidates[0]["admission_reason_code"],
+        )
+
+        packet = build_live_retrieval_packet_from_candidates(
+            self._resolution_mechanics_qdt(),
+            evidence_packet=self.evidence_packet,
+            fetched_candidates=transport.fetched_candidates,
+            search_candidate_urls=transport.search_candidate_urls,
+            forecast_timestamp=FORECAST_AT,
+            source_cutoff_timestamp=CUTOFF_AT,
+            live_policy_overlay=True,
+        )
+
+        self.assertTrue(packet["leaf_evidence_dockets"][0]["admitted_evidence_refs"])
+        self.assertTrue(
+            all(
+                item["source_metadata_resolution"]["temporal_safety_status"] == "pass"
+                for item in packet["retrieval_evidence_provenance_slices"]
+            )
+        )
+
+    def test_broad_search_without_source_time_still_fails_closed(self) -> None:
+        provider = NoTimestampBrowserProvider(search_results=[{"url": "https://secondary.example/report"}])
+        transport = collect_live_retrieval_candidates(
+            qdt=self._resolution_mechanics_qdt(),
+            evidence_packet={**self.evidence_packet, "official_source_hints": []},
+            case_contract={**self.case_contract, "market_identity": {}},
+            amrg_context=None,
+            source_cutoff_timestamp=CUTOFF_AT,
+            forecast_timestamp=FORECAST_AT,
+            provider_policy=RetrievalProviderPolicy(
+                max_direct_urls=0,
+                max_total_search_calls=1,
+                max_total_search_result_fetches=1,
+                max_search_results_per_variant=1,
+            ),
+            browser_provider=provider,
+        )
+
+        self.assertEqual(transport.fetched_candidates[0]["navigation_mode"], "web_search")
+        self.assertEqual(transport.fetched_candidates[0]["admission_status"], "rejected")
+        self.assertIn(
+            "source_time_unknown_not_admitted_by_transport_adapter",
+            transport.fetched_candidates[0]["omission_reason_codes"],
         )
 
     def test_bounded_search_caps_materialize_fail_closed_packet(self) -> None:

@@ -478,12 +478,24 @@ def _fetch_candidate(
     if extraction_status not in {"accepted", "rejected", "paywalled", "blocked", "duplicate", "temporal_fail"}:
         extraction_status = "rejected"
     final_url = _canonicalize_url(fetched.get("final_url"), fetched.get("url"), canonical_url) or canonical_url
-    published_at = _source_timestamp(fetched)
+    source_time = _source_timestamp(fetched)
+    published_at = _first_source_timestamp(fetched, ("source_published_at", "published_at"))
+    observed_at = _first_source_timestamp(fetched, ("source_observed_at",))
+    inferred_observed_at = None
     reason_codes = list(fetched.get("reason_codes") or fetched.get("omission_reason_codes") or [])
-    if extraction_status == "accepted" and not published_at:
-        extraction_status = "rejected"
-        reason_codes.append("source_time_unknown_not_admitted_by_transport_adapter")
-    if extraction_status == "accepted" and _timestamp_at_or_after(published_at, source_cutoff_timestamp):
+    if extraction_status == "accepted" and not source_time:
+        if _direct_hint_allows_inferred_source_time(
+            hint,
+            navigation_mode=navigation_mode,
+            deterministic_direct_url_source_classes=deterministic_direct_url_source_classes,
+        ):
+            inferred_observed_at = _iso_before(source_cutoff_timestamp)
+            source_time = inferred_observed_at
+            reason_codes.append("source_time_inferred_from_pre_dispatch_direct_url_hint")
+        else:
+            extraction_status = "rejected"
+            reason_codes.append("source_time_unknown_not_admitted_by_transport_adapter")
+    if extraction_status == "accepted" and _timestamp_at_or_after(source_time, source_cutoff_timestamp):
         extraction_status = "temporal_fail"
         reason_codes.append("post_cutoff_source_time")
     candidate = {
@@ -492,7 +504,7 @@ def _fetch_candidate(
         "canonical_url": final_url,
         "extraction_status": extraction_status,
         "source_published_at": published_at,
-        "source_observed_at": fetched.get("source_observed_at"),
+        "source_observed_at": observed_at or inferred_observed_at,
         "source_updated_at": fetched.get("source_updated_at"),
         "captured_at": fetched.get("captured_at") or _iso_before(source_cutoff_timestamp),
         "content": _content_from_fetch(fetched),
@@ -509,7 +521,10 @@ def _fetch_candidate(
     if extraction_status == "accepted":
         candidate["admission_status"] = "admitted"
         candidate["temporal_gate_status"] = "pass"
-        candidate["admission_reason_code"] = "transport_candidate_requires_deterministic_validation"
+        if "source_time_inferred_from_pre_dispatch_direct_url_hint" in reason_codes:
+            candidate["admission_reason_code"] = "pre_dispatch_direct_url_source_time_inferred"
+        else:
+            candidate["admission_reason_code"] = "transport_candidate_requires_deterministic_validation"
         if deterministic_direct_url_source_classes and hint.get("source_class"):
             candidate["source_class"] = hint["source_class"]
             candidate["deterministic_source_class_proof"] = True
@@ -522,6 +537,22 @@ def _fetch_candidate(
         candidate["temporal_gate_status"] = "fail" if extraction_status == "temporal_fail" else "unknown_not_counted"
         candidate["omission_reason_codes"] = reason_codes or [f"extraction_{extraction_status}"]
     return candidate
+
+
+def _direct_hint_allows_inferred_source_time(
+    hint: dict[str, Any],
+    *,
+    navigation_mode: str,
+    deterministic_direct_url_source_classes: bool,
+) -> bool:
+    if navigation_mode != "direct_url" or not deterministic_direct_url_source_classes:
+        return False
+    if hint.get("deterministic_source_class_proof") is False:
+        return False
+    if hint.get("source_class") not in {"official_or_primary", "market_rules_or_resolution_source"}:
+        return False
+    source_ref = str(hint.get("source_ref") or "")
+    return source_ref.startswith(("case_contract.", "evidence_packet."))
 
 
 def _provider_fetch(browser_provider: Any | None, url: str) -> dict[str, Any]:
@@ -807,6 +838,14 @@ def _canonicalize_url(*urls: Any) -> str:
 
 def _source_timestamp(fetched: dict[str, Any]) -> str | None:
     for field_name in ("source_published_at", "published_at", "source_observed_at", "source_updated_at", "source_authored_at"):
+        value = fetched.get(field_name)
+        if isinstance(value, str) and _parse_timestamp(value) is not None:
+            return value
+    return None
+
+
+def _first_source_timestamp(fetched: dict[str, Any], field_names: tuple[str, ...]) -> str | None:
+    for field_name in field_names:
         value = fetched.get(field_name)
         if isinstance(value, str) and _parse_timestamp(value) is not None:
             return value

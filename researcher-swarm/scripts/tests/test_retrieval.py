@@ -1381,6 +1381,31 @@ class RetrievalPacketContractTest(unittest.TestCase):
         self.assertEqual(len(assignments), len(self.qdt["required_leaf_questions"]))
         self.assertTrue(all(assignment["assigned_evidence_refs"] for assignment in assignments))
 
+    def test_direct_live_candidate_observed_before_cutoff_counts_without_published_time(self) -> None:
+        qdt = copy.deepcopy(self.qdt)
+        qdt["required_leaf_questions"] = [qdt["required_leaf_questions"][0]]
+        context = build_retrieval_query_contexts(qdt, evidence_packet=self.evidence_packet)[0]
+        candidate = self._live_candidate(context, 0, direct=True, official=True)
+        candidate.pop("source_published_at", None)
+        candidate["source_observed_at"] = "2026-06-24T11:30:00+00:00"
+
+        packet = build_live_retrieval_packet_from_candidates(
+            qdt,
+            evidence_packet=self.evidence_packet,
+            fetched_candidates=[candidate],
+            search_candidate_urls=[],
+            question_decomposition_artifact_id="artifact:qdt-1",
+            policy_context_ref="artifact:profile-1",
+        )
+        provenance = packet["retrieval_evidence_provenance_slices"][0]
+        resolution = provenance["source_metadata_resolution"]
+
+        self.assertEqual(provenance["temporal_gate_status"], "pass")
+        self.assertTrue(provenance["counts_toward_breadth"])
+        self.assertIsNone(resolution["published_at"])
+        self.assertEqual(resolution["temporal_safety_status"], "pass")
+        self.assertTrue(packet["leaf_evidence_dockets"][0]["admitted_evidence_refs"])
+
     def test_phase7_direct_url_priority_search_candidate_caps_and_dedupe(self) -> None:
         qdt = copy.deepcopy(self.qdt)
         qdt["required_leaf_questions"] = [qdt["required_leaf_questions"][0]]
