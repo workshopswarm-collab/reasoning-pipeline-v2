@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
+import subprocess
 from datetime import timezone
 from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
@@ -228,6 +230,170 @@ def _openai_search_prompt(query_context: dict[str, Any], query_variant: dict[str
     )
 
 
+def _extract_json_object_text(value: str) -> str | None:
+    start = value.find("{")
+    if start < 0:
+        return None
+    depth = 0
+    in_string = False
+    escaped = False
+    for index, ch in enumerate(value[start:], start=start):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return value[start : index + 1]
+    return None
+
+
+def _json_payload(value: Any) -> Any:
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.startswith("```"):
+            lines = stripped.splitlines()
+            if lines and lines[0].startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].startswith("```"):
+                lines = lines[:-1]
+            stripped = "\n".join(lines).strip()
+        try:
+            return json.loads(stripped)
+        except json.JSONDecodeError:
+            extracted = _extract_json_object_text(stripped)
+            if extracted is None:
+                raise
+            return json.loads(extracted)
+    return value
+
+
+def _extract_openclaw_reply_text(value: Any) -> str | None:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        texts = [_extract_openclaw_reply_text(item) for item in value]
+        joined = "\n".join(text for text in texts if text)
+        return joined or None
+    if not isinstance(value, dict):
+        return None
+    for key in (
+        "reply",
+        "response",
+        "message",
+        "content",
+        "text",
+        "output",
+        "stdout",
+        "payloads",
+        "finalAssistantVisibleText",
+        "finalAssistantRawText",
+    ):
+        text = _extract_openclaw_reply_text(value.get(key))
+        if text:
+            return text
+    return _extract_openclaw_reply_text(value.get("result"))
+
+
+def _parse_openclaw_agent_stdout(stdout: str) -> dict[str, Any]:
+    try:
+        parsed = json.loads(stdout)
+    except json.JSONDecodeError:
+        parsed = stdout
+    text = _extract_openclaw_reply_text(parsed)
+    if not text:
+        raise ValueError("OpenClaw agent response did not contain reply text")
+    payload = _json_payload(text)
+    if not isinstance(payload, dict):
+        raise ValueError("OpenClaw agent reply did not parse to a JSON object")
+    return payload
+
+
+def _openclaw_search_prompt(query_context: dict[str, Any], query_variant: dict[str, Any], search_limit: int) -> str:
+    market_question = str(query_context.get("market_question") or query_context.get("macro_question") or "").strip()
+    leaf_question = str(query_context.get("leaf_question") or query_context.get("question_text") or "").strip()
+    query_text = str(query_variant.get("query_text") or "").strip()
+    request = {
+        "schema_version": "ads-openclaw-oauth-web-search-request/v1",
+        "task": "source_url_discovery_only",
+        "search_limit": search_limit,
+        "market_question": market_question,
+        "leaf_question": leaf_question,
+        "search_query": query_text,
+        "required_response_schema": {
+            "schema_version": "ads-browser-search-candidates/v1",
+            "candidates": [
+                {
+                    "url": "https://example.com/source",
+                    "title": "Source title",
+                    "snippet": "Why this source may be relevant.",
+                }
+            ],
+        },
+        "authority_boundary": {
+            "certifies_source_class": False,
+            "certifies_claim_family": False,
+            "certifies_temporal_safety": False,
+            "certifies_research_sufficiency": False,
+            "certifies_probability": False,
+        },
+    }
+    return (
+        "Use GPT hosted web search through the OpenClaw Gateway to discover source URLs for ADS retrieval.\n"
+        "Return exactly one JSON object and no Markdown. Do not estimate probabilities, SCAE deltas, "
+        "source classes, claim families, temporal eligibility, decisions, or research sufficiency. "
+        "Do not include page text as evidence; URL content will be fetched separately by deterministic transport.\n\n"
+        "Request JSON:\n"
+        + json.dumps(request, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    )
+
+
+def _candidate_records_from_openclaw_payload(payload: dict[str, Any]) -> list[dict[str, str]]:
+    candidates = payload.get("candidates")
+    if not isinstance(candidates, list):
+        candidates = payload.get("urls")
+    if not isinstance(candidates, list):
+        return []
+    records: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in candidates:
+        if isinstance(item, str):
+            candidate = {"url": item}
+        elif isinstance(item, dict):
+            candidate = item
+        else:
+            continue
+        url = str(candidate.get("url") or candidate.get("canonical_url") or "").strip()
+        if not url or url in seen:
+            continue
+        parsed = urlsplit(url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            continue
+        seen.add(url)
+        records.append(
+            {
+                "url": url,
+                "title": str(candidate.get("title") or candidate.get("source_title") or "").strip(),
+                "snippet": str(
+                    candidate.get("snippet")
+                    or candidate.get("description")
+                    or candidate.get("why_it_may_matter")
+                    or ""
+                ).strip()[:500],
+            }
+        )
+    return records
+
+
 class ConfiguredBrowserProvider(BrowserProviderAdapter):
     """Configured search and direct-fetch provider with fail-closed defaults."""
 
@@ -241,12 +407,18 @@ class ConfiguredBrowserProvider(BrowserProviderAdapter):
         search_model: str = "gpt-5.5",
         search_api_key: str | None = None,
         brave_search_endpoint: str = "https://api.search.brave.com/res/v1/web/search",
+        openclaw_cli: str | None = None,
+        openclaw_agent_id: str = "researcher-swarm",
+        openclaw_model: str | None = None,
+        openclaw_session_key_prefix: str = "ads-browser-search",
         search_limit: int = 5,
         fetch_timeout_seconds: float = 20.0,
+        search_timeout_seconds: float = 120.0,
         max_fetch_chars: int = 16_000,
         user_agent: str = "OpenClaw ADS retrieval transport/1.0",
         opener: Callable[..., Any] = urlopen,
         responses_client: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+        subprocess_run: Callable[..., Any] = subprocess.run,
     ) -> None:
         super().__init__(provider_id=provider_id)
         self.search_backend = search_backend
@@ -255,12 +427,18 @@ class ConfiguredBrowserProvider(BrowserProviderAdapter):
         self.search_model = search_model
         self.search_api_key = search_api_key
         self.brave_search_endpoint = brave_search_endpoint
+        self.openclaw_cli = openclaw_cli
+        self.openclaw_agent_id = openclaw_agent_id
+        self.openclaw_model = openclaw_model
+        self.openclaw_session_key_prefix = openclaw_session_key_prefix
         self.search_limit = max(1, min(10, int(search_limit or 5)))
         self.fetch_timeout_seconds = max(1.0, float(fetch_timeout_seconds or 20.0))
+        self.search_timeout_seconds = max(1.0, float(search_timeout_seconds or 120.0))
         self.max_fetch_chars = max(1000, int(max_fetch_chars or 16_000))
         self.user_agent = user_agent
         self.opener = opener
         self.responses_client = responses_client
+        self.subprocess_run = subprocess_run
         self.fetch_configured = True
         self.search_configured = self._search_configured()
         self.last_search_error: str | None = None
@@ -269,6 +447,8 @@ class ConfiguredBrowserProvider(BrowserProviderAdapter):
     def _search_configured(self) -> bool:
         if self.search_backend == "openai_web_search":
             return bool(self.openai_api_key or self.responses_client)
+        if self.search_backend == "openclaw_oauth_web_search":
+            return bool(self.openclaw_cli or shutil.which("openclaw"))
         if self.search_backend == "brave_search_api":
             return bool(self.search_api_key)
         return False
@@ -283,6 +463,8 @@ class ConfiguredBrowserProvider(BrowserProviderAdapter):
         self.last_search_error = None
         if self.search_backend == "openai_web_search":
             return self._openai_search_candidate_urls(query_context, query_variant, searched_at=searched_at)
+        if self.search_backend == "openclaw_oauth_web_search":
+            return self._openclaw_oauth_search_candidate_urls(query_context, query_variant, searched_at=searched_at)
         if self.search_backend == "brave_search_api":
             return self._brave_search_candidate_urls(query_context, query_variant, searched_at=searched_at)
         self.last_search_error = f"unsupported_search_backend:{self.search_backend}"
@@ -350,6 +532,80 @@ class ConfiguredBrowserProvider(BrowserProviderAdapter):
                     searched_at=searched_at,
                     result_source="openai_web_search",
                     query_role=str(query_variant.get("query_role") or "primary_leaf_retrieval"),
+                )
+            )
+        return records
+
+    def _openclaw_oauth_search_candidate_urls(
+        self,
+        query_context: dict[str, Any],
+        query_variant: dict[str, Any],
+        *,
+        searched_at: str | None,
+    ) -> list[dict[str, Any]]:
+        resolved_cli = self.openclaw_cli or shutil.which("openclaw")
+        if not resolved_cli:
+            self.last_search_error = "openclaw_cli_not_configured"
+            return []
+        query = str(query_variant.get("query_text") or "").strip()
+        if not query:
+            return []
+        leaf_id = str(query_context.get("leaf_id") or "leaf")
+        query_role = str(query_variant.get("query_role") or "primary_leaf_retrieval")
+        session_key = f"{self.openclaw_session_key_prefix}-{leaf_id}-{query_role}".replace(":", "-")
+        command = [
+            resolved_cli,
+            "agent",
+            "--agent",
+            self.openclaw_agent_id,
+            "--session-key",
+            session_key,
+            "--message",
+            _openclaw_search_prompt(query_context, query_variant, self.search_limit),
+            "--json",
+            "--timeout",
+            str(int(self.search_timeout_seconds)),
+        ]
+        if self.openclaw_model:
+            command.extend(["--model", self.openclaw_model])
+        try:
+            completed = self.subprocess_run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=self.search_timeout_seconds + 30,
+            )
+        except Exception as exc:
+            self.last_search_error = str(exc)[:500] or exc.__class__.__name__
+            return []
+        if completed.returncode != 0:
+            detail = (completed.stderr or completed.stdout or "").strip()
+            self.last_search_error = f"openclaw_agent_failed:{detail[:450]}"
+            return []
+        try:
+            payload = _parse_openclaw_agent_stdout(completed.stdout)
+        except Exception as exc:
+            self.last_search_error = str(exc)[:500] or exc.__class__.__name__
+            return []
+        candidates = _candidate_records_from_openclaw_payload(payload)
+        if not candidates:
+            self.last_search_error = "openclaw_oauth_web_search_no_url_candidates"
+            return []
+        records: list[dict[str, Any]] = []
+        for index, candidate in enumerate(candidates[: self.search_limit], start=1):
+            records.append(
+                build_search_candidate_url(
+                    query_context,
+                    query_variant,
+                    rank=index,
+                    url=candidate["url"],
+                    title=candidate["title"],
+                    snippet=candidate["snippet"],
+                    provider_id=self.provider_id,
+                    searched_at=searched_at,
+                    result_source="openclaw_oauth_web_search",
+                    query_role=query_role,
                 )
             )
         return records
@@ -460,6 +716,11 @@ class ConfiguredBrowserProvider(BrowserProviderAdapter):
             "adapter": "configured_browser_provider",
             "search_provider": self.search_backend,
             "search_model": self.search_model if self.search_backend == "openai_web_search" else None,
+            "openclaw_model": self.openclaw_model if self.search_backend == "openclaw_oauth_web_search" else None,
+            "openclaw_agent_id": self.openclaw_agent_id if self.search_backend == "openclaw_oauth_web_search" else None,
+            "openclaw_cli_configured": bool(self.openclaw_cli or shutil.which("openclaw"))
+            if self.search_backend == "openclaw_oauth_web_search"
+            else None,
             "search_configured": self._search_configured(),
             "fetch_configured": True,
             "last_search_error": self.last_search_error,
@@ -479,7 +740,7 @@ class ConfiguredBrowserProvider(BrowserProviderAdapter):
 def build_provider() -> ConfiguredBrowserProvider:
     """Build the scheduler-loadable configured browser/search provider."""
 
-    search_backend = os.getenv("ADS_BROWSER_SEARCH_BACKEND", "openai_web_search")
+    search_backend = os.getenv("ADS_BROWSER_SEARCH_BACKEND", "openclaw_oauth_web_search")
     return ConfiguredBrowserProvider(
         search_backend=search_backend,
         openai_api_key=os.getenv("OPENAI_API_KEY") or os.getenv("ADS_OPENAI_API_KEY"),
@@ -490,8 +751,13 @@ def build_provider() -> ConfiguredBrowserProvider:
             "ADS_BRAVE_SEARCH_ENDPOINT",
             "https://api.search.brave.com/res/v1/web/search",
         ),
+        openclaw_cli=os.getenv("ADS_OPENCLAW_CLI"),
+        openclaw_agent_id=os.getenv("ADS_BROWSER_SEARCH_OPENCLAW_AGENT_ID", "researcher-swarm"),
+        openclaw_model=os.getenv("ADS_BROWSER_SEARCH_OPENCLAW_MODEL"),
+        openclaw_session_key_prefix=os.getenv("ADS_BROWSER_SEARCH_OPENCLAW_SESSION_KEY_PREFIX", "ads-browser-search"),
         search_limit=int(os.getenv("ADS_BROWSER_SEARCH_LIMIT", "5")),
         fetch_timeout_seconds=float(os.getenv("ADS_BROWSER_FETCH_TIMEOUT_SECONDS", "20")),
+        search_timeout_seconds=float(os.getenv("ADS_BROWSER_SEARCH_TIMEOUT_SECONDS", "120")),
         max_fetch_chars=int(os.getenv("ADS_BROWSER_FETCH_MAX_CHARS", "16000")),
         user_agent=os.getenv("ADS_BROWSER_PROVIDER_USER_AGENT", "OpenClaw ADS retrieval transport/1.0"),
     )

@@ -1601,6 +1601,93 @@ class RetrievalPacketContractTest(unittest.TestCase):
         self.assertFalse(provider.provider_diagnostics()["search_configured"])
         self.assertEqual(provider.provider_diagnostics()["search_provider"], "openai_web_search")
 
+    def test_configured_browser_provider_uses_openclaw_oauth_web_search(self) -> None:
+        context = build_retrieval_query_contexts(self.qdt, evidence_packet=self.evidence_packet)[0]
+        calls = []
+
+        def subprocess_run(command, **kwargs):
+            calls.append((command, kwargs))
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout=json.dumps(
+                    {
+                        "reply": json.dumps(
+                            {
+                                "schema_version": "ads-browser-search-candidates/v1",
+                                "candidates": [
+                                    {
+                                        "url": "https://source.example/openclaw",
+                                        "title": "OpenClaw source",
+                                        "snippet": "Discovered by hosted web search.",
+                                    }
+                                ],
+                            }
+                        )
+                    }
+                ),
+                stderr="",
+            )
+
+        provider = ConfiguredBrowserProvider(
+            search_backend="openclaw_oauth_web_search",
+            openclaw_cli="/usr/local/bin/openclaw",
+            openclaw_agent_id="workbench",
+            openclaw_session_key_prefix="ads-test-search",
+            openclaw_model="gpt-5.5",
+            subprocess_run=subprocess_run,
+        )
+
+        records = provider.search_candidate_urls(context, context["query_variants"][0])
+
+        self.assertEqual(records[0]["url"], "https://source.example/openclaw")
+        self.assertEqual(records[0]["result_source"], "openclaw_oauth_web_search")
+        self.assertFalse(records[0]["web_fetch_used_for_search"])
+        command, kwargs = calls[0]
+        self.assertEqual(command[:2], ["/usr/local/bin/openclaw", "agent"])
+        self.assertIn("--json", command)
+        self.assertIn("--message", command)
+        self.assertIn("--model", command)
+        self.assertIn("gpt-5.5", command)
+        self.assertNotIn("--local", command)
+        self.assertEqual(kwargs["capture_output"], True)
+        self.assertIn("Return exactly one JSON object", command[command.index("--message") + 1])
+        diagnostics = provider.provider_diagnostics()
+        self.assertEqual(diagnostics["search_provider"], "openclaw_oauth_web_search")
+        self.assertEqual(diagnostics["openclaw_agent_id"], "workbench")
+        self.assertTrue(diagnostics["search_configured"])
+        self.assertFalse(diagnostics["authority_boundary"]["certifies_research_sufficiency"])
+
+    def test_configured_browser_provider_openclaw_oauth_fails_closed_without_cli(self) -> None:
+        provider = ConfiguredBrowserProvider(search_backend="openclaw_oauth_web_search", openclaw_cli=None)
+        context = build_retrieval_query_contexts(self.qdt, evidence_packet=self.evidence_packet)[0]
+
+        with patch("researcher_swarm.browser_provider.shutil.which", return_value=None):
+            records = provider.search_candidate_urls(context, context["query_variants"][0])
+            diagnostics = provider.provider_diagnostics()
+
+        self.assertEqual(records, [])
+        self.assertEqual(provider.last_search_error, "openclaw_cli_not_configured")
+        self.assertFalse(diagnostics["search_configured"])
+        self.assertFalse(diagnostics["openclaw_cli_configured"])
+
+    def test_configured_browser_provider_openclaw_oauth_invalid_reply_fails_closed(self) -> None:
+        context = build_retrieval_query_contexts(self.qdt, evidence_packet=self.evidence_packet)[0]
+
+        def subprocess_run(command, **_kwargs):
+            return subprocess.CompletedProcess(command, 0, stdout=json.dumps({"reply": "not json"}), stderr="")
+
+        provider = ConfiguredBrowserProvider(
+            search_backend="openclaw_oauth_web_search",
+            openclaw_cli="/usr/local/bin/openclaw",
+            subprocess_run=subprocess_run,
+        )
+
+        records = provider.search_candidate_urls(context, context["query_variants"][0])
+
+        self.assertEqual(records, [])
+        self.assertTrue(provider.last_search_error)
+
     def test_configured_browser_provider_openai_without_citations_fails_closed(self) -> None:
         provider = ConfiguredBrowserProvider(responses_client=lambda _payload: {"output": [{"type": "message", "content": []}]})
         context = build_retrieval_query_contexts(self.qdt, evidence_packet=self.evidence_packet)[0]
@@ -1686,13 +1773,15 @@ class RetrievalPacketContractTest(unittest.TestCase):
         self.assertEqual(fetched["web_fetch_role"], "url_fetch_extraction_only")
         self.assertFalse(provider.provider_diagnostics()["authority_boundary"]["certifies_source_class"])
 
-    def test_default_configured_provider_factory_is_fail_closed_without_search_key(self) -> None:
+    def test_default_configured_provider_factory_uses_openclaw_oauth_backend(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
-            provider = build_provider()
+            with patch("researcher_swarm.browser_provider.shutil.which", return_value="/usr/local/bin/openclaw"):
+                provider = build_provider()
 
         self.assertIsInstance(provider, ConfiguredBrowserProvider)
-        self.assertFalse(provider.provider_diagnostics()["search_configured"])
-        self.assertEqual(provider.provider_diagnostics()["search_provider"], "openai_web_search")
+        self.assertTrue(provider.provider_diagnostics()["search_configured"])
+        self.assertEqual(provider.provider_diagnostics()["search_provider"], "openclaw_oauth_web_search")
+        self.assertEqual(provider.provider_diagnostics()["openclaw_agent_id"], "researcher-swarm")
 
     def test_phase7_native_candidate_caps_forbidden_fields_and_nonblocking_unavailability(self) -> None:
         context = build_retrieval_query_contexts(self.qdt, evidence_packet=self.evidence_packet)[0]
