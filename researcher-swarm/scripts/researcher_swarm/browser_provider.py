@@ -119,6 +119,17 @@ def _html_to_text(value: str) -> str:
     return text or re.sub(r"<[^>]+>", " ", value)
 
 
+def _squash_text(value: Any, max_chars: int) -> str:
+    return " ".join(str(value or "").split())[:max_chars]
+
+
+def _env_flag(name: str, *, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _header_mapping(response: Any) -> dict[str, str]:
     headers = getattr(response, "headers", None)
     if headers is not None:
@@ -394,6 +405,215 @@ def _candidate_records_from_openclaw_payload(payload: dict[str, Any]) -> list[di
     return records
 
 
+def _json_object_from_stdout(stdout: str) -> Any:
+    try:
+        return json.loads(stdout or "{}")
+    except json.JSONDecodeError as exc:
+        raise ValueError("browser CLI returned non-JSON output") from exc
+
+
+def _completed_error(completed: Any, default: str) -> str:
+    detail = str(getattr(completed, "stderr", "") or getattr(completed, "stdout", "") or "").strip()
+    return detail[:500] or default
+
+
+def _nested_lookup(value: Any, keys: tuple[str, ...]) -> Any:
+    if not isinstance(value, dict):
+        return None
+    for key in keys:
+        if key in value:
+            return value[key]
+    for nested_key in ("result", "value", "data", "payload", "tab", "page"):
+        nested = value.get(nested_key)
+        found = _nested_lookup(nested, keys)
+        if found not in (None, ""):
+            return found
+    return None
+
+
+def _openclaw_browser_payload(value: Any) -> dict[str, Any] | None:
+    if isinstance(value, dict):
+        for key in ("result", "value", "data", "payload"):
+            nested = value.get(key)
+            if isinstance(nested, dict) and any(
+                candidate in nested for candidate in ("final_url", "href", "url", "body_text", "text", "title")
+            ):
+                return nested
+        if any(candidate in value for candidate in ("final_url", "href", "url", "body_text", "text", "title")):
+            return value
+    return None
+
+
+def _openclaw_browser_cli_rendered_fetch(
+    url: str,
+    timeout_seconds: float,
+    max_chars: int,
+    *,
+    openclaw_cli: str | None = None,
+    subprocess_run: Callable[..., Any] = subprocess.run,
+    browser_profile: str | None = None,
+) -> dict[str, Any]:
+    resolved_cli = openclaw_cli or shutil.which("openclaw")
+    if not resolved_cli:
+        return {
+            "extraction_status": "rejected",
+            "reason_codes": ["openclaw_browser_cli_not_available"],
+        }
+    timeout_ms = str(int(max(1.0, timeout_seconds) * 1000))
+    command_prefix = [resolved_cli, "browser", "--json", "--timeout", timeout_ms]
+    if browser_profile:
+        command_prefix.extend(["--browser-profile", browser_profile])
+    subprocess_timeout = max(2.0, timeout_seconds + 2.0)
+
+    try:
+        doctor = subprocess_run(
+            [*command_prefix, "doctor"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=subprocess_timeout,
+        )
+    except Exception as exc:
+        return {
+            "extraction_status": "rejected",
+            "reason_codes": ["openclaw_browser_cli_doctor_failed"],
+            "provider_error": str(exc)[:500] or exc.__class__.__name__,
+        }
+    if getattr(doctor, "returncode", 1) != 0:
+        return {
+            "extraction_status": "rejected",
+            "reason_codes": ["openclaw_browser_cli_doctor_failed"],
+            "provider_error": _completed_error(doctor, "openclaw browser doctor failed"),
+        }
+    try:
+        doctor_payload = _json_object_from_stdout(getattr(doctor, "stdout", ""))
+    except ValueError as exc:
+        return {
+            "extraction_status": "rejected",
+            "reason_codes": ["openclaw_browser_cli_doctor_invalid_json"],
+            "provider_error": str(exc),
+        }
+    status = doctor_payload.get("status") if isinstance(doctor_payload, dict) else None
+    if not isinstance(status, dict) or not status.get("running"):
+        return {
+            "extraction_status": "rejected",
+            "reason_codes": ["openclaw_browser_not_running"],
+        }
+
+    tab_ref: str | None = None
+    open_completed: Any | None = None
+    try:
+        open_completed = subprocess_run(
+            [*command_prefix, "open", url],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=subprocess_timeout,
+        )
+        if getattr(open_completed, "returncode", 1) != 0:
+            return {
+                "extraction_status": "rejected",
+                "reason_codes": ["openclaw_browser_navigation_failed"],
+                "provider_error": _completed_error(open_completed, "openclaw browser navigation failed"),
+            }
+        open_payload = _json_object_from_stdout(getattr(open_completed, "stdout", ""))
+        tab_ref_value = _nested_lookup(open_payload, ("ref", "tabRef", "tab_ref", "targetId", "target_id", "id"))
+        tab_ref = str(tab_ref_value) if tab_ref_value not in (None, "") else None
+        js = (
+            "() => ({"
+            "final_url: window.location.href,"
+            "title: document.title || '',"
+            "body_text: document.body ? document.body.innerText : ''"
+            "})"
+        )
+        evaluate_completed = subprocess_run(
+            [*command_prefix, "evaluate", "--fn", js],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=subprocess_timeout,
+        )
+        if getattr(evaluate_completed, "returncode", 1) != 0:
+            return {
+                "extraction_status": "rejected",
+                "reason_codes": ["openclaw_browser_evaluate_failed"],
+                "provider_error": _completed_error(evaluate_completed, "openclaw browser evaluate failed"),
+            }
+        evaluate_payload = _json_object_from_stdout(getattr(evaluate_completed, "stdout", ""))
+        payload = _openclaw_browser_payload(evaluate_payload)
+        if payload is None:
+            return {
+                "extraction_status": "rejected",
+                "reason_codes": ["openclaw_browser_evaluate_invalid_payload"],
+            }
+        return {
+            "final_url": str(payload.get("final_url") or payload.get("href") or payload.get("url") or url),
+            "title": str(payload.get("title") or ""),
+            "body_text": _squash_text(payload.get("body_text") or payload.get("text") or "", max_chars),
+        }
+    except ValueError as exc:
+        return {
+            "extraction_status": "rejected",
+            "reason_codes": ["openclaw_browser_cli_invalid_json"],
+            "provider_error": str(exc),
+        }
+    except Exception as exc:
+        return {
+            "extraction_status": "rejected",
+            "reason_codes": ["openclaw_browser_cli_failed"],
+            "provider_error": str(exc)[:500] or exc.__class__.__name__,
+        }
+    finally:
+        if open_completed is not None and getattr(open_completed, "returncode", 1) == 0:
+            close_command = [*command_prefix, "close"]
+            if tab_ref:
+                close_command.append(tab_ref)
+            try:
+                subprocess_run(
+                    close_command,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=subprocess_timeout,
+                )
+            except Exception:
+                pass
+
+
+def _python_playwright_rendered_fetch(url: str, timeout_seconds: float, max_chars: int) -> dict[str, Any]:
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception as exc:
+        return {
+            "extraction_status": "rejected",
+            "reason_codes": ["python_playwright_not_available"],
+            "provider_error": str(exc)[:500] or exc.__class__.__name__,
+        }
+
+    timeout_ms = int(max(1.0, timeout_seconds) * 1000)
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True)
+        try:
+            page = browser.new_page()
+            page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+            payload = page.evaluate(
+                """() => ({
+                    final_url: window.location.href,
+                    title: document.title || "",
+                    body_text: document.body ? document.body.innerText : ""
+                })"""
+            )
+        finally:
+            browser.close()
+    if not isinstance(payload, dict):
+        return {
+            "extraction_status": "rejected",
+            "reason_codes": ["rendered_fetch_returned_non_object"],
+        }
+    payload["body_text"] = _squash_text(payload.get("body_text"), max_chars)
+    return payload
+
+
 class ConfiguredBrowserProvider(BrowserProviderAdapter):
     """Configured search and direct-fetch provider with fail-closed defaults."""
 
@@ -420,6 +640,12 @@ class ConfiguredBrowserProvider(BrowserProviderAdapter):
         opener: Callable[..., Any] = urlopen,
         responses_client: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
         subprocess_run: Callable[..., Any] = subprocess.run,
+        rendered_fetch_enabled: bool = False,
+        rendered_fetch_backend: str = "openclaw_browser_cli",
+        rendered_fetcher: Callable[[str, float, int], dict[str, Any]] | None = None,
+        rendered_fetch_timeout_seconds: float | None = None,
+        rendered_fetch_openclaw_cli: str | None = None,
+        rendered_fetch_browser_profile: str | None = None,
     ) -> None:
         super().__init__(provider_id=provider_id)
         self.search_backend = search_backend
@@ -441,10 +667,35 @@ class ConfiguredBrowserProvider(BrowserProviderAdapter):
         self.opener = opener
         self.responses_client = responses_client
         self.subprocess_run = subprocess_run
+        self.rendered_fetch_enabled = bool(rendered_fetch_enabled)
+        requested_rendered_backend = str(rendered_fetch_backend or "openclaw_browser_cli")
+        self.rendered_fetch_openclaw_cli = rendered_fetch_openclaw_cli
+        self.rendered_fetch_browser_profile = rendered_fetch_browser_profile
+        if rendered_fetcher is not None:
+            self.rendered_fetcher = rendered_fetcher
+            self.rendered_fetch_backend = "injected"
+        elif requested_rendered_backend == "python_playwright":
+            self.rendered_fetcher = _python_playwright_rendered_fetch
+            self.rendered_fetch_backend = "python_playwright"
+        else:
+            self.rendered_fetcher = lambda target_url, timeout_seconds, max_chars: _openclaw_browser_cli_rendered_fetch(
+                target_url,
+                timeout_seconds,
+                max_chars,
+                openclaw_cli=self.rendered_fetch_openclaw_cli or self.openclaw_cli,
+                subprocess_run=self.subprocess_run,
+                browser_profile=self.rendered_fetch_browser_profile,
+            )
+            self.rendered_fetch_backend = "openclaw_browser_cli"
+        self.rendered_fetch_timeout_seconds = max(
+            1.0,
+            float(rendered_fetch_timeout_seconds or self.fetch_timeout_seconds),
+        )
         self.fetch_configured = True
         self.search_configured = self._search_configured()
         self.last_search_error: str | None = None
         self.last_fetch_error: str | None = None
+        self.last_rendered_fetch_error: str | None = None
 
     def _search_configured(self) -> bool:
         if self.search_backend == "openai_web_search":
@@ -666,6 +917,7 @@ class ConfiguredBrowserProvider(BrowserProviderAdapter):
 
     def fetch_url(self, url: str) -> dict[str, Any]:
         self.last_fetch_error = None
+        self.last_rendered_fetch_error = None
         request = Request(
             url,
             headers={
@@ -680,6 +932,8 @@ class ConfiguredBrowserProvider(BrowserProviderAdapter):
                 raw = response.read(self.max_fetch_chars * 4)
         except Exception as exc:
             self.last_fetch_error = str(exc)[:500] or exc.__class__.__name__
+            if self.rendered_fetch_enabled:
+                return self._rendered_fetch_url(url, direct_error=self.last_fetch_error)
             return {
                 "url": url,
                 "final_url": url,
@@ -712,6 +966,90 @@ class ConfiguredBrowserProvider(BrowserProviderAdapter):
         }
         return {key: value for key, value in fetched.items() if value not in (None, "")}
 
+    def _rendered_fetch_url(self, url: str, *, direct_error: str) -> dict[str, Any]:
+        diagnostic: dict[str, Any] = {
+            "enabled": True,
+            "backend": self.rendered_fetch_backend,
+            "timeout_seconds": self.rendered_fetch_timeout_seconds,
+            "max_chars": self.max_fetch_chars,
+            "capture_boundary": "exact_requested_url_rendered_page_text_only",
+            "direct_fetch_error": direct_error,
+        }
+        try:
+            payload = self.rendered_fetcher(url, self.rendered_fetch_timeout_seconds, self.max_fetch_chars)
+        except Exception as exc:
+            self.last_rendered_fetch_error = str(exc)[:500] or exc.__class__.__name__
+            diagnostic.update({"status": "rejected", "reason_codes": ["rendered_fetch_failed"]})
+            return {
+                "url": url,
+                "final_url": url,
+                "extraction_status": "rejected",
+                "reason_codes": ["http_fetch_failed", "rendered_fetch_failed"],
+                "web_fetch_role": "url_fetch_extraction_only",
+                "provider_error": direct_error,
+                "rendered_fetch_error": self.last_rendered_fetch_error,
+                "rendered_fetch_diagnostic": diagnostic,
+            }
+        if not isinstance(payload, dict):
+            self.last_rendered_fetch_error = "rendered_fetch_returned_non_object"
+            diagnostic.update({"status": "rejected", "reason_codes": ["rendered_fetch_returned_non_object"]})
+            return {
+                "url": url,
+                "final_url": url,
+                "extraction_status": "rejected",
+                "reason_codes": ["http_fetch_failed", "rendered_fetch_returned_non_object"],
+                "web_fetch_role": "url_fetch_extraction_only",
+                "provider_error": direct_error,
+                "rendered_fetch_error": self.last_rendered_fetch_error,
+                "rendered_fetch_diagnostic": diagnostic,
+            }
+        if payload.get("extraction_status") == "rejected":
+            reason_codes = payload.get("reason_codes") if isinstance(payload.get("reason_codes"), list) else []
+            rendered_reason_codes = [str(reason) for reason in reason_codes if reason] or ["rendered_fetch_failed"]
+            self.last_rendered_fetch_error = str(payload.get("provider_error") or rendered_reason_codes[0])[:500]
+            diagnostic.update({"status": "rejected", "reason_codes": rendered_reason_codes})
+            return {
+                "url": url,
+                "final_url": str(payload.get("final_url") or payload.get("url") or url),
+                "extraction_status": "rejected",
+                "reason_codes": ["http_fetch_failed", *rendered_reason_codes],
+                "web_fetch_role": "url_fetch_extraction_only",
+                "provider_error": direct_error,
+                "rendered_fetch_error": self.last_rendered_fetch_error,
+                "rendered_fetch_diagnostic": diagnostic,
+            }
+        content = _squash_text(
+            payload.get("content")
+            or payload.get("markdown")
+            or payload.get("body_text")
+            or payload.get("text"),
+            self.max_fetch_chars,
+        )
+        final_url = str(payload.get("final_url") or payload.get("url") or url)
+        if not content:
+            self.last_rendered_fetch_error = "rendered_fetch_empty_content"
+            diagnostic.update({"status": "rejected", "reason_codes": ["rendered_fetch_empty_content"]})
+            return {
+                "url": url,
+                "final_url": final_url,
+                "extraction_status": "rejected",
+                "reason_codes": ["http_fetch_failed", "rendered_fetch_empty_content"],
+                "web_fetch_role": "url_fetch_extraction_only",
+                "provider_error": direct_error,
+                "rendered_fetch_error": self.last_rendered_fetch_error,
+                "rendered_fetch_diagnostic": diagnostic,
+            }
+        diagnostic.update({"status": "accepted", "reason_codes": []})
+        return {
+            "url": url,
+            "final_url": final_url,
+            "extraction_status": "accepted",
+            "content": content,
+            "web_fetch_role": "url_fetch_extraction_only",
+            "extraction_method": "local_rendered_fetch_fallback",
+            "rendered_fetch_diagnostic": diagnostic,
+        }
+
     def provider_diagnostics(self) -> dict[str, Any]:
         return {
             "provider_id": self.provider_id,
@@ -728,8 +1066,17 @@ class ConfiguredBrowserProvider(BrowserProviderAdapter):
             "search_limit": self.search_limit,
             "search_timeout_seconds": self.search_timeout_seconds,
             "search_subprocess_grace_seconds": self.search_subprocess_grace_seconds,
+            "rendered_fetch_enabled": self.rendered_fetch_enabled,
+            "rendered_fetch_backend": self.rendered_fetch_backend if self.rendered_fetch_enabled else None,
+            "rendered_fetch_browser_profile": self.rendered_fetch_browser_profile
+            if self.rendered_fetch_enabled and self.rendered_fetch_backend == "openclaw_browser_cli"
+            else None,
+            "rendered_fetch_timeout_seconds": self.rendered_fetch_timeout_seconds
+            if self.rendered_fetch_enabled
+            else None,
             "last_search_error": self.last_search_error,
             "last_fetch_error": self.last_fetch_error,
+            "last_rendered_fetch_error": self.last_rendered_fetch_error,
             "web_fetch_role": "url_fetch_extraction_only",
             "web_fetch_must_not_be_used_as_search": True,
             "authority_boundary": {
@@ -767,6 +1114,16 @@ def build_provider() -> ConfiguredBrowserProvider:
         search_subprocess_grace_seconds=float(os.getenv("ADS_BROWSER_SEARCH_SUBPROCESS_GRACE_SECONDS", "10")),
         max_fetch_chars=int(os.getenv("ADS_BROWSER_FETCH_MAX_CHARS", "16000")),
         user_agent=os.getenv("ADS_BROWSER_PROVIDER_USER_AGENT", "OpenClaw ADS retrieval transport/1.0"),
+        rendered_fetch_enabled=_env_flag("ADS_BROWSER_RENDERED_FETCH_ENABLED", default=False),
+        rendered_fetch_backend=os.getenv("ADS_BROWSER_RENDERED_FETCH_BACKEND", "openclaw_browser_cli"),
+        rendered_fetch_timeout_seconds=float(
+            os.getenv(
+                "ADS_BROWSER_RENDERED_FETCH_TIMEOUT_SECONDS",
+                os.getenv("ADS_BROWSER_FETCH_TIMEOUT_SECONDS", "20"),
+            )
+        ),
+        rendered_fetch_openclaw_cli=os.getenv("ADS_BROWSER_RENDERED_FETCH_OPENCLAW_CLI"),
+        rendered_fetch_browser_profile=os.getenv("ADS_BROWSER_RENDERED_FETCH_BROWSER_PROFILE"),
     )
 
 

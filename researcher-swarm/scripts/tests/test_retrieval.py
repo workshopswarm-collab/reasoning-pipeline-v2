@@ -1900,6 +1900,232 @@ class RetrievalPacketContractTest(unittest.TestCase):
         self.assertNotIn("snippet", fetched)
         self.assertEqual(provider.last_fetch_error, "simulated 403")
 
+    def test_configured_browser_provider_rendered_fetch_fallback_is_url_specific(self) -> None:
+        calls = []
+
+        def opener(_request, _timeout):
+            raise RuntimeError("simulated 403")
+
+        def rendered_fetcher(url, timeout_seconds, max_chars):
+            calls.append((url, timeout_seconds, max_chars))
+            return {
+                "final_url": "https://source.example/final",
+                "body_text": "Rendered protected page text from the requested URL only.",
+                "source_class": "official_or_primary",
+                "claim_family_id": "claim-family-forbidden",
+            }
+
+        provider = ConfiguredBrowserProvider(
+            openai_api_key=None,
+            opener=opener,
+            max_fetch_chars=1200,
+            rendered_fetch_enabled=True,
+            rendered_fetch_timeout_seconds=3,
+            rendered_fetcher=rendered_fetcher,
+        )
+
+        fetched = provider.fetch_url("https://source.example/protected")
+
+        self.assertEqual(calls, [("https://source.example/protected", 3.0, 1200)])
+        self.assertEqual(fetched["url"], "https://source.example/protected")
+        self.assertEqual(fetched["final_url"], "https://source.example/final")
+        self.assertEqual(fetched["extraction_status"], "accepted")
+        self.assertEqual(fetched["extraction_method"], "local_rendered_fetch_fallback")
+        self.assertEqual(fetched["web_fetch_role"], "url_fetch_extraction_only")
+        self.assertIn("Rendered protected page text", fetched["content"])
+        self.assertEqual(
+            fetched["rendered_fetch_diagnostic"]["capture_boundary"],
+            "exact_requested_url_rendered_page_text_only",
+        )
+        self.assertEqual(fetched["rendered_fetch_diagnostic"]["status"], "accepted")
+        self.assertNotIn("source_class", fetched)
+        self.assertNotIn("claim_family_id", fetched)
+        self.assertFalse(provider.provider_diagnostics()["authority_boundary"]["certifies_source_class"])
+
+    def test_configured_browser_provider_rendered_fetch_disabled_by_default_after_http_failure(self) -> None:
+        calls = []
+
+        def opener(_request, _timeout):
+            raise RuntimeError("simulated 403")
+
+        def rendered_fetcher(url, timeout_seconds, max_chars):
+            calls.append((url, timeout_seconds, max_chars))
+            return {"body_text": "Should not be used."}
+
+        provider = ConfiguredBrowserProvider(
+            openai_api_key=None,
+            opener=opener,
+            rendered_fetcher=rendered_fetcher,
+        )
+
+        fetched = provider.fetch_url("https://source.example/protected")
+
+        self.assertEqual(calls, [])
+        self.assertEqual(fetched["extraction_status"], "rejected")
+        self.assertEqual(fetched["reason_codes"], ["http_fetch_failed"])
+        self.assertNotIn("rendered_fetch_diagnostic", fetched)
+        self.assertFalse(provider.provider_diagnostics()["rendered_fetch_enabled"])
+
+    def test_configured_browser_provider_rendered_fetch_empty_text_fails_closed(self) -> None:
+        def opener(_request, _timeout):
+            raise RuntimeError("simulated 403")
+
+        provider = ConfiguredBrowserProvider(
+            openai_api_key=None,
+            opener=opener,
+            rendered_fetch_enabled=True,
+            rendered_fetcher=lambda _url, _timeout, _max_chars: {
+                "final_url": "https://source.example/protected",
+                "body_text": "   ",
+            },
+        )
+
+        fetched = provider.fetch_url("https://source.example/protected")
+
+        self.assertEqual(fetched["extraction_status"], "rejected")
+        self.assertEqual(fetched["reason_codes"], ["http_fetch_failed", "rendered_fetch_empty_content"])
+        self.assertEqual(fetched["web_fetch_role"], "url_fetch_extraction_only")
+        self.assertNotIn("content", fetched)
+        self.assertEqual(fetched["rendered_fetch_diagnostic"]["status"], "rejected")
+        self.assertEqual(provider.last_rendered_fetch_error, "rendered_fetch_empty_content")
+
+    def test_configured_browser_provider_openclaw_browser_cli_rendered_fetch_uses_requested_url_and_closes_tab(self) -> None:
+        calls = []
+
+        def opener(_request, _timeout):
+            raise RuntimeError("simulated 403")
+
+        def subprocess_run(command, **kwargs):
+            calls.append((command, kwargs))
+            if command[-1] == "doctor":
+                return subprocess.CompletedProcess(
+                    command,
+                    0,
+                    stdout=json.dumps({"ok": True, "status": {"running": True}}),
+                    stderr="",
+                )
+            if command[-2:] == ["open", "https://source.example/protected"]:
+                return subprocess.CompletedProcess(
+                    command,
+                    0,
+                    stdout=json.dumps({"targetId": "t-rendered"}),
+                    stderr="",
+                )
+            if "evaluate" in command:
+                self.assertIn("--fn", command)
+                fn = command[command.index("--fn") + 1]
+                self.assertIn("window.location.href", fn)
+                self.assertIn("document.body.innerText", fn)
+                return subprocess.CompletedProcess(
+                    command,
+                    0,
+                    stdout=json.dumps(
+                        {
+                            "result": {
+                                "final_url": "https://source.example/final",
+                                "title": "Rendered page",
+                                "body_text": "Rendered page text.",
+                                "source_class": "official_or_primary",
+                            }
+                        }
+                    ),
+                    stderr="",
+                )
+            if command[-2:] == ["close", "t-rendered"]:
+                return subprocess.CompletedProcess(command, 0, stdout=json.dumps({"ok": True}), stderr="")
+            self.fail(f"unexpected command: {command}")
+
+        provider = ConfiguredBrowserProvider(
+            openai_api_key=None,
+            opener=opener,
+            openclaw_cli="/usr/local/bin/openclaw",
+            rendered_fetch_enabled=True,
+            rendered_fetch_timeout_seconds=4,
+            rendered_fetch_backend="openclaw_browser_cli",
+            subprocess_run=subprocess_run,
+        )
+
+        fetched = provider.fetch_url("https://source.example/protected")
+
+        self.assertEqual(fetched["extraction_status"], "accepted")
+        self.assertEqual(fetched["final_url"], "https://source.example/final")
+        self.assertEqual(fetched["content"], "Rendered page text.")
+        self.assertEqual(fetched["rendered_fetch_diagnostic"]["backend"], "openclaw_browser_cli")
+        self.assertNotIn("source_class", fetched)
+        command_names = [
+            "evaluate" if "evaluate" in command else command[-1]
+            for command, _kwargs in calls
+            if command[-1] != "https://source.example/protected"
+        ]
+        self.assertEqual(command_names, ["doctor", "evaluate", "t-rendered"])
+        self.assertTrue(any(command[-2:] == ["open", "https://source.example/protected"] for command, _kwargs in calls))
+        self.assertTrue(any("evaluate" in command for command, _kwargs in calls))
+        self.assertTrue(all(kwargs["timeout"] == 6.0 for _command, kwargs in calls))
+        self.assertTrue(all("--timeout" in command and "4000" in command for command, _kwargs in calls))
+
+    def test_configured_browser_provider_openclaw_browser_cli_not_running_fails_closed(self) -> None:
+        def opener(_request, _timeout):
+            raise RuntimeError("simulated 403")
+
+        def subprocess_run(command, **_kwargs):
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout=json.dumps({"ok": False, "status": {"running": False}}),
+                stderr="",
+            )
+
+        provider = ConfiguredBrowserProvider(
+            openai_api_key=None,
+            opener=opener,
+            openclaw_cli="/usr/local/bin/openclaw",
+            rendered_fetch_enabled=True,
+            rendered_fetch_backend="openclaw_browser_cli",
+            subprocess_run=subprocess_run,
+        )
+
+        fetched = provider.fetch_url("https://source.example/protected")
+
+        self.assertEqual(fetched["extraction_status"], "rejected")
+        self.assertEqual(fetched["reason_codes"], ["http_fetch_failed", "openclaw_browser_not_running"])
+        self.assertNotIn("content", fetched)
+        self.assertEqual(provider.last_rendered_fetch_error, "openclaw_browser_not_running")
+
+    def test_default_configured_provider_factory_can_enable_rendered_fetch_by_env(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "ADS_BROWSER_RENDERED_FETCH_ENABLED": "true",
+                "ADS_BROWSER_RENDERED_FETCH_TIMEOUT_SECONDS": "6",
+            },
+            clear=True,
+        ):
+            with patch("researcher_swarm.browser_provider.shutil.which", return_value="/usr/local/bin/openclaw"):
+                provider = build_provider()
+
+        diagnostics = provider.provider_diagnostics()
+        self.assertTrue(diagnostics["rendered_fetch_enabled"])
+        self.assertEqual(diagnostics["rendered_fetch_backend"], "openclaw_browser_cli")
+        self.assertEqual(diagnostics["rendered_fetch_timeout_seconds"], 6.0)
+
+    def test_default_configured_provider_factory_can_select_python_rendered_fetch_backend(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "ADS_BROWSER_RENDERED_FETCH_ENABLED": "true",
+                "ADS_BROWSER_RENDERED_FETCH_BACKEND": "python_playwright",
+                "ADS_BROWSER_RENDERED_FETCH_TIMEOUT_SECONDS": "6",
+            },
+            clear=True,
+        ):
+            with patch("researcher_swarm.browser_provider.shutil.which", return_value="/usr/local/bin/openclaw"):
+                provider = build_provider()
+
+        diagnostics = provider.provider_diagnostics()
+        self.assertTrue(diagnostics["rendered_fetch_enabled"])
+        self.assertEqual(diagnostics["rendered_fetch_backend"], "python_playwright")
+        self.assertEqual(diagnostics["rendered_fetch_timeout_seconds"], 6.0)
+
     def test_default_configured_provider_factory_uses_openclaw_oauth_backend(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
             with patch("researcher_swarm.browser_provider.shutil.which", return_value="/usr/local/bin/openclaw"):
