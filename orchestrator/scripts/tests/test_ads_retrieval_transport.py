@@ -6,6 +6,7 @@ import copy
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -237,6 +238,66 @@ class AdsRetrievalTransportTest(unittest.TestCase):
         self.assertTrue(
             all(event[0] == "fetch" for event in provider.events[: len(transport.direct_url_candidates)])
         )
+
+    def test_direct_fetch_elapsed_does_not_preconsume_search_budget(self) -> None:
+        clock = {"now": 0.0}
+
+        class SlowDirectProvider(FakeBrowserProvider):
+            def fetch_url(self, url: str) -> dict:
+                clock["now"] += 120.0
+                return super().fetch_url(url)
+
+        provider = SlowDirectProvider(search_results=[{"url": "https://www.reuters.com/world/example-report"}])
+
+        with patch("predquant.ads_retrieval_transport.time.monotonic", side_effect=lambda: clock["now"]):
+            transport = collect_live_retrieval_candidates(
+                qdt=self._resolution_mechanics_qdt(),
+                evidence_packet=self.evidence_packet,
+                case_contract=self.case_contract,
+                amrg_context=None,
+                source_cutoff_timestamp=CUTOFF_AT,
+                forecast_timestamp=FORECAST_AT,
+                provider_policy=RetrievalProviderPolicy(
+                    max_direct_urls=1,
+                    max_total_direct_fetches=1,
+                    max_total_search_calls=1,
+                    max_total_search_elapsed_seconds=1,
+                    max_search_results_per_variant=1,
+                    max_total_search_result_fetches=1,
+                ),
+                browser_provider=provider,
+            )
+
+        diagnostics = transport.transport_diagnostics
+        self.assertEqual(diagnostics["direct_url_elapsed_seconds"], 120.0)
+        self.assertEqual(diagnostics["search_call_count"], 1)
+        self.assertEqual(diagnostics["search_call_skipped_count"], 0)
+        self.assertEqual([event[0] for event in provider.events].count("search"), 1)
+
+    def test_tesla_ir_resolution_url_is_deterministic_official_after_fetch(self) -> None:
+        provider = FakeBrowserProvider()
+        case_contract = copy.deepcopy(self.case_contract)
+        case_contract["market_identity"]["description"] = (
+            "This market resolves from Tesla releases at https://ir.tesla.com/press."
+        )
+
+        transport = collect_live_retrieval_candidates(
+            qdt=self._resolution_mechanics_qdt(),
+            evidence_packet=self.evidence_packet,
+            case_contract=case_contract,
+            amrg_context=None,
+            source_cutoff_timestamp=CUTOFF_AT,
+            forecast_timestamp=FORECAST_AT,
+            provider_policy=RetrievalProviderPolicy(max_direct_urls=8, broad_search_enabled=False),
+            browser_provider=provider,
+        )
+        tesla_candidate = next(
+            item for item in transport.fetched_candidates if item["canonical_url"] == "https://ir.tesla.com/press"
+        )
+
+        self.assertEqual(tesla_candidate["source_class"], "official_or_primary")
+        self.assertEqual(tesla_candidate["source_class_resolution_method"], "deterministic_url_registry")
+        self.assertEqual(tesla_candidate["source_class_registry_match"], "ir.tesla.com")
 
     def test_provider_diagnostics_control_configured_search_status(self) -> None:
         provider = DiagnosticsBrowserProvider(search_configured=False, fetch_configured=True)

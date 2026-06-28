@@ -72,6 +72,11 @@ DETERMINISTIC_SOURCE_CLASS_URL_REGISTRY = (
         "domain_suffixes": ("hosted.ap.org",),
         "source_class": "independent_secondary",
     },
+    {
+        "registry_id": "ads-static-official-source-registry/tesla-investor-relations",
+        "domain_suffixes": ("ir.tesla.com",),
+        "source_class": "official_or_primary",
+    },
 )
 
 NATIVE_ALLOWED_FIELDS = {
@@ -191,9 +196,8 @@ def collect_live_retrieval_candidates(
     search_skipped_diagnostics: list[dict[str, Any]] = []
     search_result_fetch_count = 0
     search_result_fetch_skipped_count = 0
-    max_total_search_elapsed_seconds = max(0.0, float(policy.max_total_search_elapsed_seconds or 0.0))
-    search_started_at = time.monotonic()
-    search_deadline = search_started_at + max_total_search_elapsed_seconds if max_total_search_elapsed_seconds else None
+    collection_started_at = time.monotonic()
+    direct_fetch_started_at = collection_started_at
 
     for context in contexts:
         for rank, hint in enumerate(direct_urls, start=1):
@@ -213,6 +217,11 @@ def collect_live_retrieval_candidates(
                     deterministic_direct_url_source_classes=policy.deterministic_direct_url_source_classes,
                 )
             )
+
+    direct_url_elapsed_seconds = max(0.0, time.monotonic() - direct_fetch_started_at)
+    max_total_search_elapsed_seconds = max(0.0, float(policy.max_total_search_elapsed_seconds or 0.0))
+    search_started_at = time.monotonic()
+    search_deadline = search_started_at + max_total_search_elapsed_seconds if max_total_search_elapsed_seconds else None
 
     if policy.broad_search_enabled:
         for context in contexts:
@@ -345,7 +354,9 @@ def collect_live_retrieval_candidates(
         "direct_url_fetch_skipped_count": direct_fetch_skipped_count,
         "search_call_count": search_call_count,
         "search_call_skipped_count": search_call_skipped_count,
+        "direct_url_elapsed_seconds": round(direct_url_elapsed_seconds, 3),
         "search_elapsed_seconds": round(max(0.0, time.monotonic() - search_started_at), 3),
+        "total_collection_elapsed_seconds": round(max(0.0, time.monotonic() - collection_started_at), 3),
         "search_failure_count": len(search_failure_diagnostics),
         "search_failure_diagnostics": search_failure_diagnostics,
         "search_skipped_diagnostics": search_skipped_diagnostics,
@@ -354,6 +365,7 @@ def collect_live_retrieval_candidates(
         "bounded_retrieval_reason_codes": _bounded_reason_codes(
             direct_fetch_skipped_count=direct_fetch_skipped_count,
             search_call_skipped_count=search_call_skipped_count,
+            search_skipped_diagnostics=search_skipped_diagnostics,
             search_failure_count=len(search_failure_diagnostics),
             search_result_fetch_skipped_count=search_result_fetch_skipped_count,
             browser_provider_diagnostics=final_browser_provider_diagnostics,
@@ -370,6 +382,7 @@ def _bounded_reason_codes(
     *,
     direct_fetch_skipped_count: int,
     search_call_skipped_count: int,
+    search_skipped_diagnostics: list[dict[str, Any]],
     search_failure_count: int,
     search_result_fetch_skipped_count: int,
     browser_provider_diagnostics: dict[str, Any],
@@ -378,7 +391,12 @@ def _bounded_reason_codes(
     if direct_fetch_skipped_count:
         reasons.append("direct_url_fetch_limit_reached")
     if search_call_skipped_count:
-        reasons.append("search_call_limit_reached")
+        skipped_reasons = [
+            str(item.get("reason_code"))
+            for item in search_skipped_diagnostics
+            if isinstance(item, dict) and item.get("reason_code")
+        ]
+        reasons.extend(skipped_reasons or ["search_call_limit_reached"])
     if search_failure_count:
         reasons.append("search_provider_failure_recorded")
     if search_result_fetch_skipped_count:
@@ -575,13 +593,21 @@ def _fetch_candidate(
             candidate["admission_reason_code"] = "pre_dispatch_direct_url_source_time_inferred"
         else:
             candidate["admission_reason_code"] = "transport_candidate_requires_deterministic_validation"
-        if deterministic_direct_url_source_classes and hint.get("source_class"):
+        registry_match = _deterministic_source_class_registry_match(final_url)
+        if registry_match and registry_match["source_class"] == "official_or_primary":
+            candidate["source_class"] = registry_match["source_class"]
+            candidate["deterministic_source_class_proof"] = True
+            candidate["source_class_resolution_method"] = "deterministic_url_registry"
+            candidate["source_class_registry_id"] = registry_match["registry_id"]
+            candidate["source_class_registry_match"] = registry_match["matched_domain"]
+            candidate["official_source_hints"] = [url]
+        elif deterministic_direct_url_source_classes and hint.get("source_class"):
             candidate["source_class"] = hint["source_class"]
             candidate["deterministic_source_class_proof"] = True
             candidate["source_class_resolution_method"] = hint.get("source_class_resolution_method")
             candidate["official_source_hints"] = [url] if hint["source_class"] == "official_or_primary" else []
             candidate["market_resolution_url"] = url if hint["source_class"] == "market_rules_or_resolution_source" else None
-        elif registry_match := _deterministic_source_class_registry_match(final_url):
+        elif registry_match:
             candidate["source_class"] = registry_match["source_class"]
             candidate["deterministic_source_class_proof"] = True
             candidate["source_class_resolution_method"] = "deterministic_url_registry"
@@ -637,7 +663,7 @@ def _deterministic_source_class_registry_match(url: str) -> dict[str, str] | Non
         return None
     for entry in DETERMINISTIC_SOURCE_CLASS_URL_REGISTRY:
         source_class = str(entry.get("source_class") or "")
-        if source_class not in {"independent_secondary", "primary_reporting"}:
+        if source_class not in {"official_or_primary", "independent_secondary", "primary_reporting"}:
             continue
         for suffix in entry.get("domain_suffixes", ()):
             normalized_suffix = str(suffix).lower().removeprefix("www.")

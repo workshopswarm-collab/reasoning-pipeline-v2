@@ -1447,6 +1447,96 @@ class RetrievalPacketContractTest(unittest.TestCase):
         self.assertEqual(packet["research_sufficiency_summary"]["classification_dispatch_status"], "blocked_insufficient_research")
         self.assertIn("claim_family_diversity", cert["unsatisfied_requirement_codes"])
 
+    def test_tesla_delivery_claim_families_are_extracted_from_exact_fetched_text(self) -> None:
+        qdt = copy.deepcopy(self.qdt)
+        qdt["required_leaf_questions"] = [qdt["required_leaf_questions"][0]]
+        context = build_retrieval_query_contexts(qdt, evidence_packet=self.evidence_packet)[0]
+        candidate = self._live_candidate(context, 0, direct=True, official=True)
+        candidate["requested_url"] = "https://ir.tesla.com/press"
+        candidate["final_url"] = "https://ir.tesla.com/press"
+        candidate["canonical_url"] = "https://ir.tesla.com/press"
+        candidate["content"] = (
+            "Tesla Q2 2025 Vehicle Production & Deliveries. "
+            "In Q2 2025, Tesla produced approximately 410,244 vehicles and delivered approximately 384,122 vehicles."
+        )
+        candidate.pop("claim_family_id", None)
+        candidate.pop("claim_family_ids", None)
+        candidate.pop("claim_family_resolution_ref", None)
+        candidate.pop("claim_family_resolution_refs", None)
+        candidate.pop("validated_atomic_claim_candidates", None)
+
+        packet = build_live_retrieval_packet_from_candidates(
+            qdt,
+            evidence_packet=self.evidence_packet,
+            fetched_candidates=[candidate],
+            search_candidate_urls=[],
+            question_decomposition_artifact_id="artifact:qdt-1",
+            policy_context_ref="artifact:profile-1",
+        )
+        provenance = packet["retrieval_evidence_provenance_slices"][0]
+        methods = {item["extraction_method"] for item in packet["atomic_claim_candidates"]}
+
+        self.assertEqual(len(packet["atomic_claim_candidates"]), 2)
+        self.assertEqual(len(packet["claim_family_resolutions"]), 2)
+        self.assertEqual(len(provenance["claim_family_ids"]), 2)
+        self.assertEqual(methods, {"fetched_text_validated_tuple"})
+        self.assertEqual(packet["retrieval_breadth_coverage_slices"][0]["claim_family_count"], 2)
+        self.assertNotIn(
+            "claim_family_unknown_not_counted",
+            provenance["unknown_reason_codes"],
+        )
+        self.assertEqual(
+            packet["research_sufficiency_summary"]["classification_dispatch_status"],
+            "blocked_insufficient_research",
+        )
+
+    def test_search_snippet_tesla_delivery_text_does_not_create_claim_family(self) -> None:
+        qdt = copy.deepcopy(self.qdt)
+        qdt["required_leaf_questions"] = [qdt["required_leaf_questions"][0]]
+        context = build_retrieval_query_contexts(qdt, evidence_packet=self.evidence_packet)[0]
+        variant = context["query_variants"][0]
+        search_candidate = build_search_candidate_url(
+            context,
+            variant,
+            rank=1,
+            url="https://www.reuters.com/world/tesla-deliveries",
+            title="Tesla delivery report",
+            snippet="In Q2 2025, Tesla produced approximately 410,244 vehicles and delivered approximately 384,122 vehicles.",
+            searched_at="2026-06-24T11:59:00+00:00",
+            result_source="openclaw_oauth_web_search",
+        )
+        fetched_candidate = {
+            "leaf_id": context["leaf_id"],
+            "parent_branch_id": context["parent_branch_id"],
+            "retrieval_transport": "browser",
+            "navigation_mode": "web_search",
+            "requested_url": "https://www.reuters.com/world/tesla-deliveries",
+            "final_url": "https://www.reuters.com/world/tesla-deliveries",
+            "canonical_url": "https://www.reuters.com/world/tesla-deliveries",
+            "search_candidate_url_ref": search_candidate["search_candidate_url_id"],
+            "source_published_at": "2026-06-24T11:30:00+00:00",
+            "captured_at": "2026-06-24T11:59:00+00:00",
+            "extraction_status": "accepted",
+            "admission_status": "admitted",
+            "content": "Fetched page text mentions Tesla but does not include delivery or production counts.",
+        }
+
+        packet = build_live_retrieval_packet_from_candidates(
+            qdt,
+            evidence_packet=self.evidence_packet,
+            fetched_candidates=[fetched_candidate],
+            search_candidate_urls=[search_candidate],
+            question_decomposition_artifact_id="artifact:qdt-1",
+            policy_context_ref="artifact:profile-1",
+        )
+        provenance = packet["retrieval_evidence_provenance_slices"][0]
+
+        self.assertEqual(packet["atomic_claim_candidates"], [])
+        self.assertEqual(provenance["claim_family_ids"], [])
+        self.assertIn("claim_family_unknown_not_counted", provenance["unknown_reason_codes"])
+        self.assertIn("snippet_sha256", packet["search_candidate_urls"][0])
+        self.assertNotIn("snippet", packet["search_candidate_urls"][0])
+
     def test_fetched_url_resolver_metadata_can_satisfy_breadth_and_freshness(self) -> None:
         qdt = copy.deepcopy(self.qdt)
         qdt["required_leaf_questions"] = [qdt["required_leaf_questions"][0]]
