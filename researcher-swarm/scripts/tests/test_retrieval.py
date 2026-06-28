@@ -1406,6 +1406,33 @@ class RetrievalPacketContractTest(unittest.TestCase):
         self.assertEqual(resolution["temporal_safety_status"], "pass")
         self.assertTrue(packet["leaf_evidence_dockets"][0]["admitted_evidence_refs"])
 
+    def test_live_candidate_without_validated_claim_family_does_not_count_toward_breadth(self) -> None:
+        qdt = copy.deepcopy(self.qdt)
+        qdt["required_leaf_questions"] = [qdt["required_leaf_questions"][0]]
+        context = build_retrieval_query_contexts(qdt, evidence_packet=self.evidence_packet)[0]
+        candidate = self._live_candidate(context, 0, direct=True, official=True)
+        candidate.pop("claim_family_id", None)
+        candidate.pop("claim_family_ids", None)
+        candidate.pop("claim_family_resolution_ref", None)
+        candidate.pop("claim_family_resolution_refs", None)
+
+        packet = build_live_retrieval_packet_from_candidates(
+            qdt,
+            evidence_packet=self.evidence_packet,
+            fetched_candidates=[candidate],
+            search_candidate_urls=[],
+            question_decomposition_artifact_id="artifact:qdt-1",
+            policy_context_ref="artifact:profile-1",
+        )
+        provenance = packet["retrieval_evidence_provenance_slices"][0]
+        cert = packet["leaf_research_sufficiency_certificates"][0]
+
+        self.assertEqual(provenance["claim_family_ids"], [])
+        self.assertIn("claim_family_unknown_not_counted", provenance["unknown_reason_codes"])
+        self.assertFalse(provenance["counts_toward_breadth"])
+        self.assertEqual(packet["research_sufficiency_summary"]["classification_dispatch_status"], "blocked_insufficient_research")
+        self.assertIn("claim_family_diversity", cert["unsatisfied_requirement_codes"])
+
     def test_phase7_direct_url_priority_search_candidate_caps_and_dedupe(self) -> None:
         qdt = copy.deepcopy(self.qdt)
         qdt["required_leaf_questions"] = [qdt["required_leaf_questions"][0]]

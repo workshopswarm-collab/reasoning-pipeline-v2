@@ -350,6 +350,45 @@ class AdsRetrievalTransportTest(unittest.TestCase):
         )
         self.assertFalse(packet["retrieval_evidence_provenance_slices"][0]["counts_toward_breadth"])
 
+    def test_browser_fetch_snippet_or_title_only_is_not_page_text_evidence(self) -> None:
+        provider = FakeBrowserProvider(
+            search_results=[{"url": "https://secondary.example/snippet-only"}],
+            fetch_payloads={
+                "https://secondary.example/snippet-only": {
+                    "source_published_at": SOURCE_AT,
+                    "content": "",
+                    "snippet": "Search snippet is not fetched page text.",
+                    "title": "Search title only",
+                }
+            },
+        )
+
+        transport = collect_live_retrieval_candidates(
+            qdt=self._resolution_mechanics_qdt(),
+            evidence_packet={**self.evidence_packet, "official_source_hints": []},
+            case_contract={**self.case_contract, "market_identity": {}},
+            amrg_context=None,
+            source_cutoff_timestamp=CUTOFF_AT,
+            forecast_timestamp=FORECAST_AT,
+            provider_policy=RetrievalProviderPolicy(max_direct_urls=0, max_search_results_per_variant=1),
+            browser_provider=provider,
+        )
+        self.assertEqual(transport.fetched_candidates[0]["content"], "")
+
+        packet = build_live_retrieval_packet_from_candidates(
+            self._resolution_mechanics_qdt(),
+            evidence_packet=self.evidence_packet,
+            fetched_candidates=transport.fetched_candidates,
+            search_candidate_urls=transport.search_candidate_urls,
+            forecast_timestamp=FORECAST_AT,
+            source_cutoff_timestamp=CUTOFF_AT,
+            live_policy_overlay=True,
+        )
+
+        self.assertEqual(packet["retrieval_runtime_summary"]["admitted_initial_evidence_count"], 0)
+        self.assertFalse(packet["leaf_evidence_dockets"][0]["admitted_evidence_refs"])
+        self.assertIn("retrieved_source_text_missing", packet["omitted_candidates"][0]["omission_reason_codes"])
+
     def test_native_candidate_output_is_url_proposal_only(self) -> None:
         def native_provider(_context: dict, _variant: dict) -> list[dict]:
             return [

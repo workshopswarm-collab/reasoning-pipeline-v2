@@ -4286,12 +4286,8 @@ def _materialize_candidate_evidence(
     source_class = str(candidate.get("source_class") or "unknown")
     if source_class not in ALLOWED_SOURCE_CLASSES:
         source_class = "unknown"
-    source_family_id = str(candidate.get("source_family_id") or f"source-family:{_registrable_domain(attempt.get('canonical_url', '')) or leaf_id}")
-    claim_family_id = str(
-        candidate.get("claim_family_id")
-        or candidate.get("claim_family_resolution_ref")
-        or f"claim-family:{leaf_id}:{_hash_suffix(attempt.get('canonical_url') or attempt['attempt_id'], 16)}"
-    )
+    source_family_id = str(candidate.get("source_family_id") or "source-family-unknown")
+    claim_family_ids = _candidate_claim_family_ids(candidate)
     evidence = build_retrieval_evidence_item(
         case_id=str(qdt.get("case_id") or context.get("case_id")),
         dispatch_id=str(qdt.get("dispatch_id") or context.get("dispatch_id")),
@@ -4319,7 +4315,7 @@ def _materialize_candidate_evidence(
             str(candidate.get("admission_reason_code") or evidence_source),
             "deterministic_retrieval_admission",
         ],
-        claim_family_resolution_refs=[claim_family_id],
+        claim_family_resolution_refs=claim_family_ids,
     )
     evidence["deterministic_source_class_proof"] = bool(candidate.get("deterministic_source_class_proof", False))
     evidence["source_class_resolution_method"] = str(
@@ -4328,7 +4324,7 @@ def _materialize_candidate_evidence(
     evidence["source_family_resolution_method"] = str(
         candidate.get("source_family_resolution_method") or "deterministic_live_retrieval_fixture"
     )
-    evidence["claim_family_ids"] = [claim_family_id]
+    evidence["claim_family_ids"] = claim_family_ids
     chunk = build_evidence_chunk(
         evidence_ref=evidence["evidence_ref"],
         content_artifact_ref=str(content_artifact_ref),
@@ -4345,6 +4341,26 @@ def _materialize_candidate_evidence(
     )
     evidence["chunk_refs"] = [chunk["chunk_ref"]]
     return evidence, chunk, span
+
+
+def _candidate_claim_family_ids(candidate: dict[str, Any]) -> list[str]:
+    ids: list[str] = []
+    raw_values = [
+        candidate.get("claim_family_id"),
+        candidate.get("claim_family_resolution_ref"),
+    ]
+    for field in ("claim_family_ids", "claim_family_resolution_refs"):
+        value = candidate.get(field)
+        if isinstance(value, list):
+            raw_values.extend(value)
+    for value in raw_values:
+        if not _is_non_empty_string(value):
+            continue
+        claim_id = str(value)
+        if "unknown" in claim_id or claim_id in ids:
+            continue
+        ids.append(claim_id)
+    return ids
 
 
 def _compact_supplemental_admission_result(record: dict[str, Any]) -> dict[str, Any]:

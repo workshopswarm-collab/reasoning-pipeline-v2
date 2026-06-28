@@ -876,7 +876,7 @@ def _iso_before(value: str) -> str:
 
 
 def _content_from_fetch(fetched: dict[str, Any]) -> str:
-    for key in ("content", "text", "markdown", "snippet", "title"):
+    for key in ("content", "extracted_text", "rendered_text", "markdown", "text"):
         value = fetched.get(key)
         if isinstance(value, str) and value:
             return value[:4000]
