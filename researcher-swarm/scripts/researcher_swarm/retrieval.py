@@ -4250,12 +4250,16 @@ def _candidate_text(candidate: dict[str, Any]) -> str:
         candidate.get("content")
         or candidate.get("extracted_text")
         or candidate.get("rendered_text")
-        or candidate.get("snippet")
-        or candidate.get("title")
-        or candidate.get("canonical_url")
-        or candidate.get("url")
+        or candidate.get("markdown")
         or "",
         max_chars=1200,
+    )
+
+
+def _candidate_has_retrieved_source_text(candidate: dict[str, Any]) -> bool:
+    return any(
+        _is_non_empty_string(candidate.get(field))
+        for field in ("content", "extracted_text", "rendered_text", "markdown")
     )
 
 
@@ -4317,9 +4321,9 @@ def _materialize_candidate_evidence(
         ],
         claim_family_resolution_refs=[claim_family_id],
     )
-    evidence["deterministic_source_class_proof"] = bool(candidate.get("deterministic_source_class_proof", True))
+    evidence["deterministic_source_class_proof"] = bool(candidate.get("deterministic_source_class_proof", False))
     evidence["source_class_resolution_method"] = str(
-        candidate.get("source_class_resolution_method") or "deterministic_live_retrieval_fixture"
+        candidate.get("source_class_resolution_method") or "unknown"
     )
     evidence["source_family_resolution_method"] = str(
         candidate.get("source_family_resolution_method") or "deterministic_live_retrieval_fixture"
@@ -4605,6 +4609,22 @@ def build_live_retrieval_packet_from_candidates(
         if canonical_url:
             seen_canonical_urls_by_leaf.setdefault(leaf_id, set()).add(canonical_url)
         if extraction_status == "accepted" and candidate.get("admission_status", "admitted") == "admitted":
+            if not _candidate_has_retrieved_source_text(candidate):
+                omitted.append(
+                    build_retrieval_candidate_record(
+                        leaf_id=leaf_id,
+                        query_context_ref=str(context["query_context_ref"]),
+                        query_variant_id=str(variant["query_variant_id"]),
+                        retrieval_transport=str(candidate.get("retrieval_transport") or "browser"),
+                        transport_attempt_ref=attempt["attempt_id"],
+                        candidate_status="rejected",
+                        requested_url=requested_url,
+                        canonical_url=canonical_url,
+                        omission_reason_codes=["retrieved_source_text_missing"],
+                        temporal_gate_status=str(candidate.get("temporal_gate_status") or "unknown_not_counted"),
+                    )
+                )
+                continue
             evidence, chunk, span = _materialize_candidate_evidence(
                 qdt=qdt,
                 context=context,

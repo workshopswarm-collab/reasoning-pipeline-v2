@@ -1469,6 +1469,57 @@ class RetrievalPacketContractTest(unittest.TestCase):
         self.assertTrue(records[0]["fetch_required_before_admission"])
         self.assertEqual(fetched["web_fetch_role"], "url_fetch_extraction_only")
 
+    def test_phase7_search_summary_without_fetched_text_is_not_admitted_as_evidence(self) -> None:
+        qdt = copy.deepcopy(self.qdt)
+        qdt["required_leaf_questions"] = [qdt["required_leaf_questions"][0]]
+        context = build_retrieval_query_contexts(qdt, evidence_packet=self.evidence_packet)[0]
+        variant = context["query_variants"][0]
+        search_candidate = build_search_candidate_url(
+            context,
+            variant,
+            rank=1,
+            url="https://source.example/search-discovered",
+            title="Search-discovered source",
+            snippet="Search summary only, not retrieved page text.",
+            searched_at="2026-06-24T11:59:00+00:00",
+            result_source="openclaw_oauth_web_search",
+        )
+        fetched_candidate = {
+            "leaf_id": context["leaf_id"],
+            "parent_branch_id": context["parent_branch_id"],
+            "retrieval_transport": "browser",
+            "navigation_mode": "web_search",
+            "requested_url": "https://source.example/search-discovered",
+            "final_url": "https://source.example/search-discovered",
+            "canonical_url": "https://source.example/search-discovered",
+            "search_candidate_url_ref": search_candidate["search_candidate_url_id"],
+            "source_class": "official_or_primary",
+            "source_published_at": "2026-06-24T11:30:00+00:00",
+            "captured_at": "2026-06-24T11:59:00+00:00",
+            "extraction_status": "accepted",
+            "admission_status": "admitted",
+            "temporal_gate_status": "pass",
+            "snippet": "Search summary only, not retrieved page text.",
+        }
+
+        packet = build_live_retrieval_packet_from_candidates(
+            qdt,
+            evidence_packet=self.evidence_packet,
+            fetched_candidates=[fetched_candidate],
+            search_candidate_urls=[search_candidate],
+            question_decomposition_artifact_id="artifact:qdt-1",
+            policy_context_ref="artifact:profile-1",
+        )
+
+        self.assertEqual(packet["retrieval_runtime_summary"]["search_candidate_url_count"], 1)
+        self.assertEqual(packet["retrieval_runtime_summary"]["admitted_initial_evidence_count"], 0)
+        self.assertFalse(packet["leaf_retrieval_results"][0]["selected_evidence"])
+        self.assertFalse(packet["evidence_chunks"])
+        self.assertIn(
+            "retrieved_source_text_missing",
+            packet["omitted_candidates"][0]["omission_reason_codes"],
+        )
+
     def test_configured_browser_provider_uses_openai_web_search_citations(self) -> None:
         context = build_retrieval_query_contexts(self.qdt, evidence_packet=self.evidence_packet)[0]
         payloads = []
@@ -1831,6 +1882,7 @@ class RetrievalPacketContractTest(unittest.TestCase):
                 provider = build_provider()
 
         self.assertIsInstance(provider, ConfiguredBrowserProvider)
+        self.assertIsNone(provider.search_api_key)
         self.assertTrue(provider.provider_diagnostics()["search_configured"])
         self.assertEqual(provider.provider_diagnostics()["search_provider"], "openclaw_oauth_web_search")
         self.assertEqual(provider.provider_diagnostics()["openclaw_agent_id"], "researcher-swarm")
