@@ -1876,6 +1876,30 @@ class RetrievalPacketContractTest(unittest.TestCase):
         self.assertEqual(fetched["web_fetch_role"], "url_fetch_extraction_only")
         self.assertFalse(provider.provider_diagnostics()["authority_boundary"]["certifies_source_class"])
 
+    def test_configured_browser_provider_fetch_failure_fails_closed_without_search_summary_content(self) -> None:
+        def opener(_request, timeout):
+            self.assertEqual(timeout, 20.0)
+            raise RuntimeError("simulated 403")
+
+        provider = ConfiguredBrowserProvider(
+            search_backend="openclaw_oauth_web_search",
+            openclaw_cli="/usr/local/bin/openclaw",
+            opener=opener,
+        )
+
+        fetched = provider.fetch_url("https://source.example/protected")
+
+        self.assertEqual(fetched["url"], "https://source.example/protected")
+        self.assertEqual(fetched["final_url"], "https://source.example/protected")
+        self.assertEqual(fetched["extraction_status"], "rejected")
+        self.assertEqual(fetched["reason_codes"], ["http_fetch_failed"])
+        self.assertEqual(fetched["web_fetch_role"], "url_fetch_extraction_only")
+        self.assertIn("simulated 403", fetched["provider_error"])
+        self.assertNotIn("content", fetched)
+        self.assertNotIn("title", fetched)
+        self.assertNotIn("snippet", fetched)
+        self.assertEqual(provider.last_fetch_error, "simulated 403")
+
     def test_default_configured_provider_factory_uses_openclaw_oauth_backend(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
             with patch("researcher_swarm.browser_provider.shutil.which", return_value="/usr/local/bin/openclaw"):
