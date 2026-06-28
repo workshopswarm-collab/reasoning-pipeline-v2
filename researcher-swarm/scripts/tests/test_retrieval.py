@@ -196,6 +196,19 @@ class RetrievalPacketContractTest(unittest.TestCase):
             "source_family_resolution_method": "deterministic_url_registry",
             "result_rank": index + 1,
             "content": f"Live-shaped candidate {index} for {leaf_id}",
+            "validated_atomic_claim_candidates": [
+                {
+                    "subject": f"Live-shaped candidate {index}",
+                    "predicate": "supports",
+                    "object_or_value": leaf_id,
+                    "event_time": "2026-06-24",
+                    "entity_or_jurisdiction": "example",
+                    "condition_scope": "unconditional",
+                    "polarity": "affirmed",
+                    "supporting_text": f"Live-shaped candidate {index} for {leaf_id}",
+                    "candidate_confidence": "high",
+                }
+            ],
         }
 
     def _live_candidates_for_context(self, context: dict, *, include_direct: bool = True, count: int = 5) -> list[dict]:
@@ -1415,6 +1428,7 @@ class RetrievalPacketContractTest(unittest.TestCase):
         candidate.pop("claim_family_ids", None)
         candidate.pop("claim_family_resolution_ref", None)
         candidate.pop("claim_family_resolution_refs", None)
+        candidate.pop("validated_atomic_claim_candidates", None)
 
         packet = build_live_retrieval_packet_from_candidates(
             qdt,
@@ -1432,6 +1446,165 @@ class RetrievalPacketContractTest(unittest.TestCase):
         self.assertFalse(provenance["counts_toward_breadth"])
         self.assertEqual(packet["research_sufficiency_summary"]["classification_dispatch_status"], "blocked_insufficient_research")
         self.assertIn("claim_family_diversity", cert["unsatisfied_requirement_codes"])
+
+    def test_fetched_url_resolver_metadata_can_satisfy_breadth_and_freshness(self) -> None:
+        qdt = copy.deepcopy(self.qdt)
+        qdt["required_leaf_questions"] = [qdt["required_leaf_questions"][0]]
+        leaf = qdt["required_leaf_questions"][0]
+        leaf["purpose"] = "resolution_mechanics"
+        leaf["bayesian_weighting"]["static_information_weight"] = "medium"
+        leaf["research_sufficiency_requirements"].update(
+            {
+                "required_source_classes": ["official_or_primary", "independent_secondary"],
+                "leaf_purpose": "resolution_mechanics",
+                "static_information_weight": "medium",
+                "retrieval_breadth_profile_ref": "breadth-profile-template:resolution_mechanics:medium:unconditional",
+                "protected_primary_required": False,
+                "min_independent_claim_families": 2,
+                "min_independent_source_families": 2,
+                "min_temporally_fresh_sources": 2,
+                "recency_window_seconds": 3600,
+                "contradiction_search_required": False,
+                "required_negative_checks": [],
+            }
+        )
+        context = build_retrieval_query_contexts(qdt, evidence_packet=self.evidence_packet)[0]
+        official = self._live_candidate(context, 0, direct=True, official=True)
+        official["source_class_resolution_method"] = "unknown"
+        official["deterministic_source_class_proof"] = False
+        secondary = self._live_candidate(context, 1)
+        search_candidates = self._search_candidates_for_context(context, [secondary])
+        evidence_packet = {
+            **self.evidence_packet,
+            "official_source_hints": [official["canonical_url"]],
+        }
+
+        packet = build_live_retrieval_packet_from_candidates(
+            qdt,
+            evidence_packet=evidence_packet,
+            fetched_candidates=[official, secondary],
+            search_candidate_urls=search_candidates,
+            question_decomposition_artifact_id="artifact:qdt-1",
+            policy_context_ref="artifact:profile-1",
+        )
+        coverage = packet["retrieval_breadth_coverage_slices"][0]
+
+        self.assertTrue(coverage["breadth_certified"], coverage["unsatisfied_breadth_dimensions"])
+        self.assertEqual(coverage["claim_family_count"], 2)
+        self.assertEqual(coverage["source_family_count"], 2)
+        self.assertEqual(coverage["fresh_source_count"], 2)
+        self.assertEqual(
+            packet["research_sufficiency_summary"]["classification_dispatch_status"],
+            "allowed",
+        )
+        self.assertTrue(packet["atomic_claim_candidates"])
+        self.assertTrue(packet["claim_family_resolutions"])
+        self.assertIn(
+            "official_url_hint",
+            {
+                item["source_metadata_resolution"]["source_class_resolution_method"]
+                for item in packet["retrieval_evidence_provenance_slices"]
+            },
+        )
+        self.assertTrue(
+            all(
+                item["source_metadata_resolution"]["source_family_resolution_method"] == "canonical_url"
+                for item in packet["retrieval_evidence_provenance_slices"]
+            )
+        )
+
+    def test_provider_authority_fields_without_resolver_metadata_do_not_count(self) -> None:
+        qdt = copy.deepcopy(self.qdt)
+        qdt["required_leaf_questions"] = [qdt["required_leaf_questions"][0]]
+        context = build_retrieval_query_contexts(qdt, evidence_packet=self.evidence_packet)[0]
+        variant = context["query_variants"][0]
+        search_candidate = build_search_candidate_url(
+            context,
+            variant,
+            rank=1,
+            url="https://source.example/search-discovered",
+            title="Provider title",
+            snippet="Provider summary",
+            searched_at="2026-06-24T11:59:00+00:00",
+            result_source="openclaw_oauth_web_search",
+        )
+        fetched_candidate = {
+            "leaf_id": context["leaf_id"],
+            "parent_branch_id": context["parent_branch_id"],
+            "retrieval_transport": "browser",
+            "navigation_mode": "web_search",
+            "requested_url": "https://source.example/search-discovered",
+            "final_url": "https://source.example/search-discovered",
+            "canonical_url": "https://source.example/search-discovered",
+            "search_candidate_url_ref": search_candidate["search_candidate_url_id"],
+            "source_class": "independent_secondary",
+            "source_family_id": "source-family-provider-supplied",
+            "claim_family_id": "claim-family-provider-supplied",
+            "source_published_at": "2026-06-24T11:30:00+00:00",
+            "captured_at": "2026-06-24T11:59:00+00:00",
+            "extraction_status": "accepted",
+            "admission_status": "admitted",
+            "content": "Fetched page text exists, but provider metadata is not resolver metadata.",
+        }
+
+        packet = build_live_retrieval_packet_from_candidates(
+            qdt,
+            evidence_packet=self.evidence_packet,
+            fetched_candidates=[fetched_candidate],
+            search_candidate_urls=[search_candidate],
+            question_decomposition_artifact_id="artifact:qdt-1",
+            policy_context_ref="artifact:profile-1",
+        )
+        provenance = packet["retrieval_evidence_provenance_slices"][0]
+
+        self.assertEqual(provenance["source_class"], "unknown")
+        self.assertEqual(provenance["claim_family_ids"], [])
+        self.assertNotEqual(provenance["source_family_id"], "source-family-provider-supplied")
+        self.assertFalse(provenance["counts_toward_breadth"])
+        self.assertIn("source_class_unknown", provenance["unknown_reason_codes"])
+        self.assertIn("claim_family_unknown_not_counted", provenance["unknown_reason_codes"])
+
+    def test_claim_family_for_fetched_url_comes_from_validated_text_not_url(self) -> None:
+        qdt = copy.deepcopy(self.qdt)
+        qdt["required_leaf_questions"] = [qdt["required_leaf_questions"][0]]
+        context = build_retrieval_query_contexts(qdt, evidence_packet=self.evidence_packet)[0]
+        first = self._live_candidate(context, 0, direct=True, official=True)
+        second = self._live_candidate(context, 1)
+        second["validated_atomic_claim_candidates"][0]["subject"] = first["validated_atomic_claim_candidates"][0]["subject"]
+        second["validated_atomic_claim_candidates"][0]["predicate"] = first["validated_atomic_claim_candidates"][0]["predicate"]
+        second["validated_atomic_claim_candidates"][0]["object_or_value"] = first["validated_atomic_claim_candidates"][0]["object_or_value"]
+        second["validated_atomic_claim_candidates"][0]["event_time"] = first["validated_atomic_claim_candidates"][0]["event_time"]
+        second["validated_atomic_claim_candidates"][0]["entity_or_jurisdiction"] = first["validated_atomic_claim_candidates"][0]["entity_or_jurisdiction"]
+        third = self._live_candidate(context, 2)
+        third["canonical_url"] = "https://independent1.example/different-url"
+        third["requested_url"] = third["canonical_url"]
+        third["final_url"] = third["canonical_url"]
+        third["content"] = "This fetched page has no matching support text for its proposed claim."
+        search_candidates = self._search_candidates_for_context(context, [second, third])
+
+        packet = build_live_retrieval_packet_from_candidates(
+            qdt,
+            evidence_packet=self.evidence_packet,
+            fetched_candidates=[first, second, third],
+            search_candidate_urls=search_candidates,
+            question_decomposition_artifact_id="artifact:qdt-1",
+            policy_context_ref="artifact:profile-1",
+        )
+        first_claims = [
+            item["claim_family_ids"]
+            for item in packet["retrieval_evidence_provenance_slices"]
+            if item["canonical_url"] in {first["canonical_url"], second["canonical_url"]}
+        ]
+        unsupported = next(
+            item
+            for item in packet["retrieval_evidence_provenance_slices"]
+            if item["canonical_url"] == third["canonical_url"]
+        )
+
+        self.assertEqual(first_claims[0], first_claims[1])
+        self.assertNotEqual(first["canonical_url"], second["canonical_url"])
+        self.assertEqual(unsupported["claim_family_ids"], [])
+        self.assertIn("claim_family_unknown_not_counted", unsupported["unknown_reason_codes"])
 
     def test_phase7_direct_url_priority_search_candidate_caps_and_dedupe(self) -> None:
         qdt = copy.deepcopy(self.qdt)

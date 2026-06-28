@@ -1905,6 +1905,24 @@ def _deterministic_source_class_proof(
     return False, "no_deterministic_proof"
 
 
+def _deterministic_source_class_or_unknown(
+    candidate: dict[str, Any],
+    *,
+    market_rules: dict[str, Any] | None = None,
+) -> tuple[str, str, bool]:
+    source_class = str(candidate.get("source_class") or "unknown")
+    if source_class not in ALLOWED_SOURCE_CLASSES or source_class == "unknown":
+        return "unknown", "unknown", False
+    has_proof, proof_method = _deterministic_source_class_proof(
+        candidate,
+        source_class,
+        market_rules=market_rules,
+    )
+    if not has_proof:
+        return "unknown", "unknown", False
+    return source_class, proof_method, True
+
+
 def _classifier_slice_ref(classifier_slice: dict[str, Any] | None) -> str | None:
     if not classifier_slice:
         return None
@@ -2011,7 +2029,7 @@ def _resolve_source_family(
 ) -> tuple[str, str, str]:
     explicit = candidate.get("source_family_id")
     if _is_non_empty_string(explicit) and explicit != "source-family-unknown":
-        return str(explicit), "candidate_field", "resolved"
+        return str(explicit), str(candidate.get("source_family_resolution_method") or "candidate_field"), "resolved"
     if _is_non_empty_string(candidate.get("syndication_key")):
         return "source-family-" + _hash_suffix({"syndication": candidate["syndication_key"]}), "syndication_key", "syndicated_copy"
     if _is_non_empty_string(candidate.get("mirrored_api_family_key")):
@@ -4263,6 +4281,54 @@ def _candidate_has_retrieved_source_text(candidate: dict[str, Any]) -> bool:
     )
 
 
+def _resolved_claim_candidates_from_fetched_text(
+    candidate: dict[str, Any],
+    *,
+    evidence_ref: str,
+    leaf_id: str,
+    chunk_ref: str,
+    text: str,
+) -> list[dict[str, Any]]:
+    raw_candidates = candidate.get("validated_atomic_claim_candidates")
+    if not isinstance(raw_candidates, list):
+        return []
+    claim_candidates: list[dict[str, Any]] = []
+    for raw in raw_candidates[:8]:
+        if not isinstance(raw, dict):
+            continue
+        _ensure_no_forbidden_keys(raw, "validated_atomic_claim_candidate")
+        proposed_tuple = raw.get("proposed_tuple") if isinstance(raw.get("proposed_tuple"), dict) else raw
+        supporting_text = _normalized_space(
+            str(raw.get("supporting_text") or raw.get("supporting_excerpt") or raw.get("span_text") or "")
+        )
+        supporting_span_refs: list[str] = []
+        validation_status = "rejected_no_span"
+        if supporting_text:
+            normalized_text = _normalized_space(text)
+            if supporting_text in normalized_text:
+                supporting_span_refs = [chunk_ref]
+                if all(
+                    _is_non_empty_string(proposed_tuple.get(field))
+                    for field in ("subject", "predicate", "object_or_value")
+                ):
+                    validation_status = "accepted_for_normalization"
+                else:
+                    validation_status = "rejected_not_market_relevant"
+        claim_candidates.append(
+            build_atomic_claim_candidate(
+                evidence_ref=evidence_ref,
+                leaf_id=leaf_id,
+                chunk_refs=[chunk_ref],
+                extraction_method="fetched_text_validated_tuple",
+                proposed_tuple=proposed_tuple,
+                supporting_span_refs=supporting_span_refs,
+                candidate_confidence=str(raw.get("candidate_confidence") or raw.get("confidence") or "unknown"),
+                validation_status=validation_status,
+            )
+        )
+    return claim_candidates
+
+
 def _materialize_candidate_evidence(
     *,
     qdt: dict[str, Any],
@@ -4271,6 +4337,9 @@ def _materialize_candidate_evidence(
     attempt: dict[str, Any],
     source_cutoff_timestamp: str,
     evidence_source: str,
+    allow_candidate_source_metadata: bool = False,
+    allow_candidate_source_family_metadata: bool = False,
+    allow_candidate_claim_family_ids: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     leaf_id = str(context["leaf_id"])
     text = _candidate_text(candidate)
@@ -4284,10 +4353,28 @@ def _materialize_candidate_evidence(
         },
     )
     source_class = str(candidate.get("source_class") or "unknown")
-    if source_class not in ALLOWED_SOURCE_CLASSES:
+    if source_class not in ALLOWED_SOURCE_CLASSES or not allow_candidate_source_metadata:
         source_class = "unknown"
-    source_family_id = str(candidate.get("source_family_id") or "source-family-unknown")
-    claim_family_ids = _candidate_claim_family_ids(candidate)
+    if allow_candidate_source_family_metadata:
+        source_family_id = str(candidate.get("source_family_id") or "source-family-unknown")
+        source_family_method = str(
+            candidate.get("source_family_resolution_method") or "deterministic_candidate_source_metadata"
+        )
+    elif canonicalize_source_url(attempt.get("canonical_url"), candidate.get("canonical_url"), candidate.get("final_url")):
+        source_family_id = "source-family-" + _hash_suffix(
+            {
+                "canonical_url": canonicalize_source_url(
+                    attempt.get("canonical_url"),
+                    candidate.get("canonical_url"),
+                    candidate.get("final_url"),
+                )
+            }
+        )
+        source_family_method = "canonical_url"
+    else:
+        source_family_id = "source-family-unknown"
+        source_family_method = "unknown"
+    claim_family_ids = _candidate_claim_family_ids(candidate) if allow_candidate_claim_family_ids else []
     evidence = build_retrieval_evidence_item(
         case_id=str(qdt.get("case_id") or context.get("case_id")),
         dispatch_id=str(qdt.get("dispatch_id") or context.get("dispatch_id")),
@@ -4322,7 +4409,7 @@ def _materialize_candidate_evidence(
         candidate.get("source_class_resolution_method") or "unknown"
     )
     evidence["source_family_resolution_method"] = str(
-        candidate.get("source_family_resolution_method") or "deterministic_live_retrieval_fixture"
+        source_family_method
     )
     evidence["claim_family_ids"] = claim_family_ids
     chunk = build_evidence_chunk(
@@ -4340,6 +4427,13 @@ def _materialize_candidate_evidence(
         text=text,
     )
     evidence["chunk_refs"] = [chunk["chunk_ref"]]
+    evidence["atomic_claim_candidates"] = _resolved_claim_candidates_from_fetched_text(
+        candidate,
+        evidence_ref=evidence["evidence_ref"],
+        leaf_id=leaf_id,
+        chunk_ref=chunk["chunk_ref"],
+        text=text,
+    )
     return evidence, chunk, span
 
 
@@ -4507,6 +4601,22 @@ def _materialize_native_candidate_discoveries(
     return discoveries
 
 
+def _source_resolution_rules(evidence_packet: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(evidence_packet, dict):
+        return {}
+    rules = copy.deepcopy(evidence_packet.get("market_rules") or {})
+    if not isinstance(rules, dict):
+        rules = {}
+    hints: list[Any] = []
+    if isinstance(rules.get("official_source_hints"), list):
+        hints.extend(rules["official_source_hints"])
+    if isinstance(evidence_packet.get("official_source_hints"), list):
+        hints.extend(evidence_packet["official_source_hints"])
+    if hints:
+        rules["official_source_hints"] = hints
+    return rules
+
+
 def build_live_retrieval_packet_from_candidates(
     qdt: dict[str, Any],
     *,
@@ -4555,6 +4665,7 @@ def build_live_retrieval_packet_from_candidates(
         native_research_candidates,
         discovered_at=forecast,
     )
+    source_resolution_rules = _source_resolution_rules(evidence_packet)
     seen_canonical_urls_by_leaf: dict[str, set[str]] = {leaf_id: set() for leaf_id in contexts_by_leaf}
 
     for candidate in sorted(fetched_candidates or [], key=_candidate_navigation_sort_key):
@@ -4641,13 +4752,28 @@ def build_live_retrieval_packet_from_candidates(
                     )
                 )
                 continue
+            resolved_source_class, resolved_source_class_method, has_source_class_proof = (
+                _deterministic_source_class_or_unknown(
+                    {**candidate, "canonical_url": canonical_url, "final_url": final_url, "requested_url": requested_url},
+                    market_rules=source_resolution_rules,
+                )
+            )
+            evidence_candidate = {
+                **candidate,
+                "canonical_url": canonical_url,
+                "source_class": resolved_source_class,
+                "source_class_resolution_method": resolved_source_class_method,
+                "deterministic_source_class_proof": has_source_class_proof,
+            }
             evidence, chunk, span = _materialize_candidate_evidence(
                 qdt=qdt,
                 context=context,
-                candidate={**candidate, "canonical_url": canonical_url},
+                candidate=evidence_candidate,
                 attempt=attempt,
                 source_cutoff_timestamp=cutoff,
                 evidence_source="live_retrieval_candidate_admitted",
+                allow_candidate_source_metadata=has_source_class_proof,
+                allow_candidate_claim_family_ids=False,
             )
             selected.append(evidence)
             chunks.append(chunk)
@@ -4736,9 +4862,12 @@ def build_live_retrieval_packet_from_candidates(
                         "final_url": record.get("final_url"),
                         "canonical_url": record.get("canonical_url"),
                     },
-                    source_cutoff_timestamp=cutoff,
-                    evidence_source="supplemental_evidence_admitted_after_validation",
-                )
+                source_cutoff_timestamp=cutoff,
+                evidence_source="supplemental_evidence_admitted_after_validation",
+                allow_candidate_source_metadata=True,
+                allow_candidate_source_family_metadata=True,
+                allow_candidate_claim_family_ids=True,
+            )
                 selected.append(evidence)
                 chunks.append(chunk)
                 spans.append(span)
@@ -4936,10 +5065,13 @@ def build_retrieval_packet(
         "pre_dispatch_input_whitelist_refs": list(pre_dispatch_input_whitelist_refs or []),
         "live_retrieval_allowlist": list(live_retrieval_allowlist or sorted(DEFAULT_LIVE_RETRIEVAL_TRANSPORT_ALLOWLIST)),
     }
+    source_resolution_rules = _source_resolution_rules(evidence_packet)
     selected = copy.deepcopy(selected_evidence or [])
     provenance_slices = []
     source_metadata_resolutions = []
     source_metadata_classifier_slices = []
+    atomic_claim_candidates = []
+    claim_family_resolutions = []
     seen_source_family_ids_by_leaf: dict[str, set[str]] = {}
     seen_claim_family_ids_by_leaf: dict[str, set[str]] = {}
     for item in selected:
@@ -4949,14 +5081,24 @@ def build_retrieval_packet(
         classifier_slice = item.get("source_metadata_classifier_slice")
         if isinstance(classifier_slice, dict):
             source_metadata_classifier_slices.append(classifier_slice)
+        item_claim_candidates = [
+            candidate
+            for candidate in item.get("atomic_claim_candidates", [])
+            if isinstance(candidate, dict)
+        ] if isinstance(item.get("atomic_claim_candidates"), list) else []
+        item_claim_family_resolutions = resolve_claim_families(item_claim_candidates) if item_claim_candidates else []
         provenance = normalize_retrieval_provenance(
             item,
             dispatch_context=dispatch_context,
             classifier_slice=classifier_slice if isinstance(classifier_slice, dict) else None,
-            market_rules=(evidence_packet or {}).get("market_rules") if isinstance(evidence_packet, dict) else None,
+            claim_candidates=item_claim_candidates,
+            claim_family_resolutions=item_claim_family_resolutions,
+            market_rules=source_resolution_rules,
             seen_source_family_ids=seen_source_family_ids,
             seen_claim_family_ids=seen_claim_family_ids,
         )
+        atomic_claim_candidates.extend(item_claim_candidates)
+        claim_family_resolutions.extend(item_claim_family_resolutions)
         if provenance.get("source_family_id") != "source-family-unknown":
             seen_source_family_ids.add(str(provenance["source_family_id"]))
         for claim_family_id in provenance.get("claim_family_ids", []):
@@ -5037,8 +5179,8 @@ def build_retrieval_packet(
         "source_metadata_classifier_slices": source_metadata_classifier_slices,
         "source_metadata_classifier_unavailable_diagnostics": [],
         "source_metadata_resolutions": source_metadata_resolutions,
-        "atomic_claim_candidates": [],
-        "claim_family_resolutions": [],
+        "atomic_claim_candidates": atomic_claim_candidates,
+        "claim_family_resolutions": claim_family_resolutions,
         "retrieval_evidence_provenance_slices": provenance_slices,
         "evidence_chunks": [],
         "evidence_spans": [],

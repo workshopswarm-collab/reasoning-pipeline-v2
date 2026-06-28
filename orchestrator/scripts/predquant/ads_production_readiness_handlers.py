@@ -497,6 +497,15 @@ def _live_fixture_direct_candidates(
                 url = f"https://evidence-fixture.example/{leaf_id}/{idx}"
                 method = "live_fixture_independent_source"
                 navigation_mode = "web_search"
+            content = canonical_json(
+                {
+                    "leaf_id": leaf_id,
+                    "purpose": purpose,
+                    "source_index": idx,
+                    "source_class": source_class,
+                    "question_text": leaf.get("question_text"),
+                }
+            )
             candidates.append(
                 {
                     "leaf_id": leaf_id,
@@ -522,15 +531,20 @@ def _live_fixture_direct_candidates(
                     "source_family_resolution_method": method,
                     "result_rank": idx + 1,
                     "direct_url_source_ref": "case_contract.market_url" if idx == 0 else None,
-                    "content": canonical_json(
+                    "content": content,
+                    "validated_atomic_claim_candidates": [
                         {
-                            "leaf_id": leaf_id,
-                            "purpose": purpose,
-                            "source_index": idx,
-                            "source_class": source_class,
-                            "question_text": leaf.get("question_text"),
+                            "subject": f"runtime fixture source {idx}",
+                            "predicate": "supports",
+                            "object_or_value": leaf_id,
+                            "event_time": observed_at.split("T", 1)[0],
+                            "entity_or_jurisdiction": "ads-runtime-fixture",
+                            "condition_scope": "unconditional",
+                            "polarity": "affirmed",
+                            "supporting_text": content,
+                            "candidate_confidence": "high",
                         }
-                    ),
+                    ],
                 }
             )
     return candidates
