@@ -9,7 +9,7 @@ from datetime import timezone
 from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
 from typing import Any, Callable
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, urlopen
 
 from .retrieval import (
@@ -142,6 +142,92 @@ def _http_datetime(value: str | None) -> str | None:
     return parsed.astimezone(timezone.utc).isoformat()
 
 
+def _annotation_snippet(annotation: dict[str, Any], text: str) -> str:
+    snippet = str(annotation.get("snippet") or annotation.get("text") or "").strip()
+    if snippet:
+        return snippet[:500]
+    try:
+        start = int(annotation.get("start_index"))
+        end = int(annotation.get("end_index"))
+    except (TypeError, ValueError):
+        return ""
+    if start < 0 or end <= start:
+        return ""
+    return text[max(0, start - 80) : min(len(text), end + 80)].strip()[:500]
+
+
+def _collect_openai_url_citations(payload: Any) -> list[dict[str, str]]:
+    """Extract URLs from Responses API web-search sources and annotations."""
+
+    citations: list[dict[str, str]] = []
+    seen: set[str] = set()
+
+    def add(annotation: dict[str, Any], text: str = "") -> None:
+        annotation_type = str(annotation.get("type") or "")
+        url = str(annotation.get("url") or annotation.get("uri") or annotation.get("link") or "").strip()
+        if not url or url in seen:
+            return
+        if annotation_type and annotation_type not in {"url_citation", "citation", "source"}:
+            return
+        parsed = urlsplit(url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            return
+        seen.add(url)
+        citations.append(
+            {
+                "url": url,
+                "title": str(annotation.get("title") or annotation.get("source_title") or annotation.get("name") or "").strip(),
+                "snippet": _annotation_snippet(annotation, text),
+            }
+        )
+
+    output = payload.get("output") if isinstance(payload, dict) else None
+    if isinstance(output, list):
+        for item in output:
+            if not isinstance(item, dict):
+                continue
+            action = item.get("action")
+            if item.get("type") == "web_search_call" and isinstance(action, dict):
+                sources = action.get("sources")
+                if isinstance(sources, list):
+                    for source in sources:
+                        if isinstance(source, dict):
+                            add(source)
+            content = item.get("content")
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                text = str(part.get("text") or part.get("output_text") or "")
+                annotations = part.get("annotations")
+                if not isinstance(annotations, list):
+                    continue
+                for annotation in annotations:
+                    if isinstance(annotation, dict):
+                        add(annotation, text)
+    return citations
+
+
+def _openai_search_prompt(query_context: dict[str, Any], query_variant: dict[str, Any], search_limit: int) -> str:
+    market_question = str(query_context.get("market_question") or query_context.get("macro_question") or "").strip()
+    leaf_question = str(query_context.get("leaf_question") or query_context.get("question_text") or "").strip()
+    query_text = str(query_variant.get("query_text") or "").strip()
+    return "\n".join(
+        part
+        for part in (
+            "Find source URLs for ADS retrieval. Use hosted web search and cite relevant pages.",
+            "Return only source discovery context; do not estimate probabilities, SCAE deltas, source classes, "
+            "claim families, temporal eligibility, or research sufficiency.",
+            f"Limit to at most {search_limit} useful URLs.",
+            f"Market question: {market_question}" if market_question else "",
+            f"Leaf question: {leaf_question}" if leaf_question else "",
+            f"Search query: {query_text}",
+        )
+        if part
+    )
+
+
 class ConfiguredBrowserProvider(BrowserProviderAdapter):
     """Configured search and direct-fetch provider with fail-closed defaults."""
 
@@ -149,6 +235,10 @@ class ConfiguredBrowserProvider(BrowserProviderAdapter):
         self,
         *,
         provider_id: str = OPENCLAW_BROWSER_PROVIDER_ID,
+        search_backend: str = "openai_web_search",
+        openai_api_key: str | None = None,
+        openai_responses_endpoint: str = "https://api.openai.com/v1/responses",
+        search_model: str = "gpt-5.5",
         search_api_key: str | None = None,
         brave_search_endpoint: str = "https://api.search.brave.com/res/v1/web/search",
         search_limit: int = 5,
@@ -156,8 +246,13 @@ class ConfiguredBrowserProvider(BrowserProviderAdapter):
         max_fetch_chars: int = 16_000,
         user_agent: str = "OpenClaw ADS retrieval transport/1.0",
         opener: Callable[..., Any] = urlopen,
+        responses_client: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
     ) -> None:
         super().__init__(provider_id=provider_id)
+        self.search_backend = search_backend
+        self.openai_api_key = openai_api_key
+        self.openai_responses_endpoint = openai_responses_endpoint
+        self.search_model = search_model
         self.search_api_key = search_api_key
         self.brave_search_endpoint = brave_search_endpoint
         self.search_limit = max(1, min(10, int(search_limit or 5)))
@@ -165,10 +260,18 @@ class ConfiguredBrowserProvider(BrowserProviderAdapter):
         self.max_fetch_chars = max(1000, int(max_fetch_chars or 16_000))
         self.user_agent = user_agent
         self.opener = opener
+        self.responses_client = responses_client
         self.fetch_configured = True
-        self.search_configured = bool(search_api_key)
+        self.search_configured = self._search_configured()
         self.last_search_error: str | None = None
         self.last_fetch_error: str | None = None
+
+    def _search_configured(self) -> bool:
+        if self.search_backend == "openai_web_search":
+            return bool(self.openai_api_key or self.responses_client)
+        if self.search_backend == "brave_search_api":
+            return bool(self.search_api_key)
+        return False
 
     def search_candidate_urls(
         self,
@@ -178,6 +281,86 @@ class ConfiguredBrowserProvider(BrowserProviderAdapter):
         searched_at: str | None = None,
     ) -> list[dict[str, Any]]:
         self.last_search_error = None
+        if self.search_backend == "openai_web_search":
+            return self._openai_search_candidate_urls(query_context, query_variant, searched_at=searched_at)
+        if self.search_backend == "brave_search_api":
+            return self._brave_search_candidate_urls(query_context, query_variant, searched_at=searched_at)
+        self.last_search_error = f"unsupported_search_backend:{self.search_backend}"
+        return []
+
+    def _openai_search_candidate_urls(
+        self,
+        query_context: dict[str, Any],
+        query_variant: dict[str, Any],
+        *,
+        searched_at: str | None,
+    ) -> list[dict[str, Any]]:
+        if not self.openai_api_key and self.responses_client is None:
+            self.last_search_error = "openai_api_key_not_configured"
+            return []
+        query = str(query_variant.get("query_text") or "").strip()
+        if not query:
+            return []
+        request_payload: dict[str, Any] = {
+            "model": self.search_model,
+            "tools": [{"type": "web_search"}],
+            "tool_choice": "auto",
+            "include": ["web_search_call.action.sources"],
+            "input": _openai_search_prompt(query_context, query_variant, self.search_limit),
+            "store": False,
+        }
+        try:
+            if self.responses_client is not None:
+                payload = self.responses_client(request_payload)
+            else:
+                request = Request(
+                    self.openai_responses_endpoint,
+                    data=json.dumps(request_payload).encode("utf-8"),
+                    headers={
+                        "Authorization": f"Bearer {self.openai_api_key}",
+                        "Content-Type": "application/json",
+                        "Accept": "application/json",
+                        "User-Agent": self.user_agent,
+                    },
+                    method="POST",
+                )
+                with self.opener(request, timeout=self.fetch_timeout_seconds) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+        except Exception as exc:
+            self.last_search_error = str(exc)[:500] or exc.__class__.__name__
+            return []
+        if not isinstance(payload, dict):
+            self.last_search_error = "openai_responses_returned_non_object"
+            return []
+        citations = _collect_openai_url_citations(payload)
+        if not citations:
+            self.last_search_error = "openai_web_search_no_url_citations"
+            return []
+        records: list[dict[str, Any]] = []
+        for index, citation in enumerate(citations[: self.search_limit], start=1):
+            records.append(
+                build_search_candidate_url(
+                    query_context,
+                    query_variant,
+                    rank=index,
+                    url=citation["url"],
+                    title=citation["title"],
+                    snippet=citation["snippet"],
+                    provider_id=self.provider_id,
+                    searched_at=searched_at,
+                    result_source="openai_web_search",
+                    query_role=str(query_variant.get("query_role") or "primary_leaf_retrieval"),
+                )
+            )
+        return records
+
+    def _brave_search_candidate_urls(
+        self,
+        query_context: dict[str, Any],
+        query_variant: dict[str, Any],
+        *,
+        searched_at: str | None,
+    ) -> list[dict[str, Any]]:
         if not self.search_api_key:
             self.last_search_error = "brave_search_api_key_not_configured"
             return []
@@ -275,8 +458,9 @@ class ConfiguredBrowserProvider(BrowserProviderAdapter):
         return {
             "provider_id": self.provider_id,
             "adapter": "configured_browser_provider",
-            "search_provider": "brave_search_api",
-            "search_configured": bool(self.search_api_key),
+            "search_provider": self.search_backend,
+            "search_model": self.search_model if self.search_backend == "openai_web_search" else None,
+            "search_configured": self._search_configured(),
             "fetch_configured": True,
             "last_search_error": self.last_search_error,
             "last_fetch_error": self.last_fetch_error,
@@ -295,7 +479,12 @@ class ConfiguredBrowserProvider(BrowserProviderAdapter):
 def build_provider() -> ConfiguredBrowserProvider:
     """Build the scheduler-loadable configured browser/search provider."""
 
+    search_backend = os.getenv("ADS_BROWSER_SEARCH_BACKEND", "openai_web_search")
     return ConfiguredBrowserProvider(
+        search_backend=search_backend,
+        openai_api_key=os.getenv("OPENAI_API_KEY") or os.getenv("ADS_OPENAI_API_KEY"),
+        openai_responses_endpoint=os.getenv("ADS_OPENAI_RESPONSES_ENDPOINT", "https://api.openai.com/v1/responses"),
+        search_model=os.getenv("ADS_OPENAI_SEARCH_MODEL") or os.getenv("ADS_BROWSER_SEARCH_MODEL", "gpt-5.5"),
         search_api_key=os.getenv("BRAVE_SEARCH_API_KEY") or os.getenv("ADS_BRAVE_SEARCH_API_KEY"),
         brave_search_endpoint=os.getenv(
             "ADS_BRAVE_SEARCH_ENDPOINT",

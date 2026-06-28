@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -1442,7 +1444,122 @@ class RetrievalPacketContractTest(unittest.TestCase):
         self.assertTrue(records[0]["fetch_required_before_admission"])
         self.assertEqual(fetched["web_fetch_role"], "url_fetch_extraction_only")
 
-    def test_configured_browser_provider_uses_explicit_search_boundary(self) -> None:
+    def test_configured_browser_provider_uses_openai_web_search_citations(self) -> None:
+        context = build_retrieval_query_contexts(self.qdt, evidence_packet=self.evidence_packet)[0]
+        payloads = []
+
+        def responses_client(payload: dict) -> dict:
+            payloads.append(payload)
+            return {
+                "output": [
+                    {"type": "web_search_call", "status": "completed", "action": {"query": "example"}},
+                    {
+                        "type": "message",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": "Use the official report and independent coverage.",
+                                "annotations": [
+                                    {
+                                        "type": "url_citation",
+                                        "url": "https://source.example/report",
+                                        "title": "Source report",
+                                        "start_index": 8,
+                                        "end_index": 23,
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                ]
+            }
+
+        provider = ConfiguredBrowserProvider(responses_client=responses_client)
+        records = provider.search_candidate_urls(context, context["query_variants"][0], searched_at="2026-06-24T12:00:00+00:00")
+
+        self.assertEqual(records[0]["url"], "https://source.example/report")
+        self.assertEqual(records[0]["result_source"], "openai_web_search")
+        self.assertFalse(records[0]["web_fetch_used_for_search"])
+        self.assertEqual(payloads[0]["model"], "gpt-5.5")
+        self.assertEqual(payloads[0]["tools"], [{"type": "web_search"}])
+        self.assertFalse(payloads[0]["store"])
+        self.assertIn("do not estimate probabilities", payloads[0]["input"])
+        diagnostics = provider.provider_diagnostics()
+        self.assertEqual(diagnostics["search_provider"], "openai_web_search")
+        self.assertEqual(diagnostics["search_model"], "gpt-5.5")
+        self.assertTrue(diagnostics["search_configured"])
+        self.assertFalse(diagnostics["authority_boundary"]["certifies_research_sufficiency"])
+
+    def test_configured_browser_provider_openai_http_path_uses_responses_api(self) -> None:
+        context = build_retrieval_query_contexts(self.qdt, evidence_packet=self.evidence_packet)[0]
+        calls = []
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self, *_args):
+                return json.dumps(
+                    {
+                        "output": [
+                            {
+                                "type": "message",
+                                "content": [
+                                    {
+                                        "type": "output_text",
+                                        "text": "Result",
+                                        "annotations": [
+                                            {
+                                                "type": "url_citation",
+                                                "url": "https://source.example/http",
+                                                "title": "HTTP result",
+                                            }
+                                        ],
+                                    }
+                                ],
+                            }
+                        ]
+                    }
+                ).encode("utf-8")
+
+        def opener(request, timeout):
+            calls.append((request.full_url, dict(request.header_items()), json.loads(request.data.decode("utf-8")), timeout))
+            return Response()
+
+        provider = ConfiguredBrowserProvider(openai_api_key="test-openai-key", opener=opener)
+        records = provider.search_candidate_urls(context, context["query_variants"][0])
+
+        self.assertEqual(records[0]["url"], "https://source.example/http")
+        self.assertEqual(calls[0][0], "https://api.openai.com/v1/responses")
+        self.assertEqual(calls[0][2]["tools"], [{"type": "web_search"}])
+        self.assertEqual(calls[0][2]["model"], "gpt-5.5")
+        self.assertIn("Authorization", calls[0][1])
+        self.assertIn("Content-type", calls[0][1])
+
+    def test_configured_browser_provider_no_openai_auth_fails_closed(self) -> None:
+        provider = ConfiguredBrowserProvider(openai_api_key=None, responses_client=None)
+        context = build_retrieval_query_contexts(self.qdt, evidence_packet=self.evidence_packet)[0]
+
+        records = provider.search_candidate_urls(context, context["query_variants"][0])
+
+        self.assertEqual(records, [])
+        self.assertEqual(provider.last_search_error, "openai_api_key_not_configured")
+        self.assertFalse(provider.provider_diagnostics()["search_configured"])
+        self.assertEqual(provider.provider_diagnostics()["search_provider"], "openai_web_search")
+
+    def test_configured_browser_provider_openai_without_citations_fails_closed(self) -> None:
+        provider = ConfiguredBrowserProvider(responses_client=lambda _payload: {"output": [{"type": "message", "content": []}]})
+        context = build_retrieval_query_contexts(self.qdt, evidence_packet=self.evidence_packet)[0]
+
+        records = provider.search_candidate_urls(context, context["query_variants"][0])
+
+        self.assertEqual(records, [])
+        self.assertEqual(provider.last_search_error, "openai_web_search_no_url_citations")
+
+    def test_configured_browser_provider_uses_explicit_brave_search_boundary(self) -> None:
         context = build_retrieval_query_contexts(self.qdt, evidence_packet=self.evidence_packet)[0]
         calls = []
 
@@ -1475,7 +1592,7 @@ class RetrievalPacketContractTest(unittest.TestCase):
             calls.append((request.full_url, dict(request.header_items()), timeout))
             return Response()
 
-        provider = ConfiguredBrowserProvider(search_api_key="test-key", opener=opener)
+        provider = ConfiguredBrowserProvider(search_backend="brave_search_api", search_api_key="test-key", opener=opener)
         records = provider.search_candidate_urls(context, context["query_variants"][0], searched_at="2026-06-24T12:00:00+00:00")
 
         self.assertEqual(records[0]["url"], "https://source.example/report")
@@ -1502,7 +1619,7 @@ class RetrievalPacketContractTest(unittest.TestCase):
             def read(self, *_args):
                 return b"<html><head><style>.x{}</style></head><body><h1>Official source</h1><script>x()</script><p>Evidence text.</p></body></html>"
 
-        provider = ConfiguredBrowserProvider(search_api_key=None, opener=lambda _request, timeout: Response())
+        provider = ConfiguredBrowserProvider(openai_api_key=None, opener=lambda _request, timeout: Response())
         records = provider.search_candidate_urls(
             build_retrieval_query_contexts(self.qdt, evidence_packet=self.evidence_packet)[0],
             build_retrieval_query_contexts(self.qdt, evidence_packet=self.evidence_packet)[0]["query_variants"][0],
@@ -1510,7 +1627,7 @@ class RetrievalPacketContractTest(unittest.TestCase):
         fetched = provider.fetch_url("https://source.example/page")
 
         self.assertEqual(records, [])
-        self.assertEqual(provider.last_search_error, "brave_search_api_key_not_configured")
+        self.assertEqual(provider.last_search_error, "openai_api_key_not_configured")
         self.assertEqual(fetched["final_url"], "https://source.example/final")
         self.assertIn("Official source", fetched["content"])
         self.assertNotIn("x()", fetched["content"])
@@ -1519,10 +1636,12 @@ class RetrievalPacketContractTest(unittest.TestCase):
         self.assertFalse(provider.provider_diagnostics()["authority_boundary"]["certifies_source_class"])
 
     def test_default_configured_provider_factory_is_fail_closed_without_search_key(self) -> None:
-        provider = build_provider()
+        with patch.dict(os.environ, {}, clear=True):
+            provider = build_provider()
 
         self.assertIsInstance(provider, ConfiguredBrowserProvider)
         self.assertFalse(provider.provider_diagnostics()["search_configured"])
+        self.assertEqual(provider.provider_diagnostics()["search_provider"], "openai_web_search")
 
     def test_phase7_native_candidate_caps_forbidden_fields_and_nonblocking_unavailability(self) -> None:
         context = build_retrieval_query_contexts(self.qdt, evidence_packet=self.evidence_packet)[0]
