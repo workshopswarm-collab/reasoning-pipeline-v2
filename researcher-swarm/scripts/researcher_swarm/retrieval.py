@@ -11,7 +11,7 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 
@@ -4546,6 +4546,68 @@ def _candidate_claim_family_ids(candidate: dict[str, Any]) -> list[str]:
     return ids
 
 
+def _compact_reason_codes(values: Iterable[Any]) -> list[str]:
+    reason_codes: list[str] = []
+    for value in values:
+        if not _is_non_empty_string(value):
+            continue
+        reason = str(value).strip().lower().replace("-", "_").replace(" ", "_")
+        if reason and len(reason) <= MAX_REASON_CODE_LENGTH and reason not in reason_codes:
+            reason_codes.append(reason)
+    return reason_codes
+
+
+def _candidate_reason_code_values(candidate: dict[str, Any]) -> list[Any]:
+    values: list[Any] = []
+    for field in ("omission_reason_codes", "reason_codes", "rejection_reason_codes"):
+        raw = candidate.get(field)
+        if isinstance(raw, list):
+            values.extend(raw)
+    temporal_validation = candidate.get("temporal_validation")
+    if isinstance(temporal_validation, dict):
+        for field in ("omission_reason_codes", "reason_codes", "rejection_reason_codes"):
+            raw = temporal_validation.get(field)
+            if isinstance(raw, list):
+                values.extend(raw)
+    return values
+
+
+def _is_temporal_rejection_reason(reason: str) -> bool:
+    return (
+        reason == "temporal_validation_failed"
+        or reason == "source_after_cutoff"
+        or "post_cutoff" in reason
+        or reason.startswith("extraction_temporal")
+    )
+
+
+def _candidate_temporal_admission_rejection_reasons(
+    candidate: dict[str, Any],
+    *,
+    extraction_status: str,
+) -> list[str]:
+    reason_codes: list[str] = []
+    candidate_reason_codes = _compact_reason_codes(_candidate_reason_code_values(candidate))
+    if extraction_status == "temporal_fail":
+        reason_codes.append("extraction_temporal_fail")
+    if str(candidate.get("temporal_gate_status") or "") == "fail":
+        reason_codes.append("temporal_validation_failed")
+    temporal_validation = candidate.get("temporal_validation")
+    if isinstance(temporal_validation, dict) and str(
+        temporal_validation.get("temporal_gate_status") or temporal_validation.get("status") or ""
+    ) == "fail":
+        reason_codes.append("temporal_validation_failed")
+    if str(candidate.get("admission_status") or "admitted") == "rejected":
+        specific_candidate_reasons = [reason for reason in candidate_reason_codes if reason != "admission_rejected"]
+        reason_codes.extend(specific_candidate_reasons or candidate_reason_codes or ["admission_rejected"])
+    reason_codes.extend(
+        reason
+        for reason in candidate_reason_codes
+        if "post_cutoff" in reason or reason == "source_after_cutoff"
+    )
+    return _compact_reason_codes(reason_codes)
+
+
 def _compact_supplemental_admission_result(record: dict[str, Any]) -> dict[str, Any]:
     return {
         "artifact_type": "supplemental_evidence_admission_result",
@@ -4755,6 +4817,14 @@ def build_live_retrieval_packet_from_candidates(
         discovered_at=forecast,
     )
     source_resolution_rules = _source_resolution_rules(evidence_packet)
+    temporal_dispatch_context = {
+        "case_id": qdt.get("case_id"),
+        "dispatch_id": qdt.get("dispatch_id"),
+        "forecast_timestamp": forecast,
+        "source_cutoff_timestamp": cutoff,
+        "live_retrieval_allowlist": list(live_retrieval_allowlist or sorted(DEFAULT_LIVE_RETRIEVAL_TRANSPORT_ALLOWLIST)),
+        "pre_dispatch_input_whitelist_refs": list(pre_dispatch_input_whitelist_refs or []),
+    }
     seen_canonical_urls_by_leaf: dict[str, set[str]] = {leaf_id: set() for leaf_id in contexts_by_leaf}
 
     for candidate in sorted(fetched_candidates or [], key=_candidate_navigation_sort_key):
@@ -4824,6 +4894,52 @@ def build_live_retrieval_packet_from_candidates(
         attempt_refs_by_leaf[leaf_id].append(attempt["attempt_id"])
         if canonical_url:
             seen_canonical_urls_by_leaf.setdefault(leaf_id, set()).add(canonical_url)
+        admission_rejection_reasons = _candidate_temporal_admission_rejection_reasons(
+            candidate,
+            extraction_status=extraction_status,
+        )
+        temporal_validation = validate_temporal_eligibility(
+            {
+                **candidate,
+                "case_id": candidate.get("case_id") or qdt.get("case_id"),
+                "dispatch_id": candidate.get("dispatch_id") or qdt.get("dispatch_id"),
+                "retrieval_transport": str(candidate.get("retrieval_transport") or "browser"),
+                "requested_url": requested_url,
+                "final_url": final_url,
+                "canonical_url": canonical_url,
+                "retrieval_capture_for_dispatch": True,
+            },
+            temporal_dispatch_context,
+        )
+        if temporal_validation["temporal_gate_status"] == "fail":
+            admission_rejection_reasons = _compact_reason_codes(
+                [
+                    *admission_rejection_reasons,
+                    "temporal_validation_failed",
+                    *temporal_validation["rejection_reason_codes"],
+                ]
+            )
+        if admission_rejection_reasons:
+            temporal_rejection = any(
+                _is_temporal_rejection_reason(reason) for reason in admission_rejection_reasons
+            )
+            omitted.append(
+                build_retrieval_candidate_record(
+                    leaf_id=leaf_id,
+                    query_context_ref=str(context["query_context_ref"]),
+                    query_variant_id=str(variant["query_variant_id"]),
+                    retrieval_transport=str(candidate.get("retrieval_transport") or "browser"),
+                    transport_attempt_ref=attempt["attempt_id"],
+                    candidate_status="rejected",
+                    requested_url=requested_url,
+                    canonical_url=canonical_url,
+                    omission_reason_codes=admission_rejection_reasons,
+                    temporal_gate_status="fail" if temporal_rejection else str(
+                        candidate.get("temporal_gate_status") or "unknown_not_counted"
+                    ),
+                )
+            )
+            continue
         if extraction_status == "accepted" and candidate.get("admission_status", "admitted") == "admitted":
             if not _candidate_has_retrieved_source_text(candidate):
                 omitted.append(

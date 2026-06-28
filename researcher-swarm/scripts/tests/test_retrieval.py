@@ -1861,6 +1861,103 @@ class RetrievalPacketContractTest(unittest.TestCase):
             packet["omitted_candidates"][0]["omission_reason_codes"],
         )
 
+    def test_post_cutoff_live_fetched_candidate_is_omitted_before_evidence_materialization(self) -> None:
+        qdt = copy.deepcopy(self.qdt)
+        qdt["required_leaf_questions"] = [qdt["required_leaf_questions"][0]]
+        context = build_retrieval_query_contexts(qdt, evidence_packet=self.evidence_packet)[0]
+        variant = context["query_variants"][0]
+        url = "https://source.example/post-cutoff"
+        search_candidate = build_search_candidate_url(
+            context,
+            variant,
+            rank=1,
+            url=url,
+            title="Post-cutoff source",
+            snippet="Search result text is not evidence.",
+            searched_at="2026-06-24T11:59:00+00:00",
+            result_source="openclaw_oauth_web_search",
+        )
+        fetched_candidate = {
+            "leaf_id": context["leaf_id"],
+            "parent_branch_id": context["parent_branch_id"],
+            "retrieval_transport": "browser",
+            "navigation_mode": "web_search",
+            "requested_url": url,
+            "final_url": url,
+            "canonical_url": url,
+            "search_candidate_url_ref": search_candidate["search_candidate_url_id"],
+            "source_class": "independent_secondary",
+            "source_family_id": "source-family-post-cutoff",
+            "claim_family_id": "claim-family-post-cutoff",
+            "source_published_at": "2026-06-24T12:00:01+00:00",
+            "captured_at": "2026-06-24T11:59:00+00:00",
+            "extraction_status": "accepted",
+            "admission_status": "admitted",
+            "temporal_gate_status": "pass",
+            "deterministic_source_class_proof": True,
+            "source_class_resolution_method": "deterministic_url_registry",
+            "content": "URL-specific fetched text from https://source.example/post-cutoff.",
+        }
+
+        packet = build_live_retrieval_packet_from_candidates(
+            qdt,
+            evidence_packet=self.evidence_packet,
+            fetched_candidates=[fetched_candidate],
+            search_candidate_urls=[search_candidate],
+            question_decomposition_artifact_id="artifact:qdt-1",
+            policy_context_ref="artifact:profile-1",
+        )
+        omitted = packet["omitted_candidates"][0]
+
+        self.assertEqual(packet["retrieval_runtime_summary"]["admitted_initial_evidence_count"], 0)
+        self.assertFalse(packet["leaf_retrieval_results"][0]["selected_evidence"])
+        self.assertFalse(packet["evidence_chunks"])
+        self.assertFalse(packet["evidence_spans"])
+        self.assertFalse(packet["retrieval_evidence_provenance_slices"])
+        self.assertEqual(omitted["candidate_status"], "rejected")
+        self.assertEqual(omitted["temporal_gate_status"], "fail")
+        self.assertIn("temporal_validation_failed", omitted["omission_reason_codes"])
+        self.assertIn("source_after_cutoff", omitted["omission_reason_codes"])
+        self.assertTrue(validate_retrieval_packet(packet).valid)
+
+    def test_admission_rejected_candidate_preserves_specific_omission_reasons(self) -> None:
+        qdt = copy.deepcopy(self.qdt)
+        qdt["required_leaf_questions"] = [qdt["required_leaf_questions"][0]]
+        context = build_retrieval_query_contexts(qdt, evidence_packet=self.evidence_packet)[0]
+        url = "https://source.example/rejected-specific"
+        fetched_candidate = {
+            "leaf_id": context["leaf_id"],
+            "parent_branch_id": context["parent_branch_id"],
+            "retrieval_transport": "browser",
+            "navigation_mode": "direct_url",
+            "requested_url": url,
+            "final_url": url,
+            "canonical_url": url,
+            "source_published_at": "2026-06-24T11:30:00+00:00",
+            "captured_at": "2026-06-24T11:59:00+00:00",
+            "extraction_status": "blocked",
+            "admission_status": "rejected",
+            "temporal_gate_status": "unknown_not_counted",
+            "omission_reason_codes": ["malformed_url"],
+            "reason_codes": ["protected_primary_blocked"],
+        }
+
+        packet = build_live_retrieval_packet_from_candidates(
+            qdt,
+            evidence_packet=self.evidence_packet,
+            fetched_candidates=[fetched_candidate],
+            question_decomposition_artifact_id="artifact:qdt-1",
+            policy_context_ref="artifact:profile-1",
+        )
+        omitted = packet["omitted_candidates"][0]
+
+        self.assertEqual(omitted["candidate_status"], "rejected")
+        self.assertEqual(omitted["temporal_gate_status"], "unknown_not_counted")
+        self.assertIn("malformed_url", omitted["omission_reason_codes"])
+        self.assertIn("protected_primary_blocked", omitted["omission_reason_codes"])
+        self.assertNotEqual(omitted["omission_reason_codes"], ["admission_rejected"])
+        self.assertTrue(validate_retrieval_packet(packet).valid)
+
     def test_phase7_whitespace_only_fetched_text_is_not_admitted_as_evidence(self) -> None:
         qdt = copy.deepcopy(self.qdt)
         qdt["required_leaf_questions"] = [qdt["required_leaf_questions"][0]]
