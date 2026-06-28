@@ -320,6 +320,20 @@ def _researcher_runtime_evidence(manifests: list[dict[str, Any]]) -> dict[str, A
     }
 
 
+def _evidence_refs_from(value: Any) -> set[str]:
+    refs: set[str] = set()
+    if not isinstance(value, list):
+        return refs
+    for item in value:
+        if isinstance(item, str) and item:
+            refs.add(item)
+        elif isinstance(item, dict):
+            ref = item.get("evidence_ref") or item.get("ref")
+            if ref:
+                refs.add(str(ref))
+    return refs
+
+
 def _retrieval_runtime_evidence(manifests: list[dict[str, Any]]) -> dict[str, Any]:
     retrieval_packets = []
     for manifest in manifests:
@@ -338,6 +352,7 @@ def _retrieval_runtime_evidence(manifests: list[dict[str, Any]]) -> dict[str, An
             else {}
         )
         leaf_results = payload.get("leaf_retrieval_results") if isinstance(payload.get("leaf_retrieval_results"), list) else []
+        leaf_dockets = payload.get("leaf_evidence_dockets") if isinstance(payload.get("leaf_evidence_dockets"), list) else []
         certificates = (
             payload.get("leaf_research_sufficiency_certificates")
             if isinstance(payload.get("leaf_research_sufficiency_certificates"), list)
@@ -357,11 +372,22 @@ def _retrieval_runtime_evidence(manifests: list[dict[str, Any]]) -> dict[str, An
         )
         source_attempt_count += int(transport.get("direct_url_candidate_count") or 0)
         source_attempt_count += len(direct_url_candidates)
-        admitted_ref_count = sum(
-            len(row.get("admitted_evidence_refs") or [])
-            for row in leaf_results
-            if isinstance(row, dict) and isinstance(row.get("admitted_evidence_refs"), list)
-        )
+        leaf_result_admitted_refs: set[str] = set()
+        selected_refs: set[str] = _evidence_refs_from(payload.get("selected_evidence_refs"))
+        for row in leaf_results:
+            if not isinstance(row, dict):
+                continue
+            leaf_result_admitted_refs.update(_evidence_refs_from(row.get("admitted_evidence_refs")))
+            selected_refs.update(_evidence_refs_from(row.get("selected_evidence_refs")))
+            selected_refs.update(_evidence_refs_from(row.get("selected_evidence")))
+        docket_admitted_refs: set[str] = set()
+        for row in leaf_dockets:
+            if isinstance(row, dict):
+                docket_admitted_refs.update(_evidence_refs_from(row.get("admitted_evidence_refs")))
+        admitted_refs = set(leaf_result_admitted_refs)
+        admitted_refs.update(docket_admitted_refs)
+        reported_refs = set(admitted_refs)
+        reported_refs.update(selected_refs)
         structural_unanswerable_count = sum(
             1
             for row in [*leaf_results, *certificates]
@@ -372,7 +398,7 @@ def _retrieval_runtime_evidence(manifests: list[dict[str, Any]]) -> dict[str, An
                 or row.get("certificate_status") == "structurally_unanswerable_certified"
             )
         )
-        source_populated = source_attempt_count > 0 or admitted_ref_count > 0
+        source_populated = source_attempt_count > 0 or len(leaf_result_admitted_refs) > 0
         structural_unanswerability_certified = (
             bool(leaf_results or certificates)
             and structural_unanswerable_count >= max(1, len(leaf_results))
@@ -385,7 +411,11 @@ def _retrieval_runtime_evidence(manifests: list[dict[str, Any]]) -> dict[str, An
                 "runtime_mode": runtime_summary.get("runtime_mode"),
                 "classification_dispatch_status": sufficiency.get("classification_dispatch_status"),
                 "source_attempt_count": source_attempt_count,
-                "admitted_evidence_ref_count": admitted_ref_count,
+                "admitted_evidence_ref_count": len(admitted_refs),
+                "leaf_result_admitted_evidence_ref_count": len(leaf_result_admitted_refs),
+                "docket_admitted_evidence_ref_count": len(docket_admitted_refs),
+                "selected_evidence_ref_count": len(selected_refs),
+                "reported_evidence_ref_count": len(reported_refs),
                 "structural_unanswerability_certified": structural_unanswerability_certified,
                 "classification_dispatch_allowed": dispatch_allowed,
                 "source_populated_or_structural_unanswerability": (

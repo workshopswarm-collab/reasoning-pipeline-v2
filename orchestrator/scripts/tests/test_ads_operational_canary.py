@@ -29,6 +29,7 @@ from predquant.ads_operator_review import build_ads_operator_review_report
 from predquant.ads_real_runtime_canary import (
     _build_runtime_criteria,
     _first_failing_gate,
+    _retrieval_runtime_evidence,
     build_real_runtime_canary_report,
 )
 from predquant.ads_scoreable_canary_handlers import build_stage_handlers
@@ -891,6 +892,53 @@ class AdsOperationalCanaryTest(unittest.TestCase):
             }
         )
         self.assertIsNone(_first_failing_gate(fully_certified))
+
+    def test_real_runtime_report_counts_docket_and_selected_evidence_refs_without_certifying_retrieval(self):
+        packet_path = Path(self.tempdir.name) / "retrieval-packet.json"
+        packet_path.write_text(
+            json.dumps(
+                {
+                    "adapter_mode": "source_populated_live_retrieval_runtime",
+                    "retrieval_runtime_summary": {"runtime_mode": "live_retrieval_runtime"},
+                    "research_sufficiency_summary": {
+                        "classification_dispatch_status": "blocked_insufficient_research"
+                    },
+                    "leaf_retrieval_results": [
+                        {
+                            "leaf_id": "leaf-a",
+                            "selected_evidence_refs": ["evidence:selected-a"],
+                            "selected_evidence": [{"evidence_ref": "evidence:selected-b"}],
+                        }
+                    ],
+                    "leaf_evidence_dockets": [
+                        {
+                            "leaf_id": "leaf-a",
+                            "admitted_evidence_refs": ["evidence:admitted-a", "evidence:selected-a"],
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        evidence = _retrieval_runtime_evidence(
+            [
+                {
+                    "artifact_id": "artifact:retrieval",
+                    "artifact_type": "retrieval-packet",
+                    "path": str(packet_path),
+                }
+            ]
+        )
+
+        packet = evidence["retrieval_packets"][0]
+        self.assertEqual(packet["admitted_evidence_ref_count"], 2)
+        self.assertEqual(packet["docket_admitted_evidence_ref_count"], 2)
+        self.assertEqual(packet["leaf_result_admitted_evidence_ref_count"], 0)
+        self.assertEqual(packet["selected_evidence_ref_count"], 2)
+        self.assertEqual(packet["reported_evidence_ref_count"], 3)
+        self.assertFalse(packet["source_populated_or_structural_unanswerability"])
+        self.assertFalse(evidence["ok"])
 
     def test_phase3_fixture_certified_retrieval_writes_runtime_bundle_manifest(self):
         config = self.config(require_scoreable_prediction=False, require_manifest_handoffs=True)
