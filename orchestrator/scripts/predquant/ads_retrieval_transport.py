@@ -31,6 +31,49 @@ SOURCE_AUTHORITY_FIELDS = {
     "admission_status",
 }
 
+DETERMINISTIC_SOURCE_CLASS_URL_REGISTRY = (
+    {
+        "registry_id": "ads-static-secondary-source-registry/reuters",
+        "domain_suffixes": ("reuters.com",),
+        "source_class": "independent_secondary",
+    },
+    {
+        "registry_id": "ads-static-secondary-source-registry/apnews",
+        "domain_suffixes": ("apnews.com", "ap.org"),
+        "source_class": "independent_secondary",
+    },
+    {
+        "registry_id": "ads-static-secondary-source-registry/bloomberg",
+        "domain_suffixes": ("bloomberg.com",),
+        "source_class": "independent_secondary",
+    },
+    {
+        "registry_id": "ads-static-secondary-source-registry/financial-times",
+        "domain_suffixes": ("ft.com",),
+        "source_class": "independent_secondary",
+    },
+    {
+        "registry_id": "ads-static-secondary-source-registry/wall-street-journal",
+        "domain_suffixes": ("wsj.com",),
+        "source_class": "independent_secondary",
+    },
+    {
+        "registry_id": "ads-static-secondary-source-registry/cnbc",
+        "domain_suffixes": ("cnbc.com",),
+        "source_class": "independent_secondary",
+    },
+    {
+        "registry_id": "ads-static-secondary-source-registry/bbc",
+        "domain_suffixes": ("bbc.com", "bbc.co.uk"),
+        "source_class": "independent_secondary",
+    },
+    {
+        "registry_id": "ads-static-secondary-source-registry/associated-press-hosted",
+        "domain_suffixes": ("hosted.ap.org",),
+        "source_class": "independent_secondary",
+    },
+)
+
 NATIVE_ALLOWED_FIELDS = {
     "url",
     "canonical_url",
@@ -518,6 +561,13 @@ def _fetch_candidate(
             "browser_fetch_certifies_sufficiency": False,
         },
     }
+    if isinstance(fetched.get("validated_atomic_claim_candidates"), list):
+        candidate["validated_atomic_claim_candidates"] = fetched["validated_atomic_claim_candidates"][:8]
+        candidate["claim_candidate_authority_boundary"] = {
+            "browser_fetch_certifies_claim_family": False,
+            "final_claim_family_requires_exact_fetched_text_span": True,
+            "final_claim_family_requires_deterministic_tuple_hash": True,
+        }
     if extraction_status == "accepted":
         candidate["admission_status"] = "admitted"
         candidate["temporal_gate_status"] = "pass"
@@ -531,6 +581,12 @@ def _fetch_candidate(
             candidate["source_class_resolution_method"] = hint.get("source_class_resolution_method")
             candidate["official_source_hints"] = [url] if hint["source_class"] == "official_or_primary" else []
             candidate["market_resolution_url"] = url if hint["source_class"] == "market_rules_or_resolution_source" else None
+        elif registry_match := _deterministic_source_class_registry_match(final_url):
+            candidate["source_class"] = registry_match["source_class"]
+            candidate["deterministic_source_class_proof"] = True
+            candidate["source_class_resolution_method"] = "deterministic_url_registry"
+            candidate["source_class_registry_id"] = registry_match["registry_id"]
+            candidate["source_class_registry_match"] = registry_match["matched_domain"]
     else:
         candidate["candidate_status"] = "omitted" if extraction_status == "duplicate" else "rejected"
         candidate["admission_status"] = "rejected"
@@ -570,6 +626,28 @@ def _provider_fetch(browser_provider: Any | None, url: str) -> dict[str, Any]:
             "reason_codes": ["browser_provider_returned_non_object"],
         }
     return fetched
+
+
+def _deterministic_source_class_registry_match(url: str) -> dict[str, str] | None:
+    parsed = urlsplit(url)
+    host = parsed.netloc.lower().split("@")[-1].split(":")[0]
+    if host.startswith("www."):
+        host = host[4:]
+    if not host:
+        return None
+    for entry in DETERMINISTIC_SOURCE_CLASS_URL_REGISTRY:
+        source_class = str(entry.get("source_class") or "")
+        if source_class not in {"independent_secondary", "primary_reporting"}:
+            continue
+        for suffix in entry.get("domain_suffixes", ()):
+            normalized_suffix = str(suffix).lower().removeprefix("www.")
+            if host == normalized_suffix or host.endswith(f".{normalized_suffix}"):
+                return {
+                    "registry_id": str(entry["registry_id"]),
+                    "matched_domain": normalized_suffix,
+                    "source_class": source_class,
+                }
+    return None
 
 
 def _provider_diagnostics(browser_provider: Any | None) -> dict[str, Any]:

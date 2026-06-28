@@ -350,6 +350,78 @@ class AdsRetrievalTransportTest(unittest.TestCase):
         )
         self.assertFalse(packet["retrieval_evidence_provenance_slices"][0]["counts_toward_breadth"])
 
+    def test_static_url_registry_enriches_secondary_without_provider_authority(self) -> None:
+        provider = FakeBrowserProvider(
+            search_results=[
+                {
+                    "url": "https://www.reuters.com/world/example-report",
+                    "title": "Provider title is discovery only",
+                    "snippet": "Provider snippet is discovery only",
+                }
+            ],
+            fetch_payloads={
+                "https://www.reuters.com/world/example-report": {
+                    "source_published_at": SOURCE_AT,
+                    "source_class": "official_or_primary",
+                    "claim_family_id": "claim-family:provider-final",
+                    "temporal_gate_status": "pass",
+                    "research_sufficiency_certification": "allowed",
+                    "content": "Reuters reported the example event before the cutoff.",
+                    "validated_atomic_claim_candidates": [
+                        {
+                            "subject": "example event",
+                            "predicate": "reported before",
+                            "object_or_value": "cutoff",
+                            "event_time": "2026-06-24",
+                            "entity_or_jurisdiction": "example",
+                            "condition_scope": "unconditional",
+                            "polarity": "affirmed",
+                            "supporting_text": "Reuters reported the example event before the cutoff.",
+                            "candidate_confidence": "high",
+                        }
+                    ],
+                }
+            },
+        )
+
+        transport = collect_live_retrieval_candidates(
+            qdt=self._resolution_mechanics_qdt(),
+            evidence_packet={**self.evidence_packet, "official_source_hints": []},
+            case_contract={**self.case_contract, "market_identity": {}},
+            amrg_context=None,
+            source_cutoff_timestamp=CUTOFF_AT,
+            forecast_timestamp=FORECAST_AT,
+            provider_policy=RetrievalProviderPolicy(max_direct_urls=0, max_search_results_per_variant=1),
+            browser_provider=provider,
+        )
+
+        candidate = transport.fetched_candidates[0]
+        self.assertEqual(candidate["source_class"], "independent_secondary")
+        self.assertEqual(candidate["source_class_resolution_method"], "deterministic_url_registry")
+        self.assertTrue(candidate["deterministic_source_class_proof"])
+        self.assertNotIn("claim_family_id", candidate)
+        self.assertEqual(candidate["source_class_registry_match"], "reuters.com")
+
+        packet = build_live_retrieval_packet_from_candidates(
+            self._resolution_mechanics_qdt(),
+            evidence_packet=self.evidence_packet,
+            fetched_candidates=transport.fetched_candidates,
+            search_candidate_urls=transport.search_candidate_urls,
+            forecast_timestamp=FORECAST_AT,
+            source_cutoff_timestamp=CUTOFF_AT,
+            live_policy_overlay=True,
+        )
+        provenance = packet["retrieval_evidence_provenance_slices"][0]
+
+        self.assertEqual(provenance["source_class"], "independent_secondary")
+        self.assertTrue(provenance["claim_family_ids"])
+        self.assertIn("snippet_sha256", packet["search_candidate_urls"][0])
+        self.assertNotIn("snippet", packet["search_candidate_urls"][0])
+        self.assertEqual(
+            packet["research_sufficiency_summary"]["classification_dispatch_status"],
+            "blocked_insufficient_research",
+        )
+
     def test_browser_fetch_snippet_or_title_only_is_not_page_text_evidence(self) -> None:
         provider = FakeBrowserProvider(
             search_results=[{"url": "https://secondary.example/snippet-only"}],

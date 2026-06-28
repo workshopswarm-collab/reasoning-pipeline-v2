@@ -2076,6 +2076,44 @@ class RetrievalPacketContractTest(unittest.TestCase):
         self.assertEqual(fetched["web_fetch_role"], "url_fetch_extraction_only")
         self.assertFalse(provider.provider_diagnostics()["authority_boundary"]["certifies_source_class"])
 
+    def test_configured_browser_provider_extracts_page_bound_dates(self) -> None:
+        class Response:
+            url = "https://source.example/final"
+            headers = {
+                "content-type": "text/html; charset=utf-8",
+                "last-modified": "Wed, 24 Jun 2026 08:00:00 GMT",
+                "date": "Wed, 24 Jun 2026 11:40:00 GMT",
+            }
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self, *_args):
+                return b"""
+                <html>
+                  <head>
+                    <meta property="article:published_time" content="2026-06-24T11:20:00Z">
+                    <script type="application/ld+json">
+                      {"@type": "NewsArticle", "dateModified": "2026-06-24T11:35:00Z"}
+                    </script>
+                  </head>
+                  <body><p>Fetched page text with page-bound publication metadata.</p></body>
+                </html>
+                """
+
+        provider = ConfiguredBrowserProvider(openai_api_key=None, opener=lambda _request, timeout: Response())
+
+        fetched = provider.fetch_url("https://source.example/page")
+
+        self.assertEqual(fetched["source_published_at"], "2026-06-24T11:20:00+00:00")
+        self.assertEqual(fetched["source_updated_at"], "2026-06-24T11:35:00+00:00")
+        self.assertIn("page-bound publication metadata", fetched["content"])
+        self.assertNotIn("source_class", fetched)
+        self.assertNotIn("claim_family_id", fetched)
+
     def test_configured_browser_provider_fetch_failure_fails_closed_without_search_summary_content(self) -> None:
         def opener(_request, timeout):
             self.assertEqual(timeout, 20.0)

@@ -7,7 +7,7 @@ import os
 import re
 import shutil
 import subprocess
-from datetime import timezone
+from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
 from typing import Any, Callable
@@ -119,6 +119,42 @@ def _html_to_text(value: str) -> str:
     return text or re.sub(r"<[^>]+>", " ", value)
 
 
+class _HTMLMetadataExtractor(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.meta: dict[str, str] = {}
+        self.json_ld_parts: list[str] = []
+        self._json_ld_depth = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attrs_by_name = {str(key).lower(): str(value or "").strip() for key, value in attrs}
+        lowered = tag.lower()
+        if lowered == "meta":
+            key = (
+                attrs_by_name.get("property")
+                or attrs_by_name.get("name")
+                or attrs_by_name.get("itemprop")
+            )
+            content = attrs_by_name.get("content")
+            if key and content:
+                self.meta[key.lower()] = content
+        elif lowered == "time":
+            key = attrs_by_name.get("itemprop")
+            content = attrs_by_name.get("datetime")
+            if key and content:
+                self.meta[key.lower()] = content
+        elif lowered == "script" and "ld+json" in attrs_by_name.get("type", "").lower():
+            self._json_ld_depth += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() == "script" and self._json_ld_depth:
+            self._json_ld_depth -= 1
+
+    def handle_data(self, data: str) -> None:
+        if self._json_ld_depth:
+            self.json_ld_parts.append(data)
+
+
 def _squash_text(value: Any, max_chars: int) -> str:
     return " ".join(str(value or "").split())[:max_chars]
 
@@ -153,6 +189,97 @@ def _http_datetime(value: str | None) -> str | None:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc).isoformat()
+
+
+def _metadata_datetime(value: Any) -> str | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = parsedate_to_datetime(text)
+    except (TypeError, ValueError, IndexError, OverflowError):
+        parsed = None
+    if parsed is None:
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError:
+            return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).isoformat()
+
+
+def _json_ld_date_values(payload: Any, keys: set[str]) -> list[str]:
+    values: list[str] = []
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            normalized = str(key).lower()
+            if normalized in keys and isinstance(value, str):
+                values.append(value)
+            elif isinstance(value, (dict, list)):
+                values.extend(_json_ld_date_values(value, keys))
+    elif isinstance(payload, list):
+        for item in payload:
+            values.extend(_json_ld_date_values(item, keys))
+    return values
+
+
+def _first_parsed_datetime(values: list[Any]) -> str | None:
+    for value in values:
+        parsed = _metadata_datetime(value)
+        if parsed:
+            return parsed
+    return None
+
+
+def _html_page_datetimes(html: str) -> dict[str, str]:
+    parser = _HTMLMetadataExtractor()
+    try:
+        parser.feed(html)
+    except Exception:
+        return {}
+    published_keys = {
+        "article:published_time",
+        "og:published_time",
+        "publishdate",
+        "pubdate",
+        "date",
+        "dc.date",
+        "dc.date.issued",
+        "dcterms.issued",
+        "citation_publication_date",
+        "datepublished",
+    }
+    updated_keys = {
+        "article:modified_time",
+        "og:updated_time",
+        "lastmod",
+        "last-modified",
+        "dateupdated",
+        "datemodified",
+        "dcterms.modified",
+    }
+    json_ld_payloads: list[Any] = []
+    for part in parser.json_ld_parts:
+        try:
+            json_ld_payloads.append(json.loads(part))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+    published_values = [value for key, value in parser.meta.items() if key in published_keys]
+    updated_values = [value for key, value in parser.meta.items() if key in updated_keys]
+    for payload in json_ld_payloads:
+        published_values.extend(_json_ld_date_values(payload, {"datepublished", "datecreated", "uploaddate"}))
+        updated_values.extend(_json_ld_date_values(payload, {"datemodified", "dateupdated"}))
+    metadata: dict[str, str] = {}
+    published = _first_parsed_datetime(published_values)
+    updated = _first_parsed_datetime(updated_values)
+    if published:
+        metadata["source_published_at"] = published
+    if updated:
+        metadata["source_updated_at"] = updated
+    return metadata
 
 
 def _annotation_snippet(annotation: dict[str, Any], text: str) -> str:
@@ -944,7 +1071,9 @@ class ConfiguredBrowserProvider(BrowserProviderAdapter):
             }
         content_type = headers.get("content-type", "")
         text = raw.decode("utf-8", errors="replace")
-        content = _html_to_text(text) if "html" in content_type.lower() else " ".join(text.split())
+        is_html = "html" in content_type.lower()
+        page_metadata = _html_page_datetimes(text) if is_html else {}
+        content = _html_to_text(text) if is_html else " ".join(text.split())
         content = content[: self.max_fetch_chars]
         if not content:
             return {
@@ -959,8 +1088,10 @@ class ConfiguredBrowserProvider(BrowserProviderAdapter):
             "final_url": final_url,
             "extraction_status": "accepted",
             "content": content,
-            "source_published_at": _http_datetime(headers.get("last-modified")),
-            "source_updated_at": _http_datetime(headers.get("last-modified")),
+            "source_published_at": page_metadata.get("source_published_at")
+            or _http_datetime(headers.get("last-modified")),
+            "source_updated_at": page_metadata.get("source_updated_at")
+            or _http_datetime(headers.get("last-modified")),
             "captured_at": _http_datetime(headers.get("date")),
             "web_fetch_role": "url_fetch_extraction_only",
         }
