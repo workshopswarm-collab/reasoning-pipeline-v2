@@ -4275,10 +4275,7 @@ def _candidate_text(candidate: dict[str, Any]) -> str:
 
 
 def _candidate_has_retrieved_source_text(candidate: dict[str, Any]) -> bool:
-    return any(
-        _is_non_empty_string(candidate.get(field))
-        for field in ("content", "extracted_text", "rendered_text", "markdown")
-    )
+    return bool(_candidate_text(candidate))
 
 
 def _resolved_claim_candidates_from_fetched_text(

@@ -1810,6 +1810,48 @@ class RetrievalPacketContractTest(unittest.TestCase):
             packet["omitted_candidates"][0]["omission_reason_codes"],
         )
 
+    def test_phase7_whitespace_only_fetched_text_is_not_admitted_as_evidence(self) -> None:
+        qdt = copy.deepcopy(self.qdt)
+        qdt["required_leaf_questions"] = [qdt["required_leaf_questions"][0]]
+        context = build_retrieval_query_contexts(qdt, evidence_packet=self.evidence_packet)[0]
+        fetched_candidate = {
+            "leaf_id": context["leaf_id"],
+            "parent_branch_id": context["parent_branch_id"],
+            "retrieval_transport": "browser",
+            "navigation_mode": "direct_url",
+            "requested_url": "https://example.com/official/empty",
+            "final_url": "https://example.com/official/empty",
+            "canonical_url": "https://example.com/official/empty",
+            "source_class": "official_or_primary",
+            "source_published_at": "2026-06-24T11:30:00+00:00",
+            "captured_at": "2026-06-24T11:59:00+00:00",
+            "extraction_status": "accepted",
+            "admission_status": "admitted",
+            "temporal_gate_status": "pass",
+            "content": " \n\t ",
+            "extracted_text": "\n ",
+            "rendered_text": "\t",
+            "markdown": "   ",
+        }
+
+        packet = build_live_retrieval_packet_from_candidates(
+            qdt,
+            evidence_packet=self.evidence_packet,
+            fetched_candidates=[fetched_candidate],
+            question_decomposition_artifact_id="artifact:qdt-1",
+            policy_context_ref="artifact:profile-1",
+        )
+
+        self.assertEqual(packet["retrieval_runtime_summary"]["admitted_initial_evidence_count"], 0)
+        self.assertFalse(packet["leaf_retrieval_results"][0]["selected_evidence"])
+        self.assertFalse(packet["evidence_chunks"])
+        self.assertFalse(packet["retrieval_evidence_provenance_slices"])
+        self.assertEqual(packet["omitted_candidates"][0]["candidate_status"], "rejected")
+        self.assertIn(
+            "retrieved_source_text_missing",
+            packet["omitted_candidates"][0]["omission_reason_codes"],
+        )
+
     def test_configured_browser_provider_uses_openai_web_search_citations(self) -> None:
         context = build_retrieval_query_contexts(self.qdt, evidence_packet=self.evidence_packet)[0]
         payloads = []
