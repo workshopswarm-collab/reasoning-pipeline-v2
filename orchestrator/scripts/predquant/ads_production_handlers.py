@@ -10,6 +10,7 @@ from predquant.ads_production_readiness_handlers import (
     TRUE_PRODUCTION_HANDLER_SCOPE,
     build_stage_handlers as _build_stage_handlers,
 )
+from researcher_swarm.browser_provider import build_provider as build_default_retrieval_browser_provider
 
 ADS_PRODUCTION_STAGE_FAILURE_POLICY_SCHEMA_VERSION = "ads-production-stage-failure-policy/v1"
 ADS_PRODUCTION_STAGE_FAILURE_POLICY_ID = "ads-production-stage-failure-policy:strict-v1"
@@ -199,6 +200,8 @@ def build_stage_handlers(**kwargs: Any) -> dict[str, Callable[..., Any]]:
     kwargs.pop("researcher_swarm_openclaw_runtime", None)
     kwargs.pop("amrg_vector_runtime", None)
     runtime_mode = kwargs.pop("decomposer_runtime_mode", "live")
+    if kwargs.get("retrieval_browser_provider") is None:
+        kwargs["retrieval_browser_provider"] = build_default_retrieval_browser_provider()
     handlers = _build_stage_handlers(
         **kwargs,
         metadata=metadata,

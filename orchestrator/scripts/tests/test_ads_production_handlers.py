@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -16,9 +17,11 @@ from predquant.ads_production_handlers import (
     ADS_PRODUCTION_STAGE_FAILURE_POLICY_SCHEMA_VERSION,
     AdsProductionStageFailure,
     build_stage_failure_policy,
+    build_stage_handlers,
     classify_stage_failure,
     wrap_production_stage_handler,
 )
+import predquant.ads_production_handlers as production_handlers
 
 
 SCHEDULER_PATH = Path(__file__).resolve().parents[1] / "bin" / "run_ads_operational_scheduler.py"
@@ -142,6 +145,61 @@ class AdsProductionHandlersTest(unittest.TestCase):
         self.assertEqual(provider.provider_id, "test-provider")
         self.assertTrue(callable(provider.fetch_url))
         self.assertTrue(callable(provider.search_candidate_urls))
+
+    def test_true_production_factory_loads_default_retrieval_provider(self):
+        class Provider:
+            provider_id = "default-provider"
+
+            def fetch_url(self, url):
+                return {"url": url, "extraction_status": "rejected"}
+
+            def search_candidate_urls(self, query_context, query_variant, *, searched_at=None):
+                return []
+
+        captured = {}
+        provider = Provider()
+
+        def fake_build_stage_handlers(**kwargs):
+            captured.update(kwargs)
+            return {}
+
+        with patch.object(
+            production_handlers,
+            "build_default_retrieval_browser_provider",
+            return_value=provider,
+        ), patch.object(production_handlers, "_build_stage_handlers", side_effect=fake_build_stage_handlers):
+            handlers = build_stage_handlers(db_path=":memory:")
+
+        self.assertEqual(handlers, {})
+        self.assertIs(captured["retrieval_browser_provider"], provider)
+        self.assertTrue(captured["live_retrieval_runtime"])
+
+    def test_true_production_factory_preserves_explicit_retrieval_provider(self):
+        class Provider:
+            provider_id = "explicit-provider"
+
+            def fetch_url(self, url):
+                return {"url": url, "extraction_status": "rejected"}
+
+            def search_candidate_urls(self, query_context, query_variant, *, searched_at=None):
+                return []
+
+        captured = {}
+        provider = Provider()
+
+        def fake_build_stage_handlers(**kwargs):
+            captured.update(kwargs)
+            return {}
+
+        with patch.object(
+            production_handlers,
+            "build_default_retrieval_browser_provider",
+            side_effect=AssertionError("default provider should not be loaded"),
+        ), patch.object(production_handlers, "_build_stage_handlers", side_effect=fake_build_stage_handlers):
+            handlers = build_stage_handlers(db_path=":memory:", retrieval_browser_provider=provider)
+
+        self.assertEqual(handlers, {})
+        self.assertIs(captured["retrieval_browser_provider"], provider)
 
 
 if __name__ == "__main__":
