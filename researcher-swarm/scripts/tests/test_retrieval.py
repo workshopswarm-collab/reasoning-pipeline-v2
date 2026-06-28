@@ -1482,6 +1482,8 @@ class RetrievalPacketContractTest(unittest.TestCase):
         self.assertFalse(records[0]["web_fetch_used_for_search"])
         self.assertEqual(payloads[0]["model"], "gpt-5.5")
         self.assertEqual(payloads[0]["tools"], [{"type": "web_search"}])
+        self.assertEqual(payloads[0]["include"], ["web_search_call.action.sources"])
+        self.assertEqual(payloads[0]["tool_choice"], "auto")
         self.assertFalse(payloads[0]["store"])
         self.assertIn("do not estimate probabilities", payloads[0]["input"])
         diagnostics = provider.provider_diagnostics()
@@ -1489,6 +1491,54 @@ class RetrievalPacketContractTest(unittest.TestCase):
         self.assertEqual(diagnostics["search_model"], "gpt-5.5")
         self.assertTrue(diagnostics["search_configured"])
         self.assertFalse(diagnostics["authority_boundary"]["certifies_research_sufficiency"])
+
+    def test_configured_browser_provider_uses_openai_web_search_action_sources(self) -> None:
+        context = build_retrieval_query_contexts(self.qdt, evidence_packet=self.evidence_packet)[0]
+
+        def responses_client(_payload: dict) -> dict:
+            return {
+                "output": [
+                    {
+                        "type": "web_search_call",
+                        "status": "completed",
+                        "action": {
+                            "type": "search",
+                            "query": "example",
+                            "sources": [
+                                {
+                                    "type": "source",
+                                    "url": "https://source.example/full-source",
+                                    "title": "Full consulted source",
+                                    "snippet": "Source from web_search_call.action.sources.",
+                                }
+                            ],
+                        },
+                    },
+                    {
+                        "type": "message",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": "Short cited answer.",
+                                "annotations": [
+                                    {
+                                        "type": "url_citation",
+                                        "url": "https://source.example/annotation-only",
+                                        "title": "Annotation-only source",
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                ]
+            }
+
+        provider = ConfiguredBrowserProvider(responses_client=responses_client)
+        records = provider.search_candidate_urls(context, context["query_variants"][0])
+
+        self.assertEqual(records[0]["url"], "https://source.example/full-source")
+        self.assertEqual(records[0]["result_source"], "openai_web_search")
+        self.assertEqual(records[1]["url"], "https://source.example/annotation-only")
 
     def test_configured_browser_provider_openai_http_path_uses_responses_api(self) -> None:
         context = build_retrieval_query_contexts(self.qdt, evidence_packet=self.evidence_packet)[0]
@@ -1535,6 +1585,7 @@ class RetrievalPacketContractTest(unittest.TestCase):
         self.assertEqual(records[0]["url"], "https://source.example/http")
         self.assertEqual(calls[0][0], "https://api.openai.com/v1/responses")
         self.assertEqual(calls[0][2]["tools"], [{"type": "web_search"}])
+        self.assertEqual(calls[0][2]["include"], ["web_search_call.action.sources"])
         self.assertEqual(calls[0][2]["model"], "gpt-5.5")
         self.assertIn("Authorization", calls[0][1])
         self.assertIn("Content-type", calls[0][1])
