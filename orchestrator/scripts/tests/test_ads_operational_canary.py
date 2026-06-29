@@ -29,6 +29,7 @@ from predquant.ads_operator_review import build_ads_operator_review_report
 from predquant.ads_real_runtime_canary import (
     _build_runtime_criteria,
     _first_failing_gate,
+    _model_runtime_evidence,
     _retrieval_runtime_evidence,
     build_real_runtime_canary_report,
 )
@@ -1174,6 +1175,28 @@ class AdsOperationalCanaryTest(unittest.TestCase):
         criteria_report = result["real_runtime_canary_report"]
         self.assertTrue(criteria_report["ok"], criteria_report["issues"])
         self.assertIsNone(criteria_report["first_failing_gate"])
+        qdt_evidence = criteria_report["model_runtime_evidence"]
+        self.assertTrue(qdt_evidence["model_runtime_ok"])
+        self.assertTrue(qdt_evidence["qdt_end_to_end_quality_ok"])
+        self.assertEqual(qdt_evidence["qdt_model_executed_count"], 1)
+        self.assertEqual(qdt_evidence["qdt_end_to_end_quality_count"], 1)
+        self.assertEqual(qdt_evidence["qdt_question_specificity_passed_count"], 1)
+        self.assertEqual(qdt_evidence["qdt_research_coverage_passed_count"], 1)
+        self.assertEqual(qdt_evidence["qdt_pre_resolution_dispatchable_count"], 1)
+        self.assertEqual(qdt_evidence["qdt_terminal_verification_gated_count"], 1)
+        self.assertEqual(qdt_evidence["qdt_forbidden_field_clean_count"], 1)
+        self.assertEqual(qdt_evidence["qdt_meaningful_leaf_requirements_count"], 1)
+        qdt_quality = qdt_evidence["qdt_results"][0]["qdt_quality"]
+        self.assertEqual(qdt_quality["market_temporal_state"], "unresolved")
+        self.assertEqual(qdt_quality["issue_codes"], [])
+        self.assertGreater(qdt_quality["dispatchable_pre_resolution_leaf_count"], 0)
+        self.assertIn("pre_resolution_forecast_driver", qdt_quality["dispatchable_temporal_roles"])
+        self.assertEqual(qdt_quality["terminal_dispatch_leaf_ids"], [])
+        runtime_gate_statuses = {
+            item["gate"]: item["status"]
+            for item in criteria_report["criteria"]["runtime_gates"]
+        }
+        self.assertEqual(runtime_gate_statuses["qdt_end_to_end_quality"], "passed")
         retrieval = criteria_report["retrieval_runtime_evidence"]
         self.assertGreater(retrieval["real_candidate_count"], 0)
         self.assertGreater(retrieval["fetched_attempt_count"], 0)
@@ -1297,6 +1320,106 @@ class AdsOperationalCanaryTest(unittest.TestCase):
             }
         )
         self.assertIsNone(_first_failing_gate(fully_certified))
+
+    def test_phase6_qdt_evidence_rejects_semantically_bad_live_artifact(self):
+        qdt_path = Path(self.tempdir.name) / "bad-live-qdt.json"
+        runtime_path = Path(self.tempdir.name) / "bad-live-runtime.json"
+        qdt_path.write_text(
+            json.dumps(
+                {
+                    "artifact_type": "question_decomposition",
+                    "schema_version": "question-decomposition/v1",
+                    "adapter_mode": "decomposer_model_runtime_live",
+                    "runtime_call_ref": "runtime-call:qdt-bad",
+                    "question_specificity_check": {
+                        "status": "failed",
+                        "reason_codes": ["terminal_verification_leaf_misclassified_as_pre_resolution"],
+                    },
+                    "research_coverage_check": {
+                        "status": "failed",
+                        "reason_codes": ["terminal_verification_dominates_unresolved_forecast_qdt"],
+                    },
+                    "research_coverage_graph": {
+                        "market_temporal_state": "unresolved",
+                        "dispatchable_pre_resolution_leaf_ids": ["leaf-victor-final-result"],
+                        "terminal_verification_leaf_ids": ["leaf-victor-final-result"],
+                    },
+                    "required_leaf_questions": [
+                        {
+                            "leaf_id": "leaf-victor-final-result",
+                            "leaf_question": "What did the final official result say about whether Victor Marx won?",
+                            "leaf_temporal_role": "terminal_verification",
+                            "coverage_dimension": "current_direct_evidence",
+                            "research_factor": "final_result_verification",
+                            "required_evidence_fields": ["official_final_result"],
+                            "evidence_requirements": [
+                                {"required_evidence_field": "official_final_result", "pre_cutoff_required": True}
+                            ],
+                            "classification_targets": ["official_final_result"],
+                            "research_sufficiency_requirements": {"requirement_id": "qdt-sufficiency:bad"},
+                            "sufficiency_criteria": {
+                                "classification_dispatch_requires_sufficiency_certificate": True
+                            },
+                            "missingness_interpretation": "final result unavailable before resolution",
+                            "forbidden_outputs": ["probability", "final_forecast"],
+                            "probability_estimate": 0.51,
+                        }
+                    ],
+                },
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+        runtime_path.write_text(
+            json.dumps(
+                {
+                    "runtime_call_id": "runtime-call:qdt-bad",
+                    "resolved_model_id": "gpt-5.5-high",
+                    "mode": "live",
+                    "fixture_mode": False,
+                    "execution_status": "succeeded",
+                },
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+
+        evidence = _model_runtime_evidence(
+            [
+                {
+                    "artifact_id": "artifact:qdt-bad",
+                    "artifact_type": "question-decomposition",
+                    "path": str(qdt_path),
+                },
+                {
+                    "artifact_id": "artifact:runtime-bad",
+                    "artifact_type": "model-runtime-call",
+                    "path": str(runtime_path),
+                },
+            ]
+        )
+        criteria = _build_runtime_criteria(
+            require_qdt_model_executed=True,
+            require_researcher_model_executed=False,
+            require_scoreable_prediction=False,
+            qdt_evidence=evidence,
+            retrieval_evidence={"ok": True, "source_populated_ok": True, "live_acceptance_ok": True},
+            researcher_evidence={"ok": True, "model_executed_count": 1, "runtime_bundle_count": 1},
+            scae_evidence={"ok": True, "valid_forecast_count": 1, "delta_ref_count": 1},
+            prediction_deltas={"expected_market_predictions": 1, "market_predictions_delta": 1},
+            active={"active_runs": 0, "active_leases": 0},
+            handoff_report={"ok": True, "unresolved_output_manifest_refs": []},
+            errors={"unexpected_count": 0, "allowed_failure_classes": []},
+        )
+
+        self.assertTrue(evidence["ok"])
+        self.assertFalse(evidence["qdt_end_to_end_quality_ok"])
+        qdt_quality = evidence["qdt_results"][0]["qdt_quality"]
+        self.assertIn("question_specificity_check_failed", qdt_quality["issue_codes"])
+        self.assertIn("research_coverage_check_failed", qdt_quality["issue_codes"])
+        self.assertIn("terminal_verification_leaf_dispatched_for_unresolved_market", qdt_quality["issue_codes"])
+        self.assertIn("forbidden_qdt_fields_present", qdt_quality["issue_codes"])
+        self.assertEqual(_first_failing_gate(criteria), "qdt_end_to_end_quality")
 
     def test_real_runtime_report_counts_docket_and_selected_evidence_refs_without_certifying_retrieval(self):
         packet_path = Path(self.tempdir.name) / "retrieval-packet.json"

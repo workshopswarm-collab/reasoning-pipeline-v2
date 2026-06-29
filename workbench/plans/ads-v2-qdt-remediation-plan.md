@@ -699,6 +699,8 @@ Success criteria:
 
 ## Phase 6 - End-To-End QDT Proof
 
+Status: completed on 2026-06-29. The real-runtime canary report now separates QDT model execution from QDT end-to-end quality and checks semantic specificity, research coverage, unresolved pre-resolution dispatchability, terminal-verification gating, forbidden QDT fields, and meaningful leaf requirements. Durable regressions cover a passing true-production search canary, a semantically bad live QDT artifact that fails the QDT quality gate even when model execution is present, and representative QDT market shapes for the James Bond negative market, a non-entertainment binary market, and a grouped/family child market. Generated canary artifacts remain confined to test temporary directories.
+
 Goal: prove QDT quality independently and then inside the full canary.
 
 Implementation:

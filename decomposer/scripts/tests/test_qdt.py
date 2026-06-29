@@ -1109,6 +1109,73 @@ class QDTContractTest(unittest.TestCase):
         self.assertEqual(checks["question_specificity_check"]["status"], "passed")
         self.assertEqual(checks["research_coverage_check"]["status"], "passed")
 
+    def test_phase6_representative_market_batch_has_pre_resolution_qdt_quality(self):
+        james_bond = copy.deepcopy(self.handoff)
+        james_bond["case_id"] = "case-james-bond-negative"
+        james_bond["case_key"] = "polymarket:james-bond-negative"
+        james_bond["dispatch_id"] = "dispatch-james-bond-negative"
+        james_bond["macro_question"] = "No one announced as the next James Bond before December 31?"
+        tesla_delivery = copy.deepcopy(self.handoff)
+        tesla_delivery["case_id"] = "case-tesla-deliveries"
+        tesla_delivery["case_key"] = "polymarket:tesla-deliveries"
+        tesla_delivery["dispatch_id"] = "dispatch-tesla-deliveries"
+        tesla_delivery["macro_question"] = "Will Tesla deliver at least 2 million vehicles in 2026?"
+        grouped_child = self._victor_marx_handoff()
+        grouped_child["case_id"] = "case-victor-marx-family-child"
+        grouped_child["dispatch_id"] = "dispatch-victor-marx-family-child"
+
+        cases = [
+            ("james_bond_negative", james_bond, None),
+            ("non_entertainment_binary", tesla_delivery, None),
+            (
+                "grouped_family_child",
+                grouped_child,
+                {"family_context": {"parent_market_id": "colorado-governor-primary-family"}},
+            ),
+        ]
+
+        for label, handoff, evidence_packet in cases:
+            with self.subTest(label=label):
+                qdt = select_qdt_candidate([build_fixture_qdt_candidate(handoff)])
+                result = validate_question_decomposition(qdt, evidence_packet=evidence_packet)
+                checks = compute_qdt_quality_checks(qdt, evidence_packet=evidence_packet)
+                graph = qdt["research_coverage_graph"]
+                leaves_by_id = {leaf["leaf_id"]: leaf for leaf in qdt["required_leaf_questions"]}
+                dispatchable_ids = graph["dispatchable_pre_resolution_leaf_ids"]
+                dispatchable_roles = {
+                    leaves_by_id[leaf_id]["leaf_temporal_role"]
+                    for leaf_id in dispatchable_ids
+                }
+
+                self.assertTrue(result.valid, result.errors)
+                self.assertEqual(checks["question_specificity_check"]["status"], "passed")
+                self.assertEqual(checks["research_coverage_check"]["status"], "passed")
+                self.assertEqual(graph["market_temporal_state"], "unresolved")
+                self.assertTrue(dispatchable_ids)
+                self.assertIn("pre_resolution_forecast_driver", dispatchable_roles)
+                self.assertNotIn("terminal_verification", dispatchable_roles)
+                self.assertFalse(set(graph["terminal_verification_leaf_ids"]) & set(dispatchable_ids))
+                self.assertIn("current_direct_evidence", graph["required_leaf_ids_by_dimension"])
+                self.assertIn("key_drivers", graph["required_leaf_ids_by_dimension"])
+                self.assertIn("material_unknowns", graph["required_leaf_ids_by_dimension"])
+                self.assertTrue(
+                    all(leaf["classification_targets"] for leaf in qdt["required_leaf_questions"])
+                )
+                self.assertTrue(
+                    all(leaf["evidence_requirements"] for leaf in qdt["required_leaf_questions"])
+                )
+                self.assertTrue(
+                    all(leaf["sufficiency_criteria"] for leaf in qdt["required_leaf_questions"])
+                )
+                if label == "james_bond_negative":
+                    mapping = json.dumps(qdt["market_resolution_contract"]["yes_no_mapping"])
+                    self.assertIn("absence", mapping)
+                if label == "grouped_family_child":
+                    self.assertNotEqual(
+                        qdt["market_resolution_contract"]["platform_family_context"],
+                        "unknown_not_promoted",
+                    )
+
 
 if __name__ == "__main__":
     unittest.main()

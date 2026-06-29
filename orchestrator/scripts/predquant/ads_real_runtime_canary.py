@@ -40,6 +40,39 @@ MARKET_SOURCE_CLASSES = {
     "market_price_or_orderbook",
 }
 UNKNOWN_SOURCE_FAMILY_IDS = {"", "source-family-unknown"}
+GENERIC_QDT_LEAF_IDS = {"leaf-source-of-truth", "leaf-direct-evidence", "leaf-resolution-mechanics"}
+QDT_UNRESOLVED_DISPATCHABLE_ROLES = {
+    "pre_resolution_forecast_driver",
+    "current_status",
+    "resolution_mechanics",
+    "material_unknown",
+}
+FORBIDDEN_QDT_FIELD_NAMES = {
+    "bayesian_weighting",
+    "probability",
+    "probability_estimate",
+    "probability_yes",
+    "probability_no",
+    "forecast_probability",
+    "production_forecast_prob",
+    "fair_value",
+    "numeric_weight",
+    "bayesian_edge",
+    "log_odds_delta",
+    "scae_delta",
+    "trade_decision",
+    "decision_recommendation",
+    "final_forecast",
+}
+FORBIDDEN_QDT_KEY_FRAGMENTS = (
+    "probability",
+    "fair_value",
+    "bayesian",
+    "log_odds",
+    "scae_delta",
+    "trade_decision",
+    "final_forecast",
+)
 
 
 def _decode_json(value: Any, fallback: Any) -> Any:
@@ -194,6 +227,164 @@ def _load_manifest_payload(manifest: dict[str, Any]) -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
+def _normalized_qdt_key(value: Any) -> str:
+    normalized = "".join(ch.lower() if ch.isalnum() else "_" for ch in str(value))
+    while "__" in normalized:
+        normalized = normalized.replace("__", "_")
+    return normalized.strip("_")
+
+
+def _forbidden_qdt_field_paths(value: Any, path: str = "qdt") -> list[str]:
+    paths: list[str] = []
+    if isinstance(value, dict):
+        for key, child in value.items():
+            normalized = _normalized_qdt_key(key)
+            if normalized in FORBIDDEN_QDT_FIELD_NAMES or any(
+                fragment in normalized for fragment in FORBIDDEN_QDT_KEY_FRAGMENTS
+            ):
+                paths.append(f"{path}.{key}")
+            paths.extend(_forbidden_qdt_field_paths(child, f"{path}.{key}"))
+    elif isinstance(value, list):
+        for idx, child in enumerate(value):
+            paths.extend(_forbidden_qdt_field_paths(child, f"{path}[{idx}]"))
+    return paths
+
+
+def _qdt_leaf_requirement_issues(leaf: dict[str, Any]) -> list[str]:
+    leaf_id = str(leaf.get("leaf_id") or "unknown-leaf")
+    issues: list[str] = []
+    required_strings = (
+        "leaf_id",
+        "leaf_question",
+        "leaf_temporal_role",
+        "coverage_dimension",
+        "research_factor",
+        "missingness_interpretation",
+    )
+    for field in required_strings:
+        if not isinstance(leaf.get(field), str) or not str(leaf.get(field)).strip():
+            issues.append(f"{leaf_id}:missing_{field}")
+    required_lists = (
+        "required_evidence_fields",
+        "evidence_requirements",
+        "classification_targets",
+        "forbidden_outputs",
+    )
+    for field in required_lists:
+        if not isinstance(leaf.get(field), list) or not leaf.get(field):
+            issues.append(f"{leaf_id}:missing_{field}")
+    required_objects = ("research_sufficiency_requirements", "sufficiency_criteria")
+    for field in required_objects:
+        if not isinstance(leaf.get(field), dict) or not leaf.get(field):
+            issues.append(f"{leaf_id}:missing_{field}")
+    return issues
+
+
+def _qdt_end_to_end_quality(payload: dict[str, Any]) -> dict[str, Any]:
+    leaves = [
+        leaf for leaf in payload.get("required_leaf_questions", [])
+        if isinstance(leaf, dict) and isinstance(leaf.get("leaf_id"), str) and leaf.get("leaf_id")
+    ]
+    leaves_by_id = {str(leaf["leaf_id"]): leaf for leaf in leaves}
+    leaf_ids = set(leaves_by_id)
+    generic_leaf_ids = sorted(leaf_ids & GENERIC_QDT_LEAF_IDS)
+    graph = payload.get("research_coverage_graph") if isinstance(payload.get("research_coverage_graph"), dict) else {}
+    market_temporal_state = graph.get("market_temporal_state")
+    dispatchable_ids = [
+        str(leaf_id)
+        for leaf_id in graph.get("dispatchable_pre_resolution_leaf_ids", [])
+        if isinstance(leaf_id, str) and leaf_id
+    ] if isinstance(graph.get("dispatchable_pre_resolution_leaf_ids"), list) else []
+    terminal_ids = [
+        str(leaf_id)
+        for leaf_id in graph.get("terminal_verification_leaf_ids", [])
+        if isinstance(leaf_id, str) and leaf_id
+    ] if isinstance(graph.get("terminal_verification_leaf_ids"), list) else []
+
+    question_specificity = (
+        payload.get("question_specificity_check")
+        if isinstance(payload.get("question_specificity_check"), dict)
+        else {}
+    )
+    research_coverage = (
+        payload.get("research_coverage_check")
+        if isinstance(payload.get("research_coverage_check"), dict)
+        else {}
+    )
+    specificity_passed = question_specificity.get("status") == "passed"
+    coverage_passed = research_coverage.get("status") == "passed"
+    forbidden_paths = _forbidden_qdt_field_paths(payload)
+    missing_requirement_issues = [
+        issue for leaf in leaves for issue in _qdt_leaf_requirement_issues(leaf)
+    ]
+
+    issues: list[str] = []
+    if not specificity_passed:
+        issues.append("question_specificity_check_failed")
+    if not coverage_passed:
+        issues.append("research_coverage_check_failed")
+    if generic_leaf_ids:
+        issues.append("generic_template_leaf_ids_present")
+    if forbidden_paths:
+        issues.append("forbidden_qdt_fields_present")
+    if missing_requirement_issues:
+        issues.append("leaf_requirements_not_meaningful")
+    if not leaves:
+        issues.append("missing_required_leaf_questions")
+    if not graph:
+        issues.append("missing_research_coverage_graph")
+
+    unknown_dispatch_ids = sorted(set(dispatchable_ids) - leaf_ids)
+    unknown_terminal_ids = sorted(set(terminal_ids) - leaf_ids)
+    if unknown_dispatch_ids:
+        issues.append("dispatchable_pre_resolution_leaf_ids_reference_unknown_leaves")
+    if unknown_terminal_ids:
+        issues.append("terminal_verification_leaf_ids_reference_unknown_leaves")
+
+    terminal_not_typed = sorted(
+        leaf_id
+        for leaf_id in terminal_ids
+        if leaf_id in leaves_by_id and leaves_by_id[leaf_id].get("leaf_temporal_role") != "terminal_verification"
+    )
+    if terminal_not_typed:
+        issues.append("terminal_verification_leaf_ids_not_typed_terminal")
+
+    terminal_dispatch_ids = sorted(set(terminal_ids) & set(dispatchable_ids))
+    dispatchable_roles = {
+        str(leaves_by_id[leaf_id].get("leaf_temporal_role"))
+        for leaf_id in dispatchable_ids
+        if leaf_id in leaves_by_id
+    }
+    if market_temporal_state == "unresolved":
+        if not dispatchable_ids:
+            issues.append("missing_dispatchable_pre_resolution_leaf_ids")
+        if terminal_dispatch_ids:
+            issues.append("terminal_verification_leaf_dispatched_for_unresolved_market")
+        invalid_roles = sorted(dispatchable_roles - QDT_UNRESOLVED_DISPATCHABLE_ROLES)
+        if invalid_roles:
+            issues.append("invalid_unresolved_dispatchable_leaf_temporal_roles")
+        if "pre_resolution_forecast_driver" not in dispatchable_roles:
+            issues.append("missing_pre_resolution_forecast_driver_leaf")
+
+    return {
+        "ok": not issues,
+        "issue_codes": sorted(set(issues)),
+        "question_specificity_status": question_specificity.get("status"),
+        "research_coverage_status": research_coverage.get("status"),
+        "market_temporal_state": market_temporal_state,
+        "leaf_count": len(leaves),
+        "generic_leaf_ids_present": generic_leaf_ids,
+        "dispatchable_pre_resolution_leaf_count": len(dispatchable_ids),
+        "dispatchable_pre_resolution_leaf_ids": dispatchable_ids,
+        "dispatchable_temporal_roles": sorted(dispatchable_roles),
+        "terminal_verification_leaf_count": len(terminal_ids),
+        "terminal_verification_leaf_ids": terminal_ids,
+        "terminal_dispatch_leaf_ids": terminal_dispatch_ids,
+        "forbidden_field_paths": forbidden_paths,
+        "missing_requirement_issues": missing_requirement_issues,
+    }
+
+
 def _model_runtime_evidence(manifests: list[dict[str, Any]]) -> dict[str, Any]:
     qdt_manifests = [item for item in manifests if item.get("artifact_type") == "question-decomposition"]
     runtime_manifests = [item for item in manifests if item.get("artifact_type") == "model-runtime-call"]
@@ -206,20 +397,33 @@ def _model_runtime_evidence(manifests: list[dict[str, Any]]) -> dict[str, Any]:
             for leaf in payload.get("required_leaf_questions", [])
             if isinstance(leaf, dict) and leaf.get("leaf_id")
         ]
-        generic_leaf_ids = {"leaf-source-of-truth", "leaf-direct-evidence", "leaf-resolution-mechanics"}
-        question_specific = bool(leaf_ids) and not bool(generic_leaf_ids & set(leaf_ids))
+        generic_leaf_ids = sorted(GENERIC_QDT_LEAF_IDS & set(leaf_ids))
+        question_specific = bool(leaf_ids) and not bool(generic_leaf_ids)
+        quality = _qdt_end_to_end_quality(payload)
+        model_runtime_ok = (
+            payload.get("adapter_mode") == "decomposer_model_runtime_live"
+            and bool(payload.get("runtime_call_ref"))
+            and question_specific
+        )
         qdt_results.append(
             {
                 "artifact_id": manifest.get("artifact_id"),
                 "adapter_mode": payload.get("adapter_mode"),
                 "runtime_call_ref": payload.get("runtime_call_ref"),
                 "leaf_count": len(leaf_ids),
+                "generic_leaf_ids_present": generic_leaf_ids,
                 "question_specific": question_specific,
-                "ok": (
-                    payload.get("adapter_mode") == "decomposer_model_runtime_live"
-                    and bool(payload.get("runtime_call_ref"))
-                    and question_specific
-                ),
+                "question_specificity_status": quality["question_specificity_status"],
+                "research_coverage_status": quality["research_coverage_status"],
+                "market_temporal_state": quality["market_temporal_state"],
+                "dispatchable_pre_resolution_leaf_count": quality["dispatchable_pre_resolution_leaf_count"],
+                "terminal_verification_leaf_count": quality["terminal_verification_leaf_count"],
+                "forbidden_field_count": len(quality["forbidden_field_paths"]),
+                "missing_requirement_issue_count": len(quality["missing_requirement_issues"]),
+                "quality_issue_codes": quality["issue_codes"],
+                "qdt_quality": quality,
+                "qdt_quality_ok": quality["ok"],
+                "ok": model_runtime_ok,
             }
         )
     for manifest in runtime_manifests:
@@ -239,18 +443,41 @@ def _model_runtime_evidence(manifests: list[dict[str, Any]]) -> dict[str, Any]:
                 ),
             }
         )
+    model_runtime_ok = bool(qdt_results) and all(item["ok"] for item in qdt_results) and bool(runtime_results) and all(
+        item["ok"] for item in runtime_results
+    )
+    qdt_quality_ok = bool(qdt_results) and all(item["qdt_quality_ok"] for item in qdt_results)
     return {
         "required_model_id": REQUIRED_RUNTIME_MODEL_ID,
         "qdt_count": len(qdt_results),
         "qdt_model_executed_count": sum(1 for item in qdt_results if item["ok"]),
+        "qdt_end_to_end_quality_count": sum(1 for item in qdt_results if item["qdt_quality_ok"]),
+        "qdt_question_specificity_passed_count": sum(
+            1 for item in qdt_results if item["question_specificity_status"] == "passed"
+        ),
+        "qdt_research_coverage_passed_count": sum(
+            1 for item in qdt_results if item["research_coverage_status"] == "passed"
+        ),
+        "qdt_pre_resolution_dispatchable_count": sum(
+            1
+            for item in qdt_results
+            if item["qdt_quality"]["dispatchable_pre_resolution_leaf_count"] > 0
+            and "pre_resolution_forecast_driver" in item["qdt_quality"]["dispatchable_temporal_roles"]
+        ),
+        "qdt_terminal_verification_gated_count": sum(
+            1 for item in qdt_results if not item["qdt_quality"]["terminal_dispatch_leaf_ids"]
+        ),
+        "qdt_forbidden_field_clean_count": sum(1 for item in qdt_results if item["forbidden_field_count"] == 0),
+        "qdt_meaningful_leaf_requirements_count": sum(
+            1 for item in qdt_results if item["missing_requirement_issue_count"] == 0
+        ),
         "runtime_call_count": len(runtime_results),
         "runtime_call_model_executed_count": sum(1 for item in runtime_results if item["ok"]),
         "qdt_results": qdt_results,
         "runtime_results": runtime_results,
-        "ok": bool(qdt_results)
-        and all(item["ok"] for item in qdt_results)
-        and bool(runtime_results)
-        and all(item["ok"] for item in runtime_results),
+        "model_runtime_ok": model_runtime_ok,
+        "qdt_end_to_end_quality_ok": qdt_quality_ok,
+        "ok": model_runtime_ok,
     }
 
 
@@ -1089,6 +1316,35 @@ def _build_runtime_criteria(
             },
         ),
         _criterion(
+            "qdt_end_to_end_quality",
+            bool(qdt_evidence.get("qdt_end_to_end_quality_ok", qdt_evidence.get("ok"))),
+            required=require_qdt_model_executed,
+            detail={
+                "qdt_end_to_end_quality_count": qdt_evidence.get("qdt_end_to_end_quality_count", 0),
+                "qdt_question_specificity_passed_count": qdt_evidence.get(
+                    "qdt_question_specificity_passed_count",
+                    0,
+                ),
+                "qdt_research_coverage_passed_count": qdt_evidence.get(
+                    "qdt_research_coverage_passed_count",
+                    0,
+                ),
+                "qdt_pre_resolution_dispatchable_count": qdt_evidence.get(
+                    "qdt_pre_resolution_dispatchable_count",
+                    0,
+                ),
+                "qdt_terminal_verification_gated_count": qdt_evidence.get(
+                    "qdt_terminal_verification_gated_count",
+                    0,
+                ),
+                "qdt_forbidden_field_clean_count": qdt_evidence.get("qdt_forbidden_field_clean_count", 0),
+                "qdt_meaningful_leaf_requirements_count": qdt_evidence.get(
+                    "qdt_meaningful_leaf_requirements_count",
+                    0,
+                ),
+            },
+        ),
+        _criterion(
             "retrieval_source_populated_or_structural_unanswerability",
             bool(retrieval_evidence.get("source_populated_ok", retrieval_evidence.get("ok"))),
             detail={
@@ -1277,6 +1533,8 @@ def build_real_runtime_canary_report(
         issues.append("unexpected_stage_error_events")
     if require_qdt_model_executed and not qdt_evidence["ok"]:
         issues.append("qdt_model_runtime_not_verified")
+    if require_qdt_model_executed and not qdt_evidence.get("qdt_end_to_end_quality_ok", qdt_evidence["ok"]):
+        issues.append("qdt_end_to_end_quality_not_verified")
     if not retrieval_evidence["source_populated_ok"]:
         issues.append("retrieval_runtime_not_source_populated_or_structurally_unanswerable")
     if not retrieval_evidence["live_acceptance_ok"]:
