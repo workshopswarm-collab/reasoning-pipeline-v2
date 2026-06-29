@@ -35,6 +35,11 @@ DEFAULT_WAL_WARNING_BYTES = 512 * 1024 * 1024
 DEFAULT_WAL_BLOCK_BYTES = 2 * 1024 * 1024 * 1024
 DEFAULT_CASE_WARNING_SECONDS = 30 * 60
 DEFAULT_CASE_BLOCK_SECONDS = 60 * 60
+MARKET_SOURCE_CLASSES = {
+    "market_rules_or_resolution_source",
+    "market_price_or_orderbook",
+}
+UNKNOWN_SOURCE_FAMILY_IDS = {"", "source-family-unknown"}
 
 
 def _decode_json(value: Any, fallback: Any) -> Any:
@@ -339,6 +344,200 @@ def _evidence_refs_from(value: Any) -> set[str]:
     return refs
 
 
+def _list_of_dicts(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, dict)]
+
+
+def _int_value(value: Any) -> int:
+    if isinstance(value, bool):
+        return int(value)
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _known_source_family_id(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    family_id = value.strip()
+    if not family_id or family_id in UNKNOWN_SOURCE_FAMILY_IDS or "unknown" in family_id:
+        return None
+    return family_id
+
+
+def _leaf_contexts_by_id(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    contexts: dict[str, dict[str, Any]] = {}
+    for item in _list_of_dicts(payload.get("leaf_query_contexts")):
+        leaf_id = item.get("leaf_id")
+        if isinstance(leaf_id, str) and leaf_id:
+            contexts[leaf_id] = item
+    return contexts
+
+
+def _selected_evidence_items(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    selected: list[dict[str, Any]] = []
+    for result in _list_of_dicts(payload.get("leaf_retrieval_results")):
+        selected.extend(_list_of_dicts(result.get("selected_evidence")))
+    return selected
+
+
+def _certified_coverage_family_ids(coverage_slices: list[dict[str, Any]]) -> set[str]:
+    family_ids: set[str] = set()
+    for coverage in coverage_slices:
+        for family_id in coverage.get("independent_source_family_ids", []):
+            known = _known_source_family_id(family_id)
+            if known:
+                family_ids.add(known)
+    return family_ids
+
+
+def _independent_non_market_source_family_ids(
+    payload: dict[str, Any],
+    coverage_slices: list[dict[str, Any]],
+) -> list[str]:
+    certified_family_ids = _certified_coverage_family_ids(coverage_slices)
+    family_ids: set[str] = set()
+    for item in _selected_evidence_items(payload):
+        family_id = _known_source_family_id(item.get("source_family_id"))
+        source_class = str(item.get("source_class") or "unknown")
+        if family_id is None or family_id not in certified_family_ids:
+            continue
+        if source_class in MARKET_SOURCE_CLASSES or source_class == "unknown":
+            continue
+        if item.get("counts_toward_breadth") is not True:
+            continue
+        if item.get("independence_status") not in {"independent", "derived_from_primary"}:
+            continue
+        family_ids.add(family_id)
+    return sorted(family_ids)
+
+
+def _coverage_requirement_counts(
+    payload: dict[str, Any],
+    coverage_slices: list[dict[str, Any]],
+) -> dict[str, Any]:
+    contexts = _leaf_contexts_by_id(payload)
+    protected_required = 0
+    protected_satisfied = 0
+    freshness_required = 0
+    freshness_satisfied = 0
+    unsatisfied: set[str] = set()
+    covered_leaf_ids: set[str] = set()
+    for coverage in coverage_slices:
+        leaf_id = str(coverage.get("leaf_id") or "")
+        if leaf_id:
+            covered_leaf_ids.add(leaf_id)
+        context = contexts.get(leaf_id, {})
+        targets = context.get("breadth_targets") if isinstance(context.get("breadth_targets"), dict) else {}
+        codes = {
+            str(code)
+            for code in coverage.get("unsatisfied_breadth_dimensions", [])
+            if isinstance(code, str) and code
+        }
+        unsatisfied.update(codes)
+
+        protected_target = bool(targets.get("protected_primary_required"))
+        protected_status = str(coverage.get("protected_primary_status") or "unknown")
+        if protected_target or protected_status not in {"not_required", ""}:
+            protected_required += 1
+            if protected_status == "satisfied":
+                protected_satisfied += 1
+
+        min_fresh_sources = _int_value(targets.get("min_temporally_fresh_sources"))
+        if min_fresh_sources > 0 or "freshness" in codes:
+            freshness_required += 1
+            if coverage.get("fresh_source_count", 0) >= min_fresh_sources and "freshness" not in codes:
+                freshness_satisfied += 1
+    for leaf_id, context in contexts.items():
+        if leaf_id in covered_leaf_ids:
+            continue
+        targets = context.get("breadth_targets") if isinstance(context.get("breadth_targets"), dict) else {}
+        if targets:
+            unsatisfied.add("missing_breadth_coverage")
+        if targets.get("protected_primary_required"):
+            protected_required += 1
+            unsatisfied.add("protected_primary_blocked")
+        if _int_value(targets.get("min_temporally_fresh_sources")) > 0:
+            freshness_required += 1
+            unsatisfied.add("freshness")
+    return {
+        "protected_primary_required_count": protected_required,
+        "protected_primary_satisfied_count": protected_satisfied,
+        "freshness_required_count": freshness_required,
+        "freshness_satisfied_count": freshness_satisfied,
+        "coverage_unsatisfied_breadth_dimensions": sorted(unsatisfied),
+    }
+
+
+def _retrieval_blocked_status(
+    sufficiency: dict[str, Any],
+    outcome_state: dict[str, Any],
+) -> bool:
+    status = str(sufficiency.get("classification_dispatch_status") or "")
+    outcome = str(outcome_state.get("retrieval_outcome") or sufficiency.get("retrieval_outcome") or "")
+    return bool(
+        status in {"blocked_insufficient_research", "blocked_until_certified"}
+        or outcome == "insufficient_evidence"
+        or outcome_state.get("terminal_blocked") is True
+    )
+
+
+def _source_collation_acceptance(
+    payload: dict[str, Any],
+    *,
+    real_candidate_count: int,
+    fetched_attempt_count: int,
+    admitted_ref_count: int,
+    sufficiency: dict[str, Any],
+    structural_unanswerability_certified: bool,
+) -> dict[str, Any]:
+    coverage_slices = _list_of_dicts(payload.get("retrieval_breadth_coverage_slices"))
+    requirement_counts = _coverage_requirement_counts(payload, coverage_slices)
+    non_market_family_ids = _independent_non_market_source_family_ids(payload, coverage_slices)
+    outcome_state = (
+        payload.get("retrieval_outcome_state")
+        if isinstance(payload.get("retrieval_outcome_state"), dict)
+        else {}
+    )
+
+    unmet: list[str] = []
+    if real_candidate_count <= 0:
+        unmet.append("candidate_discovery")
+    if fetched_attempt_count <= 0:
+        unmet.append("fetch_attempts")
+    if admitted_ref_count <= 0:
+        unmet.append("admitted_evidence")
+    if not non_market_family_ids:
+        unmet.append("independent_non_market_source_family")
+    if (
+        requirement_counts["protected_primary_required_count"]
+        > requirement_counts["protected_primary_satisfied_count"]
+    ):
+        unmet.append("protected_primary")
+    if requirement_counts["freshness_required_count"] > requirement_counts["freshness_satisfied_count"]:
+        unmet.append("freshness")
+    unmet.extend(f"breadth:{code}" for code in requirement_counts["coverage_unsatisfied_breadth_dimensions"])
+    unmet_codes = sorted(set(unmet))
+    blocked = _retrieval_blocked_status(sufficiency, outcome_state)
+    source_collation_acceptance_met = not unmet_codes and not structural_unanswerability_certified
+    return {
+        "source_collation_acceptance_met": source_collation_acceptance_met,
+        "retrieval_terminal_acceptance_met": (
+            source_collation_acceptance_met or structural_unanswerability_certified
+        ),
+        "blocked_when_acceptance_unmet": bool(unmet_codes and blocked),
+        "acceptance_unmet_not_blocked": bool(unmet_codes and not blocked and not structural_unanswerability_certified),
+        "acceptance_unmet_dimension_codes": unmet_codes,
+        "coverage_slice_count": len(coverage_slices),
+        "independent_non_market_source_family_count": len(non_market_family_ids),
+        "independent_non_market_source_family_ids": non_market_family_ids,
+        **requirement_counts,
+    }
+
+
 def _retrieval_runtime_evidence(manifests: list[dict[str, Any]]) -> dict[str, Any]:
     retrieval_packets = []
     for manifest in manifests:
@@ -533,6 +732,23 @@ def _retrieval_runtime_evidence(manifests: list[dict[str, Any]]) -> dict[str, An
         retrieval_has_real_candidates = real_candidate_count > 0
         retrieval_has_fetch_attempts = fetched_attempt_count > 0
         retrieval_has_admitted_evidence = len(admitted_refs) > 0
+        source_collation_acceptance = _source_collation_acceptance(
+            payload,
+            real_candidate_count=real_candidate_count,
+            fetched_attempt_count=fetched_attempt_count,
+            admitted_ref_count=len(admitted_refs),
+            sufficiency=sufficiency,
+            structural_unanswerability_certified=structural_unanswerability_certified,
+        )
+        source_populated_or_structural_unanswerability = bool(
+            (
+                retrieval_has_real_candidates
+                and retrieval_has_fetch_attempts
+                and retrieval_has_admitted_evidence
+                and external_source_discovery_proven
+            )
+            or structural_unanswerability_certified
+        )
         retrieval_packets.append(
             {
                 "artifact_id": manifest.get("artifact_id"),
@@ -567,17 +783,17 @@ def _retrieval_runtime_evidence(manifests: list[dict[str, Any]]) -> dict[str, An
                 "retrieval_has_real_candidates": retrieval_has_real_candidates,
                 "retrieval_has_fetch_attempts": retrieval_has_fetch_attempts,
                 "retrieval_has_admitted_evidence": retrieval_has_admitted_evidence,
-                "source_populated_or_structural_unanswerability": bool(
-                    (
-                        retrieval_has_real_candidates
-                        and retrieval_has_fetch_attempts
-                        and retrieval_has_admitted_evidence
-                        and external_source_discovery_proven
-                    )
-                    or structural_unanswerability_certified
-                ),
+                "source_populated_or_structural_unanswerability": source_populated_or_structural_unanswerability,
+                **source_collation_acceptance,
             }
         )
+    source_populated_ok = bool(retrieval_packets) and all(
+        item["source_populated_or_structural_unanswerability"] for item in retrieval_packets
+    )
+    live_acceptance_ok = bool(retrieval_packets) and all(
+        item["retrieval_terminal_acceptance_met"] and not item["acceptance_unmet_not_blocked"]
+        for item in retrieval_packets
+    )
     return {
         "retrieval_packet_count": len(retrieval_packets),
         "source_populated_count": sum(
@@ -606,10 +822,31 @@ def _retrieval_runtime_evidence(manifests: list[dict[str, Any]]) -> dict[str, An
         "metadata_classifier_assist_executed_count": sum(
             1 for item in retrieval_packets if item["metadata_classifier_assist_executed"]
         ),
+        "source_collation_acceptance_proven_count": sum(
+            1 for item in retrieval_packets if item["source_collation_acceptance_met"]
+        ),
+        "blocked_when_acceptance_unmet_count": sum(
+            1 for item in retrieval_packets if item["blocked_when_acceptance_unmet"]
+        ),
+        "acceptance_unmet_not_blocked_count": sum(
+            1 for item in retrieval_packets if item["acceptance_unmet_not_blocked"]
+        ),
+        "independent_non_market_source_family_count": sum(
+            int(item["independent_non_market_source_family_count"]) for item in retrieval_packets
+        ),
+        "protected_primary_required_count": sum(
+            int(item["protected_primary_required_count"]) for item in retrieval_packets
+        ),
+        "protected_primary_satisfied_count": sum(
+            int(item["protected_primary_satisfied_count"]) for item in retrieval_packets
+        ),
+        "freshness_required_count": sum(int(item["freshness_required_count"]) for item in retrieval_packets),
+        "freshness_satisfied_count": sum(int(item["freshness_satisfied_count"]) for item in retrieval_packets),
         "classification_dispatch_allowed": any(item["classification_dispatch_allowed"] for item in retrieval_packets),
         "retrieval_packets": retrieval_packets,
-        "ok": bool(retrieval_packets)
-        and all(item["source_populated_or_structural_unanswerability"] for item in retrieval_packets),
+        "source_populated_ok": source_populated_ok,
+        "live_acceptance_ok": live_acceptance_ok,
+        "ok": source_populated_ok and live_acceptance_ok,
     }
 
 
@@ -853,7 +1090,7 @@ def _build_runtime_criteria(
         ),
         _criterion(
             "retrieval_source_populated_or_structural_unanswerability",
-            bool(retrieval_evidence.get("ok")),
+            bool(retrieval_evidence.get("source_populated_ok", retrieval_evidence.get("ok"))),
             detail={
                 "retrieval_packet_count": retrieval_evidence.get("retrieval_packet_count", 0),
                 "source_populated_count": retrieval_evidence.get("source_populated_count", 0),
@@ -865,6 +1102,33 @@ def _build_runtime_criteria(
                     "structured_market_metadata_pilot_packet_count",
                     0,
                 ),
+            },
+        ),
+        _criterion(
+            "retrieval_live_acceptance_requirements",
+            bool(retrieval_evidence.get("live_acceptance_ok", retrieval_evidence.get("ok"))),
+            detail={
+                "retrieval_packet_count": retrieval_evidence.get("retrieval_packet_count", 0),
+                "source_collation_acceptance_proven_count": retrieval_evidence.get(
+                    "source_collation_acceptance_proven_count",
+                    0,
+                ),
+                "blocked_when_acceptance_unmet_count": retrieval_evidence.get(
+                    "blocked_when_acceptance_unmet_count",
+                    0,
+                ),
+                "acceptance_unmet_not_blocked_count": retrieval_evidence.get(
+                    "acceptance_unmet_not_blocked_count",
+                    0,
+                ),
+                "independent_non_market_source_family_count": retrieval_evidence.get(
+                    "independent_non_market_source_family_count",
+                    0,
+                ),
+                "protected_primary_required_count": retrieval_evidence.get("protected_primary_required_count", 0),
+                "protected_primary_satisfied_count": retrieval_evidence.get("protected_primary_satisfied_count", 0),
+                "freshness_required_count": retrieval_evidence.get("freshness_required_count", 0),
+                "freshness_satisfied_count": retrieval_evidence.get("freshness_satisfied_count", 0),
             },
         ),
         _criterion(
@@ -1013,8 +1277,10 @@ def build_real_runtime_canary_report(
         issues.append("unexpected_stage_error_events")
     if require_qdt_model_executed and not qdt_evidence["ok"]:
         issues.append("qdt_model_runtime_not_verified")
-    if not retrieval_evidence["ok"]:
+    if not retrieval_evidence["source_populated_ok"]:
         issues.append("retrieval_runtime_not_source_populated_or_structurally_unanswerable")
+    if not retrieval_evidence["live_acceptance_ok"]:
+        issues.append("retrieval_live_acceptance_requirements_not_met")
     if (
         require_researcher_model_executed or retrieval_evidence["classification_dispatch_allowed"]
     ) and not researcher_evidence["ok"]:

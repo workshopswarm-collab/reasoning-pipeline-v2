@@ -52,6 +52,7 @@ from researcher_swarm.isolation import (  # noqa: E402
 )
 from researcher_swarm.model_context import resolve_researcher_leaf_nli_model_context  # noqa: E402
 from researcher_swarm.retrieval import (  # noqa: E402
+    build_evidence_chunk,
     build_retrieval_evidence_item,
     build_retrieval_packet,
     build_retrieval_query_contexts,
@@ -158,8 +159,12 @@ def _evidence(context: dict[str, Any], *, suffix: str, source_class: str) -> dic
         artifact_generated_at="2026-06-24T12:01:00+00:00",
         retrieval_capture_for_dispatch=True,
         claim_family_resolution_refs=[f"claim-family-{family_suffix}"],
+        independence_status="independent",
         admission_reason_codes=["canonical_machine_fixture"],
     )
+    item["claim_family_ids"] = [f"claim-family-{family_suffix}"]
+    item["claim_family_resolution_method"] = "manual_fixture"
+    item["counts_toward_breadth"] = True
     if source_class == "official_or_primary":
         item["deterministic_source_class_proof"] = True
         item["source_class_resolution_method"] = "manual_fixture"
@@ -168,6 +173,32 @@ def _evidence(context: dict[str, Any], *, suffix: str, source_class: str) -> dic
 
 def _build_qdt() -> dict[str, Any]:
     return select_qdt_candidate([build_fixture_qdt_candidate(_fixture_handoff())])
+
+
+def _attach_fixture_chunks(packet: dict[str, Any]) -> None:
+    chunks: list[dict[str, Any]] = []
+    for result in packet.get("leaf_retrieval_results", []):
+        if not isinstance(result, dict):
+            continue
+        for evidence in result.get("selected_evidence", []):
+            if not isinstance(evidence, dict) or not evidence.get("evidence_ref"):
+                continue
+            text = (
+                f"Canonical fixture snippet for {evidence['leaf_id']} from "
+                f"{evidence['source_class']} source {evidence['source_family_id']}."
+            )
+            chunk = build_evidence_chunk(
+                evidence_ref=str(evidence["evidence_ref"]),
+                content_artifact_ref=f"artifact:canonical-content:{evidence['evidence_ref']}",
+                chunk_index=0,
+                char_start=0,
+                char_end=len(text),
+                text=text,
+                excerpt_policy="bounded_excerpt",
+            )
+            evidence["chunk_refs"] = [chunk["chunk_ref"]]
+            chunks.append(chunk)
+    packet["evidence_chunks"] = chunks
 
 
 def _build_retrieval_packet(qdt: dict[str, Any], evidence_packet: dict[str, Any]) -> dict[str, Any]:
@@ -182,6 +213,7 @@ def _build_retrieval_packet(qdt: dict[str, Any], evidence_packet: dict[str, Any]
         question_decomposition_artifact_id="artifact:qdt-1",
         policy_context_ref="artifact:profile-1",
     )
+    _attach_fixture_chunks(packet)
     return finalize_retrieval_packet_for_dispatch(packet)
 
 

@@ -825,6 +825,10 @@ class AdsOperationalCanaryTest(unittest.TestCase):
             "retrieval_runtime_not_source_populated_or_structurally_unanswerable",
             criteria_report["issues"],
         )
+        self.assertIn(
+            "retrieval_live_acceptance_requirements_not_met",
+            criteria_report["issues"],
+        )
         self.assertEqual(criteria_report["criteria_schema_version"], "ads-real-runtime-canary-criteria/v1")
         self.assertEqual(criteria_report["active_work"], {"active_runs": 0, "active_leases": 0})
         self.assertEqual(criteria_report["prediction_delta_evidence"]["expected_market_predictions"], 0)
@@ -844,6 +848,7 @@ class AdsOperationalCanaryTest(unittest.TestCase):
             runtime_gate_statuses["retrieval_source_populated_or_structural_unanswerability"],
             "failed",
         )
+        self.assertEqual(runtime_gate_statuses["retrieval_live_acceptance_requirements"], "failed")
         self.assertEqual(
             runtime_gate_statuses["researcher_model_executed_if_dispatch_allowed"],
             "skipped",
@@ -861,6 +866,7 @@ class AdsOperationalCanaryTest(unittest.TestCase):
             "retrieval_runtime_not_source_populated_or_structurally_unanswerable",
             standalone_report["issues"],
         )
+        self.assertIn("retrieval_live_acceptance_requirements_not_met", standalone_report["issues"])
         self.assertEqual(
             standalone_report["prediction_delta_evidence"]["delta_source"],
             "pipeline_run_records",
@@ -1087,6 +1093,16 @@ class AdsOperationalCanaryTest(unittest.TestCase):
         self.assertEqual(retrieval["direct_url_capture_executed_count"], 0)
         self.assertEqual(retrieval["native_research_model_executed_count"], 0)
         self.assertEqual(retrieval["metadata_classifier_assist_executed_count"], 0)
+        self.assertEqual(retrieval["source_collation_acceptance_proven_count"], 1)
+        self.assertEqual(retrieval["blocked_when_acceptance_unmet_count"], 0)
+        self.assertEqual(retrieval["acceptance_unmet_not_blocked_count"], 0)
+        self.assertGreater(retrieval["independent_non_market_source_family_count"], 0)
+        self.assertEqual(
+            retrieval["protected_primary_required_count"],
+            retrieval["protected_primary_satisfied_count"],
+        )
+        self.assertEqual(retrieval["freshness_required_count"], retrieval["freshness_satisfied_count"])
+        self.assertTrue(retrieval["live_acceptance_ok"])
         self.assertTrue(retrieval["classification_dispatch_allowed"])
         packet = retrieval["retrieval_packets"][0]
         self.assertGreater(packet["search_candidate_url_count"], 0)
@@ -1102,6 +1118,17 @@ class AdsOperationalCanaryTest(unittest.TestCase):
         self.assertEqual(packet["native_research_status"], "disabled")
         self.assertFalse(packet["metadata_classifier_assist_executed"])
         self.assertEqual(packet["metadata_classifier_assist_status"], "not_executed")
+        self.assertTrue(packet["source_collation_acceptance_met"])
+        self.assertTrue(packet["retrieval_terminal_acceptance_met"])
+        self.assertFalse(packet["blocked_when_acceptance_unmet"])
+        self.assertFalse(packet["acceptance_unmet_not_blocked"])
+        self.assertEqual(packet["acceptance_unmet_dimension_codes"], [])
+        self.assertGreater(packet["independent_non_market_source_family_count"], 0)
+        self.assertEqual(
+            packet["protected_primary_required_count"],
+            packet["protected_primary_satisfied_count"],
+        )
+        self.assertEqual(packet["freshness_required_count"], packet["freshness_satisfied_count"])
         researcher = criteria_report["researcher_runtime_evidence"]
         self.assertGreater(researcher["model_executed_count"], 0)
         self.assertGreater(researcher["runtime_bundle_count"], 0)
@@ -1225,6 +1252,85 @@ class AdsOperationalCanaryTest(unittest.TestCase):
         self.assertEqual(packet["selected_evidence_ref_count"], 2)
         self.assertEqual(packet["reported_evidence_ref_count"], 3)
         self.assertFalse(packet["source_populated_or_structural_unanswerability"])
+        self.assertFalse(evidence["ok"])
+
+    def test_live_acceptance_fails_when_unmet_collation_dimensions_advance_unblocked(self):
+        packet_path = Path(self.tempdir.name) / "retrieval-packet.json"
+        packet_path.write_text(
+            json.dumps(
+                {
+                    "adapter_mode": "source_populated_live_retrieval_runtime",
+                    "retrieval_runtime_summary": {
+                        "runtime_mode": "live_retrieval_runtime",
+                        "browser_search_executed": True,
+                        "search_candidate_url_count": 1,
+                        "web_search_attempt_count": 1,
+                    },
+                    "search_candidate_urls": [
+                        {"url": "https://reuters.com/test-source", "provider_id": "unit-test-search"}
+                    ],
+                    "browser_retrieval_attempts": [
+                        {"url": "https://reuters.com/test-source", "extraction_status": "accepted"}
+                    ],
+                    "research_sufficiency_summary": {
+                        "classification_dispatch_status": "allowed",
+                        "retrieval_outcome": "evidence_sufficient",
+                    },
+                    "retrieval_outcome_state": {
+                        "retrieval_outcome": "evidence_sufficient",
+                        "classification_dispatch_status": "allowed",
+                        "terminal_blocked": False,
+                    },
+                    "leaf_retrieval_results": [
+                        {
+                            "leaf_id": "leaf-a",
+                            "admitted_evidence_refs": ["evidence:thin-a"],
+                            "selected_evidence_refs": ["evidence:thin-a"],
+                            "selected_evidence": [
+                                {
+                                    "evidence_ref": "evidence:thin-a",
+                                    "source_class": "independent_secondary",
+                                    "source_family_id": "source-family:reuters.com",
+                                    "independence_status": "independent",
+                                    "counts_toward_breadth": True,
+                                }
+                            ],
+                        }
+                    ],
+                    "leaf_evidence_dockets": [
+                        {
+                            "leaf_id": "leaf-a",
+                            "admitted_evidence_refs": ["evidence:thin-a"],
+                        }
+                    ],
+                    "retrieval_breadth_coverage_slices": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        evidence = _retrieval_runtime_evidence(
+            [
+                {
+                    "artifact_id": "artifact:retrieval",
+                    "artifact_type": "retrieval-packet",
+                    "path": str(packet_path),
+                }
+            ]
+        )
+
+        packet = evidence["retrieval_packets"][0]
+        self.assertTrue(packet["source_populated_or_structural_unanswerability"])
+        self.assertFalse(packet["source_collation_acceptance_met"])
+        self.assertFalse(packet["retrieval_terminal_acceptance_met"])
+        self.assertFalse(packet["blocked_when_acceptance_unmet"])
+        self.assertTrue(packet["acceptance_unmet_not_blocked"])
+        self.assertIn("independent_non_market_source_family", packet["acceptance_unmet_dimension_codes"])
+        self.assertEqual(evidence["source_populated_count"], 1)
+        self.assertEqual(evidence["source_collation_acceptance_proven_count"], 0)
+        self.assertEqual(evidence["acceptance_unmet_not_blocked_count"], 1)
+        self.assertTrue(evidence["source_populated_ok"])
+        self.assertFalse(evidence["live_acceptance_ok"])
         self.assertFalse(evidence["ok"])
 
     def test_structured_metadata_pilot_does_not_prove_external_source_discovery(self):
