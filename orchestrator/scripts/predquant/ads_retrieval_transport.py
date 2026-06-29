@@ -593,7 +593,9 @@ def _fetch_candidate(
     fetched_content = _content_from_fetch(fetched)
     source_time = _source_timestamp(fetched)
     published_at = _first_source_timestamp(fetched, ("source_published_at", "published_at"))
+    updated_at = _first_source_timestamp(fetched, ("source_updated_at", "source_authored_at"))
     observed_at = _first_source_timestamp(fetched, ("source_observed_at",))
+    source_freshness_time = published_at or updated_at
     inferred_observed_at = None
     reason_codes = list(fetched.get("reason_codes") or fetched.get("omission_reason_codes") or [])
     if extraction_status == "accepted" and not source_time:
@@ -620,7 +622,13 @@ def _fetch_candidate(
         "extraction_status": extraction_status,
         "source_published_at": published_at,
         "source_observed_at": observed_at or inferred_observed_at,
-        "source_updated_at": fetched.get("source_updated_at"),
+        "source_updated_at": updated_at,
+        "source_freshness_eligible": source_freshness_time is not None,
+        "source_time_semantics": "publication_or_update"
+        if source_freshness_time
+        else "observed_or_inferred_only"
+        if observed_at or inferred_observed_at
+        else "unknown",
         "captured_at": fetched.get("captured_at") or _iso_before(source_cutoff_timestamp),
         "content": fetched_content,
         "content_artifact_ref": fetched.get("content_artifact_ref"),
@@ -995,7 +1003,7 @@ def _canonicalize_url(*urls: Any) -> str:
 
 
 def _source_timestamp(fetched: dict[str, Any]) -> str | None:
-    for field_name in ("source_published_at", "published_at", "source_observed_at", "source_updated_at", "source_authored_at"):
+    for field_name in ("source_published_at", "published_at", "source_updated_at", "source_authored_at", "source_observed_at"):
         value = fetched.get(field_name)
         if isinstance(value, str) and _parse_timestamp(value) is not None:
             return value

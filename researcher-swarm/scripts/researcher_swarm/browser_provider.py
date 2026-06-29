@@ -1092,10 +1092,9 @@ class ConfiguredBrowserProvider(BrowserProviderAdapter):
             "final_url": final_url,
             "extraction_status": "accepted",
             "content": content,
-            "source_published_at": page_metadata.get("source_published_at")
-            or _http_datetime(headers.get("last-modified")),
-            "source_updated_at": page_metadata.get("source_updated_at")
-            or _http_datetime(headers.get("last-modified")),
+            "source_published_at": page_metadata.get("source_published_at"),
+            "source_updated_at": page_metadata.get("source_updated_at"),
+            "http_last_modified_at": _http_datetime(headers.get("last-modified")),
             "captured_at": _http_datetime(headers.get("date")),
             "web_fetch_role": "url_fetch_extraction_only",
         }

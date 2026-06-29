@@ -671,6 +671,12 @@ class AdsRetrievalTransportTest(unittest.TestCase):
         self.assertTrue(
             all(candidate.get("source_observed_at") == "2026-06-24T11:58:59+00:00" for candidate in transport.fetched_candidates)
         )
+        self.assertTrue(
+            all(candidate.get("source_freshness_eligible") is False for candidate in transport.fetched_candidates)
+        )
+        self.assertTrue(
+            all(candidate.get("source_time_semantics") == "observed_or_inferred_only" for candidate in transport.fetched_candidates)
+        )
         self.assertIn(
             "pre_dispatch_direct_url_source_time_inferred",
             transport.fetched_candidates[0]["admission_reason_code"],

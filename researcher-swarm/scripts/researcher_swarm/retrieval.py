@@ -1372,6 +1372,18 @@ def validate_temporal_eligibility(
         "published_at",
     )
     source_times = {field: candidate.get(field) for field in source_time_fields if _parse_timestamp(candidate.get(field))}
+    source_freshness_time_fields = (
+        "source_published_at",
+        "published_at",
+        "source_updated_at",
+        "source_authored_at",
+        "authored_at",
+    )
+    source_freshness_times = {
+        field: candidate.get(field)
+        for field in source_freshness_time_fields
+        if _parse_timestamp(candidate.get(field))
+    }
     after_cutoff_fields = [
         field for field, value in source_times.items() if _timestamp_at_or_after(value, cutoff)
     ]
@@ -1404,7 +1416,9 @@ def validate_temporal_eligibility(
         counts_toward_temporal_freshness = False
     else:
         status = "pass"
-        counts_toward_temporal_freshness = True
+        counts_toward_temporal_freshness = bool(source_freshness_times)
+        if not source_freshness_times:
+            reason_codes.append("source_publication_or_update_time_unknown_not_freshness_eligible")
 
     validation_id = _sha_id(
         "temporal-validation",
@@ -3121,11 +3135,30 @@ def build_leaf_evidence_dockets(packet: dict[str, Any]) -> list[dict[str, Any]]:
     return dockets
 
 
+def _source_freshness_timestamp(item: dict[str, Any]) -> datetime | None:
+    for field in (
+        "source_published_at",
+        "published_at",
+        "source_updated_at",
+        "source_authored_at",
+        "authored_at",
+    ):
+        parsed = _parse_timestamp(item.get(field))
+        if parsed is not None:
+            return parsed
+    return None
+
+
 def _fresh_source_count(selected: list[dict[str, Any]], profile: dict[str, Any], source_cutoff_timestamp: str | None) -> int:
     requirement = profile.get("freshness_requirement") if isinstance(profile.get("freshness_requirement"), dict) else {}
     window_seconds = int(requirement.get("recency_window_seconds", 0) or 0)
     if window_seconds <= 0:
-        return sum(1 for item in selected if item.get("temporal_gate_status") == "pass")
+        return sum(
+            1
+            for item in selected
+            if item.get("temporal_gate_status") == "pass"
+            and _source_freshness_timestamp(item) is not None
+        )
     cutoff = _parse_timestamp(source_cutoff_timestamp)
     if cutoff is None:
         return 0
@@ -3134,12 +3167,7 @@ def _fresh_source_count(selected: list[dict[str, Any]], profile: dict[str, Any],
     for item in selected:
         if item.get("temporal_gate_status") != "pass":
             continue
-        published = _parse_timestamp(
-            item.get("source_published_at")
-            or item.get("published_at")
-            or item.get("source_updated_at")
-            or item.get("source_observed_at")
-        )
+        published = _source_freshness_timestamp(item)
         if published is not None and threshold <= published <= cutoff:
             count += 1
     return count
@@ -4481,7 +4509,7 @@ def _materialize_candidate_evidence(
         temporal_gate_status=str(candidate.get("temporal_gate_status") or "pass"),
         source_published_at=candidate.get("source_published_at") or candidate.get("published_at"),
         source_updated_at=candidate.get("source_updated_at"),
-        source_observed_at=candidate.get("source_observed_at") or candidate.get("captured_at"),
+        source_observed_at=candidate.get("source_observed_at"),
         captured_at=candidate.get("captured_at") or _iso_before_cutoff(source_cutoff_timestamp),
         artifact_generated_at=candidate.get("artifact_generated_at") or _iso_before_cutoff(source_cutoff_timestamp),
         retrieval_capture_for_dispatch=True,

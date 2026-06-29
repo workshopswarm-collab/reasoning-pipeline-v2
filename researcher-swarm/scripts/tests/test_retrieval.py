@@ -1419,6 +1419,46 @@ class RetrievalPacketContractTest(unittest.TestCase):
         self.assertEqual(resolution["temporal_safety_status"], "pass")
         self.assertTrue(packet["leaf_evidence_dockets"][0]["admitted_evidence_refs"])
 
+    def test_observed_time_does_not_satisfy_freshness_requirement(self) -> None:
+        qdt = copy.deepcopy(self.qdt)
+        qdt["required_leaf_questions"] = [qdt["required_leaf_questions"][0]]
+        leaf = qdt["required_leaf_questions"][0]
+        leaf["purpose"] = "direct_evidence"
+        leaf["research_sufficiency_requirements"].update(
+            {
+                "required_source_classes": ["official_or_primary"],
+                "min_independent_claim_families": 1,
+                "min_independent_source_families": 1,
+                "min_temporally_fresh_sources": 1,
+                "recency_window_seconds": 3600,
+                "protected_primary_required": False,
+                "contradiction_search_required": False,
+                "required_negative_checks": [],
+            }
+        )
+        context = build_retrieval_query_contexts(qdt, evidence_packet=self.evidence_packet)[0]
+        candidate = self._live_candidate(context, 0, direct=True, official=True)
+        candidate.pop("source_published_at", None)
+        candidate.pop("source_updated_at", None)
+        candidate["source_observed_at"] = "2026-06-24T11:30:00+00:00"
+
+        packet = build_live_retrieval_packet_from_candidates(
+            qdt,
+            evidence_packet=self.evidence_packet,
+            fetched_candidates=[candidate],
+            search_candidate_urls=[],
+            question_decomposition_artifact_id="artifact:qdt-1",
+            policy_context_ref="artifact:profile-1",
+        )
+        coverage = packet["retrieval_breadth_coverage_slices"][0]
+
+        self.assertEqual(coverage["fresh_source_count"], 0)
+        self.assertIn("freshness", coverage["unsatisfied_breadth_dimensions"])
+        self.assertEqual(
+            packet["research_sufficiency_summary"]["classification_dispatch_status"],
+            "blocked_insufficient_research",
+        )
+
     def test_live_candidate_without_validated_claim_family_does_not_count_toward_breadth(self) -> None:
         qdt = copy.deepcopy(self.qdt)
         qdt["required_leaf_questions"] = [qdt["required_leaf_questions"][0]]
@@ -2360,7 +2400,9 @@ class RetrievalPacketContractTest(unittest.TestCase):
         self.assertEqual(fetched["final_url"], "https://source.example/final")
         self.assertIn("Official source", fetched["content"])
         self.assertNotIn("x()", fetched["content"])
-        self.assertEqual(fetched["source_published_at"], "2026-06-24T11:30:00+00:00")
+        self.assertNotIn("source_published_at", fetched)
+        self.assertNotIn("source_updated_at", fetched)
+        self.assertEqual(fetched["http_last_modified_at"], "2026-06-24T11:30:00+00:00")
         self.assertEqual(fetched["web_fetch_role"], "url_fetch_extraction_only")
         self.assertFalse(provider.provider_diagnostics()["authority_boundary"]["certifies_source_class"])
 
