@@ -68,6 +68,20 @@ FORBIDDEN_OUTPUT_VALUES = {
     "macro_probability",
     "sub_forecast_probability",
 }
+NON_REPAIRABLE_VALIDATION_ERROR_MARKERS = (
+    "ambiguous_terms_not_decomposed",
+    "insufficient_material_leaf_count",
+    "market_family_context_not_analyzed",
+    "missing_pre_resolution_dispatchable_leaves",
+    "missing_pre_resolution_forecast_dimensions",
+    "negative_market_mapping_not_decomposed",
+    "overlapping_leaf_questions_not_deduplicated",
+    "required_coverage_dimension_missing",
+    "resolution_checklist_dominates_research_coverage",
+    "template_mad_lib_leaf",
+    "terminal_verification_dominates_unresolved_forecast_qdt",
+    "terminal_verification_leaf_misclassified_as_pre_resolution",
+)
 
 
 class ModelRuntimeError(RuntimeError):
@@ -232,6 +246,11 @@ def scan_forbidden_model_outputs(value: Any) -> dict[str, Any]:
     }
 
 
+def _validation_errors_are_repairable(errors: list[str]) -> bool:
+    text = "\n".join(str(error) for error in errors)
+    return not any(marker in text for marker in NON_REPAIRABLE_VALIDATION_ERROR_MARKERS)
+
+
 def _json_payload(value: Any) -> Any:
     if isinstance(value, str):
         try:
@@ -324,6 +343,7 @@ def _openclaw_agent_prompt(request_payload: dict[str, Any]) -> str:
                     "leaf_id": "leaf-official-resolution",
                     "parent_branch_id": "branch-resolution",
                     "question_text": "Market-specific research question for one bounded research leaf.",
+                    "leaf_temporal_role": "resolution_mechanics",
                     "purpose": "source_of_truth",
                     "coverage_dimension": "resolution_mechanics",
                     "research_factor": "resolution_condition_and_authority",
@@ -331,8 +351,30 @@ def _openclaw_agent_prompt(request_payload: dict[str, Any]) -> str:
                     "leaf_dependency_group_id": "dep-group-resolution",
                     "leaf_condition_scope": "unconditional",
                     "required_evidence_fields": ["official_status", "resolution_criteria"],
+                    "evidence_requirements": [
+                        {"required_evidence_field": "official_status", "pre_cutoff_required": True}
+                    ],
+                    "classification_targets": [
+                        "official_status",
+                        "resolution_criteria",
+                        "evidence_quality",
+                        "missingness_status",
+                    ],
+                    "sufficiency_criteria": {
+                        "classification_dispatch_requires_sufficiency_certificate": True
+                    },
                     "market_component_terms": [],
                     "amrg_usage_refs": [],
+                    "specificity_evidence": {
+                        "market_rule_clause_refs": [],
+                        "case_contract_field_refs": ["macro_question", "source_cutoff_timestamp"],
+                        "why_this_must_be_investigated": "Market-specific reason this leaf is material.",
+                        "not_a_template_reason": "Uses the concrete market subject and rule terms.",
+                        "expected_answer_type": "classification_with_extracted_values",
+                    },
+                    "overlap_risk_with_leaf_ids": [],
+                    "missingness_interpretation": "unanswered_material_question_or_structural_unanswerability_candidate",
+                    "forbidden_outputs": ["probability", "fair_value", "final_forecast"],
                     "structural_validation": {"depth": 2},
                 }
             ],
@@ -367,7 +409,19 @@ def _openclaw_agent_prompt(request_payload: dict[str, Any]) -> str:
         "estimate probability. Do not assign weights. Do not make a final "
         "forecast. Emit leaf questions, purposes, evidence requirements, "
         "classification targets, and sufficiency criteria. Avoid mad-lib leaves "
-        "that could be reused across unrelated markets by swapping entity names.\n\n"
+        "that could be reused across unrelated markets by swapping entity names. "
+        "If the request market_temporal_state is unresolved, prioritize "
+        "pre-resolution forecast research: current evidence, drivers, blockers, "
+        "source quality, timing constraints, and material unknowns before cutoff. "
+        "Do not make official-result or final-winner verification the dominant "
+        "dispatchable leaf set. Put future settlement/result checks in "
+        "terminal_verification leaves and mark them non-dispatchable before "
+        "resolution unless already observable before the source cutoff. Separate "
+        "contract guard leaves, material research-factor leaves, material unknowns, "
+        "overlap groups, terminal verification leaves, and dispatchable "
+        "pre-resolution leaves. Treat weak AMRG context as diagnostic context only; "
+        "do not use it for QDT selection, QDT repair, probability authority, SCAE "
+        "delta, or forecast writes unless a strict anchor dependency is validated.\n\n"
         "Required response skeleton:\n"
         + canonical_json(compact_candidate_schema)
         + "\n\n"
@@ -659,7 +713,8 @@ def execute_model_runtime_call(
     validation_errors: list[str] = []
     if output_validator is not None:
         valid, validation_errors = output_validator(response)
-        if not valid and repairer is not None and max_schema_repairs > 0:
+        repairable_errors = _validation_errors_are_repairable(validation_errors)
+        if not valid and repairer is not None and max_schema_repairs > 0 and repairable_errors:
             runtime_call["repair_count"] = 1
             repaired = repairer(copy.deepcopy(response), list(validation_errors))
             repaired = _json_payload(repaired)
@@ -669,9 +724,14 @@ def execute_model_runtime_call(
             if repair_scan["status"] != "passed":
                 runtime_call["execution_status"] = "failed_forbidden_output_after_repair"
                 runtime_call["latency_ms"] = int((time.monotonic() - started) * 1000)
-                raise ModelRuntimeError("repaired model output contained forbidden authority fields", runtime_call=runtime_call)
+                raise ModelRuntimeError(
+                    "repaired model output contained forbidden authority fields",
+                    runtime_call=runtime_call,
+                )
             valid, validation_errors = output_validator(repaired)
             response = repaired
+        elif not valid and repairer is not None and max_schema_repairs > 0:
+            runtime_call["runtime_reason_codes"].append("schema_repair_skipped_non_repairable_validation")
         if not valid:
             runtime_call["execution_status"] = "failed_schema_validation"
             runtime_call["latency_ms"] = int((time.monotonic() - started) * 1000)
@@ -726,7 +786,9 @@ def execute_model_runtime_call_for_lane(
         transport=transport,
         output_validator=output_validator,
         repairer=repairer,
-        timeout_seconds=timeout_seconds if timeout_seconds is not None else int(lane.get("timeout_seconds", DEFAULT_TIMEOUT_SECONDS)),
+        timeout_seconds=timeout_seconds
+        if timeout_seconds is not None
+        else int(lane.get("timeout_seconds", DEFAULT_TIMEOUT_SECONDS)),
         max_transport_retries=max_transport_retries,
         max_schema_repairs=max_schema_repairs,
     )

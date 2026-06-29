@@ -480,6 +480,8 @@ Success criteria:
 
 ## Phase 3 - Prompt And Runtime Output Alignment
 
+Status: completed on 2026-06-29. The decomposer prompt payload now carries `market_temporal_state`, `source_cutoff_timestamp`, explicit instruction blocks for pre-resolution forecast research, terminal-verification gating, QDT leaf partitions, AMRG context boundaries, and shape-only repair policy. The OpenClaw transport prompt skeleton advertises the new leaf contract fields, and runtime schema repair skips non-repairable semantic validation failures instead of normalizing them into valid QDT output.
+
 Goal: make model output naturally target the new contract.
 
 Implementation:

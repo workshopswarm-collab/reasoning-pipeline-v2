@@ -91,6 +91,36 @@ def _amrg_decomposer_context_from_payload(amrg_payload: dict[str, Any]) -> dict[
     return None
 
 
+def _market_temporal_state_from_handoff(
+    handoff: dict[str, Any],
+    *,
+    case_payload: dict[str, Any] | None = None,
+    evidence_payload: dict[str, Any] | None = None,
+) -> str:
+    market_context = handoff.get("market_context") if isinstance(handoff.get("market_context"), dict) else {}
+    case_payload = case_payload or {}
+    evidence_payload = evidence_payload or {}
+    case_identity = case_payload.get("market_identity") if isinstance(case_payload.get("market_identity"), dict) else {}
+    constraints = (
+        evidence_payload.get("market_reality_constraints")
+        if isinstance(evidence_payload.get("market_reality_constraints"), dict)
+        else {}
+    )
+    raw_status = str(
+        handoff.get("market_temporal_state")
+        or handoff.get("resolution_status")
+        or market_context.get("market_temporal_state")
+        or market_context.get("resolution_status")
+        or case_identity.get("resolution_status")
+        or constraints.get("resolution_status")
+        or constraints.get("source_of_truth_status")
+        or ""
+    ).lower()
+    if any(term in raw_status for term in ("resolved", "settled", "closed_final", "finalized")):
+        return "resolved_or_settlement_audit"
+    return "unresolved"
+
+
 def _slug(value: str, *, fallback: str) -> str:
     tokens = re.findall(r"[a-z0-9]+", value.lower())
     slug = "-".join(tokens[:4])
@@ -669,10 +699,29 @@ def build_decomposition_prompt_payload(
     amrg_decomposer_context = _amrg_decomposer_context_from_payload(amrg_payload)
     market_identity = case_payload.get("market_identity") or evidence_payload.get("market_identity", {})
     market_constraints = evidence_payload.get("market_reality_constraints", {})
+    source_cutoff_timestamp = (
+        case_payload.get("source_cutoff_timestamp")
+        or handoff.get("source_cutoff_timestamp")
+    )
+    market_temporal_state = _market_temporal_state_from_handoff(
+        handoff,
+        case_payload=case_payload,
+        evidence_payload=evidence_payload,
+    )
+    pre_resolution_instruction = (
+        "If market_temporal_state is unresolved, prioritize pre-resolution forecast research. "
+        "Ask what current evidence, drivers, blockers, source quality, timing constraints, "
+        "and missing information should be classified before cutoff. Do not make official-result "
+        "or final-winner verification the dominant dispatchable leaf set. Put future settlement/result "
+        "checks in terminal_verification leaves and mark them non-dispatchable before resolution unless "
+        "already observable before the source cutoff."
+    )
     return {
         "prompt_schema_version": "decomposer-qdt-prompt-input/v1",
         "prompt_template_id": handoff["model_execution_context"]["prompt_template_id"],
         "macro_question": handoff["macro_question"],
+        "market_temporal_state": market_temporal_state,
+        "source_cutoff_timestamp": source_cutoff_timestamp,
         "market_context": handoff.get("market_context", {}),
         "market_identity": {
             "title": market_identity.get("title"),
@@ -688,8 +737,7 @@ def build_decomposition_prompt_payload(
             "market_identity": case_payload.get("market_identity", {}),
             "prediction_time_market_baseline": case_payload.get("prediction_time_market_baseline", {}),
             "forecast_timestamp": case_payload.get("forecast_timestamp") or handoff.get("forecast_timestamp"),
-            "source_cutoff_timestamp": case_payload.get("source_cutoff_timestamp")
-            or handoff.get("source_cutoff_timestamp"),
+            "source_cutoff_timestamp": source_cutoff_timestamp,
         },
         "evidence_packet": {
             "market_rules": evidence_payload.get("market_rules", {}),
@@ -710,22 +758,78 @@ def build_decomposition_prompt_payload(
         "amrg_context_summary": {
             "artifact_type": amrg_payload.get("artifact_type"),
             "candidate_set_id": amrg_payload.get("candidate_set_id"),
-            "candidate_count": len(amrg_payload.get("candidates", [])) if isinstance(amrg_payload.get("candidates"), list) else 0,
+            "candidate_count": len(amrg_payload.get("candidates", []))
+            if isinstance(amrg_payload.get("candidates"), list)
+            else 0,
             "relationship_edge_count": len(amrg_payload.get("relationship_edges", []))
             if isinstance(amrg_payload.get("relationship_edges"), list)
             else 0,
             "waiver_reason_codes": amrg_payload.get("waiver_reason_codes", []),
         },
         "amrg_decomposer_context": amrg_decomposer_context,
+        "instruction_blocks": [
+            {
+                "block_id": "no_probability_authority",
+                "text": (
+                    "Produce a bounded research decomposition that maximizes coverage of material uncertainty. "
+                    "Do not estimate probability. Do not assign weights. Do not make a final forecast. "
+                    "Emit leaf questions, purposes, evidence requirements, classification targets, and "
+                    "sufficiency criteria."
+                ),
+            },
+            {
+                "block_id": "pre_resolution_forecast_research",
+                "text": pre_resolution_instruction,
+            },
+            {
+                "block_id": "required_qdt_partitions",
+                "text": (
+                    "Separate contract guard leaves, material research-factor leaves, material unknowns, "
+                    "overlap groups, terminal verification leaves, and dispatchable pre-resolution leaves."
+                ),
+            },
+            {
+                "block_id": "amrg_context_boundary",
+                "text": (
+                    "AMRG hints are bounded context only. Weak or generic AMRG refs must remain "
+                    "weak_context_only=true unless a strict anchor dependency is validated, and must not be "
+                    "used for QDT selection, QDT repair, probability authority, SCAE delta, or forecast writes."
+                ),
+            },
+            {
+                "block_id": "schema_repair_policy",
+                "text": (
+                    "Schema repair may normalize shape, aliases, and enum drift only. It must not invent "
+                    "semantic forecast coverage, terminal-verification classification, market-family analysis, "
+                    "or negative-market YES/NO semantics."
+                ),
+            },
+        ],
         "instructions": {
             "output": "depth_2_research_coverage_decomposition_branches_and_leaves",
             "depth": "exactly branches at depth 1 and required_leaf_questions at depth 2",
             "leaf_budget": COMPACT_DEFAULT_LEAF_BUDGET,
             "make_leaves_question_specific": True,
+            "market_temporal_state": market_temporal_state,
+            "pre_resolution_forecast_research": pre_resolution_instruction,
+            "terminal_verification_gating": (
+                "Terminal verification leaves are for settlement/result checks and must not be dispatched "
+                "as pre-resolution research for unresolved markets unless the result is already observable "
+                "before source_cutoff_timestamp."
+            ),
+            "required_leaf_partitions": [
+                "contract_guard_leaf_ids",
+                "material_question_leaf_ids",
+                "material_unknowns",
+                "overlap_groups",
+                "terminal_verification_leaf_ids",
+                "dispatchable_pre_resolution_leaf_ids",
+            ],
             "contract_text": (
                 "Produce a bounded research decomposition that maximizes coverage of material uncertainty. "
                 "Do not estimate probability. Do not assign weights. Do not make a final forecast. "
-                "Emit leaf questions, purposes, evidence requirements, classification targets, and sufficiency criteria."
+                "Emit leaf questions, purposes, evidence requirements, classification targets, "
+                "and sufficiency criteria."
             ),
             "required_top_level_contracts": [
                 "market_resolution_contract",
@@ -756,6 +860,9 @@ def build_decomposition_prompt_payload(
                 "retrieval_hint",
                 "conditional_anchor_dependency_request",
             ],
+            "amrg_weak_context_policy": (
+                "Weak AMRG refs remain weak_context_only=true unless a strict anchor dependency is validated."
+            ),
             "amrg_forbidden_uses": [
                 "qdt_selection",
                 "qdt_repair",
@@ -797,7 +904,8 @@ def build_question_decomposition_from_handoff(
         model_lane_id=base_context["model_lane_id"],
         provider=base_context.get("provider", "openai"),
         resolved_model_id=base_context["resolved_model_id"],
-        provider_route=base_context.get("provider_route") or f"{base_context.get('provider', 'openai')}/{base_context['resolved_model_id']}",
+        provider_route=base_context.get("provider_route")
+        or f"{base_context.get('provider', 'openai')}/{base_context['resolved_model_id']}",
         prompt_template_id=base_context["prompt_template_id"],
         prompt_template_sha256=base_context["prompt_template_sha256"],
         input_manifest_refs=list(base_context.get("input_manifest_ids", [])),

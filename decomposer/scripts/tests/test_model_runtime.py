@@ -20,6 +20,7 @@ from ads_decomposer.model_runtime import (  # noqa: E402
     execute_model_runtime_call,
     execute_model_runtime_call_for_lane,
     model_execution_context_from_runtime_call,
+    _openclaw_agent_prompt,
     _parse_openclaw_agent_stdout,
     resolve_model_runtime_lane,
 )
@@ -135,6 +136,34 @@ class ModelRuntimeContractTest(unittest.TestCase):
         self.assertEqual(result.runtime_call["token_usage"]["total_tokens"], 15)
         self.assertEqual(result.runtime_call["provider_status"]["finish_reason"], "stop")
         self.assertEqual(context["token_usage"]["total_tokens"], 15)
+
+    def test_openclaw_agent_prompt_contains_phase3_qdt_contract(self) -> None:
+        prompt = _openclaw_agent_prompt(
+            {
+                "schema_version": MODEL_RUNTIME_TRANSPORT_REQUEST_SCHEMA_VERSION,
+                "runtime_call_id": "runtime-1",
+                "model_lane_id": "decomposer_qdt_generation",
+                "provider": "openai",
+                "resolved_model_id": "gpt-5.5-high",
+                "provider_route": "openclaw_codex_oauth/decomposer",
+                "prompt_template_id": "decomposer-qdt/v1",
+                "prompt_template_sha256": "sha256:" + "1" * 64,
+                "output_schema_version": "question-decomposition/v1",
+                "timeout_seconds": 180,
+                "request_payload": {
+                    "macro_question": "Will Victor Marx win the 2026 Colorado primary?",
+                    "market_temporal_state": "unresolved",
+                },
+            }
+        )
+
+        self.assertIn("pre-resolution forecast research", prompt)
+        self.assertIn("terminal_verification", prompt)
+        self.assertIn("dispatchable pre-resolution", prompt)
+        self.assertIn("classification targets", prompt)
+        self.assertIn("leaf_temporal_role", prompt)
+        self.assertIn("weak AMRG context", prompt)
+        self.assertIn("gpt-5.5-high", prompt)
 
     def test_forbidden_output_fails_closed_before_schema_use(self) -> None:
         with self.assertRaises(ModelRuntimeError) as raised:

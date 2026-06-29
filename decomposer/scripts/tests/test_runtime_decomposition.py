@@ -15,7 +15,10 @@ sys.path.insert(0, str(ROOT / "decomposer" / "scripts"))
 sys.path.insert(0, str(ROOT / "decomposer" / "scripts" / "bin"))
 sys.path.insert(0, str(ROOT / "orchestrator" / "scripts"))
 
-from ads_decomposer.model_runtime import MODEL_RUNTIME_TRANSPORT_RESPONSE_SCHEMA_VERSION  # noqa: E402
+from ads_decomposer.model_runtime import (  # noqa: E402
+    MODEL_RUNTIME_TRANSPORT_RESPONSE_SCHEMA_VERSION,
+    ModelRuntimeError,
+)
 from ads_decomposer.handoff import (  # noqa: E402
     DECOMPOSER_MODEL_ID,
     DECOMPOSER_MODEL_LANE_ID,
@@ -23,6 +26,7 @@ from ads_decomposer.handoff import (  # noqa: E402
 )
 from ads_decomposer.qdt import validate_question_decomposition  # noqa: E402
 from run_decomposition import (  # noqa: E402
+    build_decomposition_prompt_payload,
     build_question_decomposition_from_handoff,
     build_question_specific_fixture_response,
 )
@@ -123,6 +127,29 @@ class RuntimeDecompositionEntrypointTest(unittest.TestCase):
         self.assertEqual(qdt["research_coverage_check"]["status"], "passed")
         self.assertIn("research_coverage_graph", qdt)
 
+    def test_prompt_payload_contains_phase3_temporal_contract(self) -> None:
+        payload = build_decomposition_prompt_payload(self._handoff(), payloads={})
+        instruction_text = json.dumps(payload["instruction_blocks"], sort_keys=True)
+
+        self.assertEqual(payload["prompt_schema_version"], "decomposer-qdt-prompt-input/v1")
+        self.assertEqual(payload["market_temporal_state"], "unresolved")
+        self.assertEqual(payload["source_cutoff_timestamp"], self._handoff()["source_cutoff_timestamp"])
+        self.assertIn("pre-resolution forecast research", instruction_text)
+        self.assertIn("terminal_verification", instruction_text)
+        self.assertIn("weak_context_only=true", instruction_text)
+        self.assertIn("Schema repair may normalize shape", instruction_text)
+        self.assertEqual(
+            payload["instructions"]["required_leaf_partitions"],
+            [
+                "contract_guard_leaf_ids",
+                "material_question_leaf_ids",
+                "material_unknowns",
+                "overlap_groups",
+                "terminal_verification_leaf_ids",
+                "dispatchable_pre_resolution_leaf_ids",
+            ],
+        )
+
     def test_live_transport_builds_question_specific_qdt_without_fixture_mode(self) -> None:
         handoff = self._handoff()
         model_response = build_question_specific_fixture_response(handoff)
@@ -171,6 +198,60 @@ class RuntimeDecompositionEntrypointTest(unittest.TestCase):
         self.assertTrue(validate_question_decomposition(qdt).valid)
         self.assertEqual(runtime["repair_count"], 1)
         self.assertEqual(qdt["model_execution_context"]["repair_count"], 1)
+
+    def test_schema_repair_does_not_convert_semantic_invalid_output(self) -> None:
+        handoff = self._handoff()
+        bad_response = build_question_specific_fixture_response(handoff)
+        for leaf in bad_response["required_leaf_questions"]:
+            question = (
+                "What did the final official result say about whether Acme shipped "
+                "the Atlas update before July 2026?"
+            )
+            leaf["question_text"] = question
+            leaf["leaf_question"] = question
+
+        with self.assertRaises(ModelRuntimeError) as raised:
+            build_question_decomposition_from_handoff(
+                handoff,
+                runtime_mode="fixture",
+                fixture_response=bad_response,
+            )
+
+        runtime = raised.exception.runtime_call
+        self.assertIsInstance(runtime, dict)
+        self.assertEqual(runtime["execution_status"], "failed_schema_validation")
+        self.assertEqual(runtime["repair_count"], 0)
+        self.assertIn("schema_repair_skipped_non_repairable_validation", runtime["runtime_reason_codes"])
+        self.assertIn(
+            "terminal_verification_dominates_unresolved_forecast_qdt",
+            "; ".join(runtime["runtime_reason_codes"]),
+        )
+
+    def test_unresolved_election_fixture_stays_pre_resolution_dispatchable(self) -> None:
+        handoff = self._handoff()
+        handoff["case_id"] = "case-victor-marx-runtime"
+        handoff["case_key"] = "polymarket:825858"
+        handoff["dispatch_id"] = "dispatch-victor-marx-runtime"
+        handoff["macro_question"] = (
+            "Will Victor Marx win the 2026 Colorado Governor Republican primary election?"
+        )
+        model_response = build_question_specific_fixture_response(handoff)
+
+        qdt, _runtime = build_question_decomposition_from_handoff(
+            handoff,
+            runtime_mode="fixture",
+            fixture_response=model_response,
+        )
+
+        graph = qdt["research_coverage_graph"]
+        self.assertTrue(validate_question_decomposition(qdt).valid)
+        self.assertEqual(qdt["research_coverage_check"]["status"], "passed")
+        self.assertEqual(graph["market_temporal_state"], "unresolved")
+        self.assertFalse(graph["terminal_verification_leaf_ids"])
+        self.assertEqual(
+            sorted(graph["dispatchable_pre_resolution_leaf_ids"]),
+            sorted(leaf["leaf_id"] for leaf in qdt["required_leaf_questions"]),
+        )
 
     def test_schema_repair_normalizes_model_enum_and_structural_drift(self) -> None:
         handoff = self._handoff()
