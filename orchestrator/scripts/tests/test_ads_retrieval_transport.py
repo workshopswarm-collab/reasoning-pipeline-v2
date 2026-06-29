@@ -207,8 +207,9 @@ class AdsRetrievalTransportTest(unittest.TestCase):
             browser_provider=provider,
         )
 
-        self.assertEqual(transport.direct_url_candidates[0]["source_ref"], "case_contract.market_url")
-        self.assertIn("source_of_truth_hints", transport.direct_url_candidates[2]["source_ref"])
+        self.assertIn("official_source_hints", transport.direct_url_candidates[0]["source_ref"])
+        self.assertIn("source_of_truth_hints", transport.direct_url_candidates[1]["source_ref"])
+        self.assertEqual(transport.direct_url_candidates[-1]["source_ref"], "case_contract.market_url")
         first_search_index = next(index for index, event in enumerate(provider.events) if event[0] == "search")
         self.assertTrue(all(event[0] == "fetch" for event in provider.events[:first_search_index]))
         self.assertGreater(len(transport.fetched_candidates), len(transport.search_candidate_urls))
@@ -235,8 +236,41 @@ class AdsRetrievalTransportTest(unittest.TestCase):
         direct_urls = [item["url"] for item in transport.direct_url_candidates]
         self.assertIn("https://ir.tesla.com/press", direct_urls)
         self.assertIn("https://example.com/fallback-report", direct_urls)
+        self.assertLess(
+            direct_urls.index("https://ir.tesla.com/press"),
+            direct_urls.index("https://polymarket.com/event/example-market"),
+        )
         self.assertTrue(
             all(event[0] == "fetch" for event in provider.events[: len(transport.direct_url_candidates)])
+        )
+
+    def test_embedded_source_url_survives_tight_direct_url_cap(self) -> None:
+        provider = FakeBrowserProvider()
+        case_contract = copy.deepcopy(self.case_contract)
+        case_contract["market_identity"]["description"] = (
+            "Resolution source: https://ir.tesla.com/press"
+        )
+        evidence_packet = {
+            **self.evidence_packet,
+            "official_source_hints": [],
+            "market_reality_constraints": {},
+            "market_rules": {},
+        }
+
+        transport = collect_live_retrieval_candidates(
+            qdt=self._resolution_mechanics_qdt(),
+            evidence_packet=evidence_packet,
+            case_contract=case_contract,
+            amrg_context=None,
+            source_cutoff_timestamp=CUTOFF_AT,
+            forecast_timestamp=FORECAST_AT,
+            provider_policy=RetrievalProviderPolicy(max_direct_urls=1, broad_search_enabled=False),
+            browser_provider=provider,
+        )
+
+        self.assertEqual(
+            [item["url"] for item in transport.direct_url_candidates],
+            ["https://ir.tesla.com/press"],
         )
 
     def test_direct_fetch_elapsed_does_not_preconsume_search_budget(self) -> None:
@@ -794,6 +828,10 @@ class AdsRetrievalTransportTest(unittest.TestCase):
                     "reason_codes": ["protected_primary_blocked"],
                 },
                 "https://official.example/source-of-truth": {
+                    "extraction_status": "blocked",
+                    "reason_codes": ["protected_primary_blocked"],
+                },
+                "https://protected.example/primary": {
                     "extraction_status": "blocked",
                     "reason_codes": ["protected_primary_blocked"],
                 },

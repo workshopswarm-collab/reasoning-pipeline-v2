@@ -429,13 +429,6 @@ def _collect_direct_url_hints(
     amrg_context: dict[str, Any] | None,
 ) -> list[dict[str, Any]]:
     hints: list[dict[str, Any]] = []
-    _add_hint(
-        hints,
-        _market_url(case_contract),
-        source_ref="case_contract.market_url",
-        source_class="official_or_primary",
-        source_class_resolution_method="official_url_hint",
-    )
     for path in (
         ("official_source_hints",),
         ("protected_primary_source_hints",),
@@ -494,6 +487,13 @@ def _collect_direct_url_hints(
             source_class_resolution_method=None,
             deterministic_source_class_proof=False,
         )
+    _add_hint(
+        hints,
+        _market_url(case_contract),
+        source_ref="case_contract.market_url",
+        source_class="official_or_primary",
+        source_class_resolution_method="official_url_hint",
+    )
     return _dedupe_hints(hints)
 
 
