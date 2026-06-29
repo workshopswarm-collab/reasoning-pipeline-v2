@@ -1810,6 +1810,14 @@ class RetrievalPacketContractTest(unittest.TestCase):
         self.assertTrue(records[0]["fetch_required_before_admission"])
         self.assertEqual(fetched["web_fetch_role"], "url_fetch_extraction_only")
 
+        fetch_calls: list[str] = []
+        fetch_only_adapter = BrowserProviderAdapter(
+            web_fetch=lambda url: fetch_calls.append(url) or {"final_url": url, "extraction_status": "accepted"},
+        )
+
+        self.assertEqual(fetch_only_adapter.search_candidate_urls(context, context["query_variants"][0]), [])
+        self.assertEqual(fetch_calls, [])
+
     def test_phase7_search_summary_without_fetched_text_is_not_admitted_as_evidence(self) -> None:
         qdt = copy.deepcopy(self.qdt)
         qdt["required_leaf_questions"] = [qdt["required_leaf_questions"][0]]
