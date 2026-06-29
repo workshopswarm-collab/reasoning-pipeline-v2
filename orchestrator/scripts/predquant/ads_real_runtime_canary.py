@@ -25,6 +25,10 @@ from predquant.sqlite_store import brier_score_report, ensure_schema
 REAL_RUNTIME_CANARY_REPORT_SCHEMA_VERSION = "ads-real-runtime-canary-report/v1"
 REAL_RUNTIME_CANARY_CRITERIA_SCHEMA_VERSION = "ads-real-runtime-canary-criteria/v1"
 REQUIRED_RUNTIME_MODEL_ID = "gpt-5.5-high"
+REQUIRED_RESEARCHER_RUNTIME_MODEL_IDS = {
+    REQUIRED_RUNTIME_MODEL_ID,
+    "openai/gpt-5.5-high",
+}
 SCAE_PROBABILITY_SOURCE = "SCAE-012.production_forecast_prob"
 SCAE_MARKET_PREDICTION_SOURCE = "scae.production_forecast_prob"
 DEFAULT_WAL_WARNING_BYTES = 512 * 1024 * 1024
@@ -269,7 +273,7 @@ def _researcher_runtime_evidence(manifests: list[dict[str, Any]]) -> dict[str, A
                     "model_executed": runtime.get("model_executed"),
                     "execution_status": runtime.get("execution_status"),
                     "ok": (
-                        context.get("resolved_model_id") == REQUIRED_RUNTIME_MODEL_ID
+                        context.get("resolved_model_id") in REQUIRED_RESEARCHER_RUNTIME_MODEL_IDS
                         and runtime.get("model_executed") is True
                         and runtime.get("execution_status") in {"succeeded", "accepted"}
                     ),
@@ -280,7 +284,7 @@ def _researcher_runtime_evidence(manifests: list[dict[str, Any]]) -> dict[str, A
             bundle_ok = bool(leaf_runtime_status) and all(
                 isinstance(row, dict)
                 and row.get("model_executed") is True
-                and row.get("resolved_model_id") == REQUIRED_RUNTIME_MODEL_ID
+                and row.get("resolved_model_id") in REQUIRED_RESEARCHER_RUNTIME_MODEL_IDS
                 for row in leaf_runtime_status
             )
             bundles.append(
@@ -309,6 +313,7 @@ def _researcher_runtime_evidence(manifests: list[dict[str, Any]]) -> dict[str, A
     )
     return {
         "required_model_id": REQUIRED_RUNTIME_MODEL_ID,
+        "accepted_researcher_runtime_model_ids": sorted(REQUIRED_RESEARCHER_RUNTIME_MODEL_IDS),
         "sidecar_count": len(sidecars),
         "runtime_bundle_count": len(bundles),
         "model_executed_count": model_executed_count,
@@ -501,7 +506,10 @@ def _retrieval_runtime_evidence(manifests: list[dict[str, Any]]) -> dict[str, An
 def _scae_runtime_evidence(manifests: list[dict[str, Any]]) -> dict[str, Any]:
     ledgers = []
     for manifest in manifests:
-        if manifest.get("artifact_type") != "scae-final-ledger":
+        if manifest.get("artifact_type") not in {
+            "scae-final-ledger",
+            "scae-final-probability-ledger",
+        }:
             continue
         payload = _load_manifest_payload(manifest) or {}
         delta_refs = payload.get("scae_evidence_delta_candidate_slice_refs")
@@ -1007,7 +1015,8 @@ def _check_prediction_deltas(evidence: dict[str, Any], issues: list[str]) -> Non
         issues.append("non_scae_forecast_decision_authority")
     if evidence.get("non_scae_prediction_ids"):
         issues.append("non_scae_market_prediction_authority")
-    if evidence.get("non_scoreable_prediction_ids"):
+    scoreable_predictions_expected = expected_predictions not in (None, 0)
+    if evidence.get("non_scoreable_prediction_ids") and not scoreable_predictions_expected:
         issues.append("non_scoreable_decision_wrote_market_prediction")
 
 

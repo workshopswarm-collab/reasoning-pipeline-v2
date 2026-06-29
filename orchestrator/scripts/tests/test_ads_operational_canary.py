@@ -32,6 +32,7 @@ from predquant.ads_real_runtime_canary import (
     _retrieval_runtime_evidence,
     build_real_runtime_canary_report,
 )
+from predquant.ads_retrieval_transport import RetrievalProviderPolicy
 from predquant.ads_scoreable_canary_handlers import build_stage_handlers
 from predquant.sqlite_store import SCHEMA
 from researcher_swarm.classification import build_researcher_sidecar_v2
@@ -76,11 +77,99 @@ class _ConfiguredEmptyRetrievalProvider:
         }
 
 
+class _SearchProofRetrievalProvider:
+    provider_id = "search-proof-test-provider"
+    fetch_configured = True
+    search_configured = True
+
+    _domains = (
+        "ir.tesla.com",
+        "reuters.com",
+        "apnews.com",
+        "bloomberg.com",
+        "ft.com",
+        "cnbc.com",
+        "bbc.com",
+    )
+
+    def __init__(self) -> None:
+        self._url_content: dict[str, dict[str, Any]] = {}
+
+    def search_candidate_urls(
+        self,
+        query_context: dict[str, Any],
+        query_variant: dict[str, Any],
+        *,
+        searched_at: Any = None,
+    ) -> list[dict[str, Any]]:
+        leaf_id = str(query_context["leaf_id"])
+        required_count = 2 if query_context.get("purpose") == "resolution_mechanics" else 5
+        records: list[dict[str, Any]] = []
+        for index, domain in enumerate(self._domains[:required_count], start=1):
+            path_leaf = leaf_id.replace("_", "-")
+            url = f"https://{domain}/ads-search-proof/{path_leaf}/{index}"
+            produced = 10_000 + (index * 101)
+            delivered = 9_000 + (index * 103)
+            content = (
+                f"Tesla produced {produced} vehicles and delivered {delivered} vehicles in Q4 2099. "
+                f"Search proof source {index} for {leaf_id}."
+            )
+            self._url_content[url] = {
+                "content": content,
+                "source_published_at": "2099-12-30T12:00:00+00:00",
+                "source_updated_at": "2099-12-30T13:00:00+00:00",
+                "captured_at": "2099-12-31T12:00:00+00:00",
+            }
+            records.append(
+                {
+                    "leaf_id": leaf_id,
+                    "query_variant_id": query_variant["query_variant_id"],
+                    "query_role": query_variant.get("query_role", "primary_leaf_retrieval"),
+                    "rank": index,
+                    "url": url,
+                    "title": f"Search proof source {index}",
+                    "snippet": content,
+                    "provider_id": self.provider_id,
+                    "searched_at": searched_at,
+                    "result_source": "unit_test_configured_search_provider",
+                }
+            )
+        return records
+
+    def fetch_url(self, url: str) -> dict[str, Any]:
+        payload = self._url_content.get(url)
+        if payload is None:
+            return {"url": url, "extraction_status": "rejected", "reason_codes": ["unit_test_url_not_discovered"]}
+        return {
+            "url": url,
+            "final_url": url,
+            "extraction_status": "accepted",
+            "web_fetch_role": "url_fetch_extraction_only",
+            **payload,
+        }
+
+    def provider_diagnostics(self) -> dict[str, Any]:
+        return {
+            "provider_id": self.provider_id,
+            "fetch_configured": self.fetch_configured,
+            "search_configured": self.search_configured,
+            "web_fetch_role": "url_fetch_extraction_only",
+            "web_fetch_must_not_be_used_as_search": True,
+        }
+
+
 def _first_assignment_evidence(
     packet: dict[str, Any],
     assignment: dict[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     evidence_ref = assignment["assigned_evidence_refs"][0]["evidence_ref"]
+    return _assignment_evidence(packet, evidence_ref)
+
+
+def _assignment_evidence(
+    packet: dict[str, Any],
+    evidence_ref: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
     provenance = _provenance_by_evidence_ref(packet)[evidence_ref]
     for result in packet.get("leaf_retrieval_results", []):
         if not isinstance(result, dict):
@@ -95,13 +184,18 @@ def _runtime_classification(
     qdt: dict[str, Any],
     packet: dict[str, Any],
     assignment: dict[str, Any],
+    evidence_ref: Any = None,
 ) -> dict[str, Any]:
     leaves = {
         str(leaf["leaf_id"]): leaf
         for leaf in qdt.get("required_leaf_questions", [])
         if isinstance(leaf, dict) and leaf.get("leaf_id")
     }
-    evidence, provenance = _first_assignment_evidence(packet, assignment)
+    evidence, provenance = (
+        _assignment_evidence(packet, evidence_ref)
+        if evidence_ref
+        else _first_assignment_evidence(packet, assignment)
+    )
     leaf = leaves[assignment["leaf_id"]]
     return {
         "leaf_id": assignment["leaf_id"],
@@ -128,8 +222,31 @@ def _runtime_classification(
     }
 
 
-def _runtime_coverage(assignment: dict[str, Any]) -> dict[str, Any]:
+def _runtime_coverage(
+    assignment: dict[str, Any],
+    retrieval_packet: Any = None,
+) -> dict[str, Any]:
     evidence_refs = [item["evidence_ref"] for item in assignment["assigned_evidence_refs"]]
+    source_classes = set()
+    source_family_ids = set()
+    claim_family_ids = set()
+    for item in assignment["assigned_evidence_refs"]:
+        if retrieval_packet is not None and item.get("evidence_ref"):
+            evidence, _ = _assignment_evidence(retrieval_packet, str(item["evidence_ref"]))
+            if evidence.get("source_class"):
+                source_classes.add(evidence["source_class"])
+            if evidence.get("source_family_id"):
+                source_family_ids.add(evidence["source_family_id"])
+            for claim_family_id in evidence.get("claim_family_ids", []):
+                if claim_family_id:
+                    claim_family_ids.add(claim_family_id)
+            continue
+        if item.get("source_class"):
+            source_classes.add(item["source_class"])
+        if item.get("source_family_id"):
+            source_family_ids.add(item["source_family_id"])
+        if item.get("claim_family_id"):
+            claim_family_ids.add(item["claim_family_id"])
     return {
         "coverage_proof_id": assignment["artifact_outputs"]["coverage_proof_ref"],
         "leaf_id": assignment["leaf_id"],
@@ -137,17 +254,9 @@ def _runtime_coverage(assignment: dict[str, Any]) -> dict[str, Any]:
         "retrieval_breadth_coverage_ref": assignment["retrieval_breadth_coverage_ref"],
         "evidence_refs_assigned": list(evidence_refs),
         "evidence_refs_reviewed": list(evidence_refs),
-        "source_class_ids_reviewed": sorted({item["source_class"] for item in assignment["assigned_evidence_refs"]}),
-        "claim_family_ids_reviewed": sorted(
-            {
-                item["claim_family_id"]
-                for item in assignment["assigned_evidence_refs"]
-                if item.get("claim_family_id")
-            }
-        ),
-        "source_family_ids_reviewed": sorted(
-            {item["source_family_id"] for item in assignment["assigned_evidence_refs"]}
-        ),
+        "source_class_ids_reviewed": sorted(source_classes),
+        "claim_family_ids_reviewed": sorted(claim_family_ids),
+        "source_family_ids_reviewed": sorted(source_family_ids),
         "requirements_reviewed": list(assignment["sufficiency_requirement_refs"]),
         "requirements_answered": list(assignment["sufficiency_requirement_refs"]),
         "requirements_unanswered": [],
@@ -223,6 +332,76 @@ def _fake_researcher_runtime_bundle(
 
 def _fake_researcher_runtime_bundle_all_accepted(**kwargs) -> dict[str, Any]:
     return _fake_researcher_runtime_bundle(**kwargs, block_first_leaf=False)
+
+
+def _fake_researcher_runtime_bundle_all_evidence_accepted(
+    *,
+    assignments: list[dict[str, Any]],
+    qdt: dict[str, Any],
+    retrieval_packet: dict[str, Any],
+    true_production_mode: bool,
+    max_concurrent: int,
+) -> dict[str, Any]:
+    model_context = resolve_researcher_leaf_nli_model_context()
+    classifications = []
+    coverage_proofs = []
+    for assignment in assignments:
+        for assigned in assignment.get("assigned_evidence_refs", []):
+            if isinstance(assigned, dict) and assigned.get("evidence_ref"):
+                classifications.append(
+                    _runtime_classification(
+                        qdt,
+                        retrieval_packet,
+                        assignment,
+                        evidence_ref=str(assigned["evidence_ref"]),
+                    )
+                )
+        coverage_proofs.append(_runtime_coverage(assignment, retrieval_packet))
+    sidecar = build_researcher_sidecar_v2(
+        qdt=qdt,
+        required_question_classifications=classifications,
+        coverage_proofs=coverage_proofs,
+        model_execution_context_ref="artifact:model-execution-context:researcher-leaf-nli",
+        model_execution_context=model_context,
+    )
+    audits = [
+        build_researcher_context_isolation_audit(
+            assignment,
+            subagent_session_ref=f"openclaw-session:{idx}",
+        )
+        for idx, assignment in enumerate(assignments)
+    ]
+    results = [
+        build_leaf_subagent_result(
+            assignment,
+            terminal_status="accepted_classification",
+            subagent_session_ref=f"openclaw-session:{idx}",
+            sidecar_refs=[sidecar["sidecar_id"]],
+            classification_refs=[
+                f"classification:{assignment['leaf_id']}:{evidence['evidence_ref']}"
+                for evidence in assignment.get("assigned_evidence_refs", [])
+                if isinstance(evidence, dict) and evidence.get("evidence_ref")
+            ],
+            isolation_audit_ref=assignment["context_isolation"]["isolation_audit_ref"],
+            runtime_provenance={
+                "model_executed": True,
+                "resolved_model_id": RESEARCHER_PROVIDER_MODEL_KEY,
+                "runtime_call_ref": f"model-runtime-call:researcher:{idx}",
+            },
+            reason_codes=["accepted_classification"],
+        )
+        for idx, assignment in enumerate(assignments)
+    ]
+    return build_researcher_swarm_runtime_bundle(
+        assignments,
+        qdt=qdt,
+        retrieval_packet=retrieval_packet,
+        sidecars=[sidecar],
+        isolation_audits=audits,
+        subagent_results=results,
+        true_production_mode=true_production_mode,
+        max_concurrent=max_concurrent,
+    )
 
 
 class AdsOperationalCanaryTest(unittest.TestCase):
@@ -867,6 +1046,53 @@ class AdsOperationalCanaryTest(unittest.TestCase):
 
         report = build_handoff_report(self.db_path)
         self.assertTrue(report["ok"], report["unresolved_output_manifest_refs"])
+
+    def test_true_production_search_runtime_canary_proves_retrieval_to_scae_inputs(self):
+        config = self.config(
+            require_scoreable_prediction=True,
+            require_manifest_handoffs=True,
+            require_real_runtime_canary_criteria=True,
+            require_researcher_model_executed=True,
+        )
+        handlers = build_true_production_handlers(
+            db_path=config.db_path,
+            runner_mode=config.runner_mode,
+            forecast_timestamp=config.forecast_timestamp,
+            max_cases=config.max_cases,
+            metadata=config.metadata,
+            decomposer_runtime_transport_response_path=self._decomposer_live_response_path(),
+            retrieval_browser_provider=_SearchProofRetrievalProvider(),
+            retrieval_provider_policy=RetrievalProviderPolicy(
+                max_direct_urls=0,
+                max_total_search_calls=3,
+                max_search_results_per_variant=5,
+                max_total_search_result_fetches=15,
+            ),
+            researcher_swarm_runtime_runner=_fake_researcher_runtime_bundle_all_evidence_accepted,
+        )
+
+        result = run_one_case_canary(config, handlers)
+
+        self.assertTrue(result["ok"], result["errors"])
+        criteria_report = result["real_runtime_canary_report"]
+        self.assertTrue(criteria_report["ok"], criteria_report["issues"])
+        self.assertIsNone(criteria_report["first_failing_gate"])
+        retrieval = criteria_report["retrieval_runtime_evidence"]
+        self.assertGreater(retrieval["real_candidate_count"], 0)
+        self.assertGreater(retrieval["fetched_attempt_count"], 0)
+        self.assertGreater(retrieval["admitted_evidence_ref_count"], 0)
+        self.assertTrue(retrieval["classification_dispatch_allowed"])
+        packet = retrieval["retrieval_packets"][0]
+        self.assertGreater(packet["search_candidate_url_count"], 0)
+        self.assertGreater(packet["fetched_attempt_count"], 0)
+        self.assertGreater(packet["admitted_evidence_ref_count"], 0)
+        researcher = criteria_report["researcher_runtime_evidence"]
+        self.assertGreater(researcher["model_executed_count"], 0)
+        self.assertGreater(researcher["runtime_bundle_count"], 0)
+        scae = criteria_report["scae_runtime_evidence"]
+        self.assertGreater(scae["valid_forecast_count"], 0)
+        self.assertGreater(scae["delta_ref_count"], 0)
+        self.assertEqual(result["protected_count_deltas"]["market_predictions"], 1)
 
     def test_phase6_runtime_criteria_reports_first_failing_gate(self):
         base = {
