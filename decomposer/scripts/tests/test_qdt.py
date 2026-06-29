@@ -28,11 +28,13 @@ from ads_decomposer.qdt import (  # noqa: E402
     build_anchor_dependency_contract,
     build_fixture_qdt_candidate,
     build_leaf_budget_decision,
+    build_qdt_candidate,
     build_research_sufficiency_requirements,
     compute_qdt_quality_checks,
     dump_question_decomposition,
     repair_anchor_dependency_contracts,
     select_qdt_candidate,
+    score_qdt_candidate,
     validate_anchor_dependency_contract,
     validate_question_decomposition,
     validate_question_decomposition_against_amrg_context,
@@ -847,6 +849,167 @@ class QDTContractTest(unittest.TestCase):
         self.assertGreaterEqual(
             len(selected["research_coverage_graph"]["material_question_leaf_ids"]),
             5,
+        )
+
+    def _market_specific_candidate(self, handoff: dict, candidate_id: str) -> dict:
+        candidate = build_fixture_qdt_candidate(handoff, candidate_id=candidate_id)
+        question = str(handoff["macro_question"])
+        replacements = {
+            "current_direct_evidence": (
+                "What current pre-cutoff evidence specifically bears on "
+                f"{question}"
+            ),
+            "key_drivers": (
+                "Which market-specific drivers, campaign signals, process milestones, "
+                f"or blocker removals change the forecast-relevant state for {question}"
+            ),
+            "counterevidence_negative_checks": (
+                "What negative checks, contradictions, stronger alternatives, or blocking "
+                f"facts reduce the chance that {question}"
+            ),
+            "source_quality": (
+                "Which independent source families for this exact market are timely, "
+                "high quality, and not repeated weak market chatter?"
+            ),
+            "timing_deadline_constraints": (
+                "Which cutoff, deadline, and observation-window constraints govern "
+                f"whether evidence can count before resolution for {question}"
+            ),
+            "material_unknowns": (
+                "What material forecast-relevant information remains missing before "
+                f"cutoff for {question}"
+            ),
+        }
+        for leaf in candidate["required_leaf_questions"]:
+            dimension = leaf["coverage_dimension"]
+            if dimension in replacements:
+                leaf["question_text"] = replacements[dimension]
+                leaf["leaf_question"] = replacements[dimension]
+            leaf["market_component_terms"] = [
+                "victor marx" if "Victor Marx" in question else "example",
+                "colorado republican primary" if "Colorado" in question else "market-specific outcome",
+                leaf["coverage_dimension"],
+            ]
+            leaf["specificity_evidence"]["not_a_template_reason"] = (
+                "Uses named market subject, event family, and coverage dimension."
+            )
+        return candidate
+
+    def _candidate_with_terminal_result_leaf(self, handoff: dict, candidate_id: str) -> dict:
+        base = self._market_specific_candidate(handoff, candidate_id + "-base")
+        branches = copy.deepcopy(base["branches"])
+        leaves = copy.deepcopy(base["required_leaf_questions"])
+        terminal_leaf = copy.deepcopy(leaves[1])
+        terminal_leaf.update(
+            {
+                "leaf_id": "leaf-terminal-final-result",
+                "question_text": (
+                    "What did the final official result say about whether Victor Marx "
+                    "won the 2026 Colorado Republican gubernatorial primary?"
+                ),
+                "leaf_question": (
+                    "What did the final official result say about whether Victor Marx "
+                    "won the 2026 Colorado Republican gubernatorial primary?"
+                ),
+                "leaf_temporal_role": "terminal_verification",
+                "research_factor": "final_result_verification",
+                "required_evidence_fields": ["official_final_result", "result_timestamp"],
+                "market_component_terms": ["victor marx", "final result", "winner"],
+            }
+        )
+        for derived_field in (
+            "research_sufficiency_requirements",
+            "evidence_requirements",
+            "classification_targets",
+            "sufficiency_criteria",
+            "specificity_evidence",
+            "forbidden_outputs",
+        ):
+            terminal_leaf.pop(derived_field, None)
+        leaves.append(terminal_leaf)
+        branches[0]["leaf_ids"].append(terminal_leaf["leaf_id"])
+        return build_qdt_candidate(
+            handoff=handoff,
+            candidate_id=candidate_id,
+            branches=branches,
+            required_leaf_questions=leaves,
+            market_complexity_score=0.72,
+        )
+
+    def test_candidate_selection_prefers_richer_specific_coverage(self):
+        shallow = build_fixture_qdt_candidate(self.handoff, candidate_id="qdt-shallow-valid")
+        rich = self._market_specific_candidate(self.handoff, "qdt-rich-specific")
+
+        selected = select_qdt_candidate([shallow, rich])
+        audit = selected["candidate_selection_audit"]
+
+        self.assertEqual(audit["selected_candidate_id"], "qdt-rich-specific")
+        self.assertGreater(score_qdt_candidate(rich), score_qdt_candidate(shallow))
+        self.assertIn("scored_candidates", audit)
+        self.assertIn("market_specificity", audit["selected_reason_codes"])
+        statuses = {item["candidate_id"]: item["selection_status"] for item in audit["scored_candidates"]}
+        self.assertEqual(statuses["qdt-shallow-valid"], "not_selected")
+
+    def test_candidate_selection_penalizes_terminal_result_overhead_for_unresolved_market(self):
+        handoff = self._victor_marx_handoff()
+        pre_resolution = self._market_specific_candidate(handoff, "qdt-victor-pre-resolution")
+        terminal_heavy = self._candidate_with_terminal_result_leaf(handoff, "qdt-victor-terminal-heavy")
+
+        selected = select_qdt_candidate([terminal_heavy, pre_resolution])
+        scored = {
+            item["candidate_id"]: item
+            for item in selected["candidate_selection_audit"]["scored_candidates"]
+        }
+
+        self.assertTrue(validate_question_decomposition(terminal_heavy, require_selected=False).valid)
+        self.assertEqual(selected["candidate_selection_audit"]["selected_candidate_id"], "qdt-victor-pre-resolution")
+        self.assertGreater(score_qdt_candidate(pre_resolution), score_qdt_candidate(terminal_heavy))
+        self.assertGreater(
+            scored["qdt-victor-terminal-heavy"]["penalty_components"]["terminal_verification_overhead"],
+            0,
+        )
+
+    def test_candidate_selection_penalizes_unsupported_amrg_refs(self):
+        clean = self._market_specific_candidate(self.handoff, "qdt-clean-amrg")
+        unsupported = copy.deepcopy(clean)
+        unsupported["candidate_id"] = "qdt-unsupported-amrg"
+        unsupported["required_leaf_questions"][1]["amrg_usage_refs"] = ["hint-unknown"]
+
+        selected = select_qdt_candidate([unsupported, clean])
+        scored = {
+            item["candidate_id"]: item
+            for item in selected["candidate_selection_audit"]["scored_candidates"]
+        }
+
+        self.assertEqual(selected["candidate_selection_audit"]["selected_candidate_id"], "qdt-clean-amrg")
+        self.assertGreater(score_qdt_candidate(clean), score_qdt_candidate(unsupported))
+        self.assertGreater(
+            scored["qdt-unsupported-amrg"]["penalty_components"]["unsupported_amrg_refs"],
+            0,
+        )
+
+    def test_candidate_selection_audit_records_duplicate_leaf_rejection(self):
+        valid = self._market_specific_candidate(self.handoff, "qdt-valid-no-duplicate")
+        duplicate = copy.deepcopy(valid)
+        duplicate["candidate_id"] = "qdt-duplicate-leaves"
+        duplicate["required_leaf_questions"][2]["question_text"] = duplicate["required_leaf_questions"][1][
+            "question_text"
+        ]
+        duplicate["required_leaf_questions"][2]["leaf_question"] = duplicate["required_leaf_questions"][1][
+            "leaf_question"
+        ]
+
+        selected = select_qdt_candidate([duplicate, valid])
+        rejection = selected["candidate_selection_audit"]["rejected_candidates"][0]
+
+        self.assertEqual(
+            selected["candidate_selection_audit"]["selected_candidate_id"],
+            "qdt-valid-no-duplicate",
+        )
+        self.assertEqual(rejection["candidate_id"], "qdt-duplicate-leaves")
+        self.assertIn(
+            "overlapping_leaf_questions_not_deduplicated",
+            "; ".join(rejection["validation_errors"]),
         )
 
     def _victor_marx_handoff(self) -> dict:

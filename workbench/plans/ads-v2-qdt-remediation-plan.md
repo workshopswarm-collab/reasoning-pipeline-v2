@@ -550,6 +550,8 @@ Success criteria:
 
 ## Phase 4 - Candidate Scoring And Selection
 
+Status: completed on 2026-06-29. QDT candidate scoring now produces deterministic component/penalty breakdowns for coverage diversity, specificity, verified-ledger mapping, missingness, pre-resolution coverage, terminal segregation, AMRG anchor use, template similarity, terminal/result overhead, unsupported AMRG refs, and duplicate/excess leaves. Selection audits now include scored valid candidates, selected score components, penalty components, and compact selected reason codes.
+
 Goal: select the best research coverage graph, not the most superficially complete schema.
 
 Implementation:

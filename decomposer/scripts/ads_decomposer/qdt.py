@@ -2446,64 +2446,241 @@ def compute_qdt_quality_checks(
     }
 
 
-def score_qdt_candidate(candidate: dict[str, Any]) -> float:
+def _leaf_has_verified_findings_ledger_mapping(leaf: dict[str, Any]) -> bool:
+    return (
+        _string_list(leaf.get("classification_targets"))
+        and isinstance(leaf.get("evidence_requirements"), list)
+        and bool(leaf.get("evidence_requirements"))
+        and isinstance(leaf.get("sufficiency_criteria"), dict)
+        and bool(leaf.get("sufficiency_criteria"))
+        and _is_non_empty_string(leaf.get("missingness_interpretation"))
+    )
+
+
+def _leaf_market_specificity_points(leaf: dict[str, Any], macro_tokens: set[str]) -> float:
+    question_tokens = _text_tokens(leaf.get("leaf_question") or leaf.get("question_text") or "")
+    term_tokens = _text_tokens(" ".join(str(item) for item in leaf.get("market_component_terms") or []))
+    matched_macro_tokens = len((question_tokens | term_tokens) & macro_tokens)
+    non_generic_terms = len(
+        term_tokens
+        - {
+            "event",
+            "market",
+            "target",
+            "cutoff",
+            "deadline",
+            "official",
+            "resolution",
+            "status",
+            "source",
+            "evidence",
+        }
+    )
+    return min(3.0, matched_macro_tokens * 0.8 + non_generic_terms * 0.4)
+
+
+def _artifact_leaf_amrg_refs(candidate: dict[str, Any]) -> set[str]:
+    refs: set[str] = set()
+    for branch in candidate.get("branches") or []:
+        if isinstance(branch, dict) and isinstance(branch.get("amrg_usage_refs"), list):
+            refs.update(str(ref) for ref in branch["amrg_usage_refs"] if _is_non_empty_string(ref))
+    for leaf in candidate.get("required_leaf_questions") or []:
+        if isinstance(leaf, dict) and isinstance(leaf.get("amrg_usage_refs"), list):
+            refs.update(str(ref) for ref in leaf["amrg_usage_refs"] if _is_non_empty_string(ref))
+    return refs
+
+
+def _strict_anchor_refs(candidate: dict[str, Any]) -> set[str]:
+    refs: set[str] = set()
+    for contract in candidate.get("amrg_anchor_dependency_contracts") or []:
+        if not isinstance(contract, dict):
+            continue
+        if (
+            contract.get("anchor_mode") in ANCHOR_MODES_SATISFYING_CONDITION_SCOPE
+            and contract.get("edge_status") in STRICT_PRECEDENCE_ANCHOR_EDGE_STATUSES
+            and _is_non_empty_string(contract.get("edge_id"))
+        ):
+            refs.add(str(contract["edge_id"]))
+    return refs
+
+
+def _score_qdt_candidate_details(candidate: dict[str, Any]) -> dict[str, Any]:
     leaves = candidate.get("required_leaf_questions", [])
     if not isinstance(leaves, list):
-        return -1.0
+        return {
+            "score": -1.0,
+            "reason_codes": ["invalid_leaf_collection"],
+            "score_components": {"invalid_leaf_collection": -1.0},
+            "penalty_components": {},
+            "diagnostics": {},
+        }
+    graph = (
+        candidate.get("research_coverage_graph")
+        if isinstance(candidate.get("research_coverage_graph"), dict)
+        else {}
+    )
+    checks = compute_qdt_quality_checks(candidate)
+    failed_checks = []
+    for check_name in ("question_specificity_check", "research_coverage_check"):
+        check = checks.get(check_name, {})
+        if check.get("status") != "passed":
+            failed_checks.extend(str(code) for code in check.get("reason_codes") or [])
+
+    macro_tokens = _text_tokens(candidate.get("macro_question"))
     purposes = {leaf.get("purpose") for leaf in leaves if isinstance(leaf, dict)}
     dimensions = {
         leaf.get("coverage_dimension")
         for leaf in leaves
         if isinstance(leaf, dict) and leaf.get("coverage_dimension") in ALLOWED_COVERAGE_DIMENSIONS
     }
-    graph = candidate.get("research_coverage_graph") if isinstance(candidate.get("research_coverage_graph"), dict) else {}
-    material_count = len(graph.get("material_question_leaf_ids") or [])
+    by_dimension = (
+        graph.get("required_leaf_ids_by_dimension")
+        if isinstance(graph.get("required_leaf_ids_by_dimension"), dict)
+        else {}
+    )
+    dispatchable_ids = {
+        str(item)
+        for item in graph.get("dispatchable_pre_resolution_leaf_ids") or []
+        if _is_non_empty_string(item)
+    }
+    terminal_ids = {
+        str(item)
+        for item in graph.get("terminal_verification_leaf_ids") or []
+        if _is_non_empty_string(item)
+    }
+    dispatchable_leaves = [
+        leaf
+        for leaf in leaves
+        if isinstance(leaf, dict) and str(leaf.get("leaf_id")) in dispatchable_ids
+    ]
+    material_ids = {
+        str(item)
+        for item in graph.get("material_question_leaf_ids") or []
+        if _is_non_empty_string(item)
+    }
+    non_terminal_material_count = len(material_ids - terminal_ids)
     guard_count = len(graph.get("contract_guard_leaf_ids") or [])
-    answerable_count = sum(
+    unique_research_factors = {
+        str(leaf.get("research_factor"))
+        for leaf in leaves
+        if isinstance(leaf, dict) and _is_non_empty_string(leaf.get("research_factor"))
+    }
+    verified_mapping_count = sum(
+        1
+        for leaf in leaves
+        if isinstance(leaf, dict) and _leaf_has_verified_findings_ledger_mapping(leaf)
+    )
+    specificity_points = sum(
+        _leaf_market_specificity_points(leaf, macro_tokens)
+        for leaf in leaves
+        if isinstance(leaf, dict)
+    )
+    pre_resolution_dimensions = {
+        str(leaf.get("coverage_dimension"))
+        for leaf in dispatchable_leaves
+        if leaf.get("coverage_dimension") in UNRESOLVED_PRE_RESOLUTION_FORECAST_DIMENSIONS
+    }
+    pre_resolution_roles = {
+        str(leaf.get("leaf_temporal_role"))
+        for leaf in dispatchable_leaves
+        if leaf.get("leaf_temporal_role") in {
+            "pre_resolution_forecast_driver",
+            "current_status",
+            "material_unknown",
+            "resolution_mechanics",
+        }
+    }
+    material_unknown_leaf_count = sum(
         1
         for leaf in leaves
         if isinstance(leaf, dict)
-        and leaf.get("classification_targets")
-        and leaf.get("evidence_requirements")
-        and leaf.get("sufficiency_criteria")
+        and leaf.get("coverage_dimension") == "material_unknowns"
+        and _is_non_empty_string(leaf.get("missingness_interpretation"))
     )
-    specificity_bonus = sum(
+    template_like_count = sum(
         1
-        for leaf in leaves
-        if isinstance(leaf, dict)
-        and isinstance(leaf.get("specificity_evidence"), dict)
-        and leaf["specificity_evidence"].get("why_this_must_be_investigated")
-        and leaf["specificity_evidence"].get("not_a_template_reason")
-    )
-    template_penalty = sum(
-        3.0
         for leaf in leaves
         if isinstance(leaf, dict)
         and _max_template_similarity(str(leaf.get("leaf_question") or leaf.get("question_text") or "")) > 0.82
     )
-    source_of_truth_bonus = 2 if "source_of_truth" in purposes else 0
-    purpose_coverage = len(purposes)
+    result_verification_count = len(_result_verification_leaf_ids(dispatchable_leaves))
+    unsupported_amrg_refs = sorted(_artifact_leaf_amrg_refs(candidate) - _strict_anchor_refs(candidate))
+    strict_anchor_count = len(_strict_anchor_refs(candidate))
+    overlap_groups = graph.get("overlap_groups") if isinstance(graph.get("overlap_groups"), list) else []
     leaf_count = len(leaves)
     budget = candidate.get("leaf_budget_decision", {}).get("effective_leaf_budget", leaf_count)
-    compact_penalty = max(0, leaf_count - int(budget if isinstance(budget, int) else leaf_count))
-    guard_penalty = 8 if guard_count >= material_count and material_count else 0
-    return float(
-        purpose_coverage * 6
-        + len(dimensions) * 8
-        + material_count * 3
-        + answerable_count * 2
-        + specificity_bonus
-        + source_of_truth_bonus
-        - compact_penalty
-        - guard_penalty
-        - template_penalty
-    )
+    compact_overage = max(0, leaf_count - int(budget if isinstance(budget, int) else leaf_count))
+    duplicate_factor_count = max(0, leaf_count - len(unique_research_factors))
+    terminal_dispatch_count = len(terminal_ids & dispatchable_ids)
+
+    score_components = {
+        "coverage_diversity": len(dimensions) * 9.0,
+        "required_core_dimension_coverage": len(set(by_dimension) & REQUIRED_CORE_COVERAGE_DIMENSIONS) * 4.0,
+        "purpose_coverage": len(purposes) * 5.0,
+        "material_research_factor_coverage": (
+            non_terminal_material_count * 4.0 + len(unique_research_factors) * 2.0
+        ),
+        "market_specificity": specificity_points,
+        "verified_findings_ledger_mapping": verified_mapping_count * 3.0,
+        "missingness_clarity": material_unknown_leaf_count * 6.0,
+        "pre_resolution_forecast_driver_coverage": (
+            len(pre_resolution_dimensions) * 8.0 + len(pre_resolution_roles) * 2.0
+        ),
+        "terminal_verification_segregation": 6.0 if not terminal_dispatch_count else 0.0,
+        "overlap_clarity": len(overlap_groups) * 2.0,
+        "validated_amrg_strict_anchor_usage": strict_anchor_count * 5.0,
+    }
+    penalty_components = {
+        "template_similarity": template_like_count * 12.0,
+        "resolution_checklist_domination": 16.0
+        if guard_count and guard_count >= non_terminal_material_count
+        else 0.0,
+        "result_verification_domination": result_verification_count * 18.0,
+        "terminal_verification_overhead": len(terminal_ids) * 14.0
+        if graph.get("market_temporal_state") == "unresolved"
+        else 0.0,
+        "terminal_verification_dispatch": terminal_dispatch_count * 30.0,
+        "unsupported_amrg_refs": len(unsupported_amrg_refs) * 18.0,
+        "excess_leaf_count": compact_overage * 8.0,
+        "duplicate_research_factors": duplicate_factor_count * 3.0,
+        "failed_quality_checks": 1000.0 if failed_checks else 0.0,
+    }
+    score = sum(score_components.values()) - sum(penalty_components.values())
+    reason_codes = [
+        code
+        for code, value in score_components.items()
+        if value > 0
+    ] + [
+        f"penalty_{code}"
+        for code, value in penalty_components.items()
+        if value > 0
+    ]
+    if failed_checks:
+        reason_codes.append("quality_checks_failed")
+    return {
+        "score": float(score),
+        "reason_codes": reason_codes or ["candidate_scored_neutral"],
+        "score_components": score_components,
+        "penalty_components": penalty_components,
+        "diagnostics": {
+            "coverage_dimensions": sorted(str(item) for item in dimensions),
+            "dispatchable_pre_resolution_leaf_count": len(dispatchable_leaves),
+            "terminal_verification_leaf_count": len(terminal_ids),
+            "result_verification_dispatchable_leaf_count": result_verification_count,
+            "unsupported_amrg_refs": unsupported_amrg_refs,
+            "failed_quality_reason_codes": failed_checks,
+        },
+    }
+
+
+def score_qdt_candidate(candidate: dict[str, Any]) -> float:
+    return _score_qdt_candidate_details(candidate)["score"]
 
 
 def select_qdt_candidate(candidates: list[dict[str, Any]]) -> dict[str, Any]:
     if not isinstance(candidates, list) or not candidates:
         raise QDTError("at least one QDT candidate is required")
-    accepted: list[tuple[float, int, dict[str, Any]]] = []
+    accepted: list[tuple[float, int, dict[str, Any], dict[str, Any]]] = []
     rejected: list[dict[str, Any]] = []
     for idx, candidate in enumerate(candidates):
         candidate_id = candidate.get("candidate_id") if isinstance(candidate, dict) else None
@@ -2511,7 +2688,8 @@ def select_qdt_candidate(candidates: list[dict[str, Any]]) -> dict[str, Any]:
             candidate_id = f"qdt-candidate-{idx + 1:03d}"
         result = validate_question_decomposition(candidate, require_selected=False)
         if result.valid:
-            accepted.append((score_qdt_candidate(candidate), idx, candidate))
+            score_details = _score_qdt_candidate_details(candidate)
+            accepted.append((float(score_details["score"]), idx, candidate, score_details))
         else:
             rejected.append(
                 {
@@ -2523,19 +2701,42 @@ def select_qdt_candidate(candidates: list[dict[str, Any]]) -> dict[str, Any]:
             )
     if not accepted:
         raise QDTError("no valid QDT candidates: " + canonical_json(rejected))
-    score, _idx, selected = sorted(
+    score, _idx, selected, selected_score_details = sorted(
         accepted,
         key=lambda item: (-item[0], str(item[2].get("candidate_id", "")), item[1]),
     )[0]
+    selected_id = str(selected["candidate_id"])
+    scored_candidates = []
+    for candidate_score, idx, candidate, details in sorted(
+        accepted,
+        key=lambda item: (-item[0], str(item[2].get("candidate_id", "")), item[1]),
+    ):
+        candidate_id = str(candidate.get("candidate_id") or f"qdt-candidate-{idx + 1:03d}")
+        scored_candidates.append(
+            {
+                "candidate_id": candidate_id,
+                "candidate_score": candidate_score,
+                "selection_status": "selected" if candidate_id == selected_id else "not_selected",
+                "reason_codes": list(details["reason_codes"]),
+                "score_components": copy.deepcopy(details["score_components"]),
+                "penalty_components": copy.deepcopy(details["penalty_components"]),
+                "diagnostics": copy.deepcopy(details["diagnostics"]),
+            }
+        )
     selected = copy.deepcopy(selected)
-    selected_id = selected["candidate_id"]
     selected["candidate_selection_audit"] = {
         "selection_status": "selected",
         "candidate_count": len(candidates),
         "selected_candidate_id": selected_id,
         "selected_candidate_score": score,
         "rejected_candidates": rejected,
-        "selected_reason_codes": ["highest_valid_schema_score", "deterministic_tie_break"],
+        "scored_candidates": scored_candidates,
+        "selected_score_components": copy.deepcopy(selected_score_details["score_components"]),
+        "selected_penalty_components": copy.deepcopy(selected_score_details["penalty_components"]),
+        "selected_reason_codes": [
+            "highest_qdt_research_coverage_score",
+            *list(selected_score_details["reason_codes"]),
+        ][:12],
         "selection_helper_version": QDT_SELECTION_HELPER_VERSION,
     }
     selected["validation_summary"] = {
