@@ -106,6 +106,53 @@ def _message_for(exc: BaseException) -> str:
     return str(exc)[:512] or exc.__class__.__name__
 
 
+def _retrieval_provider_diagnostics(provider: Any | None) -> dict[str, Any]:
+    if provider is None or not hasattr(provider, "provider_diagnostics"):
+        return {}
+    diagnostics = provider.provider_diagnostics()
+    return diagnostics if isinstance(diagnostics, dict) else {}
+
+
+def _provider_capability_configured(
+    provider: Any | None,
+    *,
+    method_name: str,
+    diagnostic_key: str,
+) -> bool:
+    if provider is None or not callable(getattr(provider, method_name, None)):
+        return False
+    diagnostics = _retrieval_provider_diagnostics(provider)
+    diagnostic_value = diagnostics.get(diagnostic_key)
+    if isinstance(diagnostic_value, bool):
+        return diagnostic_value
+    attr_value = getattr(provider, diagnostic_key, None)
+    if isinstance(attr_value, bool):
+        return attr_value
+    return True
+
+
+def _assert_retrieval_browser_provider_configured(provider: Any | None) -> None:
+    missing: list[str] = []
+    if not _provider_capability_configured(
+        provider,
+        method_name="fetch_url",
+        diagnostic_key="fetch_configured",
+    ):
+        missing.append("fetch_url")
+    if not _provider_capability_configured(
+        provider,
+        method_name="search_candidate_urls",
+        diagnostic_key="search_configured",
+    ):
+        missing.append("search_candidate_urls")
+    if missing:
+        raise AdsProductionStageFailure(
+            "retrieval_browser_provider is not configured for strict true-production retrieval: "
+            + ", ".join(sorted(missing)),
+            failure_class="fatal_operational",
+        )
+
+
 def _is_transport_exception(exc: BaseException) -> bool:
     return isinstance(exc, (ConnectionError, TimeoutError, OSError))
 
@@ -202,6 +249,7 @@ def build_stage_handlers(**kwargs: Any) -> dict[str, Callable[..., Any]]:
     runtime_mode = kwargs.pop("decomposer_runtime_mode", "live")
     if kwargs.get("retrieval_browser_provider") is None:
         kwargs["retrieval_browser_provider"] = build_default_retrieval_browser_provider()
+    _assert_retrieval_browser_provider_configured(kwargs.get("retrieval_browser_provider"))
     handlers = _build_stage_handlers(
         **kwargs,
         metadata=metadata,

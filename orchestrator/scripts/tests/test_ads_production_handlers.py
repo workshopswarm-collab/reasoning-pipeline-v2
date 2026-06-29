@@ -201,6 +201,29 @@ class AdsProductionHandlersTest(unittest.TestCase):
         self.assertEqual(handlers, {})
         self.assertIs(captured["retrieval_browser_provider"], provider)
 
+    def test_true_production_factory_rejects_unconfigured_retrieval_search_provider(self):
+        class Provider:
+            provider_id = "unconfigured-provider"
+
+            def fetch_url(self, url):
+                return {"url": url, "extraction_status": "rejected"}
+
+            def search_candidate_urls(self, query_context, query_variant, *, searched_at=None):
+                return []
+
+            def provider_diagnostics(self):
+                return {
+                    "provider_id": self.provider_id,
+                    "fetch_configured": True,
+                    "search_configured": False,
+                }
+
+        with self.assertRaises(AdsProductionStageFailure) as caught:
+            build_stage_handlers(db_path=":memory:", retrieval_browser_provider=Provider())
+
+        self.assertEqual(caught.exception.failure_class, "fatal_operational")
+        self.assertIn("search_candidate_urls", str(caught.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

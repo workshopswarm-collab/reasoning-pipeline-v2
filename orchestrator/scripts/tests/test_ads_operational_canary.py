@@ -51,6 +51,31 @@ def _provenance_by_evidence_ref(packet: dict[str, Any]) -> dict[str, dict[str, A
     return rows
 
 
+class _ConfiguredEmptyRetrievalProvider:
+    provider_id = "configured-empty-test-provider"
+    fetch_configured = True
+    search_configured = True
+
+    def fetch_url(self, url: str) -> dict[str, Any]:
+        return {"url": url, "extraction_status": "rejected", "reason_codes": ["unit_test_empty_fetch"]}
+
+    def search_candidate_urls(
+        self,
+        query_context: dict[str, Any],
+        query_variant: dict[str, Any],
+        *,
+        searched_at: Any = None,
+    ) -> list[dict[str, Any]]:
+        return []
+
+    def provider_diagnostics(self) -> dict[str, Any]:
+        return {
+            "provider_id": self.provider_id,
+            "fetch_configured": self.fetch_configured,
+            "search_configured": self.search_configured,
+        }
+
+
 def _first_assignment_evidence(
     packet: dict[str, Any],
     assignment: dict[str, Any],
@@ -605,6 +630,7 @@ class AdsOperationalCanaryTest(unittest.TestCase):
             max_cases=config.max_cases,
             metadata=config.metadata,
             decomposer_runtime_transport_response_path=self._decomposer_live_response_path(),
+            retrieval_browser_provider=_ConfiguredEmptyRetrievalProvider(),
         )
 
         result = run_one_case_canary(config, handlers)
@@ -1190,6 +1216,7 @@ class AdsOperationalCanaryTest(unittest.TestCase):
             max_cases=config.max_cases,
             metadata=config.metadata,
             decomposer_runtime_transport_response_path=self._decomposer_live_response_path(),
+            retrieval_browser_provider=_ConfiguredEmptyRetrievalProvider(),
         )
 
         result = run_one_case_canary(config, handlers)
@@ -1211,6 +1238,7 @@ class AdsOperationalCanaryTest(unittest.TestCase):
             max_cases=config.max_cases,
             metadata=config.metadata,
             decomposer_runtime_transport_response_path=self._decomposer_live_response_path(),
+            retrieval_browser_provider=_ConfiguredEmptyRetrievalProvider(),
         )
         result = run_one_case_canary(config, handlers)
         self.assertTrue(result["ok"], result["errors"])
