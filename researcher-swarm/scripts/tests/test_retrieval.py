@@ -1136,6 +1136,7 @@ class RetrievalPacketContractTest(unittest.TestCase):
         context = copy.deepcopy(context)
         context["purpose"] = "direct_evidence"
         context["breadth_targets"]["protected_primary_required"] = False
+        context["sufficiency_requirements"]["research_priority"] = "medium"
         context["sufficiency_requirements"]["static_information_weight"] = "medium"
         context["sufficiency_requirements"]["allow_macro_fallback_for_leaf"] = True
 
@@ -1666,12 +1667,13 @@ class RetrievalPacketContractTest(unittest.TestCase):
         qdt["required_leaf_questions"] = [qdt["required_leaf_questions"][0]]
         leaf = qdt["required_leaf_questions"][0]
         leaf["purpose"] = "resolution_mechanics"
-        leaf["bayesian_weighting"]["static_information_weight"] = "medium"
+        leaf["research_priority"] = "medium"
+        leaf["priority_reason_codes"] = ["test_resolution_mechanics_medium_priority"]
         leaf["research_sufficiency_requirements"].update(
             {
                 "required_source_classes": ["official_or_primary", "independent_secondary"],
                 "leaf_purpose": "resolution_mechanics",
-                "static_information_weight": "medium",
+                "research_priority": "medium",
                 "retrieval_breadth_profile_ref": "breadth-profile-template:resolution_mechanics:medium:unconditional",
                 "protected_primary_required": False,
                 "min_independent_claim_families": 2,

@@ -402,7 +402,7 @@ class LeafResearchAssignmentContractTest(unittest.TestCase):
         self.assertEqual(len(plan["launch_queue"]), len(assignments))
         self.assertEqual(
             [row["launch_allowed"] for row in plan["launch_queue"]],
-            [True, True, False],
+            [idx < 2 for idx, _row in enumerate(plan["launch_queue"])],
         )
         self.assertEqual(plan["launch_queue"][0]["required_runtime_provider_model_id"], RESEARCHER_PROVIDER_MODEL_KEY)
         self.assertEqual(plan["launch_queue"][0]["assignment_input_ref"], assignments[0]["assignment_id"])
@@ -412,7 +412,10 @@ class LeafResearchAssignmentContractTest(unittest.TestCase):
             sorted(plan["launch_queue"][0]["leaf_scoped_follow_up_research"]["allowed_transports"]),
             ["assigned_evidence_refs", "certified_snippet_artifacts"],
         )
-        self.assertEqual(plan["queued_assignment_refs"], [assignments[2]["assignment_id"]])
+        self.assertEqual(
+            plan["queued_assignment_refs"],
+            [assignment["assignment_id"] for assignment in assignments[2:]],
+        )
         validation = validate_leaf_researcher_spawn_plan(plan, assignments)
         self.assertTrue(validation.valid, validation.errors)
 

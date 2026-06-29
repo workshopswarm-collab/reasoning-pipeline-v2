@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from predquant.ads_stage_logging import (
+    STAGE_EXECUTION_EVENT_TABLE,
     StageContext,
     build_pipeline_error_event,
     build_stage_execution_event,
@@ -301,6 +302,32 @@ def add_seconds(timestamp: str, seconds: int) -> str:
     if not isinstance(seconds, int) or seconds < 0:
         raise PipelineRunnerContractError("seconds must be a non-negative integer")
     return (_parse_iso_timestamp(timestamp) + timedelta(seconds=seconds)).isoformat()
+
+
+def _duration_ms_between(started_at: str | None, completed_at: str | None) -> int:
+    if not started_at or not completed_at:
+        return 0
+    try:
+        started = _parse_iso_timestamp(str(started_at))
+        completed = _parse_iso_timestamp(str(completed_at))
+    except (TypeError, ValueError):
+        return 0
+    return max(0, int((completed - started).total_seconds() * 1000))
+
+
+def _stage_started_at(conn: sqlite3.Connection, started_event_id: str) -> str | None:
+    row = conn.execute(
+        f"""
+        SELECT started_at
+        FROM {STAGE_EXECUTION_EVENT_TABLE}
+        WHERE execution_event_id = ?
+        """,
+        (started_event_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    value = row["started_at"] if isinstance(row, sqlite3.Row) else row[0]
+    return str(value or "") or None
 
 
 def canonical_json(value: Any) -> str:
@@ -1401,6 +1428,9 @@ def _record_stage_completed(
 ) -> str:
     event_id = _stage_event_id(context, "stage_completed")
     replay_command = _stage_replay_command(context.stage, context)
+    started_at = _stage_started_at(conn, started_event_id)
+    completed_at = utc_now_iso()
+    duration_ms = _duration_ms_between(started_at, completed_at)
     metadata = dict(result["safe_metadata"])
     if result.get("forecast_decision_record_id"):
         metadata["forecast_decision_record_id"] = result["forecast_decision_record_id"]
@@ -1413,9 +1443,9 @@ def _record_stage_completed(
         context=context,
         event_type="stage_completed",
         event_status="info",
-        started_at=utc_now_iso(),
-        completed_at=utc_now_iso(),
-        duration_ms=0,
+        started_at=started_at,
+        completed_at=completed_at,
+        duration_ms=duration_ms,
         attempt_number=1,
         max_attempts=1,
         runner_ref=f"ads-runner:{context.pipeline_run_id}",
@@ -1433,8 +1463,9 @@ def _record_stage_completed(
     status = build_stage_status_snapshot(
         context=context,
         status="complete",
+        started_at=started_at,
         completed_at=event["completed_at"],
-        duration_ms=0,
+        duration_ms=duration_ms,
         output_artifacts=result["output_artifact_refs"],
         latest_execution_event_ids=[started_event_id, event_id],
         replay_command=replay_command,
@@ -1454,6 +1485,9 @@ def _record_stage_failed(
     failed_event_id = _stage_event_id(context, "stage_failed")
     error_event_id = stable_id("pipeline-error", context.pipeline_run_id, context.case_lease_id, context.stage)
     replay_command = _stage_replay_command(context.stage, context)
+    started_at = _stage_started_at(conn, started_event_id)
+    completed_at = utc_now_iso()
+    duration_ms = _duration_ms_between(started_at, completed_at)
     failure_class = str(getattr(exc, "failure_class", "missing_required_artifact") or "missing_required_artifact")
     safe_reason_code = str(getattr(exc, "safe_reason_code", "auto003_stage_failed") or "auto003_stage_failed")
     failure_policy_ref = getattr(exc, "failure_policy_ref", None)
@@ -1489,8 +1523,9 @@ def _record_stage_failed(
         context=context,
         event_type="stage_failed",
         event_status="error",
-        completed_at=utc_now_iso(),
-        duration_ms=0,
+        started_at=started_at,
+        completed_at=completed_at,
+        duration_ms=duration_ms,
         attempt_number=1,
         max_attempts=1,
         runner_ref=f"ads-runner:{context.pipeline_run_id}",
@@ -1511,8 +1546,9 @@ def _record_stage_failed(
     status = build_stage_status_snapshot(
         context=context,
         status="failed",
+        started_at=started_at,
         completed_at=event["completed_at"],
-        duration_ms=0,
+        duration_ms=duration_ms,
         latest_execution_event_ids=[started_event_id, failed_event_id],
         error_event_ids=[error_event_id],
         reason_codes=[safe_reason_code],
@@ -1541,7 +1577,10 @@ def _record_stage_retry_scheduled(
     retry_event_id = _stage_event_id(context, "retry_scheduled")
     error_event_id = stable_id("pipeline-error", context.pipeline_run_id, context.case_lease_id, context.stage, "retry")
     replay_command = _stage_replay_command(context.stage, context)
-    next_retry_at = add_seconds(utc_now_iso(), retry_after_seconds)
+    started_at = _stage_started_at(conn, started_event_id)
+    completed_at = utc_now_iso()
+    duration_ms = _duration_ms_between(started_at, completed_at)
+    next_retry_at = add_seconds(completed_at, retry_after_seconds)
     safe_message = str(exc)[:512] or exc.__class__.__name__
     failure_class = str(getattr(exc, "failure_class", "dependency_not_ready") or "dependency_not_ready")
     safe_reason_code = str(getattr(exc, "safe_reason_code", TERMINAL_REASON_RETRY_SCHEDULED) or TERMINAL_REASON_RETRY_SCHEDULED)
@@ -1578,8 +1617,9 @@ def _record_stage_retry_scheduled(
         context=context,
         event_type="retry_scheduled",
         event_status="warning",
-        completed_at=utc_now_iso(),
-        duration_ms=0,
+        started_at=started_at,
+        completed_at=completed_at,
+        duration_ms=duration_ms,
         attempt_number=1,
         max_attempts=1,
         runner_ref=f"ads-runner:{context.pipeline_run_id}",
@@ -1602,8 +1642,9 @@ def _record_stage_retry_scheduled(
     status = build_stage_status_snapshot(
         context=context,
         status="blocked",
+        started_at=started_at,
         completed_at=event["completed_at"],
-        duration_ms=0,
+        duration_ms=duration_ms,
         latest_execution_event_ids=[started_event_id, retry_event_id],
         error_event_ids=[error_event_id],
         reason_codes=[safe_reason_code],

@@ -226,7 +226,14 @@ def _lookup_qdt_leaves(qdt: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
 
 
 def _leaf_static_weight(leaf: dict[str, Any] | None) -> str:
+    if isinstance(leaf, dict) and _is_non_empty_string(leaf.get("research_priority")):
+        return str(leaf["research_priority"])
+    requirements = (leaf or {}).get("research_sufficiency_requirements")
+    if isinstance(requirements, dict) and _is_non_empty_string(requirements.get("research_priority")):
+        return str(requirements["research_priority"])
     weighting = (leaf or {}).get("bayesian_weighting")
+    if isinstance(weighting, dict) and _is_non_empty_string(weighting.get("research_priority")):
+        return str(weighting["research_priority"])
     if isinstance(weighting, dict) and _is_non_empty_string(weighting.get("static_information_weight")):
         return str(weighting["static_information_weight"])
     return "medium"

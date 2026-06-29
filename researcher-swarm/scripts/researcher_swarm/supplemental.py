@@ -245,8 +245,10 @@ def _is_critical_or_source_of_truth(raw: dict[str, Any]) -> bool:
     values = {
         str(raw.get("criticality") or "").lower(),
         str(raw.get("leaf_static_weight") or "").lower(),
+        str(raw.get("research_priority") or "").lower(),
         str(raw.get("leaf_purpose") or raw.get("purpose") or "").lower(),
         str(raw.get("source_role") or raw.get("required_source_role") or "").lower(),
+        str(requirements.get("research_priority") or "").lower(),
         str(requirements.get("static_information_weight") or "").lower(),
         str(requirements.get("leaf_purpose") or "").lower(),
     }

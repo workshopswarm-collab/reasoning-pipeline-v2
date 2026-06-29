@@ -988,7 +988,7 @@ class ScaePersistenceTest(unittest.TestCase):
             subprocess.run(
                 [
                     sys.executable,
-                    "SCAE/scripts/bin/persist_scae_forecast.py",
+                    str(Path(__file__).resolve().parents[1] / "bin" / "persist_scae_forecast.py"),
                     "--db-path",
                     str(db_path),
                     "--scae-ledger",
@@ -1031,7 +1031,7 @@ class ScaePersistenceTest(unittest.TestCase):
             subprocess.run(
                 [
                     sys.executable,
-                    "SCAE/scripts/bin/persist_scae_forecast.py",
+                    str(Path(__file__).resolve().parents[1] / "bin" / "persist_scae_forecast.py"),
                     "--db-path",
                     str(db_path),
                     "--scae-ledger",

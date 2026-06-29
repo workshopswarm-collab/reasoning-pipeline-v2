@@ -29,6 +29,7 @@ class ScaeEvidenceDeltaTest(unittest.TestCase):
         quality="high",
         acceptance_status="accepted_for_verification",
         delta_eligible=None,
+        temporal_gate_status="pass",
     ):
         if delta_eligible is None:
             delta_eligible = direction in {"supports_yes", "supports_no", "mixed"}
@@ -47,6 +48,7 @@ class ScaeEvidenceDeltaTest(unittest.TestCase):
             "claim_family_id": "claim-family-1",
             "retrieval_breadth_coverage_ref": "coverage-1",
             "research_sufficiency_certificate_ref": "certificate-1",
+            "temporal_gate_status": temporal_gate_status,
             "impact_direction": direction,
             "evidence_strength": strength,
             "classification_confidence": confidence,
@@ -252,6 +254,44 @@ class ScaeEvidenceDeltaTest(unittest.TestCase):
         self.assertEqual(candidate["candidate_status"], "rejected_quality_verification")
         self.assertEqual(candidate["signed_log_odds_delta"], 0.0)
         self.assertFalse(candidate["accepted_for_ledger_input"])
+
+    def test_uncertified_classification_lineage_is_rejected_before_ledger_input(self):
+        classification = self.classification(direction="supports_yes")
+        classification.pop("research_sufficiency_certificate_ref")
+
+        candidate = self.build_one(classification, quality=self.quality(classification, multiplier=1.0))
+
+        self.assertEqual(candidate["candidate_status"], "rejected_uncertified_evidence")
+        self.assertEqual(candidate["signed_log_odds_delta"], 0.0)
+        self.assertFalse(candidate["accepted_for_ledger_input"])
+        self.assertIn("research_sufficiency_certificate_ref_missing", candidate["rejection_reason_codes"])
+        self.assertIn("research_sufficiency_certificate_ref_missing", candidate["certified_lineage_reason_codes"])
+
+    def test_post_cutoff_or_unknown_temporal_gate_rejects_delta_candidate(self):
+        for temporal_status in ("fail", "unknown_not_counted"):
+            with self.subTest(temporal_status=temporal_status):
+                classification = self.classification(
+                    direction="supports_yes",
+                    temporal_gate_status=temporal_status,
+                )
+
+                candidate = self.build_one(classification, quality=self.quality(classification, multiplier=1.0))
+
+                self.assertEqual(candidate["candidate_status"], "rejected_temporal_gate")
+                self.assertEqual(candidate["signed_log_odds_delta"], 0.0)
+                self.assertFalse(candidate["accepted_for_ledger_input"])
+                self.assertIn(f"temporal_gate_status_{temporal_status}", candidate["rejection_reason_codes"])
+
+    def test_unknown_source_or_claim_family_is_not_certified_for_scae(self):
+        classification = self.classification(direction="supports_yes")
+        classification["source_family_id"] = "source-family-unknown"
+
+        candidate = self.build_one(classification, quality=self.quality(classification, multiplier=1.0))
+
+        self.assertEqual(candidate["candidate_status"], "rejected_uncertified_evidence")
+        self.assertEqual(candidate["signed_log_odds_delta"], 0.0)
+        self.assertFalse(candidate["accepted_for_ledger_input"])
+        self.assertIn("source_family_not_certified", candidate["rejection_reason_codes"])
 
     def test_medium_confidence_and_quality_apply_phase9_discounts(self):
         classification = self.classification(confidence="medium", quality="medium")

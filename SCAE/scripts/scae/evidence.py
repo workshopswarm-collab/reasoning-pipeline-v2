@@ -38,6 +38,8 @@ REJECTED_CANDIDATE_STATUSES = {
     "rejected_quality_verification",
     "rejected_classification_not_accepted",
     "rejected_low_certainty_or_quality",
+    "rejected_temporal_gate",
+    "rejected_uncertified_evidence",
 }
 SIGNED_DIRECTIONS = {"supports_yes", "supports_no"}
 NO_DELTA_DIRECTIONS = {"neutral", "irrelevant", "insufficient"}
@@ -284,7 +286,39 @@ def _classification_scoreability(classification: dict[str, Any]) -> tuple[bool, 
         reasons.append("evidence_delta_not_eligible_for_scae")
     if classification.get("included_for_scae", classification.get("ledger_ready", True)) is not True:
         reasons.append("classification_not_included_for_scae")
+    reasons.extend(_classification_certified_lineage_reasons(classification))
     return not reasons, sorted(set(reasons))
+
+
+def _classification_certified_lineage_reasons(classification: dict[str, Any]) -> list[str]:
+    """Require SCAE-bound classifications to trace to certified admitted evidence."""
+
+    reasons: list[str] = []
+    required_refs = {
+        "evidence_ref": "evidence_ref_missing",
+        "research_sufficiency_certificate_ref": "research_sufficiency_certificate_ref_missing",
+        "retrieval_breadth_coverage_ref": "retrieval_breadth_coverage_ref_missing",
+    }
+    for field, reason in required_refs.items():
+        if not _is_non_empty_string(classification.get(field)):
+            reasons.append(reason)
+
+    source_class = str(classification.get("source_class") or "").strip()
+    if not source_class or source_class == "unknown":
+        reasons.append("source_class_not_certified")
+    source_family_id = str(classification.get("source_family_id") or "").strip()
+    if source_family_id in {"", "unknown", "unknown_not_counted", "source-family-unknown"}:
+        reasons.append("source_family_not_certified")
+    claim_family_id = str(classification.get("claim_family_id") or "").strip()
+    if claim_family_id in {"", "unknown", "unknown_not_counted", "claim-family-unknown"}:
+        reasons.append("claim_family_not_certified")
+
+    temporal_gate_status = str(classification.get("temporal_gate_status") or "").strip()
+    if not temporal_gate_status:
+        reasons.append("temporal_gate_status_missing")
+    elif temporal_gate_status != "pass":
+        reasons.append(f"temporal_gate_status_{temporal_gate_status}")
+    return reasons
 
 
 def _classification_confidence(
@@ -329,6 +363,10 @@ def _candidate_status(
         return "no_delta_classification", [f"{claimed_direction or verified_direction}_direction_no_delta"]
     if claimed_direction in BRANCH_NETTING_DIRECTIONS or verified_direction in BRANCH_NETTING_DIRECTIONS:
         if not classification_scoreable:
+            if any(reason.startswith("temporal_gate_status") for reason in classification_reasons):
+                return "rejected_temporal_gate", classification_reasons
+            if any("not_certified" in reason or reason.endswith("_missing") for reason in classification_reasons):
+                return "rejected_uncertified_evidence", classification_reasons
             return "rejected_classification_not_accepted", classification_reasons
         if not quality_accepted:
             return "rejected_quality_verification", ["quality_verification_not_accepted"]
@@ -338,6 +376,10 @@ def _candidate_status(
             return "rejected_low_certainty_or_quality", ["phase9_confidence_or_quality_discount_zero"]
         return "mixed_branch_netting_candidate", ["mixed_direction_branch_netting_required"]
     if not classification_scoreable:
+        if any(reason.startswith("temporal_gate_status") for reason in classification_reasons):
+            return "rejected_temporal_gate", classification_reasons
+        if any("not_certified" in reason or reason.endswith("_missing") for reason in classification_reasons):
+            return "rejected_uncertified_evidence", classification_reasons
         return "rejected_classification_not_accepted", classification_reasons
     if not quality_accepted:
         return "rejected_quality_verification", ["quality_verification_not_accepted"]
@@ -509,6 +551,14 @@ def build_evidence_delta_candidate_slices(
             "claim_family_id": classification.get("claim_family_id"),
             "retrieval_breadth_coverage_ref": classification.get("retrieval_breadth_coverage_ref"),
             "research_sufficiency_certificate_ref": classification.get("research_sufficiency_certificate_ref"),
+            "temporal_gate_status": classification.get("temporal_gate_status"),
+            "certified_lineage_reason_codes": [
+                reason
+                for reason in classification_reasons
+                if reason.startswith("temporal_gate_status")
+                or "not_certified" in reason
+                or reason.endswith("_missing")
+            ],
             "claimed_impact_direction": claimed_direction,
             "verified_direction": verified_direction,
             "classification_acceptance_status": classification.get("classification_acceptance_status"),

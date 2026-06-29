@@ -525,6 +525,9 @@ class AdsOperationalCanaryTest(unittest.TestCase):
             "source_class": "official_or_primary",
             "source_family_id": "source-family-1",
             "claim_family_id": "claim-family-1",
+            "retrieval_breadth_coverage_ref": "breadth-coverage-1",
+            "research_sufficiency_certificate_ref": "research-sufficiency-1",
+            "temporal_gate_status": "pass",
             "impact_direction": "supports_yes",
             "evidence_strength": "strong",
             "classification_confidence": "high",
@@ -583,13 +586,17 @@ class AdsOperationalCanaryTest(unittest.TestCase):
                 "branches": [
                     {
                         "branch_id": branch_resolution,
-                        "branch_question": "Resolve whether the operational canary completes using official status and direct evidence.",
-                        "branch_role": "question_specific_resolution_evidence",
+                        "branch_question": "Define research coverage for whether the operational canary completes.",
+                        "branch_role": "question_specific_research_coverage",
                         "dependency_group_id": "dep-group-operational-canary-resolution",
-                        "required_evidence_purposes": ["source_of_truth", "direct_evidence"],
+                        "required_evidence_purposes": ["source_of_truth", "direct_evidence", "catalyst", "structural"],
                         "leaf_ids": [
                             "leaf-operational-canary-official-status",
                             "leaf-operational-canary-direct-status",
+                            "leaf-operational-canary-driver-stage",
+                            "leaf-operational-canary-negative-checks",
+                            "leaf-operational-canary-source-quality",
+                            "leaf-operational-canary-material-unknowns",
                         ],
                         "amrg_usage_refs": [],
                         "structural_validation": {"depth": 1},
@@ -600,7 +607,10 @@ class AdsOperationalCanaryTest(unittest.TestCase):
                         "branch_role": "question_specific_resolution_mechanics",
                         "dependency_group_id": "dep-group-operational-canary-mechanics",
                         "required_evidence_purposes": ["resolution_mechanics"],
-                        "leaf_ids": ["leaf-operational-canary-rules-window"],
+                        "leaf_ids": [
+                            "leaf-operational-canary-rules-window",
+                            "leaf-operational-canary-timing-constraints",
+                        ],
                         "amrg_usage_refs": [],
                         "structural_validation": {"depth": 1},
                     },
@@ -611,10 +621,10 @@ class AdsOperationalCanaryTest(unittest.TestCase):
                         "parent_branch_id": branch_resolution,
                         "question_text": "Which official source can establish whether the operational canary completes?",
                         "purpose": "source_of_truth",
-                        "bayesian_weighting": {
-                            "static_information_weight": "critical",
-                            "weight_reason_codes": ["official_resolution_authority"],
-                        },
+                        "coverage_dimension": "resolution_mechanics",
+                        "research_factor": "resolution_condition_and_authority",
+                        "research_priority": "critical",
+                        "priority_reason_codes": ["official_resolution_authority"],
                         "leaf_dependency_group_id": "dep-group-operational-canary-resolution",
                         "leaf_condition_scope": "unconditional",
                         "required_evidence_fields": ["official_status", "resolution_criteria"],
@@ -626,10 +636,10 @@ class AdsOperationalCanaryTest(unittest.TestCase):
                         "parent_branch_id": branch_resolution,
                         "question_text": "What direct event evidence before the cutoff bears on operational canary completion?",
                         "purpose": "direct_evidence",
-                        "bayesian_weighting": {
-                            "static_information_weight": "high",
-                            "weight_reason_codes": ["question_specific_event_status"],
-                        },
+                        "coverage_dimension": "current_direct_evidence",
+                        "research_factor": "current_target_event_status",
+                        "research_priority": "high",
+                        "priority_reason_codes": ["question_specific_event_status"],
                         "leaf_dependency_group_id": "dep-group-operational-canary-resolution",
                         "leaf_condition_scope": "unconditional",
                         "required_evidence_fields": ["event_status", "event_timestamp"],
@@ -637,18 +647,93 @@ class AdsOperationalCanaryTest(unittest.TestCase):
                         "structural_validation": {"depth": 2, "answerability_status": "answerable"},
                     },
                     {
+                        "leaf_id": "leaf-operational-canary-driver-stage",
+                        "parent_branch_id": branch_resolution,
+                        "question_text": "Which operational milestone or process-stage signal would make completion observable before cutoff?",
+                        "purpose": "catalyst",
+                        "coverage_dimension": "key_drivers",
+                        "research_factor": "process_stage_and_driver_status",
+                        "research_priority": "high",
+                        "priority_reason_codes": ["material_driver_status"],
+                        "leaf_dependency_group_id": "dep-group-operational-canary-resolution",
+                        "leaf_condition_scope": "unconditional",
+                        "required_evidence_fields": ["driver_status", "process_stage"],
+                        "market_component_terms": ["operational canary", "driver", "process stage"],
+                        "structural_validation": {"depth": 2, "answerability_status": "answerable"},
+                    },
+                    {
+                        "leaf_id": "leaf-operational-canary-negative-checks",
+                        "parent_branch_id": branch_resolution,
+                        "question_text": "What blockers, missing milestone evidence, or contradictions show the operational canary has not completed before cutoff?",
+                        "purpose": "direct_evidence",
+                        "coverage_dimension": "counterevidence_negative_checks",
+                        "research_factor": "counterevidence_and_blockers",
+                        "research_priority": "high",
+                        "priority_reason_codes": ["negative_check_required"],
+                        "leaf_dependency_group_id": "dep-group-operational-canary-resolution",
+                        "leaf_condition_scope": "unconditional",
+                        "required_evidence_fields": ["negative_check_status", "contradiction_status"],
+                        "market_component_terms": ["operational canary", "negative check", "blocker"],
+                        "structural_validation": {"depth": 2, "answerability_status": "answerable"},
+                    },
+                    {
+                        "leaf_id": "leaf-operational-canary-source-quality",
+                        "parent_branch_id": branch_resolution,
+                        "question_text": "Are operational canary completion claims independent high-quality signals or repeated weak diagnostics?",
+                        "purpose": "direct_evidence",
+                        "coverage_dimension": "source_quality",
+                        "research_factor": "claim_family_independence_and_source_quality",
+                        "research_priority": "medium",
+                        "priority_reason_codes": ["source_quality_required"],
+                        "leaf_dependency_group_id": "dep-group-operational-canary-resolution",
+                        "leaf_condition_scope": "unconditional",
+                        "required_evidence_fields": ["source_quality", "claim_family_independence"],
+                        "market_component_terms": ["operational canary", "source quality", "claim family"],
+                        "structural_validation": {"depth": 2, "answerability_status": "answerable"},
+                    },
+                    {
                         "leaf_id": "leaf-operational-canary-rules-window",
                         "parent_branch_id": branch_mechanics,
-                        "question_text": "Which rules and dates govern operational canary market resolution?",
+                        "question_text": "Which rules and source hierarchy distinguish qualifying operational canary completion evidence from weak diagnostics?",
                         "purpose": "resolution_mechanics",
-                        "bayesian_weighting": {
-                            "static_information_weight": "medium",
-                            "weight_reason_codes": ["market_specific_contract_terms"],
-                        },
+                        "coverage_dimension": "resolution_mechanics",
+                        "research_factor": "source_hierarchy_and_qualifying_claim",
+                        "research_priority": "medium",
+                        "priority_reason_codes": ["market_specific_contract_terms"],
                         "leaf_dependency_group_id": "dep-group-operational-canary-mechanics",
                         "leaf_condition_scope": "shared_context",
                         "required_evidence_fields": ["resolution_deadline", "rules_text"],
                         "market_component_terms": ["operational canary", "rules"],
+                        "structural_validation": {"depth": 2, "answerability_status": "answerable"},
+                    },
+                    {
+                        "leaf_id": "leaf-operational-canary-timing-constraints",
+                        "parent_branch_id": branch_mechanics,
+                        "question_text": "Which deadline, cutoff, and observation-window constraints determine whether operational canary evidence can count?",
+                        "purpose": "resolution_mechanics",
+                        "coverage_dimension": "timing_deadline_constraints",
+                        "research_factor": "deadline_and_cutoff_admissibility",
+                        "research_priority": "medium",
+                        "priority_reason_codes": ["contract_timing_terms"],
+                        "leaf_dependency_group_id": "dep-group-operational-canary-mechanics",
+                        "leaf_condition_scope": "shared_context",
+                        "required_evidence_fields": ["resolution_deadline", "cutoff_window"],
+                        "market_component_terms": ["operational canary", "deadline", "cutoff"],
+                        "structural_validation": {"depth": 2, "answerability_status": "answerable"},
+                    },
+                    {
+                        "leaf_id": "leaf-operational-canary-material-unknowns",
+                        "parent_branch_id": branch_resolution,
+                        "question_text": "What material operational canary questions remain unanswered after retrieval, and are they answerable through more source discovery?",
+                        "purpose": "structural",
+                        "coverage_dimension": "material_unknowns",
+                        "research_factor": "unanswered_material_questions",
+                        "research_priority": "medium",
+                        "priority_reason_codes": ["material_unknowns_required"],
+                        "leaf_dependency_group_id": "dep-group-operational-canary-resolution",
+                        "leaf_condition_scope": "unconditional",
+                        "required_evidence_fields": ["unanswered_question_status", "answerability_status"],
+                        "market_component_terms": ["operational canary", "material unknown", "answerability"],
                         "structural_validation": {"depth": 2, "answerability_status": "answerable"},
                     },
                 ],
@@ -883,6 +968,12 @@ class AdsOperationalCanaryTest(unittest.TestCase):
         )
         self.assertTrue(operator_report["ok"], operator_report["alerts"])
         self.assertTrue(operator_report["scheduler_may_continue"])
+        self.assertEqual(operator_report["status"], "review_warned")
+        self.assertEqual(
+            operator_report["true_runtime_cutover_status"],
+            "blocked_missing_retrieval_cert",
+        )
+        self.assertFalse(operator_report["true_runtime_cutover_ready"])
         self.assertEqual(operator_report["run_kind"], "true_production")
         self.assertEqual(operator_report["alert_counts_by_severity"]["blocker"], 0)
         self.assertEqual(len(operator_report["cases"]), 1)
@@ -1070,9 +1161,9 @@ class AdsOperationalCanaryTest(unittest.TestCase):
             retrieval_browser_provider=_SearchProofRetrievalProvider(),
             retrieval_provider_policy=RetrievalProviderPolicy(
                 max_direct_urls=0,
-                max_total_search_calls=3,
+                max_total_search_calls=10,
                 max_search_results_per_variant=5,
-                max_total_search_result_fetches=15,
+                max_total_search_result_fetches=50,
             ),
             researcher_swarm_runtime_runner=_fake_researcher_runtime_bundle_all_evidence_accepted,
         )
@@ -1718,6 +1809,22 @@ class AdsOperationalCanaryTest(unittest.TestCase):
         self.assertFalse(boundary["counts_as_real_retrieval_canary_proof"])
         self.assertFalse(runtime_summary["external_source_discovery_proven"])
         self.assertEqual(runtime_summary["source_discovery_proof_status"], "not_proven_structured_market_metadata_pilot")
+        self.assertEqual(
+            retrieval_payload["research_sufficiency_summary"]["classification_dispatch_status"],
+            "allowed",
+        )
+        material_unknowns_coverage = next(
+            item
+            for item in retrieval_payload["retrieval_breadth_coverage_slices"]
+            if item["leaf_id"] == "leaf-material-unknowns"
+        )
+        self.assertTrue(material_unknowns_coverage["breadth_certified"])
+        self.assertFalse(
+            any("unknown" in source_id for source_id in material_unknowns_coverage["independent_source_family_ids"])
+        )
+        self.assertFalse(
+            any("unknown" in claim_id for claim_id in material_unknowns_coverage["independent_claim_family_ids"])
+        )
 
         report = build_handoff_report(self.db_path)
         self.assertTrue(report["ok"], report["unresolved_output_manifest_refs"])

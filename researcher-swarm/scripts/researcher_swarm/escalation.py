@@ -225,10 +225,16 @@ def _requirements_from_leaf(leaf: dict[str, Any]) -> dict[str, Any]:
 
 
 def _static_information_weight(leaf: dict[str, Any]) -> str:
+    if _is_non_empty_string(leaf.get("research_priority")):
+        return str(leaf["research_priority"])
     weighting = leaf.get("bayesian_weighting")
+    if isinstance(weighting, dict) and _is_non_empty_string(weighting.get("research_priority")):
+        return str(weighting["research_priority"])
     if isinstance(weighting, dict) and _is_non_empty_string(weighting.get("static_information_weight")):
         return str(weighting["static_information_weight"])
     requirements = _requirements_from_leaf(leaf)
+    if _is_non_empty_string(requirements.get("research_priority")):
+        return str(requirements["research_priority"])
     if _is_non_empty_string(requirements.get("static_information_weight")):
         return str(requirements["static_information_weight"])
     return "medium"

@@ -48,6 +48,14 @@ SCAE_EVIDENCE_REF_FIELDS = (
     "scae_evidence_delta_direction_verification_slice_refs",
     "scae_evidence_delta_quality_verification_slice_refs",
 )
+TRUE_RUNTIME_CUTOVER_STATUSES = {
+    "ready",
+    "blocked_stage_failure",
+    "blocked_missing_retrieval_cert",
+    "blocked_missing_researcher_model_execution",
+    "blocked_missing_scae_ledger",
+    "blocked_missing_strict_canary",
+}
 
 
 def _load_health_module() -> Any:
@@ -237,6 +245,29 @@ def _strict_non_scoreable_canary_signal_report(report: dict[str, Any] | None) ->
     }
 
 
+def _true_runtime_cutover_status(
+    *,
+    strict_canary_signals: dict[str, Any],
+    researcher_runtime_mode: str | None,
+    scae_evidence_signals: dict[str, Any],
+    operator_review: dict[str, Any] | None,
+) -> str:
+    if isinstance(operator_review, dict):
+        operator_status = operator_review.get("true_runtime_cutover_status")
+        if operator_status in TRUE_RUNTIME_CUTOVER_STATUSES and operator_status != "ready":
+            return str(operator_status)
+    if not strict_canary_signals.get("ok"):
+        return "blocked_missing_strict_canary"
+    if researcher_runtime_mode != "model_executed":
+        return "blocked_missing_researcher_model_execution"
+    if (
+        not scae_evidence_signals.get("manifest_scae_evidence_delta_ref_count")
+        and not scae_evidence_signals.get("accepted_supplied_ref_count")
+    ):
+        return "blocked_missing_scae_ledger"
+    return "ready"
+
+
 def build_live_readiness_report(
     db_path: Path | str,
     *,
@@ -328,14 +359,20 @@ def build_live_readiness_report(
 
     module_ref = _handler_module(handler_factory)
     issues: list[str] = []
+    base_infrastructure_issues: list[str] = []
     if not health.get("ok"):
-        issues.extend(f"health:{issue}" for issue in health.get("issues", []))
+        health_issues = [f"health:{issue}" for issue in health.get("issues", [])]
+        issues.extend(health_issues)
+        base_infrastructure_issues.extend(health_issues)
         if not health.get("issues"):
             issues.append("health:not_ok")
+            base_infrastructure_issues.append("health:not_ok")
     if active["active_runs"]:
         issues.append("active_ads_pipeline_runs")
+        base_infrastructure_issues.append("active_ads_pipeline_runs")
     if active["active_leases"]:
         issues.append("active_ads_case_leases")
+        base_infrastructure_issues.append("active_ads_case_leases")
     if runner_mode == "calibration_debt_production" and not handler_factory:
         issues.append("production_runner_requires_handler_factory")
     if (
@@ -412,6 +449,7 @@ def build_live_readiness_report(
         )
         if candidate_rows > max_storage_retention_candidate_rows:
             issues.append("storage_retention_candidates_exceed_limit")
+            base_infrastructure_issues.append("storage_retention_candidates_exceed_limit")
     candidate_rows = sum(
         int(item.get("candidate_rows", 0))
         for item in storage.get("retention_candidates", [])
@@ -419,6 +457,7 @@ def build_live_readiness_report(
     )
     if require_fresh_storage_maintenance_plan and candidate_rows > 0:
         issues.append("stale_storage_maintenance_plan")
+        base_infrastructure_issues.append("stale_storage_maintenance_plan")
 
     operator_review = None
     if include_operator_review:
@@ -433,10 +472,21 @@ def build_live_readiness_report(
             evaluation_cluster_id=evaluation_cluster_id,
         )
 
+    true_runtime_cutover_status = _true_runtime_cutover_status(
+        strict_canary_signals=strict_canary_signals,
+        researcher_runtime_mode=researcher_runtime_mode,
+        scae_evidence_signals=scae_evidence_signals,
+        operator_review=operator_review,
+    )
+
     return {
         "schema_version": LIVE_READINESS_SCHEMA_VERSION,
         "ok": not issues,
         "status": "ready" if not issues else "blocked",
+        "base_infrastructure_status": "ready" if not base_infrastructure_issues else "blocked",
+        "base_infrastructure_issues": base_infrastructure_issues,
+        "true_runtime_cutover_status": true_runtime_cutover_status,
+        "true_runtime_cutover_ready": true_runtime_cutover_status == "ready",
         "issues": issues,
         "db_path": str(path),
         "runner_mode": runner_mode,

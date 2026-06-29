@@ -499,6 +499,7 @@ def _structured_market_metadata_evidence(
         if not isinstance(leaf, dict) or not leaf.get("leaf_id"):
             continue
         leaf_id = str(leaf["leaf_id"])
+        metadata_family_slug = leaf_id.replace("unknowns", "material-gaps").replace("unknown", "material-gap")
         parent_branch_id = str(leaf.get("parent_branch_id") or "branch-resolution")
         common = {
             "case_id": str(qdt.get("case_id") or case_contract["case_id"]),
@@ -521,10 +522,10 @@ def _structured_market_metadata_evidence(
                 **common,
                 transport_attempt_ref=f"structured-feed:market-metadata:{leaf_id}:primary",
                 canonical_source_id="source:polymarket-market-metadata",
-                source_family_id=f"source-family:polymarket-market-metadata:{leaf_id}",
+                source_family_id=f"source-family:polymarket-market-metadata:{metadata_family_slug}",
                 source_class="official_or_primary",
                 independence_status="independent",
-                claim_family_resolution_refs=[f"claim-family-resolution:market-rules:{leaf_id}"],
+                claim_family_resolution_refs=[f"claim-family-resolution:market-rules:{metadata_family_slug}"],
                 content_sha256="sha256:"
                 + hashlib.sha256(
                     canonical_json(
@@ -542,7 +543,7 @@ def _structured_market_metadata_evidence(
         selected[-1]["source_class_resolution_method"] = "structured_market_metadata_primary_source"
         selected[-1]["source_family_resolution_method"] = "structured_market_metadata_feed"
         selected[-1]["claim_family_resolution_method"] = "structured_market_metadata_pilot"
-        selected[-1]["claim_family_ids"] = [f"claim-family:market-rules:{leaf_id}"]
+        selected[-1]["claim_family_ids"] = [f"claim-family:market-rules:{metadata_family_slug}"]
         rules_text = f"Market rules metadata for {leaf_id}: {title}. {description}".strip()
         rules_chunk = build_evidence_chunk(
             evidence_ref=selected[-1]["evidence_ref"],
@@ -560,10 +561,10 @@ def _structured_market_metadata_evidence(
                 **common,
                 transport_attempt_ref=f"structured-feed:market-snapshot:{leaf_id}:secondary",
                 canonical_source_id="source:predquant-market-snapshot",
-                source_family_id=f"source-family:predquant-market-snapshot:{leaf_id}",
+                source_family_id=f"source-family:predquant-market-snapshot:{metadata_family_slug}",
                 source_class="independent_secondary",
                 independence_status="independent",
-                claim_family_resolution_refs=[f"claim-family-resolution:market-state:{leaf_id}"],
+                claim_family_resolution_refs=[f"claim-family-resolution:market-state:{metadata_family_slug}"],
                 content_sha256="sha256:"
                 + hashlib.sha256(
                     canonical_json(
@@ -581,7 +582,7 @@ def _structured_market_metadata_evidence(
         selected[-1]["source_class_resolution_method"] = "structured_market_snapshot_feed"
         selected[-1]["source_family_resolution_method"] = "structured_market_snapshot_feed"
         selected[-1]["claim_family_resolution_method"] = "structured_market_metadata_pilot"
-        selected[-1]["claim_family_ids"] = [f"claim-family:market-state:{leaf_id}"]
+        selected[-1]["claim_family_ids"] = [f"claim-family:market-state:{metadata_family_slug}"]
         snapshot_text = (
             f"Market snapshot metadata for {leaf_id}: "
             f"best bid {baseline.get('best_bid')}; best ask {baseline.get('best_ask')}; "

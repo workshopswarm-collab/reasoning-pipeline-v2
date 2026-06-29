@@ -109,7 +109,7 @@ class QDTPersistenceTest(unittest.TestCase):
     def _refresh_leaf_sufficiency(self, leaf: dict) -> None:
         leaf["research_sufficiency_requirements"] = build_research_sufficiency_requirements(
             purpose=leaf["purpose"],
-            static_information_weight=leaf["bayesian_weighting"]["static_information_weight"],
+            research_priority=leaf["research_priority"],
             condition_scope=leaf["leaf_condition_scope"],
             required_value_fields=leaf["required_evidence_fields"],
         )
@@ -233,6 +233,39 @@ class QDTPersistenceTest(unittest.TestCase):
         unsafe_probability["required_leaf_questions"][0]["probability_estimate"] = 0.7
         with self.assertRaises(QDTPersistenceError):
             write_qdt_research_sufficiency_requirements(self.conn, unsafe_probability)
+
+    def test_normalized_amrg_operator_metadata_allows_decision_leaf_ids(self) -> None:
+        qdt = self._selected_qdt()
+        qdt["amrg_operator_metadata"] = {
+            "schema_version": "qdt-amrg-operator-metadata/v1",
+            "hint_refs_considered": ["edge-1"],
+            "leaf_hint_ref_slices": [
+                {
+                    "leaf_id": "leaf-current-decision-status",
+                    "hint_refs": ["edge-1"],
+                    "consumption_status": "diagnostic_or_validated_context_ref_only",
+                }
+            ],
+            "branch_hint_ref_slices": [],
+            "weak_hint_promotion_status": "not_promoted_without_validated_anchor_contract",
+            "anchor_contract_edge_refs": [],
+            "authority": "operator_audit_only_no_forecast_authority",
+        }
+
+        run_id = write_decomposition_run(self.conn, qdt)
+
+        self.assertEqual(run_id, decomposition_run_id_for(qdt))
+
+    def test_legacy_dynamic_amrg_operator_metadata_keys_remain_forbidden(self) -> None:
+        qdt = self._selected_qdt()
+        qdt["amrg_operator_metadata"] = {
+            "schema_version": "qdt-amrg-operator-metadata/v1",
+            "leaf_hint_refs": {"leaf-current-decision-status": ["edge-1"]},
+            "branch_hint_refs": {},
+        }
+
+        with self.assertRaisesRegex(QDTPersistenceError, "leaf-current-decision-status"):
+            write_decomposition_run(self.conn, qdt)
 
     def test_schema_upgrade_preflights_legacy_qdt_tables_before_migration_indexes(self) -> None:
         self.conn.close()

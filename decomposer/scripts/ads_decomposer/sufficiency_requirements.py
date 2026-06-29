@@ -21,7 +21,7 @@ REQUIRED_SUFFICIENCY_FIELDS = (
     "template_version",
     "requirement_id",
     "leaf_purpose",
-    "static_information_weight",
+    "research_priority",
     "leaf_condition_scope",
     "sufficiency_profile_id",
     "target_answerability",
@@ -105,16 +105,16 @@ def negative_checks_for_purpose(purpose: str) -> list[str]:
 def retrieval_breadth_profile_ref(
     *,
     purpose: str,
-    static_information_weight: str,
+    research_priority: str,
     condition_scope: str,
 ) -> str:
-    return f"{RETRIEVAL_BREADTH_PROFILE_PREFIX}:{purpose}:{static_information_weight}:{condition_scope}"
+    return f"{RETRIEVAL_BREADTH_PROFILE_PREFIX}:{purpose}:{research_priority}:{condition_scope}"
 
 
 def requirement_id_for_leaf(
     *,
     purpose: str,
-    static_information_weight: str,
+    research_priority: str,
     condition_scope: str,
     required_value_fields: list[str],
     required_negative_checks: list[str],
@@ -123,7 +123,7 @@ def requirement_id_for_leaf(
         _canonical_json(
             {
                 "purpose": purpose,
-                "static_information_weight": static_information_weight,
+                "research_priority": research_priority,
                 "condition_scope": condition_scope,
                 "required_value_fields": required_value_fields,
                 "required_negative_checks": required_negative_checks,
@@ -137,7 +137,7 @@ def requirement_id_for_leaf(
 def build_research_sufficiency_requirements(
     *,
     purpose: str,
-    static_information_weight: str,
+    research_priority: str,
     condition_scope: str,
     required_value_fields: list[str] | None = None,
     required_negative_checks: list[str] | None = None,
@@ -146,27 +146,27 @@ def build_research_sufficiency_requirements(
 
     value_fields = _dedupe(required_value_fields)
     negative_checks = _dedupe(required_negative_checks) or negative_checks_for_purpose(purpose)
-    critical_or_source = static_information_weight == "critical" or purpose == "source_of_truth"
-    family_minimum = 2 if static_information_weight in {"critical", "high"} else 1
+    critical_or_source = research_priority == "critical" or purpose == "source_of_truth"
+    family_minimum = 2 if research_priority in {"critical", "high"} else 1
     fresh_sources = 1 if purpose in FRESHNESS_PURPOSES else 0
     return {
         "schema_version": RESEARCH_SUFFICIENCY_REQUIREMENTS_SCHEMA_VERSION,
         "template_version": RESEARCH_SUFFICIENCY_TEMPLATE_VERSION,
         "requirement_id": requirement_id_for_leaf(
             purpose=purpose,
-            static_information_weight=static_information_weight,
+            research_priority=research_priority,
             condition_scope=condition_scope,
             required_value_fields=value_fields,
             required_negative_checks=negative_checks,
         ),
         "leaf_purpose": purpose,
-        "static_information_weight": static_information_weight,
+        "research_priority": research_priority,
         "leaf_condition_scope": condition_scope,
         "sufficiency_profile_id": SUFFICIENCY_PROFILE_ID,
         "target_answerability": TARGET_ANSWERABILITY,
         "retrieval_breadth_profile_ref": retrieval_breadth_profile_ref(
             purpose=purpose,
-            static_information_weight=static_information_weight,
+            research_priority=research_priority,
             condition_scope=condition_scope,
         ),
         "required_source_classes": source_classes_for_purpose(purpose),
@@ -185,7 +185,7 @@ def build_research_sufficiency_requirements(
         "requirement_reason_codes": [
             "high_certainty_template",
             f"purpose_{purpose}",
-            f"weight_{static_information_weight}",
+            f"priority_{research_priority}",
             f"scope_{condition_scope}",
         ],
     }
@@ -195,7 +195,7 @@ def validate_research_sufficiency_requirements(
     requirements: Any,
     *,
     purpose: str,
-    static_information_weight: str,
+    research_priority: str,
     condition_scope: str,
     required_evidence_fields: list[str],
 ) -> list[str]:
@@ -220,14 +220,14 @@ def validate_research_sufficiency_requirements(
 
     if requirements.get("leaf_purpose") != purpose:
         errors.append("leaf_purpose must match leaf purpose")
-    if requirements.get("static_information_weight") != static_information_weight:
-        errors.append("static_information_weight must match leaf weighting")
+    if requirements.get("research_priority") != research_priority:
+        errors.append("research_priority must match leaf priority")
     if requirements.get("leaf_condition_scope") != condition_scope:
         errors.append("leaf_condition_scope must match leaf condition scope")
 
     expected_breadth_ref = retrieval_breadth_profile_ref(
         purpose=purpose,
-        static_information_weight=static_information_weight,
+        research_priority=research_priority,
         condition_scope=condition_scope,
     )
     if requirements.get("retrieval_breadth_profile_ref") != expected_breadth_ref:
@@ -237,11 +237,11 @@ def validate_research_sufficiency_requirements(
     if requirements.get("required_source_classes") != expected_source_classes:
         errors.append("required_source_classes must match canonical purpose template")
 
-    expected_family_minimum = 2 if static_information_weight in {"critical", "high"} else 1
+    expected_family_minimum = 2 if research_priority in {"critical", "high"} else 1
     if requirements.get("min_independent_claim_families") != expected_family_minimum:
-        errors.append("min_independent_claim_families must match static information weight")
+        errors.append("min_independent_claim_families must match research priority")
     if requirements.get("min_independent_source_families") != expected_family_minimum:
-        errors.append("min_independent_source_families must match static information weight")
+        errors.append("min_independent_source_families must match research priority")
 
     expected_fresh_sources = 1 if purpose in FRESHNESS_PURPOSES else 0
     if requirements.get("min_temporally_fresh_sources") != expected_fresh_sources:
@@ -269,7 +269,7 @@ def validate_research_sufficiency_requirements(
     if requirements.get("allow_macro_fallback_for_leaf") is not False:
         errors.append("allow_macro_fallback_for_leaf must be false")
 
-    critical_or_source = static_information_weight == "critical" or purpose == "source_of_truth"
+    critical_or_source = research_priority == "critical" or purpose == "source_of_truth"
     if requirements.get("unanswerability_proof_required") != critical_or_source:
         errors.append("unanswerability_proof_required must match critical/source-of-truth policy")
 
@@ -282,18 +282,18 @@ def validate_research_sufficiency_requirements(
     expected_reason_codes = {
         "high_certainty_template",
         f"purpose_{purpose}",
-        f"weight_{static_information_weight}",
+        f"priority_{research_priority}",
         f"scope_{condition_scope}",
     }
     if not _reason_codes_are_compact(reason_codes):
         errors.append("requirement_reason_codes must be compact reason codes")
     elif not expected_reason_codes.issubset(set(reason_codes)):
-        errors.append("requirement_reason_codes must include template, purpose, weight, and scope codes")
+        errors.append("requirement_reason_codes must include template, purpose, priority, and scope codes")
 
     if _string_list(required_value_fields) and _string_list(negative_checks):
         expected_requirement_id = requirement_id_for_leaf(
             purpose=purpose,
-            static_information_weight=static_information_weight,
+            research_priority=research_priority,
             condition_scope=condition_scope,
             required_value_fields=list(required_value_fields),
             required_negative_checks=list(negative_checks),

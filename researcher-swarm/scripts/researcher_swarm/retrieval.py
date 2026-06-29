@@ -481,8 +481,15 @@ def _branch_index(qdt: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return {branch.get("branch_id"): branch for branch in branches if isinstance(branch, dict)}
 
 
-def _leaf_static_weight(leaf: dict[str, Any]) -> str:
+def _leaf_research_priority(leaf: dict[str, Any]) -> str:
+    if isinstance(leaf.get("research_priority"), str):
+        return str(leaf["research_priority"])
+    requirements = leaf.get("research_sufficiency_requirements")
+    if isinstance(requirements, dict) and isinstance(requirements.get("research_priority"), str):
+        return str(requirements["research_priority"])
     weighting = leaf.get("bayesian_weighting")
+    if isinstance(weighting, dict) and isinstance(weighting.get("research_priority"), str):
+        return weighting["research_priority"]
     if isinstance(weighting, dict) and isinstance(weighting.get("static_information_weight"), str):
         return weighting["static_information_weight"]
     return "medium"
@@ -490,10 +497,10 @@ def _leaf_static_weight(leaf: dict[str, Any]) -> str:
 
 def _volume_tier_for_leaf(leaf: dict[str, Any], requirements: dict[str, Any]) -> tuple[str, int, tuple[int, int], tuple[int, int], int]:
     purpose = leaf.get("purpose")
-    weight = _leaf_static_weight(leaf)
-    if purpose == "source_of_truth" or weight == "critical" or requirements.get("protected_primary_required") is True:
+    priority = _leaf_research_priority(leaf)
+    if purpose == "source_of_truth" or priority == "critical" or requirements.get("protected_primary_required") is True:
         return ("critical_source_of_truth", 5, (80, 120), (15, 25), 5)
-    if weight == "high":
+    if priority == "high":
         return ("high", 4, (50, 80), (12, 16), 4)
     return ("normal", 3, (30, 50), (8, 12), 3)
 
@@ -513,7 +520,7 @@ def _source_class_targets(requirements: dict[str, Any]) -> list[str]:
 
 def _live_policy_thresholds_for_leaf(leaf: dict[str, Any], requirements: dict[str, Any]) -> dict[str, Any]:
     purpose = str(leaf.get("purpose") or "other")
-    weight = _leaf_static_weight(leaf)
+    weight = _leaf_research_priority(leaf)
     protected = bool(requirements.get("protected_primary_required") or purpose == "source_of_truth")
     freshness_required = int(requirements.get("min_temporally_fresh_sources", 0) or 0) > 0
     if protected or weight == "critical":
@@ -2143,6 +2150,14 @@ def _candidate_claim_family_fallback_allowed(candidate: dict[str, Any]) -> bool:
     return False
 
 
+def _is_known_source_family_id(value: Any) -> bool:
+    return _is_non_empty_string(value) and str(value) not in {"unknown", "source-family-unknown"}
+
+
+def _is_known_claim_family_id(value: Any) -> bool:
+    return _is_non_empty_string(value) and str(value) not in {"unknown", "claim-family-unknown"}
+
+
 def _merge_classifier_acceptance(
     source_class_status: str,
     source_class_reasons: list[str],
@@ -2656,13 +2671,13 @@ def normalize_retrieval_provenance(
         claim_family_ids = [
             str(ref)
             for ref in candidate["claim_family_resolution_refs"]
-            if _is_non_empty_string(ref) and "unknown" not in str(ref)
+            if _is_known_claim_family_id(ref)
         ]
     if claim_family_fallback_allowed and not claim_family_ids and isinstance(candidate.get("claim_family_ids"), list):
         claim_family_ids = [
             str(claim_id)
             for claim_id in candidate["claim_family_ids"]
-            if _is_non_empty_string(claim_id) and "unknown" not in str(claim_id)
+            if _is_known_claim_family_id(claim_id)
         ]
     independence_status = _resolve_independence_status(
         source_family_id=source_family_id,
@@ -2906,8 +2921,10 @@ def _attempts_by_leaf(attempts: list[dict[str, Any]] | None) -> dict[str, list[d
 def _metadata_field_known(item: dict[str, Any], field: str) -> bool:
     value = item.get(field)
     if field == "claim_family_ids":
-        return isinstance(value, list) and any(_is_non_empty_string(claim_id) for claim_id in value)
-    return _is_non_empty_string(value) and "unknown" not in str(value)
+        return isinstance(value, list) and any(_is_known_claim_family_id(claim_id) for claim_id in value)
+    if field == "source_family_id":
+        return _is_known_source_family_id(value)
+    return _is_non_empty_string(value) and str(value) != "unknown"
 
 
 def build_retrieval_metadata_fill_diagnostic(
@@ -3246,7 +3263,7 @@ def build_retrieval_breadth_coverage_slice(
         {
             str(item.get("source_family_id"))
             for item in independent
-            if _is_non_empty_string(item.get("source_family_id")) and item.get("source_family_id") != "source-family-unknown"
+            if _is_known_source_family_id(item.get("source_family_id"))
         }
     )
     fresh_source_count = _fresh_source_count(selected, profile, source_cutoff_timestamp)
@@ -3465,8 +3482,10 @@ def _protected_primary_admitted_for_context(selected: list[dict[str, Any]], cont
     )
 
 
-def _leaf_static_weight_from_context(context: dict[str, Any]) -> str:
+def _leaf_research_priority_from_context(context: dict[str, Any]) -> str:
     requirements = context.get("sufficiency_requirements")
+    if isinstance(requirements, dict) and _is_non_empty_string(requirements.get("research_priority")):
+        return str(requirements["research_priority"])
     if isinstance(requirements, dict) and _is_non_empty_string(requirements.get("static_information_weight")):
         return str(requirements["static_information_weight"])
     return "medium"
@@ -3475,7 +3494,7 @@ def _leaf_static_weight_from_context(context: dict[str, Any]) -> str:
 def _leaf_is_critical_or_source_of_truth(context: dict[str, Any]) -> bool:
     return (
         context.get("purpose") == "source_of_truth"
-        or _leaf_static_weight_from_context(context) == "critical"
+        or _leaf_research_priority_from_context(context) == "critical"
         or _protected_primary_required(context)
     )
 
@@ -4699,7 +4718,7 @@ def _candidate_claim_family_ids(candidate: dict[str, Any]) -> list[str]:
         if not _is_non_empty_string(value):
             continue
         claim_id = str(value)
-        if "unknown" in claim_id or claim_id in ids:
+        if not _is_known_claim_family_id(claim_id) or claim_id in ids:
             continue
         ids.append(claim_id)
     return ids

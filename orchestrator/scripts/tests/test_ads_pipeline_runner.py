@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "SCAE" / "scripts"))
@@ -30,6 +31,7 @@ from predquant.ads_pipeline_runner import (
     PipelineRunnerContractError,
     PipelineRunnerPolicy,
     RetryableStageError,
+    StageHandlerResult,
     build_pipeline_control_state,
     build_pipeline_run,
     ensure_pipeline_runner_schema,
@@ -41,11 +43,16 @@ from predquant.ads_pipeline_runner import (
     run_ads_pipeline_loop,
     validate_pipeline_run,
     write_pipeline_control_state,
+    _record_stage_completed,
+    _record_stage_failed,
+    _record_stage_retry_scheduled,
+    _record_stage_started,
 )
 from predquant.ads_pipeline_control import request_pipeline_stop
 from predquant.ads_case_selector import CASE_LEASE_TABLE, CaseSelectionPolicy, read_case_lease
 from predquant.ads_stage_logging import (
     PIPELINE_ERROR_EVENT_TABLE,
+    StageContext,
     STAGE_EXECUTION_EVENT_TABLE,
     STAGE_STATUS_TABLE,
 )
@@ -488,6 +495,134 @@ class AdsPipelineRunnerTest(unittest.TestCase):
         self.assertEqual(second_loop["terminal_status"], TERMINAL_REASON_NO_ELIGIBLE_CASE)
         self.assertIsNone(second_loop["case_lease_id"])
         self.assertTrue(second_loop["metadata"]["empty_queue"])
+
+    def test_stage_completed_duration_uses_started_event_timestamp(self):
+        context = StageContext(
+            case_id="case:duration",
+            case_key="polymarket:duration",
+            dispatch_id="dispatch:duration",
+            stage="retrieval",
+            stage_attempt_id="stage-attempt:duration",
+            pipeline_run_id="ads-pipeline-run:duration",
+            case_lease_id="case-lease:duration",
+        )
+        with patch("predquant.ads_pipeline_runner.utc_now_iso", return_value="2100-01-01T00:00:00+00:00"):
+            started_event_id = _record_stage_started(self.conn, context)
+        self.conn.execute(
+            f"""
+            UPDATE {STAGE_EXECUTION_EVENT_TABLE}
+            SET started_at = ?
+            WHERE execution_event_id = ?
+            """,
+            ("2100-01-01T00:00:00+00:00", started_event_id),
+        )
+
+        with patch("predquant.ads_pipeline_runner.utc_now_iso", return_value="2100-01-01T00:00:02.250000+00:00"):
+            _record_stage_completed(
+                self.conn,
+                context,
+                started_event_id=started_event_id,
+                result=StageHandlerResult(
+                    output_artifact_refs=("artifact:retrieval:duration",),
+                    safe_metadata={"case_id": "case:duration"},
+                ).to_record("retrieval"),
+            )
+
+        event_duration = self.conn.execute(
+            f"""
+            SELECT duration_ms
+            FROM {STAGE_EXECUTION_EVENT_TABLE}
+            WHERE event_type = 'stage_completed'
+            """
+        ).fetchone()[0]
+        status_duration = self.conn.execute(
+            f"""
+            SELECT duration_ms
+            FROM {STAGE_STATUS_TABLE}
+            WHERE stage = 'retrieval' AND status = 'complete'
+            """
+        ).fetchone()[0]
+        self.assertEqual(event_duration, 2250)
+        self.assertEqual(status_duration, 2250)
+
+    def test_stage_failed_duration_uses_started_event_timestamp(self):
+        context = StageContext(
+            case_id="case:duration-failed",
+            case_key="polymarket:duration-failed",
+            dispatch_id="dispatch:duration-failed",
+            stage="retrieval",
+            stage_attempt_id="stage-attempt:duration-failed",
+            pipeline_run_id="ads-pipeline-run:duration-failed",
+            case_lease_id="case-lease:duration-failed",
+        )
+        with patch("predquant.ads_pipeline_runner.utc_now_iso", return_value="2100-01-01T00:00:00+00:00"):
+            started_event_id = _record_stage_started(self.conn, context)
+
+        with patch("predquant.ads_pipeline_runner.utc_now_iso", return_value="2100-01-01T00:00:01.500000+00:00"):
+            _record_stage_failed(
+                self.conn,
+                context,
+                started_event_id=started_event_id,
+                exc=NonRetryableStageError("retrieval failed"),
+            )
+
+        event_duration = self.conn.execute(
+            f"""
+            SELECT duration_ms
+            FROM {STAGE_EXECUTION_EVENT_TABLE}
+            WHERE event_type = 'stage_failed'
+            """
+        ).fetchone()[0]
+        status_duration = self.conn.execute(
+            f"""
+            SELECT duration_ms
+            FROM {STAGE_STATUS_TABLE}
+            WHERE stage = 'retrieval' AND status = 'failed'
+            """
+        ).fetchone()[0]
+        self.assertEqual(event_duration, 1500)
+        self.assertEqual(status_duration, 1500)
+
+    def test_stage_retry_scheduled_duration_uses_started_event_timestamp(self):
+        context = StageContext(
+            case_id="case:duration-retry",
+            case_key="polymarket:duration-retry",
+            dispatch_id="dispatch:duration-retry",
+            stage="retrieval",
+            stage_attempt_id="stage-attempt:duration-retry",
+            pipeline_run_id="ads-pipeline-run:duration-retry",
+            case_lease_id="case-lease:duration-retry",
+        )
+        with patch("predquant.ads_pipeline_runner.utc_now_iso", return_value="2100-01-01T00:00:00+00:00"):
+            started_event_id = _record_stage_started(self.conn, context)
+
+        with patch("predquant.ads_pipeline_runner.utc_now_iso", return_value="2100-01-01T00:00:03.125000+00:00"):
+            retry = _record_stage_retry_scheduled(
+                self.conn,
+                context,
+                started_event_id=started_event_id,
+                exc=RetryableStageError("retrieval temporarily unavailable", retry_after_seconds=10),
+                policy=PipelineRunnerPolicy(retry_backoff_seconds=5),
+            )
+
+        event_row = self.conn.execute(
+            f"""
+            SELECT duration_ms, next_retry_at
+            FROM {STAGE_EXECUTION_EVENT_TABLE}
+            WHERE event_type = 'retry_scheduled'
+            """
+        ).fetchone()
+        status_duration = self.conn.execute(
+            f"""
+            SELECT duration_ms
+            FROM {STAGE_STATUS_TABLE}
+            WHERE stage = 'retrieval' AND status = 'blocked'
+            """
+        ).fetchone()[0]
+        self.assertEqual(event_row["duration_ms"], 3125)
+        self.assertEqual(status_duration, 3125)
+        self.assertEqual(event_row["next_retry_at"], "2100-01-01T00:00:13.125000+00:00")
+        self.assertEqual(retry["next_retry_at"], "2100-01-01T00:00:13.125000+00:00")
 
     def test_auto003_strict_manifest_handoffs_rejects_synthetic_refs(self):
         self.initialize_intake_case()

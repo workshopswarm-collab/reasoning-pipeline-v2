@@ -120,6 +120,8 @@ class RuntimeDecompositionEntrypointTest(unittest.TestCase):
         self.assertEqual(runtime["execution_status"], "succeeded")
         self.assertEqual(runtime["forbidden_output_scan"]["status"], "passed")
         self.assertTrue(qdt["question_specificity_check"]["generic_fixture_leaf_ids_absent"])
+        self.assertEqual(qdt["research_coverage_check"]["status"], "passed")
+        self.assertIn("research_coverage_graph", qdt)
 
     def test_live_transport_builds_question_specific_qdt_without_fixture_mode(self) -> None:
         handoff = self._handoff()
@@ -266,6 +268,72 @@ class RuntimeDecompositionEntrypointTest(unittest.TestCase):
         self.assertFalse(qdt["model_execution_context"]["fixture_mode"])
         self.assertEqual(runtime["mode"], "live")
         self.assertFalse(runtime["fixture_mode"])
+
+    def test_amrg_operator_metadata_uses_schema_stable_slices(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            temp = Path(tempdir)
+            related_path = temp / "related-context.json"
+            related_path.write_text(
+                json.dumps(
+                    {
+                        "artifact_type": "related_live_market_context",
+                        "amrg_decomposer_context": {
+                            "schema_version": "amrg-decomposer-context/v1",
+                            "context_ref": "artifact:amrg-runtime-1",
+                            "hints": [
+                                {
+                                    "hint_ref": "hint-1",
+                                    "hint_category": "weak_context_hint",
+                                    "source_market_ref": "polymarket:related-1",
+                                    "relation_type": "entity_match",
+                                    "effect_status": "weak_context_only",
+                                    "allowed_use": ["decomposition_context_hint"],
+                                    "prohibited_use": [
+                                        "qdt_selection",
+                                        "qdt_repair",
+                                        "probability_authority",
+                                        "scae_delta",
+                                    ],
+                                    "freshness_status": "current",
+                                    "candidate_leaf_relevance": "diagnostic_only",
+                                }
+                            ],
+                            "operator_metadata": {
+                                "forbidden_qdt_uses": [
+                                    "probability_authority",
+                                    "qdt_selection",
+                                    "qdt_repair",
+                                    "scae_delta",
+                                ]
+                            },
+                            "authority": "context_hints_only_no_forecast_or_selection_authority",
+                        },
+                        "relationship_edges": [{"edge_id": "hint-1"}],
+                    },
+                    sort_keys=True,
+                ),
+                encoding="utf-8",
+            )
+            handoff = self._handoff()
+            handoff["artifact_refs"]["related_market_context"]["path"] = str(related_path)
+            model_response = build_question_specific_fixture_response(handoff)
+            model_response["required_leaf_questions"][0]["leaf_id"] = "leaf-current-decision-status"
+            model_response["branches"][0]["leaf_ids"][0] = "leaf-current-decision-status"
+            model_response["required_leaf_questions"][0]["amrg_usage_refs"] = ["hint-1"]
+            model_response["branches"][0]["amrg_usage_refs"] = ["hint-1"]
+            qdt, _runtime = build_question_decomposition_from_handoff(
+                handoff,
+                runtime_mode="fixture",
+                fixture_response=model_response,
+            )
+
+        metadata = qdt["amrg_operator_metadata"]
+        self.assertNotIn("leaf_hint_refs", metadata)
+        self.assertNotIn("branch_hint_refs", metadata)
+        self.assertIn("leaf_hint_ref_slices", metadata)
+        self.assertTrue(
+            all("leaf-current-decision-status" == item["leaf_id"] for item in metadata["leaf_hint_ref_slices"])
+        )
 
 
 if __name__ == "__main__":

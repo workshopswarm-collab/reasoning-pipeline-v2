@@ -47,6 +47,14 @@ RESEARCH_SUFFICIENCY_BLOCKED_CODES = {
     "blocked_insufficient_research",
     "blocked_until_certified_retrieval",
 }
+TRUE_RUNTIME_CUTOVER_STATUSES = {
+    "ready",
+    "blocked_stage_failure",
+    "blocked_missing_retrieval_cert",
+    "blocked_missing_researcher_model_execution",
+    "blocked_missing_scae_ledger",
+    "blocked_missing_strict_canary",
+}
 
 
 def _as_list(value: Any) -> list[Any]:
@@ -787,16 +795,66 @@ def _alert_counts(alerts: list[dict[str, Any]]) -> dict[str, int]:
 
 
 def _strict_true_production_alert_severity(run: dict[str, Any] | None) -> str:
+    return "blocker" if _strict_true_production_required(run) else "warning"
+
+
+def _strict_true_production_marker(value: Any) -> bool:
+    text = str(value).lower()
+    normalized = text.replace("-", "_")
+    if "release" in text or "cutover" in text:
+        return True
+    if "scoreable" in normalized and "non_scoreable" not in normalized and "non scoreable" not in text:
+        return True
+    return False
+
+
+def _strict_true_production_required(run: dict[str, Any] | None) -> bool:
     metadata = run.get("metadata") if isinstance(run, dict) and isinstance(run.get("metadata"), dict) else {}
-    marker_text = " ".join(str(value).lower() for value in metadata.values())
     runner_mode = str((run or {}).get("runner_mode") or "")
-    strict = (
+    return (
         runner_mode == "calibration_debt_production"
-        or "release" in marker_text
-        or "cutover" in marker_text
-        or "scoreable" in marker_text
+        or any(_strict_true_production_marker(value) for value in metadata.values())
     )
-    return "blocker" if strict else "warning"
+
+
+def _run_stage_failed(run: dict[str, Any] | None) -> bool:
+    if not isinstance(run, dict):
+        return False
+    status = str(run.get("status") or "").lower()
+    terminal_reason = str(run.get("terminal_reason") or "").lower()
+    metadata = run.get("metadata") if isinstance(run.get("metadata"), dict) else {}
+    return (
+        status == "failed"
+        or "stage_failed" in terminal_reason
+        or bool(metadata.get("non_retryable_failure"))
+    )
+
+
+def _true_runtime_cutover_status(
+    *,
+    run: dict[str, Any] | None,
+    run_kind: str,
+    cases: list[dict[str, Any]],
+) -> str:
+    if run_kind != "true_production" or not run:
+        return "blocked_missing_strict_canary"
+    if _run_stage_failed(run):
+        return "blocked_stage_failure"
+    if not cases:
+        return "blocked_missing_strict_canary"
+    for case in cases:
+        retrieval = case.get("retrieval_sufficiency") or {}
+        if not retrieval.get("all_required_leaves_certified") or int(retrieval.get("admitted_evidence_ref_count") or 0) == 0:
+            return "blocked_missing_retrieval_cert"
+    for case in cases:
+        researcher = case.get("researcher_model_provenance") or {}
+        if int(researcher.get("model_executed_count") or 0) == 0:
+            return "blocked_missing_researcher_model_execution"
+    for case in cases:
+        scae = case.get("scae_readiness") or {}
+        if not scae.get("artifact_id") or scae.get("forecast_validity_status") != "valid_for_forecast":
+            return "blocked_missing_scae_ledger"
+    return "ready"
 
 
 def _scae_invalid_research_sufficiency_blocked(
@@ -845,14 +903,14 @@ def _build_alerts(
             pipeline_run_id=pipeline_run_id,
             remediation="Run a bounded ADS canary or pass --pipeline-run-id for an existing run.",
         ))
-    for run in active_runs:
-        age = run.get("run_age_seconds")
+    for active_run in active_runs:
+        age = active_run.get("run_age_seconds")
         if age is not None and age > active_run_block_seconds:
             alerts.append(_alert(
                 "blocker",
                 "active_run_older_than_policy",
                 "An ADS pipeline run is still active beyond the operator threshold.",
-                pipeline_run_id=run.get("pipeline_run_id"),
+                pipeline_run_id=active_run.get("pipeline_run_id"),
                 value=age,
                 threshold=active_run_block_seconds,
                 remediation="Inspect the run, then stop or drain with the ADS pipeline control CLI.",
@@ -927,6 +985,17 @@ def _build_alerts(
             value=handoff_report.get("error"),
             remediation="Run report_ads_handoffs.py --pretty and repair the reported handoff issue.",
         ))
+    true_production_issue_severity = _strict_true_production_alert_severity(run)
+    if run_kind == "true_production" and _run_stage_failed(run):
+        alerts.append(_alert(
+            true_production_issue_severity,
+            "true_production_stage_failed",
+            "True-production run has a failed pipeline stage.",
+            pipeline_run_id=pipeline_run_id,
+            value=(run or {}).get("terminal_reason"),
+            threshold="no stage failure",
+            remediation="Inspect the stage error and rerun a strict clone canary before release or cutover.",
+        ))
     wal_size = int(storage.get("wal_size_bytes") or 0)
     if wal_size > wal_block_bytes:
         alerts.append(_alert(
@@ -997,7 +1066,6 @@ def _build_alerts(
                 remediation="Require model-executed researcher sidecars/runtime bundles before scoreable expansion.",
                 **refs,
             ))
-        true_production_issue_severity = _strict_true_production_alert_severity(run)
         if run_kind == "true_production" and int(researcher.get("model_executed_count") or 0) == 0:
             alerts.append(_alert(
                 true_production_issue_severity,
@@ -1097,6 +1165,32 @@ def _build_alerts(
             ))
         scae = case.get("scae_readiness") or {}
         verification = case.get("verification_readiness") or {}
+        if run_kind == "true_production" and not scae.get("artifact_id"):
+            alerts.append(_alert(
+                true_production_issue_severity,
+                "true_production_scae_ledger_missing",
+                "True-production run has no SCAE ledger artifact for this case.",
+                refs=[],
+                value=scae.get("artifact_id"),
+                threshold="scae ledger artifact",
+                remediation="Run verification-to-SCAE integration or record a structured SCAE blocker before release or cutover.",
+                **refs,
+            ))
+        if (
+            run_kind == "true_production"
+            and scae.get("artifact_id")
+            and scae.get("forecast_validity_status") != "valid_for_forecast"
+        ):
+            alerts.append(_alert(
+                true_production_issue_severity,
+                "true_production_scae_ledger_not_valid_for_forecast",
+                "True-production SCAE ledger is not valid for a scoreable forecast.",
+                refs=[scae.get("artifact_id")],
+                value=scae.get("forecast_validity_status"),
+                threshold="valid_for_forecast",
+                remediation="Repair verification-to-SCAE inputs or keep the run explicitly non-scoreable before release or cutover.",
+                **refs,
+            ))
         if run_kind == "true_production" and _scae_invalid_research_sufficiency_blocked(scae, verification):
             alerts.append(_alert(
                 true_production_issue_severity,
@@ -1227,11 +1321,25 @@ def build_ads_operator_review_report(
         source_freshness_warning_fraction=source_freshness_warning_fraction,
     )
     counts = _alert_counts(alerts)
+    true_runtime_cutover_status = _true_runtime_cutover_status(
+        run=run,
+        run_kind=run_kind,
+        cases=cases,
+    )
+    review_status = (
+        "blocked"
+        if counts["blocker"]
+        else "review_warned"
+        if counts["warning"]
+        else "review_passed"
+    )
     return {
         "schema_version": ADS_OPERATOR_REVIEW_SCHEMA_VERSION,
         "ok": counts["blocker"] == 0,
         "scheduler_may_continue": counts["blocker"] == 0,
-        "status": "review_passed" if counts["blocker"] == 0 else "blocked",
+        "status": review_status,
+        "true_runtime_cutover_status": true_runtime_cutover_status,
+        "true_runtime_cutover_ready": true_runtime_cutover_status == "ready",
         "db_path": str(path),
         "pipeline_run_id": resolved_run_id,
         "run": run,

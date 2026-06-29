@@ -9,6 +9,7 @@ import math
 import os
 import re
 import sqlite3
+import time
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -55,6 +56,9 @@ AMRG_SHARED_CACHE_ELIGIBILITY_SCHEMA_VERSION = "amrg-shared-cache-eligibility/v1
 AMRG_VECTOR_MODEL_ID = "BAAI/bge-base-en-v1.5"
 AMRG_VECTOR_ROUTE_ID = "ollama/local"
 AMRG_VECTOR_PROVIDER = "ollama"
+AMRG_MODEL_ASSIST_DEFAULT_MODEL_ID = "gpt-5.4-high"
+AMRG_MODEL_ASSIST_PROVIDER_ROUTE = "openclaw_codex_oauth/amrg"
+AMRG_MODEL_ASSIST_RUNTIME_AGENT_ID = "amrg"
 AMRG_VECTOR_EMBEDDING_DIMENSION = 768
 AMRG_VECTOR_SIMILARITY_METRIC = "cosine"
 AMRG_VECTOR_CANDIDATE_SOURCE = "local_bge_vector_neighbor"
@@ -274,6 +278,19 @@ AMRG_FORBIDDEN_MODEL_OUTPUT_KEYS = AMRG_FORBIDDEN_ARTIFACT_KEYS | {
     "active_graph_promotion",
     "production_forecast_prob",
     "posterior_probability",
+    "evidence",
+    "evidence_ref",
+    "evidence_refs",
+    "source",
+    "source_url",
+    "source_urls",
+    "citation",
+    "citations",
+    "url",
+    "urls",
+    "retrieval",
+    "retrieval_result",
+    "retrieval_results",
 }
 TOKEN_STOPWORDS = {
     "the",
@@ -287,6 +304,91 @@ TOKEN_STOPWORDS = {
     "binary",
     "yes",
     "no",
+    "who",
+    "what",
+    "when",
+    "where",
+    "which",
+    "would",
+    "could",
+    "should",
+    "from",
+    "into",
+    "than",
+    "then",
+    "over",
+    "under",
+    "after",
+    "before",
+    "during",
+    "within",
+    "without",
+    "about",
+    "open",
+    "close",
+    "closed",
+    "resolve",
+    "resolves",
+    "resolved",
+    "happen",
+    "event",
+    "related",
+}
+GENERIC_RELATIONSHIP_TOKENS = TOKEN_STOPWORDS | {
+    "announce",
+    "announced",
+    "announcement",
+    "actor",
+    "actors",
+    "award",
+    "awards",
+    "best",
+    "bill",
+    "candidate",
+    "contest",
+    "contract",
+    "decision",
+    "deadline",
+    "election",
+    "elect",
+    "film",
+    "films",
+    "forecast",
+    "franchise",
+    "government",
+    "group",
+    "labs",
+    "market",
+    "movie",
+    "movies",
+    "office",
+    "official",
+    "outcome",
+    "pass",
+    "policy",
+    "politics",
+    "race",
+    "release",
+    "result",
+    "results",
+    "status",
+    "team",
+    "vote",
+    "win",
+    "wins",
+    "won",
+    "year",
+    "january",
+    "february",
+    "march",
+    "april",
+    "june",
+    "july",
+    "august",
+    "september",
+    "october",
+    "november",
+    "december",
 }
 
 
@@ -362,8 +464,16 @@ def resolve_amrg_model_assist_lane(policy: dict[str, Any] | None = None) -> dict
         raise AMRGError("model policy missing amrg_model_assist lane")
     if lane.get("provider") != "openai":
         raise AMRGError("amrg_model_assist provider must be openai")
+    if lane.get("default_model_id") != AMRG_MODEL_ASSIST_DEFAULT_MODEL_ID:
+        raise AMRGError(f"amrg_model_assist default_model_id must be {AMRG_MODEL_ASSIST_DEFAULT_MODEL_ID}")
     if lane.get("default_model_id") not in lane.get("allowed_model_ids", []):
         raise AMRGError("amrg_model_assist default_model_id must be allowed")
+    if lane.get("provider_route") != AMRG_MODEL_ASSIST_PROVIDER_ROUTE:
+        raise AMRGError(f"amrg_model_assist provider_route must be {AMRG_MODEL_ASSIST_PROVIDER_ROUTE}")
+    if lane.get("oauth_route_required") is not True:
+        raise AMRGError("amrg_model_assist oauth_route_required must be true")
+    if lane.get("runtime_agent_id") != AMRG_MODEL_ASSIST_RUNTIME_AGENT_ID:
+        raise AMRGError(f"amrg_model_assist runtime_agent_id must be {AMRG_MODEL_ASSIST_RUNTIME_AGENT_ID}")
     if lane.get("owner_feature_id") != "AMRG-004":
         raise AMRGError("amrg_model_assist owner_feature_id must be AMRG-004")
     required = set(lane.get("required_artifact_fields", []))
@@ -1465,6 +1575,10 @@ def text_tokens(value: Any) -> set[str]:
     }
 
 
+def salient_entity_tokens(value: Any) -> set[str]:
+    return text_tokens(value) - GENERIC_RELATIONSHIP_TOKENS
+
+
 def normalize_source_refs(value: Any) -> list[str]:
     if value is None:
         return []
@@ -1876,7 +1990,11 @@ def selected_case_tokens(evidence_packet: dict[str, Any]) -> dict[str, set[str]]
     regime = evidence_packet.get("regime_seed_fields", {})
     family = evidence_packet.get("family_context", {})
     return {
-        "entities": text_tokens(identity.get("title")) | text_tokens(identity.get("description")),
+        "entities": (
+            salient_entity_tokens(identity.get("normalized_entities"))
+            | salient_entity_tokens(identity.get("title"))
+            | salient_entity_tokens(identity.get("description"))
+        ),
         "contract_terms": text_tokens(identity.get("outcome_type")),
         "category": text_tokens(identity.get("category") or regime.get("category")),
         "family": text_tokens(family.get("parent_event_id"))
@@ -1911,7 +2029,7 @@ def market_record_tokens(record: dict[str, Any]) -> dict[str, set[str]]:
     active_safe = record["active_safe_fields"]
     market = record["market"]
     return {
-        "entities": text_tokens(active_safe.get("normalized_entities")) | text_tokens(active_safe.get("title")),
+        "entities": salient_entity_tokens(active_safe.get("normalized_entities")) | salient_entity_tokens(active_safe.get("title")),
         "contract_terms": text_tokens(active_safe.get("contract_terms")),
         "category": text_tokens(market.get("category")) | text_tokens(active_safe.get("market_state_tags")),
         "family": text_tokens(active_safe.get("family_context_tokens")),
@@ -1953,6 +2071,7 @@ def make_candidate(
         "market_id": record["market_id"],
         "external_market_id": record.get("external_market_id"),
         "title": active_safe.get("title"),
+        "domain_category_tokens": sorted(text_tokens(record["market"].get("category"))),
         "active_safe_fields_hash": record["active_safe_fields_hash"],
         "reason_codes": sorted(set(reason_codes)),
         "source_refs": source_refs,
@@ -2043,13 +2162,13 @@ def active_market_entity_matches(
     rows: list[dict[str, Any]] = []
     for record in records:
         tokens = market_record_tokens(record)
-        overlaps = (selected["entities"] & tokens["entities"]) | (selected["contract_terms"] & tokens["contract_terms"])
+        overlaps = selected["entities"] & tokens["entities"]
         if overlaps:
             rows.append(
                 make_candidate(
                     record,
                     source="entity_match",
-                    reason_codes=["active_safe_entity_or_contract_term_overlap"],
+                    reason_codes=["active_safe_salient_entity_overlap"],
                     source_refs=[
                         candidate_source_ref(
                             "active_market_index",
@@ -2895,12 +3014,37 @@ def timing_alignment_for_candidate(
     }
 
 
-def status_for_typed_candidate(candidate: dict[str, Any], relationship_types: list[str], timing_status: str) -> str:
+def domain_compatibility_for_candidate(evidence_packet: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
+    selected_categories = selected_case_tokens(evidence_packet)["category"]
+    candidate_categories = set(candidate.get("domain_category_tokens") or [])
+    overlaps = selected_categories & candidate_categories
+    if overlaps:
+        status = "compatible"
+    elif not selected_categories or not candidate_categories:
+        status = "unknown_domain_weak_context_only"
+    else:
+        status = "cross_domain_weak_context_only"
+    return {
+        "domain_compatibility_status": status,
+        "domain_compatible": bool(overlaps),
+        "selected_category_tokens": sorted(selected_categories),
+        "candidate_category_tokens": sorted(candidate_categories),
+        "overlap_tokens": sorted(overlaps),
+    }
+
+
+def status_for_typed_candidate(
+    candidate: dict[str, Any],
+    relationship_types: list[str],
+    timing_status: str,
+    *,
+    domain_compatible: bool = True,
+) -> str:
     if timing_status in {"lookahead_blocked", "skew_exceeds_policy", "missing_related_snapshot"}:
         return "timing_mismatch_weak_context_only"
     if candidate.get("vector_only") or relationship_types == ["generic_theme"] or relationship_types == ["vector_similarity_neighbor"]:
         return WEAK_CONTEXT_ONLY
-    if timing_status == "aligned":
+    if timing_status == "aligned" and domain_compatible:
         return "deterministic_context_candidate"
     return WEAK_CONTEXT_ONLY
 
@@ -3628,6 +3772,7 @@ def refresh_lifecycle_state(
 
 def apply_refresh_state_to_edge(edge: dict[str, Any], state: dict[str, Any], *, downgrade_reasons: list[str] | None = None) -> dict[str, Any]:
     updated = dict(edge)
+    existing_downgrade_reasons = list(edge.get("downgrade_reason_codes", []))
     if state["stale_effect_downgrade_applied"]:
         updated["relationship_status"] = WEAK_CONTEXT_ONLY
         updated["allowed_effects"] = AMRG_ALLOWED_EFFECTS_BY_STATUS[WEAK_CONTEXT_ONLY]
@@ -3638,7 +3783,10 @@ def apply_refresh_state_to_edge(edge: dict[str, Any], state: dict[str, Any], *, 
     updated["refresh_generation_id"] = state["refresh_generation_id"]
     if state["stale_effect_downgrade_applied"]:
         updated["downgrade_applied"] = True
-        updated["downgrade_reason_codes"] = sorted(set((downgrade_reasons or []) + state["refresh_reason_codes"]))
+        updated["downgrade_reason_codes"] = sorted(set(existing_downgrade_reasons + (downgrade_reasons or []) + state["refresh_reason_codes"]))
+    elif existing_downgrade_reasons:
+        updated["downgrade_reason_codes"] = sorted(set(existing_downgrade_reasons + updated.get("downgrade_reason_codes", [])))
+        updated["downgrade_applied"] = bool(updated["downgrade_reason_codes"])
     validate_relationship_edge(updated)
     return updated
 
@@ -3858,10 +4006,24 @@ def type_and_validate_edge(
         else relationship_types_for_candidate(candidate)
     )
     timing = timing_alignment_for_candidate(evidence_packet, candidate)
-    status = status_for_typed_candidate(candidate, relationship_types, timing["timing_alignment_status"])
+    domain = domain_compatibility_for_candidate(evidence_packet, candidate)
+    status_without_domain_gate = status_for_typed_candidate(
+        candidate,
+        relationship_types,
+        timing["timing_alignment_status"],
+        domain_compatible=True,
+    )
+    status = status_for_typed_candidate(
+        candidate,
+        relationship_types,
+        timing["timing_alignment_status"],
+        domain_compatible=domain["domain_compatible"],
+    )
+    domain_downgraded = status_without_domain_gate == "deterministic_context_candidate" and status == WEAK_CONTEXT_ONLY
     explicit_status = edge.get("relationship_status")
     if explicit_status == "strict_precedence_anchor_candidate":
         status = explicit_status if timing["timing_alignment_status"] == "aligned" else "timing_mismatch_weak_context_only"
+        domain_downgraded = False
     if model_assist_status == "advisory_validated" and status == WEAK_CONTEXT_ONLY:
         status = "model_assisted_weak_context_only"
     enriched = {
@@ -3878,8 +4040,14 @@ def type_and_validate_edge(
         "forbidden_effects": forbidden_effects_for_status(status),
         "model_assist_status": model_assist_status,
         "model_assist_context": {},
+        "domain_compatibility": domain,
     }
     enriched.update(graph_safety_for_edge(enriched))
+    if domain_downgraded:
+        enriched["downgrade_applied"] = True
+        enriched["downgrade_reason_codes"] = sorted(set(
+            enriched.get("downgrade_reason_codes", []) + ["domain_mismatch_downgraded_weak_context_only"]
+        ))
     validate_relationship_edge(enriched)
     return enriched
 
@@ -3984,6 +4152,9 @@ def build_amrg_model_assist_packet(
         "schema_version": AMRG_MODEL_ASSIST_PACKET_SCHEMA_VERSION,
         "model_lane_id": AMRG_MODEL_ASSIST_LANE_ID,
         "resolved_model_id": lane["default_model_id"],
+        "provider_route": lane["provider_route"],
+        "oauth_route_required": bool(lane["oauth_route_required"]),
+        "runtime_agent_id": lane["runtime_agent_id"],
         "model_policy_ref": model_lane_policy_ref,
         "prompt_template_id": "amrg-model-assist-advisory/v1",
         "prompt_template_sha256": prefixed_sha256(model_assist_prompt_descriptor()),
@@ -3991,7 +4162,7 @@ def build_amrg_model_assist_packet(
         "input_manifest_ids": context["input_manifest_ids"],
         "output_schema_version": AMRG_MODEL_ASSIST_OUTPUT_SCHEMA_VERSION,
         "authority": "advisory_only_no_promotion",
-        "forbidden_outputs": sorted(lane["forbidden_outputs"]),
+        "forbidden_outputs": sorted(set(lane["forbidden_outputs"]) | AMRG_FORBIDDEN_MODEL_OUTPUT_KEYS),
         "relationship_type_vocabulary": sorted(RELATIONSHIP_TYPES),
         "relationship_status_vocabulary": sorted(RELATIONSHIP_STATUSES),
         "candidate_set_id": context["candidate_set_id"],
@@ -4024,6 +4195,9 @@ def validate_amrg_model_assist_packet(packet: dict[str, Any]) -> None:
         "schema_version",
         "model_lane_id",
         "resolved_model_id",
+        "provider_route",
+        "oauth_route_required",
+        "runtime_agent_id",
         "model_policy_ref",
         "prompt_template_id",
         "prompt_template_sha256",
@@ -4044,6 +4218,14 @@ def validate_amrg_model_assist_packet(packet: dict[str, Any]) -> None:
         raise AMRGError(f"model assist packet schema_version must be {AMRG_MODEL_ASSIST_PACKET_SCHEMA_VERSION}")
     if packet["model_lane_id"] != AMRG_MODEL_ASSIST_LANE_ID:
         raise AMRGError("model assist packet must use amrg_model_assist lane")
+    if packet["resolved_model_id"] != AMRG_MODEL_ASSIST_DEFAULT_MODEL_ID:
+        raise AMRGError(f"model assist packet resolved_model_id must be {AMRG_MODEL_ASSIST_DEFAULT_MODEL_ID}")
+    if packet["provider_route"] != AMRG_MODEL_ASSIST_PROVIDER_ROUTE:
+        raise AMRGError(f"model assist packet provider_route must be {AMRG_MODEL_ASSIST_PROVIDER_ROUTE}")
+    if packet["oauth_route_required"] is not True:
+        raise AMRGError("model assist packet oauth_route_required must be true")
+    if packet["runtime_agent_id"] != AMRG_MODEL_ASSIST_RUNTIME_AGENT_ID:
+        raise AMRGError(f"model assist packet runtime_agent_id must be {AMRG_MODEL_ASSIST_RUNTIME_AGENT_ID}")
     if packet["output_schema_version"] != AMRG_MODEL_ASSIST_OUTPUT_SCHEMA_VERSION:
         raise AMRGError(f"model assist output schema must be {AMRG_MODEL_ASSIST_OUTPUT_SCHEMA_VERSION}")
     if packet["authority"] != "advisory_only_no_promotion":
@@ -4072,8 +4254,12 @@ def validate_amrg_model_assist_output(output: dict[str, Any]) -> None:
         raise AMRGError(f"model assist output schema_version must be {AMRG_MODEL_ASSIST_OUTPUT_SCHEMA_VERSION}")
     if output["model_lane_id"] != AMRG_MODEL_ASSIST_LANE_ID:
         raise AMRGError("model assist output must use amrg_model_assist lane")
+    if output["resolved_model_id"] != AMRG_MODEL_ASSIST_DEFAULT_MODEL_ID:
+        raise AMRGError(f"model assist output resolved_model_id must be {AMRG_MODEL_ASSIST_DEFAULT_MODEL_ID}")
     if output["authority"] != "advisory_only_no_promotion":
         raise AMRGError("model assist output authority must be advisory_only_no_promotion")
+    if not output["candidate_set_id"]:
+        raise AMRGError("model assist output candidate_set_id is required")
     ensure_no_forbidden_model_output_fields(output)
     for annotation in output["edge_annotations"]:
         if not isinstance(annotation, dict):
@@ -4089,8 +4275,11 @@ def build_model_assist_provenance(
     *,
     packet: dict[str, Any] | None = None,
     output: dict[str, Any] | None = None,
+    raw_output: dict[str, Any] | None = None,
     status: str | None = None,
     output_artifact_ref: str | None = None,
+    latency_ms: int | None = None,
+    execution_status: str | None = None,
 ) -> dict[str, Any]:
     if status is None:
         status = "advisory_validated" if output is not None else "not_requested"
@@ -4102,6 +4291,29 @@ def build_model_assist_provenance(
         validate_amrg_model_assist_packet(packet)
     if output is not None:
         validate_amrg_model_assist_output(output)
+        if output.get("candidate_set_id") != context.get("candidate_set_id"):
+            raise AMRGError("model assist output candidate_set_id must match AMRG candidate_set_id")
+    output_for_hash = output if output is not None else raw_output
+    output_artifact_sha256 = (
+        prefixed_sha256(canonical_json(output_for_hash))
+        if isinstance(output_for_hash, dict)
+        else None
+    )
+    model_executed = status in {"advisory_validated", "advisory_rejected_forbidden_output"} and output_for_hash is not None
+    if execution_status is None:
+        execution_status = {
+            "advisory_validated": "succeeded",
+            "advisory_rejected_forbidden_output": "failed_output_validation",
+            "advisory_unavailable_non_blocking": "unavailable_non_blocking",
+            "not_invoked_missing_active_safe_manifest": "not_invoked_missing_active_safe_manifest",
+            "not_requested": "not_invoked",
+        }.get(status, status)
+    if output is not None:
+        forbidden_check_status = "passed"
+    elif status == "advisory_rejected_forbidden_output":
+        forbidden_check_status = "failed"
+    else:
+        forbidden_check_status = "not_applicable"
     provenance = {
         "schema_version": AMRG_MODEL_ASSIST_PROVENANCE_SCHEMA_VERSION,
         "model_assist_id": stable_id("amrg-model-assist", context["case_id"], context["dispatch_id"], context["candidate_set_id"], status),
@@ -4109,17 +4321,37 @@ def build_model_assist_provenance(
         "market_id": str(context.get("market_id") or context["case_key"]),
         "dispatch_id": context["dispatch_id"],
         "candidate_set_id": context["candidate_set_id"],
+        "model_lane_id": packet.get("model_lane_id") if packet else AMRG_MODEL_ASSIST_LANE_ID,
         "model_assist_status": status,
         "model_id": packet.get("resolved_model_id") if packet else "not_invoked",
+        "resolved_model_id": packet.get("resolved_model_id") if packet else None,
+        "provider_route": packet.get("provider_route") if packet else None,
+        "oauth_route_required": packet.get("oauth_route_required") if packet else None,
+        "runtime_agent_id": packet.get("runtime_agent_id") if packet else None,
+        "prompt_template_sha256": packet.get("prompt_template_sha256") if packet else None,
         "input_manifest_sha256": context.get("input_manifest_hash") or "sha256:missing",
+        "output_artifact_sha256": output_artifact_sha256,
         "output_artifact_ref": output_artifact_ref,
-        "forbidden_output_check_status": "passed" if output is not None else "not_applicable",
-        "invoked_at": utc_now_iso() if output is not None else None,
+        "forbidden_output_check_status": forbidden_check_status,
+        "model_executed": model_executed,
+        "execution_status": execution_status,
+        "latency_ms": latency_ms,
+        "invoked_at": utc_now_iso() if model_executed else None,
         "generated_at": utc_now_iso(),
         "metadata": {
             "authority": "advisory_only_no_promotion",
+            "model_lane_id": packet.get("model_lane_id") if packet else AMRG_MODEL_ASSIST_LANE_ID,
+            "resolved_model_id": packet.get("resolved_model_id") if packet else None,
+            "provider_route": packet.get("provider_route") if packet else None,
+            "oauth_route_required": packet.get("oauth_route_required") if packet else None,
+            "runtime_agent_id": packet.get("runtime_agent_id") if packet else None,
+            "prompt_template_sha256": packet.get("prompt_template_sha256") if packet else None,
             "output_schema_version": output.get("schema_version") if output else None,
             "edge_annotation_count": len(output.get("edge_annotations", [])) if output else 0,
+            "output_artifact_sha256": output_artifact_sha256,
+            "model_executed": model_executed,
+            "execution_status": execution_status,
+            "latency_ms": latency_ms,
         },
     }
     ensure_no_raw_amrg_fields(provenance, "model_assist_provenance")
@@ -4147,29 +4379,36 @@ def invoke_amrg_model_assist(
     if not context.get("input_manifest_hash"):
         return model_assist_downgrade_for_missing_manifest(context)
     packet = build_amrg_model_assist_packet(context)
+    started_at = time.monotonic()
     try:
         raw_output = output if output is not None else transport(packet)
+        latency_ms = int((time.monotonic() - started_at) * 1000)
         if not isinstance(raw_output, dict):
             raise AMRGError("model assist output must be an object")
     except Exception as exc:
+        latency_ms = int((time.monotonic() - started_at) * 1000)
         provenance = build_model_assist_provenance(
             context,
             packet=packet,
             status="advisory_unavailable_non_blocking",
             output_artifact_ref=output_artifact_ref,
+            latency_ms=latency_ms,
         )
         provenance["metadata"]["unavailable_reason"] = str(exc)
         return provenance
     try:
         validate_amrg_model_assist_output(raw_output)
+        if raw_output.get("candidate_set_id") != context.get("candidate_set_id"):
+            raise AMRGError("model assist output candidate_set_id must match AMRG candidate_set_id")
     except AMRGError as exc:
         provenance = build_model_assist_provenance(
             context,
             packet=packet,
+            raw_output=raw_output,
             status="advisory_rejected_forbidden_output",
             output_artifact_ref=output_artifact_ref,
+            latency_ms=latency_ms,
         )
-        provenance["forbidden_output_check_status"] = "failed"
         provenance["metadata"]["rejection_reason"] = str(exc)
         return provenance
     return build_model_assist_provenance(
@@ -4177,6 +4416,7 @@ def invoke_amrg_model_assist(
         packet=packet,
         output=raw_output,
         output_artifact_ref=output_artifact_ref,
+        latency_ms=latency_ms,
     )
 
 
@@ -4248,18 +4488,31 @@ def build_amrg_operator_report(
     consumed_leaf_refs: dict[str, list[str]] = {}
     consumed_branch_refs: dict[str, list[str]] = {}
     if isinstance(question_decomposition, dict):
+        for idx, leaf in enumerate(question_decomposition.get("required_leaf_questions") or []):
+            if not isinstance(leaf, dict) or not isinstance(leaf.get("amrg_usage_refs"), list):
+                continue
+            leaf_id = str(leaf.get("leaf_id") or leaf.get("id") or leaf.get("question_id") or f"leaf[{idx}]")
+            consumed_leaf_refs[leaf_id] = [str(ref) for ref in leaf["amrg_usage_refs"]]
+        for idx, branch in enumerate(question_decomposition.get("branches") or []):
+            if not isinstance(branch, dict) or not isinstance(branch.get("amrg_usage_refs"), list):
+                continue
+            branch_id = str(branch.get("branch_id") or branch.get("id") or f"branch[{idx}]")
+            consumed_branch_refs[branch_id] = [str(ref) for ref in branch["amrg_usage_refs"]]
+        usage = question_decomposition.get("related_market_context_usage")
+        if isinstance(usage, dict) and isinstance(usage.get("amrg_usage_refs"), list):
+            consumed_branch_refs["related_market_context_usage"] = [str(ref) for ref in usage["amrg_usage_refs"]]
         metadata = question_decomposition.get("amrg_operator_metadata")
         if isinstance(metadata, dict):
-            consumed_leaf_refs = {
+            consumed_leaf_refs.update({
                 str(leaf_id): [str(ref) for ref in refs]
                 for leaf_id, refs in (metadata.get("leaf_hint_refs") or {}).items()
                 if isinstance(refs, list)
-            }
-            consumed_branch_refs = {
+            })
+            consumed_branch_refs.update({
                 str(branch_id): [str(ref) for ref in refs]
                 for branch_id, refs in (metadata.get("branch_hint_refs") or {}).items()
                 if isinstance(refs, list)
-            }
+            })
     consumed_by_ref: dict[str, dict[str, list[str]]] = {
         str(hint.get("hint_ref")): {"leaf_ids": [], "branch_ids": []}
         for hint in hints

@@ -6,6 +6,7 @@ import copy
 import hashlib
 import json
 import os
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -49,7 +50,7 @@ QDT_SCHEMA_VALIDATOR_VERSION = "ads-qdt-schema/v1"
 QDT_SELECTION_HELPER_VERSION = "ads-qdt-selection/v1"
 ANCHOR_DEPENDENCY_CONTRACT_SCHEMA_VERSION = "amrg-anchor-dependency-contract/v1"
 ANCHOR_DEPENDENCY_REPAIR_HELPER_VERSION = "ads-qdt-anchor-repair/v1"
-COMPACT_DEFAULT_LEAF_BUDGET = 6
+COMPACT_DEFAULT_LEAF_BUDGET = 10
 MAX_REASON_CODE_LENGTH = 80
 DEFAULT_ANCHOR_REPAIR_ATTEMPTS = 2
 DEFAULT_ANCHOR_REPAIR_WALL_CLOCK_SECONDS = 120
@@ -64,7 +65,7 @@ ALLOWED_PURPOSES = {
     "structural",
     "other",
 }
-ALLOWED_STATIC_INFORMATION_WEIGHTS = {"critical", "high", "medium", "low"}
+ALLOWED_RESEARCH_PRIORITIES = {"critical", "high", "medium", "low"}
 ALLOWED_CONDITION_SCOPES = {
     "unconditional",
     "target_given_upstream",
@@ -107,6 +108,7 @@ ALLOWED_RELATED_CONTEXT_USAGE_STATUS = {
     "not_used",
 }
 FORBIDDEN_QDT_KEY_FRAGMENTS = (
+    "bayesian",
     "probability",
     "fair_value",
     "confidence_interval",
@@ -114,6 +116,53 @@ FORBIDDEN_QDT_KEY_FRAGMENTS = (
     "prediction_interval",
     "interval",
     "reassembly",
+    "log_odds",
+    "bayesian_edge",
+    "scae_delta",
+    "trade_decision",
+    "final_forecast",
+    "weight",
+)
+ALLOWED_COVERAGE_DIMENSIONS = {
+    "resolution_mechanics",
+    "current_direct_evidence",
+    "key_drivers",
+    "counterevidence_negative_checks",
+    "timing_deadline_constraints",
+    "source_quality",
+    "related_market_or_base_rate_context",
+    "material_unknowns",
+}
+REQUIRED_CORE_COVERAGE_DIMENSIONS = {
+    "resolution_mechanics",
+    "current_direct_evidence",
+    "key_drivers",
+    "counterevidence_negative_checks",
+    "timing_deadline_constraints",
+    "source_quality",
+    "material_unknowns",
+}
+CONTRACT_GUARD_COVERAGE_DIMENSIONS = {"resolution_mechanics"}
+FORBIDDEN_LEAF_OUTPUTS = {
+    "probability",
+    "odds",
+    "numeric_weight",
+    "bayesian_edge",
+    "log_odds_delta",
+    "fair_value",
+    "trade_decision",
+    "scae_delta",
+    "final_forecast",
+}
+GENERIC_QDT_SKELETONS = (
+    "What official or primary-source information can resolve the market question?",
+    "What fresh direct evidence bears on the target event before the cutoff?",
+    "Which market rules and timing terms govern how the outcome resolves?",
+    "What is the official announcement status?",
+    "What is the actor identity?",
+    "What is the timing window?",
+    "What is the credible reporting consensus?",
+    "How do official sources and reporting align?",
 )
 REQUIRED_QDT_FIELDS = (
     "artifact_type",
@@ -124,6 +173,8 @@ REQUIRED_QDT_FIELDS = (
     "macro_question",
     "market_reality_constraints_digest",
     "leaf_budget_decision",
+    "market_resolution_contract",
+    "research_coverage_graph",
     "branches",
     "required_leaf_questions",
     "required_evidence_purposes",
@@ -137,13 +188,45 @@ REQUIRED_LEAF_FIELDS = (
     "parent_branch_id",
     "question_text",
     "purpose",
-    "bayesian_weighting",
+    "research_priority",
     "leaf_dependency_group_id",
     "leaf_condition_scope",
     "required_evidence_fields",
     "research_sufficiency_requirements",
+    "coverage_dimension",
+    "research_factor",
+    "leaf_question",
+    "evidence_requirements",
+    "classification_targets",
+    "sufficiency_criteria",
+    "specificity_evidence",
+    "overlap_risk_with_leaf_ids",
+    "missingness_interpretation",
+    "forbidden_outputs",
     "market_component_terms",
     "structural_validation",
+)
+REQUIRED_MARKET_RESOLUTION_CONTRACT_FIELDS = (
+    "yes_no_mapping",
+    "resolution_subject",
+    "resolution_authority",
+    "contract_deadline",
+    "forecast_cutoff",
+    "platform_family_context",
+    "ambiguous_terms",
+    "disqualifying_evidence_types",
+    "source_hierarchy",
+)
+REQUIRED_RESEARCH_COVERAGE_GRAPH_FIELDS = (
+    "target_event_description",
+    "coverage_dimensions",
+    "research_factors",
+    "contract_guard_leaf_ids",
+    "material_question_leaf_ids",
+    "required_leaf_ids_by_dimension",
+    "overlap_groups",
+    "unanswered_material_questions",
+    "coverage_summary",
 )
 REQUIRED_MODEL_FIELDS = (
     "model_lane_id",
@@ -244,6 +327,319 @@ def _extract_string_list(value: Any) -> list[str] | None:
 def _stable_id(prefix: str, *parts: Any) -> str:
     digest = hashlib.sha256(canonical_json(parts).encode("utf-8")).hexdigest()
     return f"{prefix}{digest[:24]}"
+
+
+def _text_tokens(value: Any) -> set[str]:
+    return {
+        token
+        for token in re.findall(r"[a-z0-9]+", str(value or "").lower())
+        if len(token) > 2
+        and token
+        not in {
+            "the",
+            "and",
+            "for",
+            "with",
+            "will",
+            "market",
+            "question",
+            "target",
+            "event",
+            "before",
+            "after",
+            "status",
+            "evidence",
+            "source",
+            "sources",
+        }
+    }
+
+
+def _token_slug(value: Any, *, fallback: str = "market") -> str:
+    allowed = _text_tokens(value)
+    tokens = []
+    seen: set[str] = set()
+    for token in re.findall(r"[a-z0-9]+", str(value or "").lower()):
+        if token in allowed and token not in seen:
+            seen.add(token)
+            tokens.append(token)
+    slug = "-".join(tokens[:4])
+    return slug or fallback
+
+
+def _template_similarity(left: str, right: str) -> float:
+    left_tokens = _text_tokens(left)
+    right_tokens = _text_tokens(right)
+    if not left_tokens or not right_tokens:
+        return 0.0
+    intersection = len(left_tokens & right_tokens)
+    union = len(left_tokens | right_tokens)
+    return intersection / union if union else 0.0
+
+
+def _max_template_similarity(question_text: Any) -> float:
+    text = str(question_text or "")
+    if not text.strip():
+        return 1.0
+    return max((_template_similarity(text, skeleton) for skeleton in GENERIC_QDT_SKELETONS), default=0.0)
+
+
+def _question_looks_negative(question: Any) -> bool:
+    text = " " + str(question or "").lower() + " "
+    return bool(
+        re.search(r"\b(no one|none|not|without|won't|will not|no qualifying|absence of)\b", text)
+    )
+
+
+def _ambiguous_terms_from_question(question: Any) -> list[dict[str, str]]:
+    text = str(question or "")
+    terms: list[dict[str, str]] = []
+    for term in ("above actor", "announced", "no one", "qualifying announcement"):
+        if term in text.lower():
+            terms.append(
+                {
+                    "term": term,
+                    "resolution_question": f"Clarify how '{term}' is defined by the market contract.",
+                }
+            )
+    return terms
+
+
+def _coverage_dimension_for_leaf(leaf: dict[str, Any]) -> str:
+    explicit = leaf.get("coverage_dimension")
+    if explicit in ALLOWED_COVERAGE_DIMENSIONS:
+        return str(explicit)
+    text = " ".join(
+        str(value or "")
+        for value in (
+            leaf.get("question_text"),
+            leaf.get("leaf_question"),
+            leaf.get("research_factor"),
+            " ".join(leaf.get("market_component_terms") or []),
+        )
+    ).lower()
+    purpose = leaf.get("purpose")
+    if any(term in text for term in ("rumor", "quality", "source class", "claim family", "syndicat")):
+        return "source_quality"
+    if any(term in text for term in ("timing", "deadline", "cutoff", "window", "time remaining")):
+        return "timing_deadline_constraints"
+    if any(term in text for term in ("negative", "contradict", "blocker", "not imminent", "unresolved")):
+        return "counterevidence_negative_checks"
+    if any(term in text for term in ("driver", "stage", "process", "readiness", "commitment", "negotiation")):
+        return "key_drivers"
+    if any(term in text for term in ("unknown", "unanswered", "missing", "structural")):
+        return "material_unknowns"
+    if purpose in {"resolution_mechanics", "source_of_truth"}:
+        return "resolution_mechanics"
+    if purpose in {"base_rate", "market_pricing"}:
+        return "related_market_or_base_rate_context"
+    if purpose in {"catalyst", "structural"}:
+        return "key_drivers"
+    return "current_direct_evidence"
+
+
+def _research_factor_for_leaf(leaf: dict[str, Any]) -> str:
+    explicit = leaf.get("research_factor")
+    if _is_non_empty_string(explicit):
+        return str(explicit)
+    dimension = _coverage_dimension_for_leaf(leaf)
+    terms = leaf.get("market_component_terms") if isinstance(leaf.get("market_component_terms"), list) else []
+    term = _token_slug(" ".join(str(item) for item in terms), fallback=str(leaf.get("purpose") or dimension))
+    return f"{dimension}:{term}".replace(" ", "_")
+
+
+def _default_expected_answer_type(leaf: dict[str, Any]) -> str:
+    fields = leaf.get("required_evidence_fields")
+    if isinstance(fields, list) and fields:
+        return "classified_values:" + ",".join(str(field) for field in fields[:4])
+    return "classification_with_extracted_values"
+
+
+def _default_leaf_specificity_evidence(leaf: dict[str, Any], handoff: dict[str, Any]) -> dict[str, Any]:
+    terms = [str(item) for item in leaf.get("market_component_terms") or [] if _is_non_empty_string(item)]
+    macro_question = str(handoff.get("macro_question") or "")
+    return {
+        "market_rule_clause_refs": list(leaf.get("market_rule_clause_refs") or []),
+        "case_contract_field_refs": [
+            "macro_question",
+            "market_context.market_id",
+            "source_cutoff_timestamp",
+        ],
+        "why_this_must_be_investigated": leaf.get("purpose_detail")
+        or f"Required to classify {leaf.get('leaf_id')} for the market-specific question: {macro_question[:160]}",
+        "not_a_template_reason": leaf.get("not_a_template_reason")
+        or "Instantiated with market terms: " + (", ".join(terms[:6]) if terms else _token_slug(macro_question)),
+        "expected_answer_type": leaf.get("expected_answer_type") or _default_expected_answer_type(leaf),
+    }
+
+
+def _default_evidence_requirements(leaf: dict[str, Any]) -> list[dict[str, Any]]:
+    requirements = leaf.get("evidence_requirements")
+    if isinstance(requirements, list) and requirements:
+        return copy.deepcopy(requirements)
+    sufficiency = leaf.get("research_sufficiency_requirements")
+    source_classes = []
+    if isinstance(sufficiency, dict):
+        source_classes = list(sufficiency.get("required_source_classes") or [])
+    return [
+        {
+            "required_evidence_field": str(field),
+            "required_source_classes": source_classes,
+            "pre_cutoff_required": True,
+        }
+        for field in (leaf.get("required_evidence_fields") or [])
+    ] or [{"required_evidence_field": "classified_status", "pre_cutoff_required": True}]
+
+
+def _default_classification_targets(leaf: dict[str, Any]) -> list[str]:
+    targets = leaf.get("classification_targets")
+    if isinstance(targets, list) and all(_is_non_empty_string(item) for item in targets):
+        return list(targets)
+    fields = [str(field) for field in leaf.get("required_evidence_fields") or [] if _is_non_empty_string(field)]
+    base = ["evidence_direction", "evidence_strength", "confidence", "evidence_quality", "missingness_status"]
+    return sorted(set(base + fields))
+
+
+def _default_sufficiency_criteria(leaf: dict[str, Any]) -> dict[str, Any]:
+    criteria = leaf.get("sufficiency_criteria")
+    if isinstance(criteria, dict) and criteria:
+        return copy.deepcopy(criteria)
+    requirements = leaf.get("research_sufficiency_requirements")
+    if not isinstance(requirements, dict):
+        return {"classification_dispatch_requires_sufficiency_certificate": True}
+    return {
+        "required_source_classes": list(requirements.get("required_source_classes") or []),
+        "required_value_fields": list(requirements.get("required_value_fields") or []),
+        "required_negative_checks": list(requirements.get("required_negative_checks") or []),
+        "min_independent_claim_families": requirements.get("min_independent_claim_families"),
+        "min_independent_source_families": requirements.get("min_independent_source_families"),
+        "unanswerability_allowed": bool(requirements.get("unanswerability_proof_required")),
+        "classification_dispatch_requires_sufficiency_certificate": True,
+    }
+
+
+def _leaf_research_priority(leaf: dict[str, Any]) -> str:
+    explicit = leaf.get("research_priority")
+    if explicit in ALLOWED_RESEARCH_PRIORITIES:
+        return str(explicit)
+    legacy = leaf.get("bayesian_weighting")
+    if isinstance(legacy, dict):
+        for key in ("research_priority", "static_information_weight"):
+            value = legacy.get(key)
+            if value in ALLOWED_RESEARCH_PRIORITIES:
+                return str(value)
+    return "medium"
+
+
+def _enrich_leaf_research_contract(leaf: dict[str, Any], handoff: dict[str, Any]) -> dict[str, Any]:
+    enriched = copy.deepcopy(leaf)
+    enriched["research_priority"] = _leaf_research_priority(enriched)
+    enriched.pop("bayesian_weighting", None)
+    enriched["coverage_dimension"] = _coverage_dimension_for_leaf(enriched)
+    enriched["research_factor"] = _research_factor_for_leaf(enriched)
+    enriched["leaf_question"] = str(enriched.get("leaf_question") or enriched.get("question_text") or "")
+    enriched["evidence_requirements"] = _default_evidence_requirements(enriched)
+    enriched["classification_targets"] = _default_classification_targets(enriched)
+    enriched["sufficiency_criteria"] = _default_sufficiency_criteria(enriched)
+    enriched["specificity_evidence"] = _default_leaf_specificity_evidence(enriched, handoff)
+    if not isinstance(enriched.get("overlap_risk_with_leaf_ids"), list):
+        enriched["overlap_risk_with_leaf_ids"] = []
+    enriched["missingness_interpretation"] = str(
+        enriched.get("missingness_interpretation")
+        or "unanswered_material_question_or_structural_unanswerability_candidate"
+    )
+    forbidden = set(enriched.get("forbidden_outputs") or [])
+    enriched["forbidden_outputs"] = sorted(forbidden | FORBIDDEN_LEAF_OUTPUTS)
+    return enriched
+
+
+def _build_market_resolution_contract(handoff: dict[str, Any]) -> dict[str, Any]:
+    question = str(handoff.get("macro_question") or "the market question")
+    negative = _question_looks_negative(question)
+    market_context = handoff.get("market_context") if isinstance(handoff.get("market_context"), dict) else {}
+    return {
+        "yes_no_mapping": {
+            "yes_means": (
+                "The market's YES side means the negative or absence condition remains true at resolution."
+                if negative
+                else "The market's YES side means the target event occurs under the market rules."
+            ),
+            "no_means": (
+                "The market's NO side means a qualifying contrary event occurred under the market rules."
+                if negative
+                else "The market's NO side means the target event does not occur under the market rules."
+            ),
+            "mapping_confidence": "requires_case_contract_confirmation",
+        },
+        "resolution_subject": question,
+        "resolution_authority": market_context.get("resolution_authority") or "market_rules_or_platform_resolution_source",
+        "contract_deadline": market_context.get("resolves_at") or market_context.get("closes_at"),
+        "forecast_cutoff": handoff.get("source_cutoff_timestamp") or handoff.get("forecast_timestamp"),
+        "platform_family_context": market_context.get("platform_family_context") or "unknown_not_promoted",
+        "ambiguous_terms": _ambiguous_terms_from_question(question),
+        "disqualifying_evidence_types": [
+            "rumor_only",
+            "unsupported_social_media_claim",
+            "post_cutoff_source_fact",
+            "market_price_only",
+        ],
+        "source_hierarchy": [
+            "official_or_primary_resolution_source",
+            "market_rules_or_resolution_source",
+            "independent_secondary_confirmation",
+        ],
+    }
+
+
+def _build_research_coverage_graph(handoff: dict[str, Any], leaves: list[dict[str, Any]]) -> dict[str, Any]:
+    by_dimension: dict[str, list[str]] = {}
+    research_factors: list[dict[str, str]] = []
+    guard_leaf_ids: list[str] = []
+    material_leaf_ids: list[str] = []
+    for leaf in leaves:
+        leaf_id = str(leaf.get("leaf_id") or "")
+        dimension = str(leaf.get("coverage_dimension") or _coverage_dimension_for_leaf(leaf))
+        by_dimension.setdefault(dimension, []).append(leaf_id)
+        research_factors.append(
+            {
+                "leaf_id": leaf_id,
+                "coverage_dimension": dimension,
+                "research_factor": str(leaf.get("research_factor") or _research_factor_for_leaf(leaf)),
+            }
+        )
+        if dimension in CONTRACT_GUARD_COVERAGE_DIMENSIONS and leaf.get("purpose") in {
+            "source_of_truth",
+            "resolution_mechanics",
+        }:
+            guard_leaf_ids.append(leaf_id)
+        else:
+            material_leaf_ids.append(leaf_id)
+    missing = sorted(REQUIRED_CORE_COVERAGE_DIMENSIONS - set(by_dimension))
+    unanswered = [
+        {
+            "coverage_dimension": dimension,
+            "question": f"No leaf currently covers required dimension {dimension}.",
+            "status": "requires_decomposer_repair",
+        }
+        for dimension in missing
+    ]
+    return {
+        "target_event_description": str(handoff.get("macro_question") or ""),
+        "coverage_dimensions": sorted(by_dimension),
+        "research_factors": research_factors,
+        "contract_guard_leaf_ids": guard_leaf_ids,
+        "material_question_leaf_ids": material_leaf_ids,
+        "required_leaf_ids_by_dimension": {key: sorted(value) for key, value in sorted(by_dimension.items())},
+        "overlap_groups": [],
+        "unanswered_material_questions": unanswered,
+        "coverage_summary": {
+            "status": "requires_repair" if unanswered else "coverage_ready",
+            "material_leaf_count": len(material_leaf_ids),
+            "contract_guard_leaf_count": len(guard_leaf_ids),
+            "coverage_dimension_count": len(by_dimension),
+            "authority": "research_coverage_only_no_forecast_authority",
+        },
+    }
 
 
 def _normalize_leaf_collection(leaves: Any) -> list[dict[str, Any]]:
@@ -531,14 +927,14 @@ def build_leaf_budget_decision(
 def build_research_sufficiency_requirements(
     *,
     purpose: str,
-    static_information_weight: str,
+    research_priority: str,
     condition_scope: str,
     required_value_fields: list[str] | None = None,
     required_negative_checks: list[str] | None = None,
 ) -> dict[str, Any]:
     return _build_research_sufficiency_requirements(
         purpose=purpose,
-        static_information_weight=static_information_weight,
+        research_priority=research_priority,
         condition_scope=condition_scope,
         required_value_fields=required_value_fields,
         required_negative_checks=required_negative_checks,
@@ -585,16 +981,19 @@ def build_qdt_candidate(
 ) -> dict[str, Any]:
     leaves = copy.deepcopy(required_leaf_questions)
     for leaf in leaves:
-        weighting = leaf.get("bayesian_weighting", {})
-        if isinstance(weighting, dict) and "research_sufficiency_requirements" not in leaf:
+        priority = _leaf_research_priority(leaf)
+        leaf["research_priority"] = priority
+        leaf.pop("bayesian_weighting", None)
+        if "research_sufficiency_requirements" not in leaf:
             leaf["research_sufficiency_requirements"] = build_research_sufficiency_requirements(
                 purpose=leaf.get("purpose", "other"),
-                static_information_weight=weighting.get("static_information_weight", "medium"),
+                research_priority=priority,
                 condition_scope=leaf.get("leaf_condition_scope", "unconditional"),
                 required_value_fields=leaf.get("required_evidence_fields")
                 if isinstance(leaf.get("required_evidence_fields"), list)
                 else None,
             )
+    leaves = [_enrich_leaf_research_contract(leaf, handoff) for leaf in leaves]
     purposes = sorted({leaf.get("purpose") for leaf in leaves if leaf.get("purpose")})
     if leaf_budget_decision is None:
         leaf_budget_decision = build_leaf_budget_decision(
@@ -619,6 +1018,8 @@ def build_qdt_candidate(
             or _prefixed_sha256({})
         ),
         "leaf_budget_decision": leaf_budget_decision,
+        "market_resolution_contract": _build_market_resolution_contract(handoff),
+        "research_coverage_graph": _build_research_coverage_graph(handoff, leaves),
         "branches": copy.deepcopy(branches),
         "required_leaf_questions": leaves,
         "required_evidence_purposes": purposes,
@@ -652,12 +1053,11 @@ def build_fixture_qdt_candidate(
         {
             "leaf_id": "leaf-source-of-truth",
             "parent_branch_id": "branch-resolution",
-            "question_text": "What official or primary-source information can resolve the market question?",
+            "question_text": "What market rule, platform resolver, or primary authority defines the exact YES/NO outcome for this market?",
             "purpose": "source_of_truth",
-            "bayesian_weighting": {
-                "static_information_weight": "critical",
-                "weight_reason_codes": ["official_resolution_authority"],
-            },
+            "coverage_dimension": "resolution_mechanics",
+            "research_factor": "resolution_condition_and_authority",
+            "research_priority": "critical",
             "leaf_dependency_group_id": "dep-group-resolution",
             "leaf_condition_scope": "unconditional",
             "required_evidence_fields": ["official_status", "resolution_criteria"],
@@ -667,27 +1067,103 @@ def build_fixture_qdt_candidate(
         {
             "leaf_id": "leaf-direct-evidence",
             "parent_branch_id": "branch-resolution",
-            "question_text": "What fresh direct evidence bears on the target event before the cutoff?",
+            "question_text": "What direct pre-cutoff evidence shows whether the target event is currently observed, contradicted, or unresolved?",
             "purpose": "direct_evidence",
-            "bayesian_weighting": {
-                "static_information_weight": "high",
-                "weight_reason_codes": ["event_proximity"],
-            },
+            "coverage_dimension": "current_direct_evidence",
+            "research_factor": "current_target_event_status",
+            "research_priority": "high",
             "leaf_dependency_group_id": "dep-group-resolution",
             "leaf_condition_scope": "unconditional",
             "required_evidence_fields": ["event_status", "event_timestamp"],
             "market_component_terms": ["event", "cutoff"],
             "structural_validation": {"depth": 2, "answerability_status": "answerable"},
         },
+        {
+            "leaf_id": "leaf-key-driver-status",
+            "parent_branch_id": "branch-resolution",
+            "question_text": "Which market-specific drivers or process milestones would make the target event materially more or less observable before cutoff?",
+            "purpose": "catalyst",
+            "coverage_dimension": "key_drivers",
+            "research_factor": "process_stage_and_driver_status",
+            "research_priority": "high",
+            "leaf_dependency_group_id": "dep-group-resolution",
+            "leaf_condition_scope": "unconditional",
+            "required_evidence_fields": ["driver_status", "process_stage"],
+            "market_component_terms": ["driver", "process stage", "milestone"],
+            "structural_validation": {"depth": 2, "answerability_status": "answerable"},
+        },
+        {
+            "leaf_id": "leaf-negative-checks",
+            "parent_branch_id": "branch-resolution",
+            "question_text": "What negative checks, blockers, or contradictory signals show the target event has not cleanly occurred before cutoff?",
+            "purpose": "direct_evidence",
+            "coverage_dimension": "counterevidence_negative_checks",
+            "research_factor": "counterevidence_and_blockers",
+            "research_priority": "high",
+            "leaf_dependency_group_id": "dep-group-resolution",
+            "leaf_condition_scope": "unconditional",
+            "required_evidence_fields": ["negative_check_status", "contradiction_status"],
+            "market_component_terms": ["negative check", "blocker", "contradiction"],
+            "structural_validation": {"depth": 2, "answerability_status": "answerable"},
+        },
+        {
+            "leaf_id": "leaf-source-quality",
+            "parent_branch_id": "branch-resolution",
+            "question_text": "Are the relevant claim families independent high-quality reports, official statements, or repeated low-quality rumors that should be collapsed?",
+            "purpose": "direct_evidence",
+            "coverage_dimension": "source_quality",
+            "research_factor": "claim_family_independence_and_source_quality",
+            "research_priority": "medium",
+            "leaf_dependency_group_id": "dep-group-resolution",
+            "leaf_condition_scope": "unconditional",
+            "required_evidence_fields": ["source_quality", "claim_family_independence"],
+            "market_component_terms": ["claim family", "source quality", "rumor"],
+            "structural_validation": {"depth": 2, "answerability_status": "answerable"},
+        },
+        {
+            "leaf_id": "leaf-timing-constraints",
+            "parent_branch_id": "branch-mechanics",
+            "question_text": "Which deadline, cutoff, and observation-window constraints determine whether evidence can count for this market?",
+            "purpose": "resolution_mechanics",
+            "coverage_dimension": "timing_deadline_constraints",
+            "research_factor": "deadline_and_cutoff_admissibility",
+            "research_priority": "medium",
+            "leaf_dependency_group_id": "dep-group-mechanics",
+            "leaf_condition_scope": "shared_context",
+            "required_evidence_fields": ["resolution_deadline", "cutoff_window"],
+            "market_component_terms": ["deadline", "cutoff", "observation window"],
+            "structural_validation": {"depth": 2, "answerability_status": "answerable"},
+        },
+        {
+            "leaf_id": "leaf-material-unknowns",
+            "parent_branch_id": "branch-resolution",
+            "question_text": "What material questions remain unanswered after retrieval, and are they answerable through more source discovery or structurally unavailable before cutoff?",
+            "purpose": "structural",
+            "coverage_dimension": "material_unknowns",
+            "research_factor": "unanswered_material_questions",
+            "research_priority": "medium",
+            "leaf_dependency_group_id": "dep-group-resolution",
+            "leaf_condition_scope": "unconditional",
+            "required_evidence_fields": ["unanswered_question_status", "answerability_status"],
+            "market_component_terms": ["material unknown", "answerability", "retrieval gap"],
+            "structural_validation": {"depth": 2, "answerability_status": "answerable"},
+        },
     ]
     branches = [
         {
             "branch_id": "branch-resolution",
-            "branch_question": "Resolve the target market through primary authority and fresh direct evidence.",
-            "branch_role": "resolution_evidence",
+            "branch_question": "Define the market-specific research coverage needed to classify the target outcome before cutoff.",
+            "branch_role": "research_coverage",
             "dependency_group_id": "dep-group-resolution",
-            "required_evidence_purposes": ["direct_evidence", "source_of_truth"],
-            "leaf_ids": ["leaf-source-of-truth", "leaf-direct-evidence"],
+            "required_evidence_purposes": ["catalyst", "direct_evidence", "source_of_truth", "structural"],
+            "leaf_ids": [
+                "leaf-source-of-truth",
+                "leaf-direct-evidence",
+                "leaf-key-driver-status",
+                "leaf-negative-checks",
+                "leaf-source-quality",
+                "leaf-material-unknowns",
+            ],
             "amrg_usage_refs": [],
             "structural_validation": {"depth": 1},
         }
@@ -697,12 +1173,11 @@ def build_fixture_qdt_candidate(
             {
                 "leaf_id": "leaf-resolution-mechanics",
                 "parent_branch_id": "branch-mechanics",
-                "question_text": "Which market rules and timing terms govern how the outcome resolves?",
+                "question_text": "Which market rules and source hierarchy distinguish a qualifying resolution claim from rumor, weak context, or post-cutoff evidence?",
                 "purpose": "resolution_mechanics",
-                "bayesian_weighting": {
-                    "static_information_weight": "medium",
-                    "weight_reason_codes": ["contract_resolution_terms"],
-                },
+                "coverage_dimension": "resolution_mechanics",
+                "research_factor": "source_hierarchy_and_qualifying_claim",
+                "research_priority": "medium",
                 "leaf_dependency_group_id": "dep-group-mechanics",
                 "leaf_condition_scope": "shared_context",
                 "required_evidence_fields": ["resolution_deadline", "rules_text"],
@@ -713,11 +1188,11 @@ def build_fixture_qdt_candidate(
         branches.append(
             {
                 "branch_id": "branch-mechanics",
-                "branch_question": "Clarify contract mechanics that constrain admissible evidence.",
+                "branch_question": "Clarify contract mechanics, deadlines, and source hierarchy that constrain admissible evidence.",
                 "branch_role": "resolution_mechanics",
                 "dependency_group_id": "dep-group-mechanics",
                 "required_evidence_purposes": ["resolution_mechanics"],
-                "leaf_ids": ["leaf-resolution-mechanics"],
+                "leaf_ids": ["leaf-timing-constraints", "leaf-resolution-mechanics"],
                 "amrg_usage_refs": [],
                 "structural_validation": {"depth": 1},
             }
@@ -880,11 +1355,10 @@ def _validate_sufficiency(requirements: Any, leaf: dict[str, Any], path: str, er
             errors.append(f"{path}.{list_field} must be a string list")
     if requirements.get("classification_dispatch_requires_sufficiency_certificate") is not True:
         errors.append(f"{path}.classification_dispatch_requires_sufficiency_certificate must be true")
-    weighting = leaf.get("bayesian_weighting", {})
+    priority = leaf.get("research_priority")
     critical_or_source = (
         leaf.get("purpose") == "source_of_truth"
-        or isinstance(weighting, dict)
-        and weighting.get("static_information_weight") == "critical"
+        or priority == "critical"
     )
     if critical_or_source and not (
         requirements.get("protected_primary_required") or requirements.get("unanswerability_proof_required")
@@ -892,12 +1366,12 @@ def _validate_sufficiency(requirements: Any, leaf: dict[str, Any], path: str, er
         errors.append(f"{path} critical/source-of-truth leaves require protected primary or unanswerability proof")
     if critical_or_source and requirements.get("allow_macro_fallback_for_leaf") is True:
         errors.append(f"{path} critical/source-of-truth leaves cannot allow macro fallback as sufficient research")
-    if isinstance(weighting, dict):
+    if priority in ALLOWED_RESEARCH_PRIORITIES:
         required_evidence_fields = leaf.get("required_evidence_fields")
         template_errors = validate_research_sufficiency_requirements(
             requirements,
             purpose=str(leaf.get("purpose")),
-            static_information_weight=str(weighting.get("static_information_weight")),
+            research_priority=str(priority),
             condition_scope=str(leaf.get("leaf_condition_scope")),
             required_evidence_fields=list(required_evidence_fields)
             if _string_list(required_evidence_fields)
@@ -931,6 +1405,65 @@ def _validate_leaf_structural_validation(
         errors.append(f"{path}.structural_validation.unanswerable_policy_consequence is required")
     if not isinstance(requirements, dict) or requirements.get("unanswerability_proof_required") is not True:
         errors.append(f"{path}.structural_validation unanswerable policy candidates require proof before dispatch")
+
+
+def _validate_specificity_evidence(value: Any, path: str, errors: list[str]) -> None:
+    if not isinstance(value, dict):
+        errors.append(f"{path}.specificity_evidence must be an object")
+        return
+    for field in (
+        "market_rule_clause_refs",
+        "case_contract_field_refs",
+        "why_this_must_be_investigated",
+        "not_a_template_reason",
+        "expected_answer_type",
+    ):
+        if field not in value:
+            errors.append(f"{path}.specificity_evidence missing {field}")
+    for list_field in ("market_rule_clause_refs", "case_contract_field_refs"):
+        if not isinstance(value.get(list_field), list):
+            errors.append(f"{path}.specificity_evidence.{list_field} must be a list")
+    for text_field in (
+        "why_this_must_be_investigated",
+        "not_a_template_reason",
+        "expected_answer_type",
+    ):
+        if not _is_non_empty_string(value.get(text_field)):
+            errors.append(f"{path}.specificity_evidence.{text_field} is required")
+
+
+def _validate_leaf_research_contract(leaf: dict[str, Any], path: str, errors: list[str]) -> None:
+    dimension = leaf.get("coverage_dimension")
+    if dimension not in ALLOWED_COVERAGE_DIMENSIONS:
+        errors.append(f"{path}.coverage_dimension is invalid")
+    if not _is_non_empty_string(leaf.get("research_factor")):
+        errors.append(f"{path}.research_factor is required")
+    if not _is_non_empty_string(leaf.get("leaf_question")):
+        errors.append(f"{path}.leaf_question is required")
+    elif leaf.get("question_text") and str(leaf["leaf_question"]).strip() != str(leaf["question_text"]).strip():
+        errors.append(f"{path}.leaf_question must match question_text")
+    if not isinstance(leaf.get("evidence_requirements"), list) or not leaf.get("evidence_requirements"):
+        errors.append(f"{path}.evidence_requirements must be non-empty")
+    if not _string_list(leaf.get("classification_targets")):
+        errors.append(f"{path}.classification_targets must be a string list")
+    if not isinstance(leaf.get("sufficiency_criteria"), dict) or not leaf.get("sufficiency_criteria"):
+        errors.append(f"{path}.sufficiency_criteria must be a non-empty object")
+    _validate_specificity_evidence(leaf.get("specificity_evidence"), path, errors)
+    overlap = leaf.get("overlap_risk_with_leaf_ids")
+    if not isinstance(overlap, list):
+        errors.append(f"{path}.overlap_risk_with_leaf_ids must be a list")
+    if not _is_non_empty_string(leaf.get("missingness_interpretation")):
+        errors.append(f"{path}.missingness_interpretation is required")
+    forbidden = leaf.get("forbidden_outputs")
+    if not _string_list(forbidden):
+        errors.append(f"{path}.forbidden_outputs must be a string list")
+    else:
+        missing = FORBIDDEN_LEAF_OUTPUTS - set(str(item) for item in forbidden)
+        if missing:
+            errors.append(f"{path}.forbidden_outputs missing " + ", ".join(sorted(missing)))
+    similarity = _max_template_similarity(str(leaf.get("leaf_question") or leaf.get("question_text") or ""))
+    if similarity > 0.82:
+        errors.append(f"{path}:template_mad_lib_leaf")
 
 
 def _validate_leaves(
@@ -970,14 +1503,8 @@ def _validate_leaves(
             errors.append(f"{path}.question_text is required")
         if leaf.get("purpose") not in ALLOWED_PURPOSES:
             errors.append(f"{path}.purpose is invalid")
-        weighting = leaf.get("bayesian_weighting")
-        if not isinstance(weighting, dict):
-            errors.append(f"{path}.bayesian_weighting must be an object")
-        else:
-            if weighting.get("static_information_weight") not in ALLOWED_STATIC_INFORMATION_WEIGHTS:
-                errors.append(f"{path}.static_information_weight is invalid")
-            if not _reason_codes_are_compact(weighting.get("weight_reason_codes")):
-                errors.append(f"{path}.weight_reason_codes must be compact reason codes")
+        if leaf.get("research_priority") not in ALLOWED_RESEARCH_PRIORITIES:
+            errors.append(f"{path}.research_priority is invalid")
         if not _is_non_empty_string(leaf.get("leaf_dependency_group_id")):
             errors.append(f"{path}.leaf_dependency_group_id is required")
         if leaf.get("leaf_condition_scope") not in ALLOWED_CONDITION_SCOPES:
@@ -996,6 +1523,7 @@ def _validate_leaves(
             depth_waived=depth_waived,
         )
         _validate_sufficiency(leaf.get("research_sufficiency_requirements"), leaf, path, errors)
+        _validate_leaf_research_contract(leaf, path, errors)
 
     for branch_id, branch in branches_by_id.items():
         expected = set(branch.get("leaf_ids", []))
@@ -1209,6 +1737,173 @@ def _validate_required_purpose_coverage(
         errors.append("required_purpose_coverage_missing: " + ", ".join(missing))
 
 
+def _validate_market_resolution_contract(value: Any, artifact: dict[str, Any], errors: list[str]) -> None:
+    if not isinstance(value, dict):
+        errors.append("market_resolution_contract must be an object")
+        return
+    for field in REQUIRED_MARKET_RESOLUTION_CONTRACT_FIELDS:
+        if field not in value:
+            errors.append(f"market_resolution_contract missing {field}")
+    mapping = value.get("yes_no_mapping")
+    if not isinstance(mapping, dict):
+        errors.append("market_resolution_contract.yes_no_mapping must be an object")
+    else:
+        for field in ("yes_means", "no_means", "mapping_confidence"):
+            if not _is_non_empty_string(mapping.get(field)):
+                errors.append(f"market_resolution_contract.yes_no_mapping.{field} is required")
+    for field in ("resolution_subject", "resolution_authority", "platform_family_context"):
+        if not _is_non_empty_string(value.get(field)):
+            errors.append(f"market_resolution_contract.{field} is required")
+    if not isinstance(value.get("ambiguous_terms"), list):
+        errors.append("market_resolution_contract.ambiguous_terms must be a list")
+    if not _string_list(value.get("disqualifying_evidence_types")):
+        errors.append("market_resolution_contract.disqualifying_evidence_types must be a string list")
+    if not _string_list(value.get("source_hierarchy")):
+        errors.append("market_resolution_contract.source_hierarchy must be a string list")
+    if _question_looks_negative(artifact.get("macro_question")):
+        joined = canonical_json(mapping or {}).lower()
+        if not any(term in joined for term in ("absence", "negative", "no qualifying", "contrary")):
+            errors.append("negative_market_mapping_not_decomposed")
+
+
+def _evidence_packet_suggests_market_family(evidence_packet: dict[str, Any] | None) -> bool:
+    if not isinstance(evidence_packet, dict):
+        return False
+    family = evidence_packet.get("family_context")
+    if isinstance(family, dict):
+        for field in ("family_id", "parent_market_id", "sibling_market_ids", "child_market_ids"):
+            value = family.get(field)
+            if value:
+                return True
+    identity = evidence_packet.get("market_identity")
+    if isinstance(identity, dict):
+        return bool(identity.get("parent_market_id") or identity.get("event_id") or identity.get("group_id"))
+    return False
+
+
+def _unanswered_dimensions(value: dict[str, Any]) -> set[str]:
+    unanswered = value.get("unanswered_material_questions")
+    dimensions: set[str] = set()
+    if isinstance(unanswered, list):
+        for item in unanswered:
+            if isinstance(item, dict) and item.get("coverage_dimension") in ALLOWED_COVERAGE_DIMENSIONS:
+                dimensions.add(str(item["coverage_dimension"]))
+    return dimensions
+
+
+def _minimum_material_leaf_count(leaf_budget_decision: Any) -> int:
+    budget = None
+    if isinstance(leaf_budget_decision, dict) and isinstance(leaf_budget_decision.get("effective_leaf_budget"), int):
+        budget = int(leaf_budget_decision["effective_leaf_budget"])
+    budget = budget or COMPACT_DEFAULT_LEAF_BUDGET
+    return min(5, max(2, budget // 2))
+
+
+def _validate_overlap_groups(
+    graph: dict[str, Any],
+    leaves_by_id: dict[str, dict[str, Any]],
+    errors: list[str],
+) -> None:
+    overlap_groups = graph.get("overlap_groups")
+    grouped_pairs: set[tuple[str, str]] = set()
+    if isinstance(overlap_groups, list):
+        for idx, group in enumerate(overlap_groups):
+            if not isinstance(group, dict):
+                errors.append(f"research_coverage_graph.overlap_groups[{idx}] must be an object")
+                continue
+            ids = group.get("leaf_ids")
+            if not isinstance(ids, list) or len(ids) < 2:
+                errors.append(f"research_coverage_graph.overlap_groups[{idx}].leaf_ids must contain at least two leaves")
+                continue
+            for left in ids:
+                for right in ids:
+                    if left != right:
+                        grouped_pairs.add(tuple(sorted((str(left), str(right)))))
+    questions = {
+        leaf_id: str(leaf.get("leaf_question") or leaf.get("question_text") or "")
+        for leaf_id, leaf in leaves_by_id.items()
+    }
+    ids = list(questions)
+    for idx, left in enumerate(ids):
+        for right in ids[idx + 1 :]:
+            if _template_similarity(questions[left], questions[right]) > 0.86:
+                if tuple(sorted((left, right))) not in grouped_pairs:
+                    errors.append("overlapping_leaf_questions_not_deduplicated")
+                    return
+
+
+def _validate_research_coverage_graph(
+    value: Any,
+    artifact: dict[str, Any],
+    leaves_by_id: dict[str, dict[str, Any]],
+    evidence_packet: dict[str, Any] | None,
+    errors: list[str],
+) -> None:
+    if not isinstance(value, dict):
+        errors.append("research_coverage_graph must be an object")
+        return
+    for field in REQUIRED_RESEARCH_COVERAGE_GRAPH_FIELDS:
+        if field not in value:
+            errors.append(f"research_coverage_graph missing {field}")
+    if not _is_non_empty_string(value.get("target_event_description")):
+        errors.append("research_coverage_graph.target_event_description is required")
+    coverage_dimensions = value.get("coverage_dimensions")
+    if not isinstance(coverage_dimensions, list) or not coverage_dimensions:
+        errors.append("research_coverage_graph.coverage_dimensions must be non-empty")
+        coverage_set: set[str] = set()
+    else:
+        coverage_set = {str(item) for item in coverage_dimensions}
+        unknown = sorted(coverage_set - ALLOWED_COVERAGE_DIMENSIONS)
+        if unknown:
+            errors.append("research_coverage_graph.coverage_dimensions contains unknown dimensions")
+    by_dimension = value.get("required_leaf_ids_by_dimension")
+    leaf_ids = set(leaves_by_id)
+    if not isinstance(by_dimension, dict) or not by_dimension:
+        errors.append("research_coverage_graph.required_leaf_ids_by_dimension must be non-empty")
+        by_dimension = {}
+    for dimension, ids in by_dimension.items():
+        if dimension not in ALLOWED_COVERAGE_DIMENSIONS:
+            errors.append(f"research_coverage_graph.required_leaf_ids_by_dimension.{dimension} is invalid")
+        if not isinstance(ids, list) or not ids:
+            errors.append(f"research_coverage_graph.required_leaf_ids_by_dimension.{dimension} must be non-empty")
+            continue
+        unknown_ids = sorted(str(item) for item in ids if str(item) not in leaf_ids)
+        if unknown_ids:
+            errors.append(f"research_coverage_graph.required_leaf_ids_by_dimension.{dimension} references unknown leaves")
+    for list_field in ("contract_guard_leaf_ids", "material_question_leaf_ids"):
+        ids = value.get(list_field)
+        if not isinstance(ids, list):
+            errors.append(f"research_coverage_graph.{list_field} must be a list")
+        else:
+            unknown_ids = sorted(str(item) for item in ids if str(item) not in leaf_ids)
+            if unknown_ids:
+                errors.append(f"research_coverage_graph.{list_field} references unknown leaves")
+    guard = set(str(item) for item in value.get("contract_guard_leaf_ids") or [])
+    material = set(str(item) for item in value.get("material_question_leaf_ids") or [])
+    if guard & material:
+        errors.append("research_coverage_graph guard and material leaf ids must be disjoint")
+    if len(material) < _minimum_material_leaf_count(artifact.get("leaf_budget_decision")):
+        errors.append("insufficient_material_leaf_count")
+    if guard and len(guard) >= len(material):
+        errors.append("resolution_checklist_dominates_research_coverage")
+    missing_dimensions = REQUIRED_CORE_COVERAGE_DIMENSIONS - set(by_dimension)
+    missing_unanswered = missing_dimensions - _unanswered_dimensions(value)
+    if missing_unanswered:
+        errors.append("required_coverage_dimension_missing: " + ", ".join(sorted(missing_unanswered)))
+    for leaf_id, leaf in leaves_by_id.items():
+        dimension = leaf.get("coverage_dimension")
+        if dimension in ALLOWED_COVERAGE_DIMENSIONS:
+            ids = by_dimension.get(dimension, [])
+            if isinstance(ids, list) and leaf_id not in ids:
+                errors.append(f"research_coverage_graph.required_leaf_ids_by_dimension omits {leaf_id}")
+    if _evidence_packet_suggests_market_family(evidence_packet):
+        contract = artifact.get("market_resolution_contract")
+        context = contract.get("platform_family_context") if isinstance(contract, dict) else None
+        if not _is_non_empty_string(context) or context == "unknown_not_promoted":
+            errors.append("market_family_context_not_analyzed")
+    _validate_overlap_groups(value, leaves_by_id, errors)
+
+
 def _validate_market_reality_digest(
     artifact: dict[str, Any],
     evidence_packet: dict[str, Any] | None,
@@ -1332,6 +2027,14 @@ def validate_question_decomposition(
         artifact.get("required_evidence_purposes"),
         errors,
         depth_waived=depth_waived,
+    )
+    _validate_market_resolution_contract(artifact.get("market_resolution_contract"), artifact, errors)
+    _validate_research_coverage_graph(
+        artifact.get("research_coverage_graph"),
+        artifact,
+        leaves_by_id,
+        evidence_packet,
+        errors,
     )
     _validate_required_purpose_coverage(artifact, leaves_by_id, evidence_packet, errors)
     _validate_leaf_budget(
@@ -1465,24 +2168,140 @@ def require_valid_question_decomposition(
         raise QDTError("; ".join(result.errors))
 
 
+def compute_qdt_quality_checks(
+    artifact: dict[str, Any],
+    *,
+    evidence_packet: dict[str, Any] | None = None,
+) -> dict[str, dict[str, Any]]:
+    validation = validate_question_decomposition(
+        artifact,
+        require_selected=artifact.get("candidate_selection_audit", {}).get("selection_status") == "selected",
+        evidence_packet=evidence_packet,
+    )
+    leaf_ids = {
+        str(leaf.get("leaf_id"))
+        for leaf in artifact.get("required_leaf_questions", [])
+        if isinstance(leaf, dict) and leaf.get("leaf_id")
+    }
+    graph = artifact.get("research_coverage_graph") if isinstance(artifact.get("research_coverage_graph"), dict) else {}
+    dimensions = graph.get("coverage_dimensions") if isinstance(graph.get("coverage_dimensions"), list) else []
+    template_like = []
+    for leaf in artifact.get("required_leaf_questions", []):
+        if not isinstance(leaf, dict):
+            continue
+        similarity = _max_template_similarity(str(leaf.get("leaf_question") or leaf.get("question_text") or ""))
+        if similarity > 0.82:
+            template_like.append({"leaf_id": leaf.get("leaf_id"), "similarity": round(similarity, 3)})
+    coverage_errors = [
+        error
+        for error in validation.errors
+        if any(
+            marker in error
+            for marker in (
+                "research_coverage_graph",
+                "coverage_dimension",
+                "template_mad_lib_leaf",
+                "insufficient_material_leaf_count",
+                "resolution_checklist_dominates_research_coverage",
+                "required_coverage_dimension_missing",
+                "overlapping_leaf_questions_not_deduplicated",
+                "classification_targets",
+                "evidence_requirements",
+                "specificity_evidence",
+            )
+        )
+    ]
+    question_errors = [
+        error
+        for error in validation.errors
+        if any(
+            marker in error
+            for marker in (
+                "template_mad_lib_leaf",
+                "negative_market_mapping_not_decomposed",
+                "market_family_context_not_analyzed",
+                "specificity_evidence",
+                "leaf_question",
+            )
+        )
+    ]
+    question_status = "failed" if question_errors or template_like else "passed"
+    coverage_status = "failed" if coverage_errors else "passed"
+    return {
+        "question_specificity_check": {
+            "status": question_status,
+            "macro_question_sha256": _prefixed_sha256(artifact.get("macro_question", "")),
+            "generic_fixture_leaf_ids_absent": not {
+                "leaf-source-of-truth",
+                "leaf-direct-evidence",
+                "leaf-resolution-mechanics",
+            }.intersection(leaf_ids),
+            "template_like_leaf_count": len(template_like),
+            "template_like_leaf_refs": template_like,
+            "reason_codes": ["semantic_specificity_passed"] if question_status == "passed" else question_errors,
+        },
+        "research_coverage_check": {
+            "status": coverage_status,
+            "coverage_dimensions": list(dimensions),
+            "material_leaf_count": len(graph.get("material_question_leaf_ids") or []),
+            "contract_guard_leaf_count": len(graph.get("contract_guard_leaf_ids") or []),
+            "reason_codes": ["research_coverage_graph_valid"] if coverage_status == "passed" else coverage_errors,
+        },
+    }
+
+
 def score_qdt_candidate(candidate: dict[str, Any]) -> float:
     leaves = candidate.get("required_leaf_questions", [])
     if not isinstance(leaves, list):
         return -1.0
     purposes = {leaf.get("purpose") for leaf in leaves if isinstance(leaf, dict)}
-    weights = [
-        leaf.get("bayesian_weighting", {}).get("static_information_weight")
+    dimensions = {
+        leaf.get("coverage_dimension")
         for leaf in leaves
-        if isinstance(leaf, dict) and isinstance(leaf.get("bayesian_weighting"), dict)
-    ]
-    critical_count = weights.count("critical")
-    high_count = weights.count("high")
+        if isinstance(leaf, dict) and leaf.get("coverage_dimension") in ALLOWED_COVERAGE_DIMENSIONS
+    }
+    graph = candidate.get("research_coverage_graph") if isinstance(candidate.get("research_coverage_graph"), dict) else {}
+    material_count = len(graph.get("material_question_leaf_ids") or [])
+    guard_count = len(graph.get("contract_guard_leaf_ids") or [])
+    answerable_count = sum(
+        1
+        for leaf in leaves
+        if isinstance(leaf, dict)
+        and leaf.get("classification_targets")
+        and leaf.get("evidence_requirements")
+        and leaf.get("sufficiency_criteria")
+    )
+    specificity_bonus = sum(
+        1
+        for leaf in leaves
+        if isinstance(leaf, dict)
+        and isinstance(leaf.get("specificity_evidence"), dict)
+        and leaf["specificity_evidence"].get("why_this_must_be_investigated")
+        and leaf["specificity_evidence"].get("not_a_template_reason")
+    )
+    template_penalty = sum(
+        3.0
+        for leaf in leaves
+        if isinstance(leaf, dict)
+        and _max_template_similarity(str(leaf.get("leaf_question") or leaf.get("question_text") or "")) > 0.82
+    )
     source_of_truth_bonus = 2 if "source_of_truth" in purposes else 0
     purpose_coverage = len(purposes)
     leaf_count = len(leaves)
     budget = candidate.get("leaf_budget_decision", {}).get("effective_leaf_budget", leaf_count)
     compact_penalty = max(0, leaf_count - int(budget if isinstance(budget, int) else leaf_count))
-    return float(purpose_coverage * 10 + critical_count * 3 + high_count * 2 + source_of_truth_bonus - compact_penalty)
+    guard_penalty = 8 if guard_count >= material_count and material_count else 0
+    return float(
+        purpose_coverage * 6
+        + len(dimensions) * 8
+        + material_count * 3
+        + answerable_count * 2
+        + specificity_bonus
+        + source_of_truth_bonus
+        - compact_penalty
+        - guard_penalty
+        - template_penalty
+    )
 
 
 def select_qdt_candidate(candidates: list[dict[str, Any]]) -> dict[str, Any]:
@@ -1530,6 +2349,8 @@ def select_qdt_candidate(candidates: list[dict[str, Any]]) -> dict[str, Any]:
             "question_decomposition_schema_valid",
             "depth_2_branch_leaf_contract_present",
             "deterministic_structural_validation_passed",
+            "research_coverage_graph_valid",
+            "semantic_specificity_check_passed",
             "research_sufficiency_requirement_fields_present",
             "model_provenance_fields_present",
             "forbidden_output_check_passed",
@@ -1537,6 +2358,7 @@ def select_qdt_candidate(candidates: list[dict[str, Any]]) -> dict[str, Any]:
         "forbidden_output_check_status": "passed",
     }
     require_valid_question_decomposition(selected)
+    selected.update(compute_qdt_quality_checks(selected))
     return selected
 
 

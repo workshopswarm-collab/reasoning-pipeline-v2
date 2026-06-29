@@ -310,10 +310,10 @@ def _openclaw_agent_prompt(request_payload: dict[str, Any]) -> str:
             "branches": [
                 {
                     "branch_id": "branch-resolution",
-                    "branch_question": "Question-specific branch to resolve the market outcome.",
-                    "branch_role": "model_generated_branch",
+                    "branch_question": "Question-specific branch to define bounded research coverage for the market outcome.",
+                    "branch_role": "model_generated_research_coverage",
                     "dependency_group_id": "dep-group-resolution",
-                    "required_evidence_purposes": ["source_of_truth", "direct_evidence"],
+                    "required_evidence_purposes": ["source_of_truth", "direct_evidence", "catalyst", "structural"],
                     "leaf_ids": ["leaf-official-resolution", "leaf-current-status"],
                     "amrg_usage_refs": [],
                     "structural_validation": {"depth": 1},
@@ -323,12 +323,11 @@ def _openclaw_agent_prompt(request_payload: dict[str, Any]) -> str:
                 {
                     "leaf_id": "leaf-official-resolution",
                     "parent_branch_id": "branch-resolution",
-                    "question_text": "Market-specific research question for a single leaf.",
+                    "question_text": "Market-specific research question for one bounded research leaf.",
                     "purpose": "source_of_truth",
-                    "bayesian_weighting": {
-                        "static_information_weight": "critical",
-                        "weight_reason_codes": ["official_resolution_authority"],
-                    },
+                    "coverage_dimension": "resolution_mechanics",
+                    "research_factor": "resolution_condition_and_authority",
+                    "research_priority": "critical",
                     "leaf_dependency_group_id": "dep-group-resolution",
                     "leaf_condition_scope": "unconditional",
                     "required_evidence_fields": ["official_status", "resolution_criteria"],
@@ -362,7 +361,13 @@ def _openclaw_agent_prompt(request_payload: dict[str, Any]) -> str:
         "question-specific leaf IDs, branch IDs, questions, evidence fields, "
         "and market terms for the runtime request. Do not include "
         "probabilities, fair values, SCAE deltas, decisions, execution advice, "
-        "or production forecast outputs anywhere in the response payload.\n\n"
+        "numeric weights, Bayesian/log-odds edges, or production forecast "
+        "outputs anywhere in the response payload. Produce a bounded research "
+        "decomposition that maximizes coverage of material uncertainty. Do not "
+        "estimate probability. Do not assign weights. Do not make a final "
+        "forecast. Emit leaf questions, purposes, evidence requirements, "
+        "classification targets, and sufficiency criteria. Avoid mad-lib leaves "
+        "that could be reused across unrelated markets by swapping entity names.\n\n"
         "Required response skeleton:\n"
         + canonical_json(compact_candidate_schema)
         + "\n\n"

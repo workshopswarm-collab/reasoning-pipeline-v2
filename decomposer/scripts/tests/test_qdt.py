@@ -75,7 +75,7 @@ class QDTContractTest(unittest.TestCase):
     def _refresh_leaf_sufficiency(self, leaf: dict) -> None:
         leaf["research_sufficiency_requirements"] = build_research_sufficiency_requirements(
             purpose=leaf["purpose"],
-            static_information_weight=leaf["bayesian_weighting"]["static_information_weight"],
+            research_priority=leaf["research_priority"],
             condition_scope=leaf["leaf_condition_scope"],
             required_value_fields=leaf["required_evidence_fields"],
         )
@@ -132,7 +132,6 @@ class QDTContractTest(unittest.TestCase):
 
         for leaf in selected["required_leaf_questions"]:
             requirements = leaf["research_sufficiency_requirements"]
-            weighting = leaf["bayesian_weighting"]
             self.assertEqual(
                 requirements["schema_version"],
                 RESEARCH_SUFFICIENCY_REQUIREMENTS_SCHEMA_VERSION,
@@ -141,8 +140,8 @@ class QDTContractTest(unittest.TestCase):
             self.assertTrue(requirements["requirement_id"].startswith("qdt-sufficiency:"))
             self.assertEqual(requirements["leaf_purpose"], leaf["purpose"])
             self.assertEqual(
-                requirements["static_information_weight"],
-                weighting["static_information_weight"],
+                requirements["research_priority"],
+                leaf["research_priority"],
             )
             self.assertEqual(requirements["leaf_condition_scope"], leaf["leaf_condition_scope"])
             self.assertTrue(
@@ -151,7 +150,23 @@ class QDTContractTest(unittest.TestCase):
             self.assertTrue(requirements["required_negative_checks"])
             self.assertTrue(requirements["classification_dispatch_requires_sufficiency_certificate"])
 
-    def test_sufficiency_requirement_must_match_leaf_scope_and_weight(self):
+    def test_selected_qdt_has_no_legacy_weight_or_bayesian_keys(self):
+        selected = select_qdt_candidate([build_fixture_qdt_candidate(self.handoff)])
+
+        def assert_clean_keys(value: object) -> None:
+            if isinstance(value, dict):
+                for key, child in value.items():
+                    normalized = str(key).lower()
+                    self.assertNotIn("bayesian", normalized)
+                    self.assertNotIn("weight", normalized)
+                    assert_clean_keys(child)
+            elif isinstance(value, list):
+                for child in value:
+                    assert_clean_keys(child)
+
+        assert_clean_keys(json.loads(dump_question_decomposition(selected)))
+
+    def test_sufficiency_requirement_must_match_leaf_scope_and_priority(self):
         selected = select_qdt_candidate([build_fixture_qdt_candidate(self.handoff)])
         broken = copy.deepcopy(selected)
         requirements = broken["required_leaf_questions"][1]["research_sufficiency_requirements"]
@@ -199,7 +214,7 @@ class QDTContractTest(unittest.TestCase):
         selected = select_qdt_candidate([build_fixture_qdt_candidate(self.handoff)])
         evidence_packet = {
             "market_reality_constraints_digest": selected["market_reality_constraints_digest"],
-            "required_evidence_purposes": ["direct_evidence", "source_of_truth", "catalyst"],
+            "required_evidence_purposes": ["direct_evidence", "source_of_truth", "market_pricing"],
         }
 
         result = validate_question_decomposition(selected, evidence_packet=evidence_packet)
@@ -542,7 +557,7 @@ class QDTContractTest(unittest.TestCase):
 
         self.assertFalse(result.valid)
         self.assertIn("research_sufficiency_requirements", "; ".join(result.errors))
-        self.assertIn("bayesian_weighting", "; ".join(result.errors))
+        self.assertIn("research_priority", "; ".join(result.errors))
 
     def test_large_leaf_budget_requires_hierarchical_branch_ledger_flag(self):
         candidate = build_fixture_qdt_candidate(
@@ -647,6 +662,114 @@ class QDTContractTest(unittest.TestCase):
 
         self.assertEqual(decision["budget_audit"]["selected_leaf_count"], 3)
         self.assertFalse(decision["hierarchical_branch_ledger_required"])
+
+    def test_selected_qdt_has_research_coverage_graph_and_contract(self):
+        selected = select_qdt_candidate([build_fixture_qdt_candidate(self.handoff)])
+
+        self.assertIn("market_resolution_contract", selected)
+        self.assertIn("research_coverage_graph", selected)
+        self.assertEqual(selected["question_specificity_check"]["status"], "passed")
+        self.assertEqual(selected["research_coverage_check"]["status"], "passed")
+        graph = selected["research_coverage_graph"]
+        for dimension in (
+            "resolution_mechanics",
+            "current_direct_evidence",
+            "key_drivers",
+            "counterevidence_negative_checks",
+            "timing_deadline_constraints",
+            "source_quality",
+            "material_unknowns",
+        ):
+            self.assertIn(dimension, graph["required_leaf_ids_by_dimension"])
+        for leaf in selected["required_leaf_questions"]:
+            self.assertIn("coverage_dimension", leaf)
+            self.assertIn("research_factor", leaf)
+            self.assertIn("evidence_requirements", leaf)
+            self.assertIn("classification_targets", leaf)
+            self.assertIn("sufficiency_criteria", leaf)
+            self.assertIn("why_this_must_be_investigated", leaf["specificity_evidence"])
+            self.assertIn("probability", leaf["forbidden_outputs"])
+            self.assertIn("final_forecast", leaf["forbidden_outputs"])
+
+    def test_generic_mad_lib_leaf_is_rejected(self):
+        selected = select_qdt_candidate([build_fixture_qdt_candidate(self.handoff)])
+        broken = copy.deepcopy(selected)
+        broken["required_leaf_questions"][0]["question_text"] = (
+            "What official or primary-source information can resolve the market question?"
+        )
+        broken["required_leaf_questions"][0]["leaf_question"] = broken["required_leaf_questions"][0]["question_text"]
+
+        result = validate_question_decomposition(broken)
+
+        self.assertFalse(result.valid)
+        self.assertIn("template_mad_lib_leaf", "; ".join(result.errors))
+
+    def test_resolution_checklist_only_coverage_is_rejected(self):
+        selected = select_qdt_candidate([build_fixture_qdt_candidate(self.handoff)])
+        broken = copy.deepcopy(selected)
+        all_leaf_ids = [leaf["leaf_id"] for leaf in broken["required_leaf_questions"]]
+        broken["research_coverage_graph"]["contract_guard_leaf_ids"] = all_leaf_ids
+        broken["research_coverage_graph"]["material_question_leaf_ids"] = []
+
+        result = validate_question_decomposition(broken)
+
+        self.assertFalse(result.valid)
+        self.assertIn("insufficient_material_leaf_count", "; ".join(result.errors))
+
+    def test_missing_research_assignment_fields_are_rejected(self):
+        selected = select_qdt_candidate([build_fixture_qdt_candidate(self.handoff)])
+        for field, expected in (
+            ("classification_targets", "classification_targets"),
+            ("evidence_requirements", "evidence_requirements"),
+            ("sufficiency_criteria", "sufficiency_criteria"),
+        ):
+            with self.subTest(field=field):
+                broken = copy.deepcopy(selected)
+                broken["required_leaf_questions"][0].pop(field)
+                result = validate_question_decomposition(broken)
+                self.assertFalse(result.valid)
+                self.assertIn(expected, "; ".join(result.errors))
+
+    def test_missing_specificity_purpose_is_rejected(self):
+        selected = select_qdt_candidate([build_fixture_qdt_candidate(self.handoff)])
+        broken = copy.deepcopy(selected)
+        broken["required_leaf_questions"][0]["specificity_evidence"]["why_this_must_be_investigated"] = ""
+
+        result = validate_question_decomposition(broken)
+
+        self.assertFalse(result.valid)
+        self.assertIn("why_this_must_be_investigated", "; ".join(result.errors))
+
+    def test_leaf_forbidden_outputs_must_cover_no_forecast_authority(self):
+        selected = select_qdt_candidate([build_fixture_qdt_candidate(self.handoff)])
+        broken = copy.deepcopy(selected)
+        broken["required_leaf_questions"][0]["forbidden_outputs"] = ["probability"]
+
+        result = validate_question_decomposition(broken)
+
+        self.assertFalse(result.valid)
+        self.assertIn("forbidden_outputs missing", "; ".join(result.errors))
+
+    def test_negative_semantic_market_requires_negative_yes_no_mapping(self):
+        handoff = copy.deepcopy(self.handoff)
+        handoff["macro_question"] = "No one announced as next James Bond?"
+
+        selected = select_qdt_candidate([build_fixture_qdt_candidate(handoff)])
+
+        self.assertTrue(validate_question_decomposition(selected).valid)
+        mapping = json.dumps(selected["market_resolution_contract"]["yes_no_mapping"])
+        self.assertIn("absence", mapping)
+        self.assertIn("current_direct_evidence", selected["research_coverage_graph"]["required_leaf_ids_by_dimension"])
+
+    def test_valid_research_coverage_graph_output_is_accepted(self):
+        base = build_fixture_qdt_candidate(self.handoff)
+        selected = select_qdt_candidate([base])
+
+        self.assertTrue(validate_question_decomposition(selected).valid)
+        self.assertGreaterEqual(
+            len(selected["research_coverage_graph"]["material_question_leaf_ids"]),
+            5,
+        )
 
 
 if __name__ == "__main__":

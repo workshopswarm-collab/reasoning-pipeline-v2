@@ -211,7 +211,14 @@ def _dicts_by_leaf(items: Any, key: str = "leaf_id") -> dict[str, dict[str, Any]
 
 
 def _leaf_static_weight(leaf: dict[str, Any]) -> str | None:
+    if _is_non_empty_string(leaf.get("research_priority")):
+        return str(leaf["research_priority"])
+    requirements = leaf.get("research_sufficiency_requirements")
+    if isinstance(requirements, dict) and _is_non_empty_string(requirements.get("research_priority")):
+        return str(requirements["research_priority"])
     weighting = leaf.get("bayesian_weighting")
+    if isinstance(weighting, dict) and _is_non_empty_string(weighting.get("research_priority")):
+        return str(weighting["research_priority"])
     if isinstance(weighting, dict) and _is_non_empty_string(weighting.get("static_information_weight")):
         return str(weighting["static_information_weight"])
     return None

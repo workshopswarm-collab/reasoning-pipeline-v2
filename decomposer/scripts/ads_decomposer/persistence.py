@@ -462,9 +462,18 @@ def _leaf_rows(
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for idx, leaf in enumerate(qdt["required_leaf_questions"]):
-        weighting = leaf["bayesian_weighting"]
         requirements = leaf["research_sufficiency_requirements"]
-        weight = weighting["static_information_weight"]
+        legacy_weighting = leaf.get("bayesian_weighting") if isinstance(leaf.get("bayesian_weighting"), dict) else {}
+        priority = (
+            leaf.get("research_priority")
+            or requirements.get("research_priority")
+            or legacy_weighting.get("research_priority")
+            or legacy_weighting.get("static_information_weight")
+            or "medium"
+        )
+        priority_reason_codes = leaf.get("priority_reason_codes")
+        if not isinstance(priority_reason_codes, list):
+            priority_reason_codes = legacy_weighting.get("priority_reason_codes") or legacy_weighting.get("weight_reason_codes") or []
         rows.append(
             {
                 "decomposition_run_id": decomposition_run_id,
@@ -483,10 +492,10 @@ def _leaf_rows(
                 "question": leaf["question_text"],
                 "leaf_json_pointer": f"/required_leaf_questions/{idx}",
                 "leaf_digest": _prefixed_sha256(leaf),
-                "bayesian_weight_class": weight,
-                "static_information_weight": weight,
-                "information_weight": _weight_value(weight),
-                "weight_reason_codes": _json(weighting.get("weight_reason_codes", [])),
+                "bayesian_weight_class": priority,
+                "static_information_weight": priority,
+                "information_weight": _weight_value(str(priority)),
+                "weight_reason_codes": _json(priority_reason_codes),
                 "required_evidence_fields": _json(leaf.get("required_evidence_fields", [])),
                 "required_sufficiency_requirement_id": requirements["requirement_id"],
                 "retrieval_breadth_profile_ref": requirements["retrieval_breadth_profile_ref"],
@@ -516,8 +525,15 @@ def _sufficiency_rows(
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for leaf in qdt["required_leaf_questions"]:
-        weighting = leaf["bayesian_weighting"]
         requirements = leaf["research_sufficiency_requirements"]
+        legacy_weighting = leaf.get("bayesian_weighting") if isinstance(leaf.get("bayesian_weighting"), dict) else {}
+        priority = (
+            leaf.get("research_priority")
+            or requirements.get("research_priority")
+            or legacy_weighting.get("research_priority")
+            or legacy_weighting.get("static_information_weight")
+            or "medium"
+        )
         record_id = _stable_id(
             "qdt-sufficiency-record",
             decomposition_run_id,
@@ -539,7 +555,7 @@ def _sufficiency_rows(
                 "leaf_id": leaf["leaf_id"],
                 "parent_branch_id": leaf["parent_branch_id"],
                 "purpose": leaf["purpose"],
-                "static_information_weight": weighting["static_information_weight"],
+                "static_information_weight": priority,
                 "leaf_condition_scope": leaf["leaf_condition_scope"],
                 "requirement_id": requirements["requirement_id"],
                 "sufficiency_profile_id": requirements["sufficiency_profile_id"],

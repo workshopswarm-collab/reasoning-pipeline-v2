@@ -253,6 +253,8 @@ class AdsLiveReadinessTest(unittest.TestCase):
 
         self.assertTrue(report["ok"], report["issues"])
         self.assertEqual(report["status"], "ready")
+        self.assertEqual(report["base_infrastructure_status"], "ready")
+        self.assertEqual(report["true_runtime_cutover_status"], "blocked_missing_strict_canary")
         self.assertFalse(report["require_scoreable_live"])
         self.assertFalse(report["calibration_debt_report"]["clears_calibration_debt"])
 
@@ -323,6 +325,7 @@ class AdsLiveReadinessTest(unittest.TestCase):
 
         self.assertFalse(report["ok"])
         self.assertIn("strict_true_runtime_canary_evidence_missing", report["issues"])
+        self.assertEqual(report["true_runtime_cutover_status"], "blocked_missing_strict_canary")
         self.assertEqual(
             report["strict_non_scoreable_canary_signal_report"]["status"],
             "missing",
@@ -495,6 +498,8 @@ class AdsLiveReadinessTest(unittest.TestCase):
 
         self.assertTrue(report["ok"], report["issues"])
         self.assertEqual(report["status"], "ready")
+        self.assertEqual(report["true_runtime_cutover_status"], "ready")
+        self.assertTrue(report["true_runtime_cutover_ready"])
         self.assertTrue(report["require_scoreable_live"])
         self.assertEqual(report["scoreable_readiness_mode"], "true_scoreable_live_readiness")
         self.assertEqual(report["scae_evidence_signal_report"]["accepted_supplied_refs"], [scae_manifest_ref])

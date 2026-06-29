@@ -7,7 +7,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from predquant.ads_operator_review import _build_alerts, _retrieval_summary
+from predquant.ads_operator_review import _build_alerts, _retrieval_summary, _true_runtime_cutover_status
 
 
 class AdsOperatorReviewTest(unittest.TestCase):
@@ -50,7 +50,10 @@ class AdsOperatorReviewTest(unittest.TestCase):
         alerts = self._true_production_alerts_for_run(
             {
                 "runner_mode": "non_executing_canary",
-                "metadata": {"handler_factory": "predquant.ads_production_handlers"},
+                "metadata": {
+                    "handler_factory": "predquant.ads_production_handlers",
+                    "purpose": "strict_non_scoreable_canary",
+                },
             }
         )
 
@@ -67,6 +70,118 @@ class AdsOperatorReviewTest(unittest.TestCase):
             by_code["true_production_scae_invalid_research_sufficiency_blocked"]["severity"],
             "warning",
         )
+
+    def test_true_runtime_cutover_status_prioritizes_missing_retrieval_cert(self):
+        status = _true_runtime_cutover_status(
+            run={
+                "runner_mode": "non_executing_canary",
+                "status": "stopped",
+                "terminal_reason": "auto003_single_case_complete",
+                "metadata": {"handler_factory": "predquant.ads_production_handlers"},
+            },
+            run_kind="true_production",
+            cases=[
+                {
+                    "retrieval_sufficiency": {
+                        "all_required_leaves_certified": False,
+                        "admitted_evidence_ref_count": 0,
+                    },
+                    "researcher_model_provenance": {"model_executed_count": 0},
+                    "scae_readiness": {"artifact_id": None},
+                }
+            ],
+        )
+
+        self.assertEqual(status, "blocked_missing_retrieval_cert")
+
+    def test_true_runtime_cutover_status_blocks_failed_stage(self):
+        status = _true_runtime_cutover_status(
+            run={
+                "runner_mode": "calibration_debt_production",
+                "status": "failed",
+                "terminal_reason": "auto003_stage_failed",
+                "metadata": {"handler_factory": "predquant.ads_production_handlers"},
+            },
+            run_kind="true_production",
+            cases=[],
+        )
+
+        self.assertEqual(status, "blocked_stage_failure")
+
+    def test_true_runtime_cutover_status_blocks_missing_researcher_model(self):
+        status = _true_runtime_cutover_status(
+            run={
+                "runner_mode": "calibration_debt_production",
+                "status": "stopped",
+                "terminal_reason": "auto003_single_case_complete",
+                "metadata": {"handler_factory": "predquant.ads_production_handlers"},
+            },
+            run_kind="true_production",
+            cases=[
+                {
+                    "retrieval_sufficiency": {
+                        "all_required_leaves_certified": True,
+                        "admitted_evidence_ref_count": 2,
+                    },
+                    "researcher_model_provenance": {"model_executed_count": 0},
+                    "scae_readiness": {
+                        "artifact_id": "artifact:scae-ledger:1",
+                        "forecast_validity_status": "valid_for_forecast",
+                    },
+                }
+            ],
+        )
+
+        self.assertEqual(status, "blocked_missing_researcher_model_execution")
+
+    def test_true_runtime_cutover_status_blocks_missing_scae_ledger(self):
+        status = _true_runtime_cutover_status(
+            run={
+                "runner_mode": "calibration_debt_production",
+                "status": "stopped",
+                "terminal_reason": "auto003_single_case_complete",
+                "metadata": {"handler_factory": "predquant.ads_production_handlers"},
+            },
+            run_kind="true_production",
+            cases=[
+                {
+                    "retrieval_sufficiency": {
+                        "all_required_leaves_certified": True,
+                        "admitted_evidence_ref_count": 2,
+                    },
+                    "researcher_model_provenance": {"model_executed_count": 1},
+                    "scae_readiness": {"artifact_id": None},
+                }
+            ],
+        )
+
+        self.assertEqual(status, "blocked_missing_scae_ledger")
+
+    def test_true_runtime_cutover_status_ready_for_complete_full_run(self):
+        status = _true_runtime_cutover_status(
+            run={
+                "runner_mode": "calibration_debt_production",
+                "status": "stopped",
+                "terminal_reason": "auto003_single_case_complete",
+                "metadata": {"handler_factory": "predquant.ads_production_handlers"},
+            },
+            run_kind="true_production",
+            cases=[
+                {
+                    "retrieval_sufficiency": {
+                        "all_required_leaves_certified": True,
+                        "admitted_evidence_ref_count": 2,
+                    },
+                    "researcher_model_provenance": {"model_executed_count": 1},
+                    "scae_readiness": {
+                        "artifact_id": "artifact:scae-ledger:1",
+                        "forecast_validity_status": "valid_for_forecast",
+                    },
+                }
+            ],
+        )
+
+        self.assertEqual(status, "ready")
 
     def test_true_production_release_alerts_are_blockers(self):
         alerts = self._true_production_alerts_for_run(

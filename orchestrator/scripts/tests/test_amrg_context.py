@@ -27,8 +27,10 @@ from predquant.amrg import (
     build_model_assist_provenance,
     enrich_related_live_market_context,
     ensure_amrg_context_schema,
+    invoke_amrg_model_assist,
     materialize_related_live_market_context,
     model_assist_downgrade_for_missing_manifest,
+    resolve_amrg_model_assist_lane,
     validate_amrg_decomposer_context,
     validate_amrg_model_assist_output,
     write_related_market_context,
@@ -294,6 +296,17 @@ class AMRGContextTest(unittest.TestCase):
         conn = sqlite3.connect(":memory:")
         conn.row_factory = sqlite3.Row
         try:
+            def model_assist_transport(packet):
+                return {
+                    "artifact_type": "amrg_model_assist_output",
+                    "schema_version": AMRG_MODEL_ASSIST_OUTPUT_SCHEMA_VERSION,
+                    "model_lane_id": "amrg_model_assist",
+                    "resolved_model_id": packet["resolved_model_id"],
+                    "authority": "advisory_only_no_promotion",
+                    "candidate_set_id": packet["candidate_set_id"],
+                    "edge_annotations": [],
+                }
+
             result = materialize_related_live_market_context(
                 conn,
                 evidence_packet=self.evidence_packet(),
@@ -302,15 +315,7 @@ class AMRGContextTest(unittest.TestCase):
                 active_market_index=[self.market(2), self.market(3, title="Will unrelated beta happen?")],
                 run_vector_runtime=True,
                 ollama_client=FakeOllama(self),
-                model_assist_output={
-                    "artifact_type": "amrg_model_assist_output",
-                    "schema_version": AMRG_MODEL_ASSIST_OUTPUT_SCHEMA_VERSION,
-                    "model_lane_id": "amrg_model_assist",
-                    "resolved_model_id": "gpt-5.5-high",
-                    "authority": "advisory_only_no_promotion",
-                    "candidate_set_id": "candidate-set-filled-by-runtime",
-                    "edge_annotations": [],
-                },
+                model_assist_transport=model_assist_transport,
             )
 
             artifact = result["artifact"]
@@ -343,10 +348,15 @@ class AMRGContextTest(unittest.TestCase):
             qdt_report = build_amrg_operator_report(
                 artifact,
                 question_decomposition={
-                    "amrg_operator_metadata": {
-                        "leaf_hint_refs": {"leaf-1": [hint_ref]},
-                        "branch_hint_refs": {},
-                    }
+                    "required_leaf_questions": [{"leaf_id": "leaf-1", "amrg_usage_refs": [hint_ref]}],
+                    "branches": [],
+                    "related_market_context_usage": {
+                        "usage_status": "used_context_hints",
+                        "related_context_artifact_ref": "artifact:related-live-market-context",
+                        "amrg_usage_refs": [hint_ref],
+                        "weak_context_only": False,
+                        "anchor_dependency_status": "none",
+                    },
                 },
             )
             consumed = {
@@ -431,6 +441,97 @@ class AMRGContextTest(unittest.TestCase):
         self.assertIn("scae_delta", hint["prohibited_use"])
         self.assertIn("context_leaf", hint["candidate_leaf_relevance"]["allowed_leaf_uses"])
         validate_amrg_decomposer_context(prompt_context)
+
+    def test_entity_match_requires_high_salience_shared_entity(self):
+        base_packet = self.evidence_packet()
+        bond_identity = {
+            **base_packet["market_identity"],
+            "title": "Will James Bond win a franchise award?",
+            "description": "James Bond entertainment award market",
+            "category": "entertainment",
+            "normalized_entities": ["James Bond"],
+            "source_of_truth_kind": "entertainment-database",
+            "source_url": "https://example.test/bond-awards",
+        }
+        bond_packet = self.evidence_packet(
+            market_identity=bond_identity,
+            regime_seed_fields={**base_packet["regime_seed_fields"], "category": "entertainment"},
+        )
+
+        unrelated = build_related_live_market_context_or_waiver(
+            evidence_packet=bond_packet,
+            evidence_packet_ref="artifact:evidence-packet",
+            active_market_index=[
+                self.market(
+                    2,
+                    title="Will Russia announce a policy deadline?",
+                    normalized_entities=["Russia"],
+                    contract_terms=["announcement", "deadline"],
+                    category="politics",
+                    source_of_truth_kind="government",
+                    source_url="https://example.test/russia-policy",
+                )
+            ],
+        )
+        self.assertEqual(unrelated["artifact_type"], "no_related_context_waiver")
+        self.assertEqual(unrelated["candidates"], [])
+
+        related = build_related_live_market_context_or_waiver(
+            evidence_packet=bond_packet,
+            evidence_packet_ref="artifact:evidence-packet",
+            active_market_index=[
+                self.market(
+                    3,
+                    title="Will James Bond release another film?",
+                    normalized_entities=["James Bond"],
+                    contract_terms=["release"],
+                    category="entertainment",
+                    source_of_truth_kind="box-office",
+                    source_url="https://example.test/bond-release",
+                )
+            ],
+        )
+        self.assertEqual(related["candidates"][0]["candidate_source"], "entity_match")
+        self.assertIn("active_safe_salient_entity_overlap", related["candidates"][0]["reason_codes"])
+        enriched = enrich_related_live_market_context(related, evidence_packet=bond_packet)
+        self.assertEqual(enriched["relationship_edges"][0]["relationship_status"], "deterministic_context_candidate")
+
+    def test_cross_domain_entity_match_is_weak_context_only(self):
+        base_packet = self.evidence_packet()
+        bond_packet = self.evidence_packet(
+            market_identity={
+                **base_packet["market_identity"],
+                "title": "Will James Bond win a franchise award?",
+                "description": "James Bond entertainment award market",
+                "category": "entertainment",
+                "normalized_entities": ["James Bond"],
+                "source_of_truth_kind": "entertainment-database",
+                "source_url": "https://example.test/bond-awards",
+            },
+            regime_seed_fields={**base_packet["regime_seed_fields"], "category": "entertainment"},
+        )
+        artifact = build_related_live_market_context_or_waiver(
+            evidence_packet=bond_packet,
+            evidence_packet_ref="artifact:evidence-packet",
+            active_market_index=[
+                self.market(
+                    4,
+                    title="Will James Bond be appointed to a policy role?",
+                    normalized_entities=["James Bond"],
+                    contract_terms=["appointment"],
+                    category="politics",
+                    source_of_truth_kind="government",
+                    source_url="https://example.test/bond-policy",
+                )
+            ],
+        )
+        self.assertEqual(artifact["candidates"][0]["candidate_source"], "entity_match")
+        enriched = enrich_related_live_market_context(artifact, evidence_packet=bond_packet)
+        edge = enriched["relationship_edges"][0]
+        self.assertEqual(edge["relationship_status"], WEAK_CONTEXT_ONLY)
+        self.assertEqual(edge["allowed_effects"], ["decomposition_context_hint"])
+        self.assertEqual(edge["domain_compatibility"]["domain_compatibility_status"], "cross_domain_weak_context_only")
+        self.assertIn("domain_mismatch_downgraded_weak_context_only", edge["downgrade_reason_codes"])
 
     def test_vector_unavailable_is_non_blocking_with_deterministic_candidate(self):
         diagnostic = build_unavailable_vector_source_diagnostic(
@@ -695,11 +796,57 @@ class AMRGContextTest(unittest.TestCase):
         finally:
             conn.close()
 
+    def test_model_assist_lane_requires_oauth_route_and_gpt54(self):
+        lane = {
+            "provider": "openai",
+            "default_model_id": "gpt-5.4-high",
+            "provider_route": "openclaw_codex_oauth/amrg",
+            "oauth_route_required": True,
+            "runtime_agent_id": "amrg",
+            "allowed_model_ids": ["gpt-5.4-high"],
+            "owner_feature_id": "AMRG-004",
+            "required_artifact_fields": [
+                "model_lane_id",
+                "resolved_model_id",
+                "model_policy_ref",
+                "prompt_template_id",
+                "prompt_template_sha256",
+                "input_manifest_sha256",
+                "output_schema_version",
+            ],
+            "forbidden_outputs": [
+                "probability",
+                "scae_evidence_delta",
+                "qdt_selection",
+                "edge_promotion",
+                "concept_creation",
+                "label_creation",
+                "active_graph_promotion",
+            ],
+        }
+        policy = {"lanes": {"amrg_model_assist": lane}}
+        self.assertEqual(resolve_amrg_model_assist_lane(policy)["provider_route"], "openclaw_codex_oauth/amrg")
+
+        for field, value, error in (
+            ("default_model_id", "gpt-5.5-high", "gpt-5.4-high"),
+            ("provider_route", "openclaw_codex_oauth/decomposer", "provider_route"),
+            ("oauth_route_required", False, "oauth_route_required"),
+            ("runtime_agent_id", "decomposer", "runtime_agent_id"),
+        ):
+            mutated_lane = {**lane, field: value}
+            if field == "default_model_id":
+                mutated_lane["allowed_model_ids"] = ["gpt-5.4-high", "gpt-5.5-high"]
+            with self.assertRaisesRegex(Exception, error):
+                resolve_amrg_model_assist_lane({"lanes": {"amrg_model_assist": mutated_lane}})
+
     def test_model_assist_forbidden_probability_output_is_rejected(self):
         artifact = self.build_artifact([self.market(2)])
         packet = build_amrg_model_assist_packet(artifact)
         self.assertEqual(packet["model_lane_id"], "amrg_model_assist")
         self.assertEqual(packet["authority"], "advisory_only_no_promotion")
+        self.assertEqual(packet["resolved_model_id"], "gpt-5.4-high")
+        self.assertEqual(packet["provider_route"], "openclaw_codex_oauth/amrg")
+        self.assertTrue(packet["oauth_route_required"])
 
         output = {
             "artifact_type": "amrg_model_assist_output",
@@ -732,6 +879,18 @@ class AMRGContextTest(unittest.TestCase):
         scae_delta_output["edge_annotations"][0]["scae_delta"] = {"direction": "up"}
         with self.assertRaisesRegex(Exception, "scae_delta"):
             validate_amrg_model_assist_output(scae_delta_output)
+
+        citation_output = json.loads(json.dumps(output))
+        citation_output["edge_annotations"][0].pop("probability")
+        citation_output["edge_annotations"][0]["citation"] = "https://example.test/evidence"
+        with self.assertRaisesRegex(Exception, "citation"):
+            validate_amrg_model_assist_output(citation_output)
+
+        wrong_model_output = json.loads(json.dumps(output))
+        wrong_model_output["edge_annotations"][0].pop("probability")
+        wrong_model_output["resolved_model_id"] = "gpt-5.5-high"
+        with self.assertRaisesRegex(Exception, "gpt-5.4-high"):
+            validate_amrg_model_assist_output(wrong_model_output)
 
     def test_model_assist_remains_advisory_and_model_only_candidate_stays_weak(self):
         artifact = self.build_artifact(
@@ -766,6 +925,12 @@ class AMRGContextTest(unittest.TestCase):
         }
         validate_amrg_model_assist_output(output)
         provenance = build_model_assist_provenance(artifact, packet=packet, output=output)
+        self.assertTrue(provenance["model_executed"])
+        self.assertEqual(provenance["execution_status"], "succeeded")
+        self.assertEqual(provenance["provider_route"], "openclaw_codex_oauth/amrg")
+        self.assertTrue(provenance["oauth_route_required"])
+        self.assertTrue(provenance["output_artifact_sha256"].startswith("sha256:"))
+        self.assertEqual(provenance["metadata"]["resolved_model_id"], "gpt-5.4-high")
         enriched = enrich_related_live_market_context(
             artifact,
             evidence_packet=self.evidence_packet(),
@@ -781,6 +946,37 @@ class AMRGContextTest(unittest.TestCase):
         degraded = model_assist_downgrade_for_missing_manifest({**artifact, "input_manifest_hash": None})
         self.assertEqual(degraded["model_assist_status"], "not_invoked_missing_active_safe_manifest")
         self.assertEqual(degraded["forbidden_output_check_status"], "not_applicable")
+
+    def test_invalid_model_assist_output_records_rejected_provenance(self):
+        artifact = self.build_artifact([self.market(2)])
+        packet = build_amrg_model_assist_packet(artifact)
+        rejected = invoke_amrg_model_assist(
+            artifact,
+            output={
+                "artifact_type": "amrg_model_assist_output",
+                "schema_version": AMRG_MODEL_ASSIST_OUTPUT_SCHEMA_VERSION,
+                "model_lane_id": "amrg_model_assist",
+                "resolved_model_id": packet["resolved_model_id"],
+                "authority": "advisory_only_no_promotion",
+                "candidate_set_id": artifact["candidate_set_id"],
+                "edge_annotations": [
+                    {
+                        "edge_id": artifact["relationship_edges"][0]["edge_id"],
+                        "candidate_id": artifact["candidates"][0]["candidate_id"],
+                        "suggested_relationship_types": ["shared_named_entity"],
+                        "advisory_only": True,
+                        "evidence": {"url": "https://example.test/model-authored-evidence"},
+                    }
+                ],
+            },
+        )
+
+        self.assertEqual(rejected["model_assist_status"], "advisory_rejected_forbidden_output")
+        self.assertEqual(rejected["forbidden_output_check_status"], "failed")
+        self.assertTrue(rejected["model_executed"])
+        self.assertEqual(rejected["execution_status"], "failed_output_validation")
+        self.assertTrue(rejected["output_artifact_sha256"].startswith("sha256:"))
+        self.assertIn("evidence", rejected["metadata"]["rejection_reason"])
 
     def test_refresh_success_retains_deterministic_effect_after_ttl_refresh(self):
         artifact = self.build_artifact([self.market(2)])

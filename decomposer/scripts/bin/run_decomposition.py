@@ -33,11 +33,12 @@ from ads_decomposer.model_runtime import (  # noqa: E402
 from ads_decomposer.qdt import (  # noqa: E402
     ALLOWED_CONDITION_SCOPES,
     ALLOWED_PURPOSES,
-    ALLOWED_STATIC_INFORMATION_WEIGHTS,
+    ALLOWED_RESEARCH_PRIORITIES,
     COMPACT_DEFAULT_LEAF_BUDGET,
     QUESTION_DECOMPOSITION_SCHEMA_VERSION,
     QDTError,
     build_qdt_candidate,
+    compute_qdt_quality_checks,
     dump_question_decomposition,
     select_qdt_candidate,
     validate_question_decomposition_against_amrg_context,
@@ -109,11 +110,18 @@ def build_question_specific_fixture_response(handoff: dict[str, Any]) -> dict[st
     branches = [
         {
             "branch_id": f"branch-{topic}-resolution",
-            "branch_question": _bounded_question_text("Resolve the target question with official status and direct evidence:", question),
-            "branch_role": "question_specific_resolution_evidence",
+            "branch_question": _bounded_question_text("Define market-specific research coverage for the target outcome:", question),
+            "branch_role": "question_specific_research_coverage",
             "dependency_group_id": f"dep-group-{topic}-resolution",
-            "required_evidence_purposes": ["source_of_truth", "direct_evidence"],
-            "leaf_ids": [f"leaf-{topic}-official-status", f"leaf-{topic}-direct-status"],
+            "required_evidence_purposes": ["source_of_truth", "direct_evidence", "catalyst", "structural"],
+            "leaf_ids": [
+                f"leaf-{topic}-official-status",
+                f"leaf-{topic}-direct-status",
+                f"leaf-{topic}-driver-stage",
+                f"leaf-{topic}-negative-checks",
+                f"leaf-{topic}-source-quality",
+                f"leaf-{topic}-material-unknowns",
+            ],
             "amrg_usage_refs": [],
             "structural_validation": {"depth": 1},
         },
@@ -123,7 +131,7 @@ def build_question_specific_fixture_response(handoff: dict[str, Any]) -> dict[st
             "branch_role": "question_specific_resolution_mechanics",
             "dependency_group_id": f"dep-group-{topic}-mechanics",
             "required_evidence_purposes": ["resolution_mechanics"],
-            "leaf_ids": [f"leaf-{topic}-rules-window"],
+            "leaf_ids": [f"leaf-{topic}-rules-window", f"leaf-{topic}-timing-constraints"],
             "amrg_usage_refs": [],
             "structural_validation": {"depth": 1},
         },
@@ -132,12 +140,11 @@ def build_question_specific_fixture_response(handoff: dict[str, Any]) -> dict[st
         {
             "leaf_id": f"leaf-{topic}-official-status",
             "parent_branch_id": branches[0]["branch_id"],
-            "question_text": _bounded_question_text("Which official or primary source can establish the resolution status for:", question),
+            "question_text": _bounded_question_text("Which official, platform, or primary resolver source defines the exact YES/NO condition for:", question),
             "purpose": "source_of_truth",
-            "bayesian_weighting": {
-                "static_information_weight": "critical",
-                "weight_reason_codes": ["official_resolution_authority"],
-            },
+            "coverage_dimension": "resolution_mechanics",
+            "research_factor": "resolution_condition_and_authority",
+            "research_priority": "critical",
             "leaf_dependency_group_id": branches[0]["dependency_group_id"],
             "leaf_condition_scope": "unconditional",
             "required_evidence_fields": ["official_status", "resolution_criteria"],
@@ -147,12 +154,11 @@ def build_question_specific_fixture_response(handoff: dict[str, Any]) -> dict[st
         {
             "leaf_id": f"leaf-{topic}-direct-status",
             "parent_branch_id": branches[0]["branch_id"],
-            "question_text": _bounded_question_text("What fresh direct evidence before the cutoff supports or contradicts:", question),
+            "question_text": _bounded_question_text("What direct pre-cutoff evidence shows the target event is observed, contradicted, or unresolved for:", question),
             "purpose": "direct_evidence",
-            "bayesian_weighting": {
-                "static_information_weight": "high",
-                "weight_reason_codes": ["question_specific_event_status"],
-            },
+            "coverage_dimension": "current_direct_evidence",
+            "research_factor": "current_target_event_status",
+            "research_priority": "high",
             "leaf_dependency_group_id": branches[0]["dependency_group_id"],
             "leaf_condition_scope": "unconditional",
             "required_evidence_fields": ["event_status", "event_timestamp"],
@@ -160,18 +166,87 @@ def build_question_specific_fixture_response(handoff: dict[str, Any]) -> dict[st
             "structural_validation": {"depth": 2, "answerability_status": "answerable"},
         },
         {
+            "leaf_id": f"leaf-{topic}-driver-stage",
+            "parent_branch_id": branches[0]["branch_id"],
+            "question_text": _bounded_question_text("Which process stage, commitment signal, or market-specific driver materially changes observability before cutoff for:", question),
+            "purpose": "catalyst",
+            "coverage_dimension": "key_drivers",
+            "research_factor": "process_stage_and_driver_status",
+            "research_priority": "high",
+            "leaf_dependency_group_id": branches[0]["dependency_group_id"],
+            "leaf_condition_scope": "unconditional",
+            "required_evidence_fields": ["driver_status", "process_stage"],
+            "market_component_terms": [topic, "driver", "process stage"],
+            "structural_validation": {"depth": 2, "answerability_status": "answerable"},
+        },
+        {
+            "leaf_id": f"leaf-{topic}-negative-checks",
+            "parent_branch_id": branches[0]["branch_id"],
+            "question_text": _bounded_question_text("What negative checks, blockers, or contradictions show the target event has not cleanly occurred before cutoff for:", question),
+            "purpose": "direct_evidence",
+            "coverage_dimension": "counterevidence_negative_checks",
+            "research_factor": "counterevidence_and_blockers",
+            "research_priority": "high",
+            "leaf_dependency_group_id": branches[0]["dependency_group_id"],
+            "leaf_condition_scope": "unconditional",
+            "required_evidence_fields": ["negative_check_status", "contradiction_status"],
+            "market_component_terms": [topic, "negative check", "blocker"],
+            "structural_validation": {"depth": 2, "answerability_status": "answerable"},
+        },
+        {
+            "leaf_id": f"leaf-{topic}-source-quality",
+            "parent_branch_id": branches[0]["branch_id"],
+            "question_text": _bounded_question_text("Are the relevant claim families independent high-quality evidence or repeated weak reports that should be collapsed for:", question),
+            "purpose": "direct_evidence",
+            "coverage_dimension": "source_quality",
+            "research_factor": "claim_family_independence_and_source_quality",
+            "research_priority": "medium",
+            "leaf_dependency_group_id": branches[0]["dependency_group_id"],
+            "leaf_condition_scope": "unconditional",
+            "required_evidence_fields": ["source_quality", "claim_family_independence"],
+            "market_component_terms": [topic, "claim family", "source quality"],
+            "structural_validation": {"depth": 2, "answerability_status": "answerable"},
+        },
+        {
             "leaf_id": f"leaf-{topic}-rules-window",
             "parent_branch_id": branches[1]["branch_id"],
-            "question_text": _bounded_question_text("Which resolution rules, dates, and source windows govern the market for:", question),
+            "question_text": _bounded_question_text("Which source hierarchy and rule clauses distinguish qualifying evidence from rumor or weak context for:", question),
             "purpose": "resolution_mechanics",
-            "bayesian_weighting": {
-                "static_information_weight": "medium",
-                "weight_reason_codes": ["market_specific_contract_terms"],
-            },
+            "coverage_dimension": "resolution_mechanics",
+            "research_factor": "source_hierarchy_and_qualifying_claim",
+            "research_priority": "medium",
             "leaf_dependency_group_id": branches[1]["dependency_group_id"],
             "leaf_condition_scope": "shared_context",
             "required_evidence_fields": ["resolution_deadline", "rules_text"],
             "market_component_terms": [topic, "rules", "deadline"],
+            "structural_validation": {"depth": 2, "answerability_status": "answerable"},
+        },
+        {
+            "leaf_id": f"leaf-{topic}-timing-constraints",
+            "parent_branch_id": branches[1]["branch_id"],
+            "question_text": _bounded_question_text("Which deadline, cutoff, and observation-window constraints govern whether evidence can count for:", question),
+            "purpose": "resolution_mechanics",
+            "coverage_dimension": "timing_deadline_constraints",
+            "research_factor": "deadline_and_cutoff_admissibility",
+            "research_priority": "medium",
+            "leaf_dependency_group_id": branches[1]["dependency_group_id"],
+            "leaf_condition_scope": "shared_context",
+            "required_evidence_fields": ["resolution_deadline", "cutoff_window"],
+            "market_component_terms": [topic, "deadline", "cutoff"],
+            "structural_validation": {"depth": 2, "answerability_status": "answerable"},
+        },
+        {
+            "leaf_id": f"leaf-{topic}-material-unknowns",
+            "parent_branch_id": branches[0]["branch_id"],
+            "question_text": _bounded_question_text("What material questions remain unanswered after retrieval, and are they answerable through more source discovery for:", question),
+            "purpose": "structural",
+            "coverage_dimension": "material_unknowns",
+            "research_factor": "unanswered_material_questions",
+            "research_priority": "medium",
+            "leaf_dependency_group_id": branches[0]["dependency_group_id"],
+            "leaf_condition_scope": "unconditional",
+            "required_evidence_fields": ["unanswered_question_status", "answerability_status"],
+            "market_component_terms": [topic, "material unknown", "answerability"],
             "structural_validation": {"depth": 2, "answerability_status": "answerable"},
         },
     ]
@@ -308,6 +383,10 @@ def _ensure_model_candidate_contract_shape(repaired: dict[str, Any]) -> dict[str
         if not leaf_id.startswith("leaf-"):
             leaf_id = "leaf-" + _normalized_token(leaf_id)
         leaf["leaf_id"] = leaf_id
+        if not leaf.get("question_text") and leaf.get("leaf_question"):
+            leaf["question_text"] = leaf["leaf_question"]
+        if not leaf.get("question_text"):
+            leaf["question_text"] = f"What market-specific evidence should classify {leaf_id}?"
         parent_id = str(leaf.get("parent_branch_id") or default_branch_id)
         if parent_id not in branch_by_id:
             parent_id = default_branch_id
@@ -316,16 +395,13 @@ def _ensure_model_candidate_contract_shape(repaired: dict[str, Any]) -> dict[str
         purpose = _normalize_purpose(leaf.get("purpose"))
         leaf["purpose"] = purpose
         leaf_purposes_by_branch.setdefault(parent_id, set()).add(purpose)
-        weighting = leaf.get("bayesian_weighting")
-        if not isinstance(weighting, dict):
-            weighting = {}
-        if weighting.get("static_information_weight") not in ALLOWED_STATIC_INFORMATION_WEIGHTS:
-            weighting["static_information_weight"] = "medium"
-        weighting["weight_reason_codes"] = _compact_reason_codes(
-            weighting.get("weight_reason_codes"),
-            "model_schema_normalized",
-        )
-        leaf["bayesian_weighting"] = weighting
+        legacy_weighting = leaf.pop("bayesian_weighting", None)
+        priority = leaf.get("research_priority")
+        if priority not in ALLOWED_RESEARCH_PRIORITIES and isinstance(legacy_weighting, dict):
+            priority = legacy_weighting.get("research_priority") or legacy_weighting.get("static_information_weight")
+        if priority not in ALLOWED_RESEARCH_PRIORITIES:
+            priority = "medium"
+        leaf["research_priority"] = priority
         leaf["leaf_dependency_group_id"] = str(
             leaf.get("leaf_dependency_group_id")
             or branch_by_id[parent_id].get("dependency_group_id")
@@ -492,15 +568,7 @@ def _candidate_from_model_payload(
     selected.setdefault("validation_summary", {}).setdefault("reason_codes", []).append(
         f"decomposer_model_runtime_{runtime_mode}"
     )
-    selected["question_specificity_check"] = {
-        "status": "passed",
-        "macro_question_sha256": prefixed_sha256(handoff.get("macro_question", "")),
-        "generic_fixture_leaf_ids_absent": not {
-            "leaf-source-of-truth",
-            "leaf-direct-evidence",
-            "leaf-resolution-mechanics",
-        }.intersection({str(leaf.get("leaf_id")) for leaf in selected.get("required_leaf_questions", [])}),
-    }
+    selected.update(compute_qdt_quality_checks(selected))
     return selected
 
 
@@ -510,26 +578,39 @@ def _amrg_operator_metadata(
 ) -> dict[str, Any]:
     hints = amrg_decomposer_context.get("hints", []) if isinstance(amrg_decomposer_context, dict) else []
     hint_refs = {str(hint.get("hint_ref")) for hint in hints if isinstance(hint, dict) and hint.get("hint_ref")}
-    leaf_refs: dict[str, list[str]] = {}
-    branch_refs: dict[str, list[str]] = {}
+    leaf_slices: list[dict[str, Any]] = []
+    branch_slices: list[dict[str, Any]] = []
     for branch in selected.get("branches", []):
         if isinstance(branch, dict) and isinstance(branch.get("amrg_usage_refs"), list):
             refs = sorted({str(ref) for ref in branch["amrg_usage_refs"] if str(ref) in hint_refs})
             if refs:
-                branch_refs[str(branch.get("branch_id"))] = refs
+                branch_slices.append(
+                    {
+                        "branch_id": str(branch.get("branch_id")),
+                        "hint_refs": refs,
+                        "consumption_status": "diagnostic_or_validated_context_ref_only",
+                    }
+                )
     for leaf in selected.get("required_leaf_questions", []):
         if isinstance(leaf, dict) and isinstance(leaf.get("amrg_usage_refs"), list):
             refs = sorted({str(ref) for ref in leaf["amrg_usage_refs"] if str(ref) in hint_refs})
             if refs:
-                leaf_refs[str(leaf.get("leaf_id"))] = refs
+                leaf_slices.append(
+                    {
+                        "leaf_id": str(leaf.get("leaf_id")),
+                        "hint_refs": refs,
+                        "consumption_status": "diagnostic_or_validated_context_ref_only",
+                    }
+                )
     return {
         "schema_version": "qdt-amrg-operator-metadata/v1",
         "amrg_decomposer_context_ref": amrg_decomposer_context.get("context_ref")
         if isinstance(amrg_decomposer_context, dict)
         else None,
         "hint_refs_considered": sorted(hint_refs),
-        "branch_hint_refs": branch_refs,
-        "leaf_hint_refs": leaf_refs,
+        "branch_hint_ref_slices": branch_slices,
+        "leaf_hint_ref_slices": leaf_slices,
+        "weak_hint_promotion_status": "not_promoted_without_validated_anchor_contract",
         "anchor_contract_edge_refs": sorted(
             {
                 str(contract.get("edge_id"))
@@ -637,13 +718,36 @@ def build_decomposition_prompt_payload(
         },
         "amrg_decomposer_context": amrg_decomposer_context,
         "instructions": {
-            "output": "depth_2_question_decomposition_branches_and_leaves",
+            "output": "depth_2_research_coverage_decomposition_branches_and_leaves",
             "depth": "exactly branches at depth 1 and required_leaf_questions at depth 2",
             "leaf_budget": COMPACT_DEFAULT_LEAF_BUDGET,
             "make_leaves_question_specific": True,
+            "contract_text": (
+                "Produce a bounded research decomposition that maximizes coverage of material uncertainty. "
+                "Do not estimate probability. Do not assign weights. Do not make a final forecast. "
+                "Emit leaf questions, purposes, evidence requirements, classification targets, and sufficiency criteria."
+            ),
+            "required_top_level_contracts": [
+                "market_resolution_contract",
+                "research_coverage_graph",
+            ],
+            "required_coverage_dimensions": [
+                "resolution_mechanics",
+                "current_direct_evidence",
+                "key_drivers",
+                "counterevidence_negative_checks",
+                "timing_deadline_constraints",
+                "source_quality",
+                "material_unknowns",
+            ],
             "include_research_sufficiency_inputs": [
                 "purpose",
-                "static_information_weight",
+                "coverage_dimension",
+                "research_factor",
+                "classification_targets",
+                "evidence_requirements",
+                "sufficiency_criteria",
+                "research_priority",
                 "leaf_condition_scope",
                 "required_evidence_fields",
             ],
