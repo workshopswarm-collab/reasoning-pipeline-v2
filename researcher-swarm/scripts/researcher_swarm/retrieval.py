@@ -5106,15 +5106,51 @@ def build_live_retrieval_packet_from_candidates(
     packet["evidence_spans"] = spans
     packet["supplemental_evidence_candidates"] = copy.deepcopy(supplemental_candidates or [])
     packet["supplemental_evidence_admission_results"] = supplemental_records
+    direct_url_attempt_count = sum(
+        1 for item in browser_attempts if item.get("navigation_mode") == "direct_url"
+    )
+    web_search_attempt_count = sum(
+        1 for item in browser_attempts if item.get("navigation_mode") == "web_search"
+    )
+    native_candidate_discovery_count = len(native_candidate_discoveries)
+    native_candidate_url_count = sum(
+        len(item.get("candidate_urls", [])) for item in native_candidate_discoveries
+    )
+    metadata_classifier_slice_count = len(
+        packet.get("source_metadata_classifier_slices", [])
+        if isinstance(packet.get("source_metadata_classifier_slices"), list)
+        else []
+    )
+    metadata_classifier_unavailable_count = len(
+        packet.get("source_metadata_classifier_unavailable_diagnostics", [])
+        if isinstance(packet.get("source_metadata_classifier_unavailable_diagnostics"), list)
+        else []
+    )
     packet["retrieval_runtime_summary"] = {
         "schema_version": "retrieval-runtime-summary/v1",
         "runtime_mode": runtime_mode,
-        "direct_url_attempt_count": sum(1 for item in browser_attempts if item.get("navigation_mode") == "direct_url"),
-        "web_search_attempt_count": sum(1 for item in browser_attempts if item.get("navigation_mode") == "web_search"),
+        "direct_url_attempt_count": direct_url_attempt_count,
+        "web_search_attempt_count": web_search_attempt_count,
         "search_candidate_url_count": len(search_candidate_records),
         "search_candidate_omission_count": len(search_candidate_omissions),
-        "native_candidate_discovery_count": len(native_candidate_discoveries),
-        "native_candidate_url_count": sum(len(item.get("candidate_urls", [])) for item in native_candidate_discoveries),
+        "native_candidate_discovery_count": native_candidate_discovery_count,
+        "native_candidate_url_count": native_candidate_url_count,
+        "direct_url_capture_executed": direct_url_attempt_count > 0,
+        "direct_url_capture_status": "executed" if direct_url_attempt_count > 0 else "not_executed",
+        "browser_search_executed": web_search_attempt_count > 0 or bool(search_candidate_records),
+        "browser_search_status": "executed"
+        if web_search_attempt_count > 0 or search_candidate_records
+        else "not_executed",
+        "native_research_model_executed": native_candidate_discovery_count > 0,
+        "native_research_status": "executed" if native_candidate_discovery_count > 0 else "not_executed",
+        "metadata_classifier_assist_executed": metadata_classifier_slice_count > 0,
+        "metadata_classifier_assist_status": "executed"
+        if metadata_classifier_slice_count > 0
+        else "unavailable"
+        if metadata_classifier_unavailable_count > 0
+        else "not_executed",
+        "metadata_classifier_slice_count": metadata_classifier_slice_count,
+        "metadata_classifier_unavailable_count": metadata_classifier_unavailable_count,
         "admitted_initial_evidence_count": len(selected) - sum(
             1 for item in supplemental_records if item.get("normalization_status") == "normalized"
         ),
@@ -5180,6 +5216,13 @@ def attach_native_research_transport_diagnostics(
             attempts.append(attempt)
     packet_copy["native_research_transport_diagnostics"] = [diagnostic]
     packet_copy["native_research_attempts"] = attempts
+    runtime_summary = packet_copy.get("retrieval_runtime_summary")
+    if isinstance(runtime_summary, dict):
+        runtime_summary.setdefault("native_research_model_executed", availability_status == "available")
+        runtime_summary.setdefault(
+            "native_research_status",
+            "executed" if availability_status == "available" else "not_configured",
+        )
     attempt_refs_by_leaf: dict[str, list[str]] = {}
     for attempt in attempts:
         attempt_refs_by_leaf.setdefault(str(attempt.get("leaf_id")), []).append(attempt["attempt_id"])
@@ -5215,6 +5258,24 @@ def attach_source_metadata_classifier_unavailable(
     )
     packet_copy["source_metadata_classifier_unavailable_diagnostics"] = [diagnostic]
     packet_copy.setdefault("source_metadata_classifier_slices", [])
+    runtime_summary = packet_copy.get("retrieval_runtime_summary")
+    if isinstance(runtime_summary, dict):
+        slice_count = len(
+            packet_copy.get("source_metadata_classifier_slices", [])
+            if isinstance(packet_copy.get("source_metadata_classifier_slices"), list)
+            else []
+        )
+        unavailable_count = len(
+            packet_copy.get("source_metadata_classifier_unavailable_diagnostics", [])
+            if isinstance(packet_copy.get("source_metadata_classifier_unavailable_diagnostics"), list)
+            else []
+        )
+        runtime_summary["metadata_classifier_assist_executed"] = slice_count > 0
+        runtime_summary["metadata_classifier_assist_status"] = (
+            "executed" if slice_count > 0 else "unavailable"
+        )
+        runtime_summary["metadata_classifier_slice_count"] = slice_count
+        runtime_summary["metadata_classifier_unavailable_count"] = unavailable_count
     packet_copy.setdefault("schema_feature_gates", {})["RET-011"] = "implemented"
     packet_copy.setdefault("validation_summary", {}).setdefault("reason_codes", []).append(
         "ret_011_classifier_unavailable_diagnostic_recorded"

@@ -213,6 +213,13 @@ class AdsRetrievalTransportTest(unittest.TestCase):
         first_search_index = next(index for index, event in enumerate(provider.events) if event[0] == "search")
         self.assertTrue(all(event[0] == "fetch" for event in provider.events[:first_search_index]))
         self.assertGreater(len(transport.fetched_candidates), len(transport.search_candidate_urls))
+        diagnostics = transport.transport_diagnostics
+        self.assertTrue(diagnostics["direct_url_capture_executed"])
+        self.assertEqual(diagnostics["direct_url_capture_status"], "executed")
+        self.assertTrue(diagnostics["browser_search_executed"])
+        self.assertEqual(diagnostics["browser_search_status"], "executed")
+        self.assertFalse(diagnostics["native_research_model_executed"])
+        self.assertEqual(diagnostics["native_research_status"], "disabled")
 
     def test_embedded_resolution_urls_become_direct_candidates(self) -> None:
         provider = FakeBrowserProvider(search_results=[{"url": "https://secondary.example/report"}])
@@ -583,6 +590,9 @@ class AdsRetrievalTransportTest(unittest.TestCase):
         )
         native_candidate = transport.native_research_candidates[0]["candidate_urls"][0]
 
+        self.assertTrue(transport.transport_diagnostics["native_research_model_executed"])
+        self.assertEqual(transport.transport_diagnostics["native_research_status"], "executed")
+        self.assertEqual(transport.transport_diagnostics["native_research_call_count"], 1)
         self.assertEqual(native_candidate["url"], "https://native.example/source")
         self.assertNotIn("source_class", native_candidate)
         self.assertNotIn("claim_family_id", native_candidate)
@@ -600,6 +610,11 @@ class AdsRetrievalTransportTest(unittest.TestCase):
             live_policy_overlay=True,
         )
         discovery = packet["native_research_candidate_discoveries"][0]
+        runtime_summary = packet["retrieval_runtime_summary"]
+        self.assertTrue(runtime_summary["native_research_model_executed"])
+        self.assertEqual(runtime_summary["native_research_status"], "executed")
+        self.assertFalse(runtime_summary["browser_search_executed"])
+        self.assertEqual(runtime_summary["metadata_classifier_assist_status"], "not_executed")
         self.assertFalse(discovery["authority_boundary"]["research_sufficiency_authority"])
         self.assertTrue(discovery["fetch_required_before_admission"])
 

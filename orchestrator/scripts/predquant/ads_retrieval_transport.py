@@ -149,6 +149,39 @@ class RetrievalTransportResult:
     transport_diagnostics: dict[str, Any] = field(default_factory=dict)
 
 
+def _browser_search_status(
+    *,
+    policy: RetrievalProviderPolicy,
+    browser_search_configured: bool,
+    search_call_count: int,
+    search_failure_count: int,
+) -> str:
+    if not policy.broad_search_enabled:
+        return "disabled"
+    if not browser_search_configured:
+        return "not_configured"
+    if search_call_count <= 0:
+        return "not_executed"
+    if search_failure_count > 0:
+        return "executed_with_failures"
+    return "executed"
+
+
+def _native_research_status(
+    *,
+    policy: RetrievalProviderPolicy,
+    native_candidate_provider: Callable[[dict[str, Any], dict[str, Any]], Any] | None,
+    native_research_call_count: int,
+) -> str:
+    if not policy.native_enabled:
+        return "disabled"
+    if native_candidate_provider is None:
+        return "not_configured"
+    if native_research_call_count <= 0:
+        return "not_executed"
+    return "executed"
+
+
 def collect_live_retrieval_candidates(
     *,
     qdt: dict[str, Any],
@@ -196,6 +229,7 @@ def collect_live_retrieval_candidates(
     search_skipped_diagnostics: list[dict[str, Any]] = []
     search_result_fetch_count = 0
     search_result_fetch_skipped_count = 0
+    native_research_call_count = 0
     collection_started_at = time.monotonic()
     direct_fetch_started_at = collection_started_at
 
@@ -302,6 +336,7 @@ def collect_live_retrieval_candidates(
             variants = context.get("query_variants") if isinstance(context.get("query_variants"), list) else []
             if not variants:
                 continue
+            native_research_call_count += 1
             raw_native = native_candidate_provider(context, variants[0])
             native_candidates = _native_candidate_list(raw_native)
             if native_candidates:
@@ -341,6 +376,22 @@ def collect_live_retrieval_candidates(
         "omitted_candidate_count": len(result.omitted_candidates),
         "search_candidate_url_count": len(result.search_candidate_urls),
         "native_research_candidate_count": len(result.native_research_candidates),
+        "direct_url_capture_executed": bool(result.direct_url_candidates),
+        "direct_url_capture_status": "executed" if result.direct_url_candidates else "not_executed",
+        "browser_search_executed": search_call_count > 0,
+        "browser_search_status": _browser_search_status(
+            policy=policy,
+            browser_search_configured=browser_search_configured,
+            search_call_count=search_call_count,
+            search_failure_count=len(search_failure_diagnostics),
+        ),
+        "native_research_model_executed": native_research_call_count > 0,
+        "native_research_status": _native_research_status(
+            policy=policy,
+            native_candidate_provider=native_candidate_provider,
+            native_research_call_count=native_research_call_count,
+        ),
+        "native_research_call_count": native_research_call_count,
         "bounded_retrieval_policy": {
             "max_direct_urls": policy.max_direct_urls,
             "max_total_direct_fetches": policy.max_total_direct_fetches,

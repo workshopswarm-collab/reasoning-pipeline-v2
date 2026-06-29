@@ -347,6 +347,74 @@ def _attach_live_retrieval_transport_metadata(
 ) -> dict[str, Any]:
     packet["ads_retrieval_transport_diagnostics"] = transport_diagnostics
     packet["ads_retrieval_direct_url_candidates"] = direct_url_candidates
+    runtime_summary = packet.get("retrieval_runtime_summary")
+    if isinstance(runtime_summary, dict):
+        direct_url_candidate_count = max(
+            len(direct_url_candidates),
+            int(transport_diagnostics.get("direct_url_candidate_count") or 0),
+        )
+        direct_url_capture_executed = bool(
+            transport_diagnostics.get("direct_url_capture_executed")
+            or direct_url_candidate_count > 0
+        )
+        browser_search_executed = bool(
+            transport_diagnostics.get("browser_search_executed")
+            or int(transport_diagnostics.get("search_call_count") or 0) > 0
+        )
+        native_research_executed = bool(
+            transport_diagnostics.get("native_research_model_executed")
+            or int(transport_diagnostics.get("native_research_call_count") or 0) > 0
+        )
+        classifier_slices = (
+            packet.get("source_metadata_classifier_slices")
+            if isinstance(packet.get("source_metadata_classifier_slices"), list)
+            else []
+        )
+        classifier_unavailable = (
+            packet.get("source_metadata_classifier_unavailable_diagnostics")
+            if isinstance(packet.get("source_metadata_classifier_unavailable_diagnostics"), list)
+            else []
+        )
+        runtime_summary.update(
+            {
+                "direct_url_candidate_count": direct_url_candidate_count,
+                "direct_url_fetch_attempt_count": int(
+                    transport_diagnostics.get("direct_url_fetch_attempt_count") or 0
+                ),
+                "direct_url_capture_executed": direct_url_capture_executed,
+                "direct_url_capture_status": str(
+                    transport_diagnostics.get("direct_url_capture_status")
+                    or ("executed" if direct_url_capture_executed else "not_executed")
+                ),
+                "browser_search_executed": browser_search_executed,
+                "browser_search_status": str(
+                    transport_diagnostics.get("browser_search_status")
+                    or ("executed" if browser_search_executed else "not_executed")
+                ),
+                "browser_search_call_count": int(transport_diagnostics.get("search_call_count") or 0),
+                "browser_search_failure_count": int(
+                    transport_diagnostics.get("search_failure_count") or 0
+                ),
+                "native_research_model_executed": native_research_executed,
+                "native_research_status": str(
+                    transport_diagnostics.get("native_research_status")
+                    or ("executed" if native_research_executed else "not_executed")
+                ),
+                "native_research_call_count": int(
+                    transport_diagnostics.get("native_research_call_count") or 0
+                ),
+                "metadata_classifier_assist_executed": bool(classifier_slices),
+                "metadata_classifier_assist_status": (
+                    "executed"
+                    if classifier_slices
+                    else "unavailable"
+                    if classifier_unavailable
+                    else "not_executed"
+                ),
+                "metadata_classifier_slice_count": len(classifier_slices),
+                "metadata_classifier_unavailable_count": len(classifier_unavailable),
+            }
+        )
     if transport_diagnostics.get("browser_provider_status") == "unavailable":
         reason = str(
             transport_diagnostics.get("browser_provider_unavailable_reason")

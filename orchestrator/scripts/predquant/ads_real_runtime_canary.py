@@ -381,6 +381,16 @@ def _retrieval_runtime_evidence(manifests: list[dict[str, Any]]) -> dict[str, An
             if isinstance(payload.get("native_research_candidate_discoveries"), list)
             else []
         )
+        metadata_classifier_slices = (
+            payload.get("source_metadata_classifier_slices")
+            if isinstance(payload.get("source_metadata_classifier_slices"), list)
+            else []
+        )
+        metadata_classifier_unavailable = (
+            payload.get("source_metadata_classifier_unavailable_diagnostics")
+            if isinstance(payload.get("source_metadata_classifier_unavailable_diagnostics"), list)
+            else []
+        )
         source_attempt_count = sum(
             int(runtime_summary.get(field) or 0)
             for field in (
@@ -419,6 +429,51 @@ def _retrieval_runtime_evidence(manifests: list[dict[str, Any]]) -> dict[str, An
             direct_url_candidate_count
             + search_candidate_url_count
             + native_candidate_url_count
+        )
+        direct_url_capture_executed = bool(
+            runtime_summary.get("direct_url_capture_executed") is True
+            or transport.get("direct_url_capture_executed") is True
+            or direct_url_candidate_count > 0
+        )
+        browser_search_executed = bool(
+            runtime_summary.get("browser_search_executed") is True
+            or transport.get("browser_search_executed") is True
+            or int(transport.get("search_call_count") or 0) > 0
+        )
+        native_research_model_executed = bool(
+            runtime_summary.get("native_research_model_executed") is True
+            or transport.get("native_research_model_executed") is True
+            or int(runtime_summary.get("native_research_call_count") or 0) > 0
+            or int(transport.get("native_research_call_count") or 0) > 0
+        )
+        metadata_classifier_assist_executed = bool(
+            runtime_summary.get("metadata_classifier_assist_executed") is True
+            or metadata_classifier_slices
+        )
+        direct_url_capture_status = str(
+            transport.get("direct_url_capture_status")
+            or runtime_summary.get("direct_url_capture_status")
+            or ("executed" if direct_url_capture_executed else "not_executed")
+        )
+        browser_search_status = str(
+            transport.get("browser_search_status")
+            or runtime_summary.get("browser_search_status")
+            or ("executed" if browser_search_executed else "not_executed")
+        )
+        native_research_status = str(
+            transport.get("native_research_status")
+            or runtime_summary.get("native_research_status")
+            or ("executed" if native_research_model_executed else "not_executed")
+        )
+        metadata_classifier_assist_status = str(
+            runtime_summary.get("metadata_classifier_assist_status")
+            or (
+                "executed"
+                if metadata_classifier_assist_executed
+                else "unavailable"
+                if metadata_classifier_unavailable
+                else "not_executed"
+            )
         )
         leaf_result_admitted_refs: set[str] = set()
         selected_refs: set[str] = _evidence_refs_from(payload.get("selected_evidence_refs"))
@@ -466,6 +521,16 @@ def _retrieval_runtime_evidence(manifests: list[dict[str, Any]]) -> dict[str, An
                 "native_candidate_url_count": native_candidate_url_count,
                 "real_candidate_count": real_candidate_count,
                 "fetched_attempt_count": fetched_attempt_count,
+                "browser_search_executed": browser_search_executed,
+                "browser_search_status": browser_search_status,
+                "direct_url_capture_executed": direct_url_capture_executed,
+                "direct_url_capture_status": direct_url_capture_status,
+                "native_research_model_executed": native_research_model_executed,
+                "native_research_status": native_research_status,
+                "metadata_classifier_assist_executed": metadata_classifier_assist_executed,
+                "metadata_classifier_assist_status": metadata_classifier_assist_status,
+                "metadata_classifier_slice_count": len(metadata_classifier_slices),
+                "metadata_classifier_unavailable_count": len(metadata_classifier_unavailable),
                 "admitted_evidence_ref_count": len(admitted_refs),
                 "leaf_result_admitted_evidence_ref_count": len(leaf_result_admitted_refs),
                 "docket_admitted_evidence_ref_count": len(docket_admitted_refs),
@@ -495,6 +560,18 @@ def _retrieval_runtime_evidence(manifests: list[dict[str, Any]]) -> dict[str, An
         "fetched_attempt_count": sum(int(item["fetched_attempt_count"]) for item in retrieval_packets),
         "admitted_evidence_ref_count": sum(
             int(item["admitted_evidence_ref_count"]) for item in retrieval_packets
+        ),
+        "browser_search_executed_count": sum(
+            1 for item in retrieval_packets if item["browser_search_executed"]
+        ),
+        "direct_url_capture_executed_count": sum(
+            1 for item in retrieval_packets if item["direct_url_capture_executed"]
+        ),
+        "native_research_model_executed_count": sum(
+            1 for item in retrieval_packets if item["native_research_model_executed"]
+        ),
+        "metadata_classifier_assist_executed_count": sum(
+            1 for item in retrieval_packets if item["metadata_classifier_assist_executed"]
         ),
         "classification_dispatch_allowed": any(item["classification_dispatch_allowed"] for item in retrieval_packets),
         "retrieval_packets": retrieval_packets,
