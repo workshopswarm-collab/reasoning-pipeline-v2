@@ -186,6 +186,18 @@ class AdsRetrievalTransportTest(unittest.TestCase):
         ]
         return qdt
 
+    def _source_of_truth_qdt(self) -> dict:
+        qdt = copy.deepcopy(self.qdt)
+        qdt["required_leaf_questions"] = [
+            leaf for leaf in qdt["required_leaf_questions"] if leaf["leaf_id"] == "leaf-source-of-truth"
+        ]
+        qdt["branches"] = [
+            branch
+            for branch in qdt["branches"]
+            if "leaf-source-of-truth" in branch.get("leaf_ids", [])
+        ]
+        return qdt
+
     def test_direct_url_collection_prioritizes_source_truth_before_broad_search(self) -> None:
         provider = FakeBrowserProvider(search_results=[{"url": "https://secondary.example/report"}])
 
@@ -210,6 +222,14 @@ class AdsRetrievalTransportTest(unittest.TestCase):
         self.assertIn("official_source_hints", transport.direct_url_candidates[0]["source_ref"])
         self.assertIn("source_of_truth_hints", transport.direct_url_candidates[1]["source_ref"])
         self.assertEqual(transport.direct_url_candidates[-1]["source_ref"], "case_contract.market_url")
+        self.assertEqual(
+            transport.direct_url_candidates[-1]["source_class"],
+            "market_rules_or_resolution_source",
+        )
+        self.assertEqual(
+            transport.direct_url_candidates[-1]["source_class_resolution_method"],
+            "market_platform_resolution_url",
+        )
         first_search_index = next(index for index, event in enumerate(provider.events) if event[0] == "search")
         self.assertTrue(all(event[0] == "fetch" for event in provider.events[:first_search_index]))
         self.assertGreater(len(transport.fetched_candidates), len(transport.search_candidate_urls))
@@ -220,6 +240,46 @@ class AdsRetrievalTransportTest(unittest.TestCase):
         self.assertEqual(diagnostics["browser_search_status"], "executed")
         self.assertFalse(diagnostics["native_research_model_executed"])
         self.assertEqual(diagnostics["native_research_status"], "disabled")
+
+    def test_market_url_does_not_satisfy_event_protected_primary(self) -> None:
+        provider = FakeBrowserProvider()
+        transport = collect_live_retrieval_candidates(
+            qdt=self._source_of_truth_qdt(),
+            evidence_packet={
+                **self.evidence_packet,
+                "market_rules": {},
+                "official_source_hints": [],
+                "market_reality_constraints": {},
+            },
+            case_contract=self.case_contract,
+            amrg_context=None,
+            source_cutoff_timestamp=CUTOFF_AT,
+            forecast_timestamp=FORECAST_AT,
+            provider_policy=RetrievalProviderPolicy(max_direct_urls=1, broad_search_enabled=False),
+            browser_provider=provider,
+        )
+        candidate = transport.fetched_candidates[0]
+        self.assertEqual(candidate["direct_url_source_ref"], "case_contract.market_url")
+        self.assertEqual(candidate["source_class"], "market_rules_or_resolution_source")
+        self.assertEqual(candidate["source_class_resolution_method"], "market_platform_resolution_url")
+
+        packet = build_live_retrieval_packet_from_candidates(
+            self._source_of_truth_qdt(),
+            evidence_packet=self.evidence_packet,
+            fetched_candidates=transport.fetched_candidates,
+            search_candidate_urls=transport.search_candidate_urls,
+            forecast_timestamp=FORECAST_AT,
+            source_cutoff_timestamp=CUTOFF_AT,
+            live_policy_overlay=True,
+        )
+        coverage = packet["retrieval_breadth_coverage_slices"][0]
+
+        self.assertEqual(coverage["protected_primary_status"], "blocked")
+        self.assertIn("protected_primary_blocked", coverage["unsatisfied_breadth_dimensions"])
+        self.assertEqual(
+            packet["research_sufficiency_summary"]["classification_dispatch_status"],
+            "blocked_insufficient_research",
+        )
 
     def test_embedded_resolution_urls_become_direct_candidates(self) -> None:
         provider = FakeBrowserProvider(search_results=[{"url": "https://secondary.example/report"}])

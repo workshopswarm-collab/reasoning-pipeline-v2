@@ -546,8 +546,8 @@ def _collect_direct_url_hints(
         hints,
         _market_url(case_contract),
         source_ref="case_contract.market_url",
-        source_class="official_or_primary",
-        source_class_resolution_method="official_url_hint",
+        source_class="market_rules_or_resolution_source",
+        source_class_resolution_method="market_platform_resolution_url",
     )
     return _dedupe_hints(hints)
 

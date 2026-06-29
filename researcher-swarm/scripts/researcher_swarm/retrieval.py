@@ -3242,8 +3242,7 @@ def build_retrieval_breadth_coverage_slice(
     negative_refs = [attempt["attempt_id"] for attempt in negative_check_attempts]
     protected_required = bool(profile.get("source_class_requirements", {}).get("protected_primary_required"))
     protected_satisfied = any(
-        item.get("source_class") in PROTECTED_SOURCE_CLASSES and item.get("temporal_gate_status") == "pass"
-        for item in selected
+        _evidence_counts_as_protected_primary(item, query_context) for item in selected
     )
     requirements = (
         query_context.get("sufficiency_requirements")
@@ -3401,10 +3400,41 @@ def _protected_primary_required(context: dict[str, Any]) -> bool:
     return bool(targets.get("protected_primary_required") is True)
 
 
-def _protected_primary_admitted_for_context(selected: list[dict[str, Any]]) -> bool:
+def _context_is_resolution_mechanics(context: dict[str, Any]) -> bool:
+    requirements = (
+        context.get("sufficiency_requirements")
+        if isinstance(context.get("sufficiency_requirements"), dict)
+        else {}
+    )
+    return str(context.get("purpose") or requirements.get("leaf_purpose") or "") == "resolution_mechanics"
+
+
+def _source_class_counts_as_protected_primary(source_class: Any, context: dict[str, Any]) -> bool:
+    if source_class == "official_or_primary":
+        return True
+    if source_class == "market_rules_or_resolution_source":
+        return _context_is_resolution_mechanics(context)
+    return False
+
+
+def _evidence_counts_as_protected_primary(item: dict[str, Any], context: dict[str, Any]) -> bool:
+    return bool(
+        item.get("temporal_gate_status") == "pass"
+        and _source_class_counts_as_protected_primary(item.get("source_class"), context)
+    )
+
+
+def _required_protected_source_classes_from_context(context: dict[str, Any]) -> list[str]:
+    return [
+        item
+        for item in _required_source_classes_from_context(context)
+        if _source_class_counts_as_protected_primary(item, context)
+    ]
+
+
+def _protected_primary_admitted_for_context(selected: list[dict[str, Any]], context: dict[str, Any]) -> bool:
     return any(
-        item.get("source_class") in PROTECTED_SOURCE_CLASSES and item.get("temporal_gate_status") == "pass"
-        for item in selected
+        _evidence_counts_as_protected_primary(item, context) for item in selected
     )
 
 
@@ -3487,14 +3517,14 @@ def build_protected_primary_access_failure(
         "leaf_id": query_context.get("leaf_id"),
         "query_context_ref": query_context.get("query_context_ref"),
         "required_source_classes": [
-            item for item in _required_source_classes_from_context(query_context) if item in PROTECTED_SOURCE_CLASSES
+            item for item in _required_protected_source_classes_from_context(query_context)
         ],
         "expected_source_refs": _expected_source_refs(query_context),
         "observed_attempt_refs": observed_attempt_refs,
         "admitted_evidence_refs": [
             item.get("evidence_ref")
             for item in selected
-            if item.get("source_class") in PROTECTED_SOURCE_CLASSES and item.get("temporal_gate_status") == "pass"
+            if _evidence_counts_as_protected_primary(item, query_context)
         ],
         "access_status": "missing" if not observed_attempt_refs else "attempted_without_admitted_primary",
         "reason_codes": sorted(set(reasons)),
@@ -3567,7 +3597,8 @@ def build_source_access_and_missingness_report(packet: dict[str, Any]) -> dict[s
             for source_class in _required_source_classes_from_context(context)
             if source_class not in present_classes
         ]
-        if _protected_primary_required(context) and not _protected_primary_admitted_for_context(selected):
+        protected_classes = set(_required_protected_source_classes_from_context(context))
+        if _protected_primary_required(context) and not _protected_primary_admitted_for_context(selected, context):
             failures.append(build_protected_primary_access_failure(context, result))
         for source_class in missing_classes:
             missingness.append(
@@ -3577,7 +3608,9 @@ def build_source_access_and_missingness_report(packet: dict[str, Any]) -> dict[s
                     expected_source_class=source_class,
                     reason_codes=[
                         "required_source_class_absent",
-                        "protected_primary_missing" if source_class in PROTECTED_SOURCE_CLASSES else "expected_source_class_missing",
+                        "protected_primary_missing"
+                        if source_class in protected_classes
+                        else "expected_source_class_missing",
                     ],
                 )
             )
@@ -3641,7 +3674,7 @@ def _unsatisfied_requirement_codes_for_expansion(context: dict[str, Any], result
     present_classes = _selected_source_classes(selected)
     if any(source_class not in present_classes for source_class in _required_source_classes_from_context(context)):
         codes.append("required_source_class_missing")
-    if _protected_primary_required(context) and not _protected_primary_admitted_for_context(selected):
+    if _protected_primary_required(context) and not _protected_primary_admitted_for_context(selected, context):
         codes.append("protected_primary_missing")
     return sorted(set(codes))
 
