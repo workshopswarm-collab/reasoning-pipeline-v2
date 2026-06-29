@@ -398,6 +398,8 @@ Success criteria:
 
 ## Phase 2 - Semantic Specificity And Coverage Validator
 
+Status: completed on 2026-06-29. The QDT validator now rejects unresolved-market QDTs dominated by terminal/result-verification leaves, reports semantic reason codes through `question_specificity_check` and `research_coverage_check`, preserves negative/ambiguous/family semantic guards, and promotes the Victor Marx result-verification regression from expected failure to a passing rejection test.
+
 Goal: reject QDTs that are syntactically valid but semantically shallow.
 
 Implementation:

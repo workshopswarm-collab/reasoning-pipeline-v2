@@ -810,6 +810,35 @@ class QDTContractTest(unittest.TestCase):
         self.assertIn("absence", mapping)
         self.assertIn("current_direct_evidence", selected["research_coverage_graph"]["required_leaf_ids_by_dimension"])
 
+    def test_negative_market_without_explicit_yes_no_semantics_is_rejected(self):
+        handoff = copy.deepcopy(self.handoff)
+        handoff["macro_question"] = "No one announced as next James Bond?"
+        selected = select_qdt_candidate([build_fixture_qdt_candidate(handoff)])
+        broken = copy.deepcopy(selected)
+        broken["market_resolution_contract"]["yes_no_mapping"] = {
+            "yes_means": "The target event occurs under the market rules.",
+            "no_means": "The target event does not occur under the market rules.",
+            "mapping_confidence": "requires_case_contract_confirmation",
+        }
+
+        result = validate_question_decomposition(broken)
+        checks = compute_qdt_quality_checks(broken)
+
+        self.assertFalse(result.valid)
+        self.assertIn("negative_market_mapping_not_decomposed", "; ".join(result.errors))
+        self.assertEqual(checks["question_specificity_check"]["status"], "failed")
+
+    def test_grouped_market_family_context_requires_contract_analysis(self):
+        selected = select_qdt_candidate([build_fixture_qdt_candidate(self.handoff)])
+        evidence_packet = {"family_context": {"parent_market_id": "parent-market-1"}}
+
+        result = validate_question_decomposition(selected, evidence_packet=evidence_packet)
+        checks = compute_qdt_quality_checks(selected, evidence_packet=evidence_packet)
+
+        self.assertFalse(result.valid)
+        self.assertIn("market_family_context_not_analyzed", "; ".join(result.errors))
+        self.assertEqual(checks["question_specificity_check"]["status"], "failed")
+
     def test_valid_research_coverage_graph_output_is_accepted(self):
         base = build_fixture_qdt_candidate(self.handoff)
         selected = select_qdt_candidate([base])
@@ -859,7 +888,6 @@ class QDTContractTest(unittest.TestCase):
             )
         return selected
 
-    @unittest.expectedFailure
     def test_unresolved_election_result_verification_dominant_qdt_is_rejected(self):
         qdt = self._victor_marx_result_verification_dominant_qdt()
 
@@ -872,6 +900,11 @@ class QDTContractTest(unittest.TestCase):
         self.assertIn(
             "terminal_verification_dominates_unresolved_forecast_qdt",
             "; ".join(checks["research_coverage_check"]["reason_codes"]),
+        )
+        self.assertEqual(checks["question_specificity_check"]["status"], "failed")
+        self.assertIn(
+            "terminal_verification_leaf_misclassified_as_pre_resolution",
+            "; ".join(checks["question_specificity_check"]["reason_codes"]),
         )
 
     def test_unresolved_election_pre_resolution_forecast_driver_qdt_is_accepted(self):

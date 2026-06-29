@@ -151,6 +151,27 @@ REQUIRED_CORE_COVERAGE_DIMENSIONS = {
     "material_unknowns",
 }
 CONTRACT_GUARD_COVERAGE_DIMENSIONS = {"resolution_mechanics"}
+UNRESOLVED_PRE_RESOLUTION_FORECAST_DIMENSIONS = {
+    "current_direct_evidence",
+    "key_drivers",
+    "counterevidence_negative_checks",
+    "timing_deadline_constraints",
+    "source_quality",
+    "material_unknowns",
+}
+TERMINAL_VERIFICATION_DOMINATION_THRESHOLD = 0.5
+TERMINAL_RESULT_VERIFICATION_PATTERNS = (
+    r"\bwon\b",
+    r"\boverall winner\b",
+    r"\bofficial result\b",
+    r"\bfirst official announcement\b",
+    r"\bofficial\b.{0,80}\bwinner\b",
+    r"\bwhat did\b.{0,120}\bstate\b.{0,120}\bwinner\b",
+    r"\bwhether\b.{0,120}\bwon\b",
+    r"\bdid\b.{0,120}\btake place\b",
+    r"\bfinal\b.{0,80}\bresult\b",
+    r"\bresolved\b",
+)
 FORBIDDEN_LEAF_OUTPUTS = {
     "probability",
     "odds",
@@ -395,6 +416,31 @@ def _max_template_similarity(question_text: Any) -> float:
     if not text.strip():
         return 1.0
     return max((_template_similarity(text, skeleton) for skeleton in GENERIC_QDT_SKELETONS), default=0.0)
+
+
+def _leaf_semantic_text(leaf: dict[str, Any]) -> str:
+    values = [
+        leaf.get("question_text"),
+        leaf.get("leaf_question"),
+        leaf.get("research_factor"),
+        " ".join(str(item) for item in leaf.get("market_component_terms") or []),
+    ]
+    return " ".join(str(value or "") for value in values).lower()
+
+
+def _leaf_looks_like_terminal_verification(leaf: dict[str, Any]) -> bool:
+    if leaf.get("leaf_temporal_role") == "terminal_verification":
+        return True
+    text = _leaf_semantic_text(leaf)
+    return any(re.search(pattern, text) for pattern in TERMINAL_RESULT_VERIFICATION_PATTERNS)
+
+
+def _result_verification_leaf_ids(leaves: list[dict[str, Any]]) -> list[str]:
+    return [
+        str(leaf.get("leaf_id"))
+        for leaf in leaves
+        if leaf.get("leaf_id") and _leaf_looks_like_terminal_verification(leaf)
+    ]
 
 
 def _question_looks_negative(question: Any) -> bool:
@@ -1819,6 +1865,8 @@ def _validate_market_resolution_contract(value: Any, artifact: dict[str, Any], e
             errors.append(f"market_resolution_contract.{field} is required")
     if not isinstance(value.get("ambiguous_terms"), list):
         errors.append("market_resolution_contract.ambiguous_terms must be a list")
+    elif _ambiguous_terms_from_question(artifact.get("macro_question")) and not value.get("ambiguous_terms"):
+        errors.append("ambiguous_terms_not_decomposed")
     if not _string_list(value.get("disqualifying_evidence_types")):
         errors.append("market_resolution_contract.disqualifying_evidence_types must be a string list")
     if not _string_list(value.get("source_hierarchy")):
@@ -1893,6 +1941,58 @@ def _validate_overlap_groups(
                 if tuple(sorted((left, right))) not in grouped_pairs:
                     errors.append("overlapping_leaf_questions_not_deduplicated")
                     return
+
+
+def _validate_unresolved_forecast_semantics(
+    graph: dict[str, Any],
+    leaves_by_id: dict[str, dict[str, Any]],
+    errors: list[str],
+) -> None:
+    if graph.get("market_temporal_state") != "unresolved":
+        return
+    dispatchable_ids = [
+        str(item)
+        for item in graph.get("dispatchable_pre_resolution_leaf_ids") or []
+        if str(item) in leaves_by_id
+    ]
+    dispatchable_leaves = [leaves_by_id[leaf_id] for leaf_id in dispatchable_ids]
+    if not dispatchable_leaves:
+        errors.append("missing_pre_resolution_dispatchable_leaves")
+        return
+
+    result_verification_ids = _result_verification_leaf_ids(dispatchable_leaves)
+    misclassified_ids = sorted(
+        str(leaf.get("leaf_id"))
+        for leaf in dispatchable_leaves
+        if leaf.get("leaf_id")
+        and leaf.get("leaf_temporal_role") != "terminal_verification"
+        and _leaf_looks_like_terminal_verification(leaf)
+    )
+    if misclassified_ids:
+        errors.append(
+            "terminal_verification_leaf_misclassified_as_pre_resolution: "
+            + ", ".join(misclassified_ids)
+        )
+
+    terminal_ratio = len(result_verification_ids) / max(1, len(dispatchable_leaves))
+    if result_verification_ids and terminal_ratio >= TERMINAL_VERIFICATION_DOMINATION_THRESHOLD:
+        errors.append(
+            "terminal_verification_dominates_unresolved_forecast_qdt: "
+            + ", ".join(sorted(result_verification_ids))
+        )
+
+    dispatchable_dimensions = {
+        str(leaf.get("coverage_dimension"))
+        for leaf in dispatchable_leaves
+        if leaf.get("coverage_dimension") in ALLOWED_COVERAGE_DIMENSIONS
+    }
+    missing_dimensions = (
+        UNRESOLVED_PRE_RESOLUTION_FORECAST_DIMENSIONS
+        - dispatchable_dimensions
+        - _unanswered_dimensions(graph)
+    )
+    if missing_dimensions:
+        errors.append("missing_pre_resolution_forecast_dimensions: " + ", ".join(sorted(missing_dimensions)))
 
 
 def _validate_research_coverage_graph(
@@ -1989,6 +2089,7 @@ def _validate_research_coverage_graph(
         context = contract.get("platform_family_context") if isinstance(contract, dict) else None
         if not _is_non_empty_string(context) or context == "unknown_not_promoted":
             errors.append("market_family_context_not_analyzed")
+    _validate_unresolved_forecast_semantics(value, leaves_by_id, errors)
     _validate_overlap_groups(value, leaves_by_id, errors)
 
 
@@ -2293,6 +2394,10 @@ def compute_qdt_quality_checks(
                 "resolution_checklist_dominates_research_coverage",
                 "required_coverage_dimension_missing",
                 "overlapping_leaf_questions_not_deduplicated",
+                "missing_pre_resolution_dispatchable_leaves",
+                "missing_pre_resolution_forecast_dimensions",
+                "terminal_verification_leaf_misclassified_as_pre_resolution",
+                "terminal_verification_dominates_unresolved_forecast_qdt",
                 "classification_targets",
                 "evidence_requirements",
                 "specificity_evidence",
@@ -2307,7 +2412,10 @@ def compute_qdt_quality_checks(
             for marker in (
                 "template_mad_lib_leaf",
                 "negative_market_mapping_not_decomposed",
+                "ambiguous_terms_not_decomposed",
                 "market_family_context_not_analyzed",
+                "terminal_verification_leaf_misclassified_as_pre_resolution",
+                "terminal_verification_dominates_unresolved_forecast_qdt",
                 "specificity_evidence",
                 "leaf_question",
             )
