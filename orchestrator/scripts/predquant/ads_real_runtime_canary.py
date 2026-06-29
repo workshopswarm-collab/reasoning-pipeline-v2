@@ -361,6 +361,21 @@ def _retrieval_runtime_evidence(manifests: list[dict[str, Any]]) -> dict[str, An
         direct_url_candidates = payload.get("ads_retrieval_direct_url_candidates")
         if not isinstance(direct_url_candidates, list):
             direct_url_candidates = []
+        browser_attempts = (
+            payload.get("browser_retrieval_attempts")
+            if isinstance(payload.get("browser_retrieval_attempts"), list)
+            else []
+        )
+        search_candidate_urls = (
+            payload.get("search_candidate_urls")
+            if isinstance(payload.get("search_candidate_urls"), list)
+            else []
+        )
+        native_discoveries = (
+            payload.get("native_research_candidate_discoveries")
+            if isinstance(payload.get("native_research_candidate_discoveries"), list)
+            else []
+        )
         source_attempt_count = sum(
             int(runtime_summary.get(field) or 0)
             for field in (
@@ -372,6 +387,34 @@ def _retrieval_runtime_evidence(manifests: list[dict[str, Any]]) -> dict[str, An
         )
         source_attempt_count += int(transport.get("direct_url_candidate_count") or 0)
         source_attempt_count += len(direct_url_candidates)
+        direct_url_candidate_count = max(
+            len(direct_url_candidates),
+            int(transport.get("direct_url_candidate_count") or 0),
+        )
+        search_candidate_url_count = max(
+            len(search_candidate_urls),
+            int(runtime_summary.get("search_candidate_url_count") or 0),
+            int(transport.get("search_candidate_url_count") or 0),
+        )
+        native_candidate_url_count = max(
+            int(runtime_summary.get("native_candidate_url_count") or 0),
+            sum(
+                len(item.get("candidate_urls", []))
+                for item in native_discoveries
+                if isinstance(item, dict) and isinstance(item.get("candidate_urls"), list)
+            ),
+        )
+        fetched_attempt_count = max(
+            len(browser_attempts),
+            int(runtime_summary.get("direct_url_attempt_count") or 0)
+            + int(runtime_summary.get("web_search_attempt_count") or 0),
+            int(transport.get("fetched_candidate_count") or 0),
+        )
+        real_candidate_count = (
+            direct_url_candidate_count
+            + search_candidate_url_count
+            + native_candidate_url_count
+        )
         leaf_result_admitted_refs: set[str] = set()
         selected_refs: set[str] = _evidence_refs_from(payload.get("selected_evidence_refs"))
         for row in leaf_results:
@@ -398,12 +441,14 @@ def _retrieval_runtime_evidence(manifests: list[dict[str, Any]]) -> dict[str, An
                 or row.get("certificate_status") == "structurally_unanswerable_certified"
             )
         )
-        source_populated = source_attempt_count > 0 or len(leaf_result_admitted_refs) > 0
         structural_unanswerability_certified = (
             bool(leaf_results or certificates)
             and structural_unanswerable_count >= max(1, len(leaf_results))
         )
         dispatch_allowed = sufficiency.get("classification_dispatch_status") == "allowed"
+        retrieval_has_real_candidates = real_candidate_count > 0
+        retrieval_has_fetch_attempts = fetched_attempt_count > 0
+        retrieval_has_admitted_evidence = len(admitted_refs) > 0
         retrieval_packets.append(
             {
                 "artifact_id": manifest.get("artifact_id"),
@@ -411,6 +456,11 @@ def _retrieval_runtime_evidence(manifests: list[dict[str, Any]]) -> dict[str, An
                 "runtime_mode": runtime_summary.get("runtime_mode"),
                 "classification_dispatch_status": sufficiency.get("classification_dispatch_status"),
                 "source_attempt_count": source_attempt_count,
+                "direct_url_candidate_count": direct_url_candidate_count,
+                "search_candidate_url_count": search_candidate_url_count,
+                "native_candidate_url_count": native_candidate_url_count,
+                "real_candidate_count": real_candidate_count,
+                "fetched_attempt_count": fetched_attempt_count,
                 "admitted_evidence_ref_count": len(admitted_refs),
                 "leaf_result_admitted_evidence_ref_count": len(leaf_result_admitted_refs),
                 "docket_admitted_evidence_ref_count": len(docket_admitted_refs),
@@ -418,8 +468,16 @@ def _retrieval_runtime_evidence(manifests: list[dict[str, Any]]) -> dict[str, An
                 "reported_evidence_ref_count": len(reported_refs),
                 "structural_unanswerability_certified": structural_unanswerability_certified,
                 "classification_dispatch_allowed": dispatch_allowed,
-                "source_populated_or_structural_unanswerability": (
-                    source_populated or structural_unanswerability_certified
+                "retrieval_has_real_candidates": retrieval_has_real_candidates,
+                "retrieval_has_fetch_attempts": retrieval_has_fetch_attempts,
+                "retrieval_has_admitted_evidence": retrieval_has_admitted_evidence,
+                "source_populated_or_structural_unanswerability": bool(
+                    (
+                        retrieval_has_real_candidates
+                        and retrieval_has_fetch_attempts
+                        and retrieval_has_admitted_evidence
+                    )
+                    or structural_unanswerability_certified
                 ),
             }
         )
@@ -427,6 +485,11 @@ def _retrieval_runtime_evidence(manifests: list[dict[str, Any]]) -> dict[str, An
         "retrieval_packet_count": len(retrieval_packets),
         "source_populated_count": sum(
             1 for item in retrieval_packets if item["source_populated_or_structural_unanswerability"]
+        ),
+        "real_candidate_count": sum(int(item["real_candidate_count"]) for item in retrieval_packets),
+        "fetched_attempt_count": sum(int(item["fetched_attempt_count"]) for item in retrieval_packets),
+        "admitted_evidence_ref_count": sum(
+            int(item["admitted_evidence_ref_count"]) for item in retrieval_packets
         ),
         "classification_dispatch_allowed": any(item["classification_dispatch_allowed"] for item in retrieval_packets),
         "retrieval_packets": retrieval_packets,

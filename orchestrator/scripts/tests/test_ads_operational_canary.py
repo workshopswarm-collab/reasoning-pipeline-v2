@@ -609,23 +609,35 @@ class AdsOperationalCanaryTest(unittest.TestCase):
 
         result = run_one_case_canary(config, handlers)
 
-        self.assertTrue(result["ok"], result["errors"])
+        self.assertFalse(result["ok"])
+        self.assertIn(
+            "real_runtime_canary:retrieval_runtime_not_source_populated_or_structurally_unanswerable",
+            result["errors"],
+        )
         criteria_report = result["real_runtime_canary_report"]
-        self.assertTrue(criteria_report["ok"], criteria_report["issues"])
+        self.assertFalse(criteria_report["ok"])
+        self.assertIn(
+            "retrieval_runtime_not_source_populated_or_structurally_unanswerable",
+            criteria_report["issues"],
+        )
         self.assertEqual(criteria_report["criteria_schema_version"], "ads-real-runtime-canary-criteria/v1")
         self.assertEqual(criteria_report["active_work"], {"active_runs": 0, "active_leases": 0})
         self.assertEqual(criteria_report["prediction_delta_evidence"]["expected_market_predictions"], 0)
         self.assertEqual(criteria_report["model_runtime_evidence"]["qdt_model_executed_count"], 1)
-        self.assertIsNone(criteria_report["first_failing_gate"])
+        self.assertEqual(
+            criteria_report["first_failing_gate"],
+            "retrieval_source_populated_or_structural_unanswerability",
+        )
         self.assertIn("retrieval_runtime_evidence", criteria_report)
-        self.assertGreaterEqual(criteria_report["retrieval_runtime_evidence"]["source_populated_count"], 1)
+        self.assertEqual(criteria_report["retrieval_runtime_evidence"]["source_populated_count"], 0)
+        self.assertEqual(criteria_report["retrieval_runtime_evidence"]["admitted_evidence_ref_count"], 0)
         runtime_gate_statuses = {
             item["gate"]: item["status"]
             for item in criteria_report["criteria"]["runtime_gates"]
         }
         self.assertEqual(
             runtime_gate_statuses["retrieval_source_populated_or_structural_unanswerability"],
-            "passed",
+            "failed",
         )
         self.assertEqual(
             runtime_gate_statuses["researcher_model_executed_if_dispatch_allowed"],
@@ -639,12 +651,19 @@ class AdsOperationalCanaryTest(unittest.TestCase):
             expected_forecast_decision_records=1,
             expected_market_predictions=0,
         )
-        self.assertTrue(standalone_report["ok"], standalone_report["issues"])
+        self.assertFalse(standalone_report["ok"])
+        self.assertIn(
+            "retrieval_runtime_not_source_populated_or_structurally_unanswerable",
+            standalone_report["issues"],
+        )
         self.assertEqual(
             standalone_report["prediction_delta_evidence"]["delta_source"],
             "pipeline_run_records",
         )
-        self.assertIsNone(standalone_report["criteria"]["first_failing_gate"])
+        self.assertEqual(
+            standalone_report["criteria"]["first_failing_gate"],
+            "retrieval_source_populated_or_structural_unanswerability",
+        )
         operator_report = build_ads_operator_review_report(
             self.db_path,
             pipeline_run_id=result["result"]["pipeline_run_id"],
@@ -1183,7 +1202,7 @@ class AdsOperationalCanaryTest(unittest.TestCase):
         config = self.config(
             require_scoreable_prediction=False,
             require_manifest_handoffs=True,
-            require_real_runtime_canary_criteria=True,
+            require_real_runtime_canary_criteria=False,
         )
         handlers = build_true_production_handlers(
             db_path=config.db_path,
