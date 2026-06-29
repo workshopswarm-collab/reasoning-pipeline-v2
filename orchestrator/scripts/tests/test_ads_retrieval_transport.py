@@ -502,6 +502,8 @@ class AdsRetrievalTransportTest(unittest.TestCase):
         self.assertEqual(candidate["source_class_resolution_method"], "deterministic_url_registry")
         self.assertTrue(candidate["deterministic_source_class_proof"])
         self.assertNotIn("claim_family_id", candidate)
+        self.assertNotIn("validated_atomic_claim_candidates", candidate)
+        self.assertNotIn("claim_candidate_authority_boundary", candidate)
         self.assertEqual(candidate["source_class_registry_match"], "reuters.com")
 
         packet = build_live_retrieval_packet_from_candidates(
@@ -516,7 +518,9 @@ class AdsRetrievalTransportTest(unittest.TestCase):
         provenance = packet["retrieval_evidence_provenance_slices"][0]
 
         self.assertEqual(provenance["source_class"], "independent_secondary")
-        self.assertTrue(provenance["claim_family_ids"])
+        self.assertEqual(provenance["claim_family_ids"], [])
+        self.assertIn("claim_family_unknown_not_counted", provenance["unknown_reason_codes"])
+        self.assertEqual(packet["atomic_claim_candidates"], [])
         self.assertIn("snippet_sha256", packet["search_candidate_urls"][0])
         self.assertNotIn("snippet", packet["search_candidate_urls"][0])
         self.assertEqual(

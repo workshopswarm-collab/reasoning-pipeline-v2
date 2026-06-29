@@ -23,6 +23,10 @@ SOURCE_AUTHORITY_FIELDS = {
     "claim_family_ids",
     "claim_family_resolution_ref",
     "claim_family_resolution_refs",
+    "validated_atomic_claim_candidates",
+    "atomic_claim_candidates",
+    "claim_candidates",
+    "claim_candidate_authority_boundary",
     "temporal_gate_status",
     "temporal_safety_status",
     "research_sufficiency",
@@ -644,13 +648,6 @@ def _fetch_candidate(
             "browser_fetch_certifies_sufficiency": False,
         },
     }
-    if isinstance(fetched.get("validated_atomic_claim_candidates"), list):
-        candidate["validated_atomic_claim_candidates"] = fetched["validated_atomic_claim_candidates"][:8]
-        candidate["claim_candidate_authority_boundary"] = {
-            "browser_fetch_certifies_claim_family": False,
-            "final_claim_family_requires_exact_fetched_text_span": True,
-            "final_claim_family_requires_deterministic_tuple_hash": True,
-        }
     if extraction_status == "accepted":
         candidate["admission_status"] = "admitted"
         candidate["temporal_gate_status"] = "pass"
