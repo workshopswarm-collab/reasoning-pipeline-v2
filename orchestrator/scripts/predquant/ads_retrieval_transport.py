@@ -598,6 +598,9 @@ def _fetch_candidate(
     source_freshness_time = published_at or updated_at
     inferred_observed_at = None
     reason_codes = list(fetched.get("reason_codes") or fetched.get("omission_reason_codes") or [])
+    if extraction_status == "accepted" and not fetched_content:
+        extraction_status = "rejected"
+        reason_codes.append("retrieved_source_text_missing")
     if extraction_status == "accepted" and not source_time:
         if _direct_hint_allows_inferred_source_time(
             hint,

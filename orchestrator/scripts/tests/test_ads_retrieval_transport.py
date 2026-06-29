@@ -548,6 +548,12 @@ class AdsRetrievalTransportTest(unittest.TestCase):
             browser_provider=provider,
         )
         self.assertEqual(transport.fetched_candidates[0]["content"], "")
+        self.assertEqual(transport.fetched_candidates[0]["extraction_status"], "rejected")
+        self.assertEqual(transport.fetched_candidates[0]["admission_status"], "rejected")
+        self.assertIn(
+            "retrieved_source_text_missing",
+            transport.fetched_candidates[0]["omission_reason_codes"],
+        )
 
         packet = build_live_retrieval_packet_from_candidates(
             self._resolution_mechanics_qdt(),
