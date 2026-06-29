@@ -29,6 +29,7 @@ from ads_decomposer.qdt import (  # noqa: E402
     build_fixture_qdt_candidate,
     build_leaf_budget_decision,
     build_research_sufficiency_requirements,
+    compute_qdt_quality_checks,
     dump_question_decomposition,
     repair_anchor_dependency_contracts,
     select_qdt_candidate,
@@ -770,6 +771,99 @@ class QDTContractTest(unittest.TestCase):
             len(selected["research_coverage_graph"]["material_question_leaf_ids"]),
             5,
         )
+
+    def _victor_marx_handoff(self) -> dict:
+        handoff = copy.deepcopy(self.handoff)
+        handoff["case_id"] = "case-victor-marx"
+        handoff["case_key"] = "polymarket:825858"
+        handoff["dispatch_id"] = "dispatch-victor-marx"
+        handoff["macro_question"] = (
+            "Will Victor Marx win the 2026 Colorado Governor Republican primary election?"
+        )
+        handoff["market_context"] = {
+            "market_id": "825858",
+            "market_reality_constraints_digest": "sha256:" + "2" * 64,
+            "closes_at": "2026-06-30T23:59:00+00:00",
+            "platform_family_context": "polymarket-colorado-governor-primary-family",
+        }
+        return handoff
+
+    def _victor_marx_result_verification_dominant_qdt(self) -> dict:
+        selected = select_qdt_candidate([build_fixture_qdt_candidate(self._victor_marx_handoff())])
+        replacement_questions = [
+            "Did the 2026 Colorado Republican gubernatorial primary take place under rules relevant to this market?",
+            "Was Victor Marx a candidate in the 2026 Colorado Republican gubernatorial primary covered by this market?",
+            "What did the first official Colorado Republican Party announcement state about the winner of the 2026 Colorado gubernatorial Republican primary?",
+            "Was Victor Marx the overall winner of the 2026 Colorado gubernatorial Republican primary, including any second round or run-off if applicable?",
+            "If no 2026 Colorado gubernatorial Republican primary took place, does the market rule require resolution to Other rather than Victor Marx?",
+            "If the Colorado Republican Party official announcement is unavailable or delayed, is there an overwhelming consensus of credible reporting on whether Victor Marx won the primary?",
+        ]
+        for leaf, question in zip(selected["required_leaf_questions"], replacement_questions):
+            leaf["question_text"] = question
+            leaf["leaf_question"] = question
+            leaf["specificity_evidence"]["why_this_must_be_investigated"] = (
+                "Captured from the audited Victor Marx live QDT baseline to prove "
+                "that terminal result-verification wording is currently not rejected "
+                "when the leaf is otherwise shaped like a material research leaf."
+            )
+            leaf["specificity_evidence"]["not_a_template_reason"] = (
+                "References Victor Marx and the 2026 Colorado Republican gubernatorial primary."
+            )
+        return selected
+
+    @unittest.expectedFailure
+    def test_unresolved_election_result_verification_dominant_qdt_is_rejected(self):
+        qdt = self._victor_marx_result_verification_dominant_qdt()
+
+        result = validate_question_decomposition(qdt)
+        checks = compute_qdt_quality_checks(qdt)
+
+        self.assertFalse(result.valid)
+        self.assertIn("terminal_verification_dominates_unresolved_forecast_qdt", "; ".join(result.errors))
+        self.assertEqual(checks["research_coverage_check"]["status"], "failed")
+        self.assertIn(
+            "terminal_verification_dominates_unresolved_forecast_qdt",
+            "; ".join(checks["research_coverage_check"]["reason_codes"]),
+        )
+
+    def test_unresolved_election_pre_resolution_forecast_driver_qdt_is_accepted(self):
+        qdt = select_qdt_candidate([build_fixture_qdt_candidate(self._victor_marx_handoff())])
+        replacements = {
+            "leaf-direct-evidence": (
+                "What pre-cutoff evidence shows Victor Marx's current ballot access, eligibility, "
+                "and active campaign status in the Colorado Republican gubernatorial primary?"
+            ),
+            "leaf-key-driver-status": (
+                "What polling, endorsements, fundraising, field strength, campaign activity, or "
+                "local reporting bears on Victor Marx's chance of winning before resolution?"
+            ),
+            "leaf-negative-checks": (
+                "What withdrawals, ballot-access problems, weak campaign signals, stronger opponents, "
+                "or contradictory reporting reduce Victor Marx's chance before resolution?"
+            ),
+            "leaf-source-quality": (
+                "Which current sources about Victor Marx's campaign strength are independent, timely, "
+                "and high quality rather than repeated rumor or market chatter?"
+            ),
+            "leaf-material-unknowns": (
+                "What material pre-resolution evidence about Victor Marx's primary chances remains "
+                "unknown or structurally unavailable before the source cutoff?"
+            ),
+        }
+        for leaf in qdt["required_leaf_questions"]:
+            if leaf["leaf_id"] in replacements:
+                leaf["question_text"] = replacements[leaf["leaf_id"]]
+                leaf["leaf_question"] = replacements[leaf["leaf_id"]]
+                leaf["specificity_evidence"]["why_this_must_be_investigated"] = (
+                    "This is a pre-resolution forecast-driver leaf for the Victor Marx market."
+                )
+
+        result = validate_question_decomposition(qdt)
+        checks = compute_qdt_quality_checks(qdt)
+
+        self.assertTrue(result.valid, result.errors)
+        self.assertEqual(checks["question_specificity_check"]["status"], "passed")
+        self.assertEqual(checks["research_coverage_check"]["status"], "passed")
 
 
 if __name__ == "__main__":
