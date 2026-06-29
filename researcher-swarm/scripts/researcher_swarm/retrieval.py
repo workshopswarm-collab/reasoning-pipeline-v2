@@ -411,6 +411,14 @@ def _content_sha256(candidate: dict[str, Any], canonical_url: str = "") -> str:
     )
 
 
+def _content_hash_for_duplicate_detection(candidate: dict[str, Any], content_sha256: str) -> str:
+    if any(_is_non_empty_string(candidate.get(field)) for field in ("content", "extracted_text", "rendered_text", "snippet")):
+        return content_sha256
+    if candidate.get("chunk_refs") or _is_non_empty_string(candidate.get("content_artifact_ref")):
+        return content_sha256
+    return ""
+
+
 def _claim_contradiction_family_id(normalized: dict[str, Any]) -> str | None:
     polarity = normalized.get("polarity")
     if polarity not in {"affirmed", "negated"}:
@@ -2048,13 +2056,6 @@ def _resolve_source_family(
         return "source-family-" + _hash_suffix({"syndication": candidate["syndication_key"]}), "syndication_key", "syndicated_copy"
     if _is_non_empty_string(candidate.get("mirrored_api_family_key")):
         return "source-family-" + _hash_suffix({"api_mirror": candidate["mirrored_api_family_key"]}), "mirrored_api_family_key", "mirrored_api_endpoint"
-    explicit_content_hash = _is_non_empty_string(candidate.get("content_sha256")) or any(
-        _is_non_empty_string(candidate.get(field)) for field in ("content", "extracted_text", "rendered_text", "snippet")
-    )
-    if explicit_content_hash and content_sha256:
-        return "source-family-" + _hash_suffix({"content": content_sha256}), "content_sha256", "content_hash_dedupe"
-    if canonical_url:
-        return "source-family-" + _hash_suffix({"canonical_url": canonical_url}), "canonical_url", "resolved"
     domain = _registrable_domain(canonical_url)
     if domain:
         return "source-family-" + _hash_suffix({"domain": domain}), "registrable_domain", "resolved"
@@ -2066,11 +2067,15 @@ def _resolve_independence_status(
     source_family_id: str,
     claim_family_ids: list[str],
     source_family_status: str,
+    content_duplicate_hash: str = "",
     seen_source_family_ids: set[str] | None = None,
     seen_claim_family_ids: set[str] | None = None,
+    seen_content_hashes: set[str] | None = None,
 ) -> str:
     if source_family_id == "source-family-unknown" or not claim_family_ids:
         return "unknown_not_counted"
+    if content_duplicate_hash and seen_content_hashes and content_duplicate_hash in seen_content_hashes:
+        return "syndicated_copy"
     if seen_claim_family_ids and any(claim_id in seen_claim_family_ids for claim_id in claim_family_ids):
         return "same_claim_family"
     if seen_source_family_ids and source_family_id in seen_source_family_ids:
@@ -2121,6 +2126,21 @@ def _classifier_source_family_hint_status(
     if source_family_status == "syndicated_copy" and syndication_hint not in {"none", "unknown"}:
         return "accepted_source_family_hint", ["classifier_syndication_hint_supported_by_syndication_key"]
     return None, ["classifier_source_family_hint_not_used_for_final_family"]
+
+
+def _candidate_claim_family_fallback_allowed(candidate: dict[str, Any]) -> bool:
+    method = str(candidate.get("claim_family_resolution_method") or "")
+    if method in {
+        "explicit_candidate_claim_family_ids_allowed",
+        "normalized_supplemental_evidence",
+        "manual_fixture",
+        "structured_market_metadata_pilot",
+    }:
+        return True
+    reason_codes = candidate.get("admission_reason_codes")
+    if isinstance(reason_codes, list) and "manual_fixture_selected" in reason_codes:
+        return True
+    return False
 
 
 def _merge_classifier_acceptance(
@@ -2566,6 +2586,7 @@ def normalize_retrieval_provenance(
     market_rules: dict[str, Any] | None = None,
     seen_source_family_ids: set[str] | None = None,
     seen_claim_family_ids: set[str] | None = None,
+    seen_content_hashes: set[str] | None = None,
 ) -> dict[str, Any]:
     if not isinstance(candidate, dict):
         raise RetrievalPacketError("candidate must be an object")
@@ -2577,6 +2598,7 @@ def normalize_retrieval_provenance(
     final_url = str(candidate.get("final_url") or "")
     canonical_url = canonicalize_source_url(candidate.get("canonical_url"), final_url, requested_url)
     content_hash = _content_sha256(candidate, canonical_url)
+    content_duplicate_hash = _content_hash_for_duplicate_detection(candidate, content_hash)
     source_class, source_class_method, classifier_status, classifier_reason_codes = _resolve_source_class(
         {**candidate, "canonical_url": canonical_url},
         classifier_slice,
@@ -2629,13 +2651,14 @@ def normalize_retrieval_provenance(
         for resolution in resolutions
         if resolution.get("counts_toward_claim_family_breadth") and resolution.get("claim_family_id") != "claim-family-unknown"
     ]
-    if not claim_family_ids and isinstance(candidate.get("claim_family_resolution_refs"), list):
+    claim_family_fallback_allowed = _candidate_claim_family_fallback_allowed(candidate)
+    if claim_family_fallback_allowed and not claim_family_ids and isinstance(candidate.get("claim_family_resolution_refs"), list):
         claim_family_ids = [
             str(ref)
             for ref in candidate["claim_family_resolution_refs"]
             if _is_non_empty_string(ref) and "unknown" not in str(ref)
         ]
-    if not claim_family_ids and isinstance(candidate.get("claim_family_ids"), list):
+    if claim_family_fallback_allowed and not claim_family_ids and isinstance(candidate.get("claim_family_ids"), list):
         claim_family_ids = [
             str(claim_id)
             for claim_id in candidate["claim_family_ids"]
@@ -2645,8 +2668,10 @@ def normalize_retrieval_provenance(
         source_family_id=source_family_id,
         claim_family_ids=claim_family_ids,
         source_family_status=source_family_status,
+        content_duplicate_hash=content_duplicate_hash,
         seen_source_family_ids=seen_source_family_ids,
         seen_claim_family_ids=seen_claim_family_ids,
+        seen_content_hashes=seen_content_hashes,
     )
     counts_toward_breadth = (
         source_class != "unknown"
@@ -2715,6 +2740,7 @@ def normalize_retrieval_provenance(
         "transport_attempt_ref": candidate.get("transport_attempt_ref"),
         "canonical_url": canonical_url,
         "content_sha256": content_hash,
+        "content_duplicate_detection_hash": content_duplicate_hash,
         "claim_family_ids": claim_family_ids,
     }
     return {
@@ -2757,6 +2783,7 @@ def normalize_retrieval_provenance(
         "source_family_status": source_family_status,
         "independence_status": independence_status,
         "content_sha256": content_hash,
+        "content_duplicate_detection_hash": content_duplicate_hash,
         "temporal_gate_status": temporal_validation["temporal_gate_status"],
         "temporal_validation_ref": temporal_validation["temporal_validation_id"],
         "temporal_validation": temporal_validation,
@@ -4510,20 +4537,19 @@ def _materialize_candidate_evidence(
         source_family_method = str(
             candidate.get("source_family_resolution_method") or "deterministic_candidate_source_metadata"
         )
-    elif canonicalize_source_url(attempt.get("canonical_url"), candidate.get("canonical_url"), candidate.get("final_url")):
-        source_family_id = "source-family-" + _hash_suffix(
-            {
-                "canonical_url": canonicalize_source_url(
-                    attempt.get("canonical_url"),
-                    candidate.get("canonical_url"),
-                    candidate.get("final_url"),
-                )
-            }
-        )
-        source_family_method = "canonical_url"
     else:
-        source_family_id = "source-family-unknown"
-        source_family_method = "unknown"
+        canonical_for_family = canonicalize_source_url(
+            attempt.get("canonical_url"),
+            candidate.get("canonical_url"),
+            candidate.get("final_url"),
+        )
+        domain = _registrable_domain(canonical_for_family)
+        if domain:
+            source_family_id = "source-family-" + _hash_suffix({"domain": domain})
+            source_family_method = "registrable_domain"
+        else:
+            source_family_id = "source-family-unknown"
+            source_family_method = "unknown"
     claim_family_ids = _candidate_claim_family_ids(candidate) if allow_candidate_claim_family_ids else []
     evidence = build_retrieval_evidence_item(
         case_id=str(qdt.get("case_id") or context.get("case_id")),
@@ -4562,6 +4588,8 @@ def _materialize_candidate_evidence(
         source_family_method
     )
     evidence["claim_family_ids"] = claim_family_ids
+    if claim_family_ids and allow_candidate_claim_family_ids:
+        evidence["claim_family_resolution_method"] = "explicit_candidate_claim_family_ids_allowed"
     chunk = build_evidence_chunk(
         evidence_ref=evidence["evidence_ref"],
         content_artifact_ref=str(content_artifact_ref),
@@ -5075,6 +5103,11 @@ def build_live_retrieval_packet_from_candidates(
             for claim_id in item.get("claim_family_ids", [])
             if _is_non_empty_string(claim_id)
         }
+        seen_content_hashes = {
+            str(_content_hash_for_duplicate_detection(item, str(item.get("content_sha256") or "")))
+            for item in selected
+            if _is_non_empty_string(_content_hash_for_duplicate_detection(item, str(item.get("content_sha256") or "")))
+        }
         dispatch_context = {
             "case_id": qdt.get("case_id"),
             "dispatch_id": qdt.get("dispatch_id"),
@@ -5101,6 +5134,7 @@ def build_live_retrieval_packet_from_candidates(
                 dispatch_context,
                 seen_source_family_ids=seen_source_family_ids,
                 seen_claim_family_ids=seen_claim_family_ids,
+                seen_content_hashes=seen_content_hashes,
             )
             validation = validate_normalized_supplemental_evidence(record)
             if not validation.valid:
@@ -5111,6 +5145,8 @@ def build_live_retrieval_packet_from_candidates(
                     seen_source_family_ids.add(str(record["source_family_id"]))
                 if _is_non_empty_string(record.get("claim_family_id")):
                     seen_claim_family_ids.add(str(record["claim_family_id"]))
+                if _is_non_empty_string(record.get("content_sha256")):
+                    seen_content_hashes.add(str(record["content_sha256"]))
                 evidence, chunk, span = _materialize_candidate_evidence(
                     qdt=qdt,
                     context=context,
@@ -5401,10 +5437,12 @@ def build_retrieval_packet(
     claim_family_resolutions = []
     seen_source_family_ids_by_leaf: dict[str, set[str]] = {}
     seen_claim_family_ids_by_leaf: dict[str, set[str]] = {}
+    seen_content_hashes_by_leaf: dict[str, set[str]] = {}
     for item in selected:
         leaf_id = str(item.get("leaf_id") or "")
         seen_source_family_ids = seen_source_family_ids_by_leaf.setdefault(leaf_id, set())
         seen_claim_family_ids = seen_claim_family_ids_by_leaf.setdefault(leaf_id, set())
+        seen_content_hashes = seen_content_hashes_by_leaf.setdefault(leaf_id, set())
         classifier_slice = item.get("source_metadata_classifier_slice")
         if isinstance(classifier_slice, dict):
             source_metadata_classifier_slices.append(classifier_slice)
@@ -5423,6 +5461,7 @@ def build_retrieval_packet(
             market_rules=source_resolution_rules,
             seen_source_family_ids=seen_source_family_ids,
             seen_claim_family_ids=seen_claim_family_ids,
+            seen_content_hashes=seen_content_hashes,
         )
         atomic_claim_candidates.extend(item_claim_candidates)
         claim_family_resolutions.extend(item_claim_family_resolutions)
@@ -5431,6 +5470,8 @@ def build_retrieval_packet(
         for claim_family_id in provenance.get("claim_family_ids", []):
             if _is_non_empty_string(claim_family_id):
                 seen_claim_family_ids.add(str(claim_family_id))
+        if _is_non_empty_string(provenance.get("content_duplicate_detection_hash")):
+            seen_content_hashes.add(str(provenance["content_duplicate_detection_hash"]))
         provenance_slices.append(provenance)
         source_metadata_resolutions.append(provenance["source_metadata_resolution"])
         item["source_metadata_resolution_ref"] = provenance["source_metadata_resolution_ref"]

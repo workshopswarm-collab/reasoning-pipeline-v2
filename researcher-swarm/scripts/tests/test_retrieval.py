@@ -606,6 +606,28 @@ class RetrievalPacketContractTest(unittest.TestCase):
             )
             for idx in range(5)
         ]
+        same_publisher = [
+            self._evidence(
+                context,
+                attempt_ref=f"same-publisher-{idx}",
+                canonical_url=f"https://same-publisher.example.com/story-{idx}",
+                source_family_id="source-family-unknown",
+                claim_family_id=f"claim-family-publisher-{idx}",
+            )
+            for idx in range(5)
+        ]
+        duplicate_content = []
+        for idx in range(2):
+            item = self._evidence(
+                context,
+                attempt_ref=f"duplicate-content-{idx}",
+                canonical_url=f"https://mirror-{idx}.test/story",
+                source_family_id="source-family-unknown",
+                claim_family_id=f"claim-family-duplicate-content-{idx}",
+            )
+            item["content_sha256"] = "sha256:" + "b" * 64
+            item["chunk_refs"] = [f"chunk:duplicate-content-{idx}"]
+            duplicate_content.append(item)
 
         same_claim_packet = build_retrieval_packet(qdt, evidence_packet=self.evidence_packet, selected_evidence=same_claim)
         same_claim_coverage = next(
@@ -614,6 +636,14 @@ class RetrievalPacketContractTest(unittest.TestCase):
         same_source_packet = build_retrieval_packet(qdt, evidence_packet=self.evidence_packet, selected_evidence=same_source)
         same_source_coverage = next(
             item for item in same_source_packet["retrieval_breadth_coverage_slices"] if item["leaf_id"] == leaf["leaf_id"]
+        )
+        same_publisher_packet = build_retrieval_packet(qdt, evidence_packet=self.evidence_packet, selected_evidence=same_publisher)
+        same_publisher_coverage = next(
+            item for item in same_publisher_packet["retrieval_breadth_coverage_slices"] if item["leaf_id"] == leaf["leaf_id"]
+        )
+        duplicate_content_packet = build_retrieval_packet(qdt, evidence_packet=self.evidence_packet, selected_evidence=duplicate_content)
+        duplicate_content_coverage = next(
+            item for item in duplicate_content_packet["retrieval_breadth_coverage_slices"] if item["leaf_id"] == leaf["leaf_id"]
         )
 
         self.assertEqual(same_claim_coverage["claim_family_count"], 1)
@@ -629,6 +659,20 @@ class RetrievalPacketContractTest(unittest.TestCase):
         self.assertIn(
             "same_source_family",
             {item["independence_status"] for item in same_source_packet["retrieval_evidence_provenance_slices"]},
+        )
+        self.assertEqual(same_publisher_coverage["source_family_count"], 1)
+        self.assertFalse(same_publisher_coverage["breadth_certified"])
+        self.assertIn("source_family_diversity", same_publisher_coverage["unsatisfied_breadth_dimensions"])
+        self.assertIn(
+            "same_source_family",
+            {item["independence_status"] for item in same_publisher_packet["retrieval_evidence_provenance_slices"]},
+        )
+        self.assertEqual(duplicate_content_coverage["source_family_count"], 1)
+        self.assertFalse(duplicate_content_coverage["breadth_certified"])
+        self.assertIn("source_family_diversity", duplicate_content_coverage["unsatisfied_breadth_dimensions"])
+        self.assertIn(
+            "syndicated_copy",
+            {item["independence_status"] for item in duplicate_content_packet["retrieval_evidence_provenance_slices"]},
         )
 
     def test_unknown_metadata_and_protected_primary_gaps_block_breadth(self) -> None:
@@ -944,6 +988,7 @@ class RetrievalPacketContractTest(unittest.TestCase):
                 "transport_attempt_ref": "browser:content-a",
                 "canonical_url": "https://mirror-a.example/story",
                 "content_sha256": "sha256:" + "a" * 64,
+                "chunk_refs": ["retrieval-chunk:content-a"],
                 "source_published_at": "2026-06-24T11:00:00+00:00",
             },
             dispatch_context=dispatch,
@@ -954,6 +999,7 @@ class RetrievalPacketContractTest(unittest.TestCase):
                 "transport_attempt_ref": "browser:content-b",
                 "canonical_url": "https://mirror-b.example/story",
                 "content_sha256": "sha256:" + "a" * 64,
+                "chunk_refs": ["retrieval-chunk:content-b"],
                 "source_published_at": "2026-06-24T11:00:00+00:00",
             },
             dispatch_context=dispatch,
@@ -964,8 +1010,16 @@ class RetrievalPacketContractTest(unittest.TestCase):
         self.assertEqual(api_a["source_family_id"], api_b["source_family_id"])
         self.assertEqual(api_a["source_family_status"], "mirrored_api_endpoint")
         self.assertEqual(direct["source_family_id"], search["source_family_id"])
-        self.assertEqual(content_a["source_family_id"], content_b["source_family_id"])
-        self.assertEqual(content_a["source_family_status"], "content_hash_dedupe")
+        self.assertNotEqual(content_a["source_family_id"], content_b["source_family_id"])
+        self.assertEqual(
+            content_a["source_metadata_resolution"]["source_family_resolution_method"],
+            "registrable_domain",
+        )
+        self.assertEqual(
+            content_b["source_metadata_resolution"]["source_family_resolution_method"],
+            "registrable_domain",
+        )
+        self.assertEqual(content_a["content_duplicate_detection_hash"], "sha256:" + "a" * 64)
 
     def test_claim_family_identity_and_contradiction_family_are_deterministic(self) -> None:
         base_tuple = {
@@ -1638,7 +1692,8 @@ class RetrievalPacketContractTest(unittest.TestCase):
         )
         self.assertTrue(
             all(
-                item["source_metadata_resolution"]["source_family_resolution_method"] == "canonical_url"
+                item["source_metadata_resolution"]["source_family_resolution_method"]
+                in {"registrable_domain", "deterministic_candidate_source_metadata"}
                 for item in packet["retrieval_evidence_provenance_slices"]
             )
         )

@@ -539,6 +539,7 @@ def _structured_market_metadata_evidence(
         selected[-1]["deterministic_source_class_proof"] = True
         selected[-1]["source_class_resolution_method"] = "structured_market_metadata_primary_source"
         selected[-1]["source_family_resolution_method"] = "structured_market_metadata_feed"
+        selected[-1]["claim_family_resolution_method"] = "structured_market_metadata_pilot"
         selected[-1]["claim_family_ids"] = [f"claim-family:market-rules:{leaf_id}"]
         selected.append(
             build_retrieval_evidence_item(
@@ -565,6 +566,7 @@ def _structured_market_metadata_evidence(
         )
         selected[-1]["source_class_resolution_method"] = "structured_market_snapshot_feed"
         selected[-1]["source_family_resolution_method"] = "structured_market_snapshot_feed"
+        selected[-1]["claim_family_resolution_method"] = "structured_market_metadata_pilot"
         selected[-1]["claim_family_ids"] = [f"claim-family:market-state:{leaf_id}"]
     return selected
 

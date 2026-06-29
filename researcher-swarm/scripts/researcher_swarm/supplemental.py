@@ -295,10 +295,6 @@ def _source_family(raw: dict[str, Any], *, canonical_url: str, content_sha256: s
         return "source-family-" + _hash_suffix({"syndication": raw["syndication_key"]}), "syndication_key", "syndicated_copy"
     if _is_non_empty_string(raw.get("mirrored_api_family_key")):
         return "source-family-" + _hash_suffix({"api_mirror": raw["mirrored_api_family_key"]}), "mirrored_api_family_key", "mirrored_api_endpoint"
-    if any(_is_non_empty_string(raw.get(field)) for field in ("content_sha256", "content", "extracted_text", "rendered_text", "snippet")):
-        return "source-family-" + _hash_suffix({"content": content_sha256}), "content_sha256", "content_hash_dedupe"
-    if canonical_url:
-        return "source-family-" + _hash_suffix({"canonical_url": canonical_url}), "canonical_url", "resolved"
     domain = _registrable_domain(canonical_url)
     if domain:
         return "source-family-" + _hash_suffix({"domain": domain}), "registrable_domain", "resolved"
@@ -367,11 +363,15 @@ def _independence_status(
     source_family_id: str,
     claim_family_id: str,
     source_family_status: str,
+    content_sha256: str,
     seen_source_family_ids: set[str] | None,
     seen_claim_family_ids: set[str] | None,
+    seen_content_hashes: set[str] | None = None,
 ) -> str:
     if source_family_id == UNKNOWN_SOURCE_FAMILY_ID or claim_family_id == UNKNOWN_CLAIM_FAMILY_ID:
         return "unknown_not_counted"
+    if content_sha256 and seen_content_hashes and content_sha256 in seen_content_hashes:
+        return "syndicated_copy"
     if seen_claim_family_ids and claim_family_id in seen_claim_family_ids:
         return "same_claim_family"
     if seen_source_family_ids and source_family_id in seen_source_family_ids:
@@ -532,6 +532,7 @@ def normalize_supplemental_evidence(
     metadata_by_ref: dict[str, dict[str, Any]] | None = None,
     seen_source_family_ids: set[str] | None = None,
     seen_claim_family_ids: set[str] | None = None,
+    seen_content_hashes: set[str] | None = None,
 ) -> dict[str, Any]:
     """Normalize one supplemental citation ref using supplied deterministic metadata."""
 
@@ -678,8 +679,10 @@ def normalize_supplemental_evidence(
         source_family_id=source_family_id,
         claim_family_id=claim_family_id,
         source_family_status=source_family_status,
+        content_sha256=content_sha256,
         seen_source_family_ids=seen_source_family_ids,
         seen_claim_family_ids=seen_claim_family_ids,
+        seen_content_hashes=seen_content_hashes,
     )
     blockers = list(claim_blockers)
     temporal_status = str(temporal_validation.get("temporal_gate_status"))
@@ -736,6 +739,7 @@ def normalize_supplemental_evidence_batch(
     records: list[dict[str, Any]] = []
     seen_source_family_ids: set[str] = set()
     seen_claim_family_ids: set[str] = set()
+    seen_content_hashes: set[str] = set()
     for raw_ref in raw_refs:
         record = normalize_supplemental_evidence(
             raw_ref,
@@ -743,6 +747,7 @@ def normalize_supplemental_evidence_batch(
             metadata_by_ref=metadata_by_ref,
             seen_source_family_ids=seen_source_family_ids,
             seen_claim_family_ids=seen_claim_family_ids,
+            seen_content_hashes=seen_content_hashes,
         )
         records.append(record)
         if record.get("normalization_status") == "normalized":
@@ -750,6 +755,8 @@ def normalize_supplemental_evidence_batch(
                 seen_source_family_ids.add(str(record["source_family_id"]))
             if _is_non_empty_string(record.get("claim_family_id")) and record["claim_family_id"] != UNKNOWN_CLAIM_FAMILY_ID:
                 seen_claim_family_ids.add(str(record["claim_family_id"]))
+            if _is_non_empty_string(record.get("content_sha256")):
+                seen_content_hashes.add(str(record["content_sha256"]))
     summary = {
         "normalized": sum(1 for item in records if item.get("normalization_status") == "normalized"),
         "degraded": sum(1 for item in records if item.get("normalization_status") == "degraded"),
