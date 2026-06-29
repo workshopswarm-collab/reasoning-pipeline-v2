@@ -20,6 +20,7 @@ from researcher_swarm.assignments import (  # noqa: E402
     DEFAULT_FORBIDDEN_ARTIFACT_REF_PATTERNS,
     LEAF_RESEARCH_ASSIGNMENT_ARTIFACT_TYPE,
     LEAF_RESEARCH_ASSIGNMENT_SCHEMA_VERSION,
+    QDT_LEAF_ASSIGNMENT_CONTRACT_SCHEMA_VERSION,
     compute_leaf_research_assignment_digest,
 )
 from researcher_swarm.classification import (  # noqa: E402
@@ -475,6 +476,45 @@ class ResearcherPersistenceTest(unittest.TestCase):
                 "artifact_ref": "artifact:question-decomposition/qdt-1",
                 "leaf_json_pointer": "/required_leaf_questions/0",
                 "leaf_digest": SHA,
+            },
+            "qdt_leaf_contract": {
+                "schema_version": QDT_LEAF_ASSIGNMENT_CONTRACT_SCHEMA_VERSION,
+                "artifact_ref": "artifact:question-decomposition/qdt-1",
+                "leaf_id": "leaf-1",
+                "leaf_question_ref": "artifact:question-decomposition/qdt-1/required_leaf_questions/0/leaf_question",
+                "leaf_question_sha256": SHA,
+                "market_temporal_state": "unresolved",
+                "leaf_temporal_role": "pre_resolution_forecast_driver",
+                "coverage_dimension": "key_drivers",
+                "research_factor": "driver_status",
+                "evidence_requirement_refs": [
+                    {
+                        "requirement_ref": "qdt-evidence-requirement:leaf-1:0",
+                        "required_evidence_field": "value-field-1",
+                        "required_source_classes": ["official_or_primary"],
+                        "pre_cutoff_required": True,
+                        "requirement_digest": SHA,
+                    }
+                ],
+                "classification_targets": [
+                    "evidence_direction",
+                    "evidence_strength",
+                    "missingness_status",
+                    "value-field-1",
+                ],
+                "sufficiency_criteria_ref": "artifact:question-decomposition/qdt-1/required_leaf_questions/0/sufficiency_criteria",
+                "sufficiency_criteria_sha256": SHA,
+                "sufficiency_criteria_summary": {
+                    "required_source_classes": ["official_or_primary"],
+                    "required_value_fields": ["value-field-1"],
+                    "required_negative_checks": ["negative-check-1"],
+                    "min_independent_claim_families": 1,
+                    "min_independent_source_families": 1,
+                    "classification_dispatch_requires_sufficiency_certificate": True,
+                },
+                "missingness_interpretation": "unanswered_material_question_or_structural_unanswerability_candidate",
+                "forbidden_outputs": list(FORBIDDEN_OUTPUT_FIELDS),
+                "assignment_authority": "classification_only_no_forecast_authority",
             },
             "condition_scope": "unconditional",
             "sufficiency_requirement_refs": ["requirement-1"],

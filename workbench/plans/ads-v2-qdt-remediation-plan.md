@@ -613,19 +613,21 @@ Success criteria:
 
 ## Phase 5 - Downstream Assignment Contract Bridge
 
+Status: completed on 2026-06-29. Researcher assignment compilation now consumes QDT `dispatchable_pre_resolution_leaf_ids`, excludes terminal verification leaves from unresolved forecast assignments, requires at least one pre-resolution forecast-driver leaf, and carries a compact `qdt_leaf_contract` seed with leaf refs/hashes, temporal role, coverage dimension, research factor, evidence requirement refs, classification targets, sufficiency summary, missingness interpretation, and forbidden outputs. The contract deliberately avoids raw QDT leaf payloads, raw source bodies, and any researcher-side search authority.
+
 Goal: make QDT output line up with active Retrieval and Researcher Swarm contracts.
 
 Implementation:
 
 1. Compile each QDT leaf into a stable research assignment seed:
    - leaf id
-   - leaf question
+   - leaf question ref/hash, not raw embedded QDT payload
    - leaf temporal role
    - coverage dimension
    - research factor
-   - evidence requirements
+   - evidence requirement refs/hashes
    - classification targets
-   - sufficiency criteria
+   - sufficiency criteria ref/hash and compact summary
    - missingness interpretation
    - forbidden outputs
 2. Ensure leaf assignment expectations are compatible with active bounded certified snippet work:
@@ -644,22 +646,41 @@ Pseudocode:
 def compile_leaf_assignments(qdt, retrieval_packet):
     graph = qdt["research_coverage_graph"]
     leaf_ids = graph["dispatchable_pre_resolution_leaf_ids"]
+    if graph["market_temporal_state"] == "unresolved":
+        if not leaf_ids:
+            raise AssignmentError("missing_dispatchable_pre_resolution_leaf_assignments")
+        if not any(leaf_by_id(qdt, leaf_id)["leaf_temporal_role"] == "pre_resolution_forecast_driver"
+                   for leaf_id in leaf_ids):
+            raise AssignmentError("missing_pre_resolution_forecast_driver_coverage")
+
     assignments = []
     for leaf_id in leaf_ids:
         leaf = leaf_by_id(qdt, leaf_id)
         if graph["market_temporal_state"] == "unresolved":
-            assert leaf["leaf_temporal_role"] != "terminal_verification"
+            if leaf["leaf_temporal_role"] == "terminal_verification":
+                raise AssignmentError("terminal_verification_leaf_not_dispatchable_for_unresolved_forecast")
+        contract_seed = {
+            "schema_version": "qdt-leaf-assignment-contract/v1",
+            "leaf_id": leaf_id,
+            "leaf_question_ref": qdt_ref(qdt, leaf, "leaf_question"),
+            "leaf_question_sha256": sha256(leaf["leaf_question"]),
+            "leaf_temporal_role": leaf["leaf_temporal_role"],
+            "coverage_dimension": leaf["coverage_dimension"],
+            "research_factor": leaf["research_factor"],
+            "classification_targets": require_nonempty(leaf["classification_targets"]),
+            "evidence_requirement_refs": compact_requirement_refs(leaf["evidence_requirements"]),
+            "sufficiency_criteria_ref": qdt_ref(qdt, leaf, "sufficiency_criteria"),
+            "sufficiency_criteria_sha256": sha256(leaf["sufficiency_criteria"]),
+            "missingness_interpretation": leaf["missingness_interpretation"],
+            "forbidden_outputs": leaf["forbidden_outputs"],
+            "assignment_authority": "classification_only_no_forecast_authority",
+        }
         assignments.append({
             "leaf_id": leaf_id,
-            "leaf_question": leaf["leaf_question"],
-            "leaf_temporal_role": leaf["leaf_temporal_role"],
-            "classification_targets": leaf["classification_targets"],
-            "evidence_requirements": leaf["evidence_requirements"],
+            "qdt_leaf_contract": contract_seed,
             "certified_snippet_refs": certified_refs_for_leaf(retrieval_packet, leaf_id),
-            "forbidden_outputs": leaf["forbidden_outputs"],
+            "follow_up_research": "assigned_evidence_refs_and_certified_snippets_only",
         })
-    if not assignments and graph["market_temporal_state"] == "unresolved":
-        raise AssignmentError("missing_dispatchable_pre_resolution_leaf_assignments")
     return assignments
 ```
 

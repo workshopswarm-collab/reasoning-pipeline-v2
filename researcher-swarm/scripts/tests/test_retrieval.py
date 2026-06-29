@@ -1189,6 +1189,24 @@ class RetrievalPacketContractTest(unittest.TestCase):
         qdt["required_leaf_questions"] = [qdt["required_leaf_questions"][0]]
         leaf = qdt["required_leaf_questions"][0]
         leaf["purpose"] = "source_of_truth"
+        leaf["leaf_temporal_role"] = "pre_resolution_forecast_driver"
+        leaf["coverage_dimension"] = "key_drivers"
+        leaf["research_factor"] = "thin_source_of_truth_driver_status"
+        graph = qdt["research_coverage_graph"]
+        graph["coverage_dimensions"] = ["key_drivers"]
+        graph["research_factors"] = [
+            {
+                "leaf_id": leaf["leaf_id"],
+                "coverage_dimension": leaf["coverage_dimension"],
+                "research_factor": leaf["research_factor"],
+                "leaf_temporal_role": leaf["leaf_temporal_role"],
+            }
+        ]
+        graph["contract_guard_leaf_ids"] = []
+        graph["material_question_leaf_ids"] = [leaf["leaf_id"]]
+        graph["terminal_verification_leaf_ids"] = []
+        graph["dispatchable_pre_resolution_leaf_ids"] = [leaf["leaf_id"]]
+        graph["required_leaf_ids_by_dimension"] = {"key_drivers": [leaf["leaf_id"]]}
         leaf["research_sufficiency_requirements"].update(
             {
                 "required_source_classes": ["official_or_primary", "independent_secondary"],

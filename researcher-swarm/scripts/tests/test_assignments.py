@@ -23,6 +23,7 @@ from ads_decomposer.qdt import build_fixture_qdt_candidate, select_qdt_candidate
 from researcher_swarm.assignments import (  # noqa: E402
     DEFAULT_FORBIDDEN_ARTIFACT_REF_PATTERNS,
     LEAF_RESEARCH_ASSIGNMENT_SCHEMA_VERSION,
+    QDT_LEAF_ASSIGNMENT_CONTRACT_SCHEMA_VERSION,
     LeafResearchAssignmentError,
     build_leaf_research_assignments,
     compute_leaf_research_assignment_digest,
@@ -192,6 +193,7 @@ class LeafResearchAssignmentContractTest(unittest.TestCase):
 
     def test_builds_compact_primary_assignment_for_each_dispatchable_leaf(self) -> None:
         packet = self._certifiable_packet()
+        leaves_by_id = {leaf["leaf_id"]: leaf for leaf in self.qdt["required_leaf_questions"]}
 
         assignments = build_leaf_research_assignments(qdt=self.qdt, retrieval_packet=packet)
 
@@ -210,6 +212,22 @@ class LeafResearchAssignmentContractTest(unittest.TestCase):
             self.assertEqual(assignment["trigger_codes"], [])
             self.assertTrue(assignment["leaf_ref"]["leaf_digest"].startswith("sha256:"))
             self.assertTrue(assignment["leaf_ref"]["leaf_json_pointer"].startswith("/required_leaf_questions/"))
+            qdt_contract = assignment["qdt_leaf_contract"]
+            source_leaf = leaves_by_id[assignment["leaf_id"]]
+            self.assertEqual(qdt_contract["schema_version"], QDT_LEAF_ASSIGNMENT_CONTRACT_SCHEMA_VERSION)
+            self.assertEqual(qdt_contract["leaf_id"], assignment["leaf_id"])
+            self.assertEqual(qdt_contract["market_temporal_state"], "unresolved")
+            self.assertEqual(qdt_contract["leaf_temporal_role"], source_leaf["leaf_temporal_role"])
+            self.assertEqual(qdt_contract["coverage_dimension"], source_leaf["coverage_dimension"])
+            self.assertEqual(qdt_contract["research_factor"], source_leaf["research_factor"])
+            self.assertTrue(qdt_contract["leaf_question_ref"].endswith("/leaf_question"))
+            self.assertTrue(qdt_contract["leaf_question_sha256"].startswith("sha256:"))
+            self.assertTrue(qdt_contract["evidence_requirement_refs"])
+            self.assertTrue(qdt_contract["classification_targets"])
+            self.assertTrue(qdt_contract["sufficiency_criteria_sha256"].startswith("sha256:"))
+            self.assertTrue(qdt_contract["missingness_interpretation"])
+            self.assertEqual(qdt_contract["assignment_authority"], "classification_only_no_forecast_authority")
+            self.assertIn("probability", qdt_contract["forbidden_outputs"])
             self.assertTrue(assignment["sufficiency_requirement_refs"])
             self.assertTrue(assignment["required_value_field_ids"])
             self.assertTrue(assignment["required_negative_check_ids"])
@@ -262,6 +280,64 @@ class LeafResearchAssignmentContractTest(unittest.TestCase):
             self.assertFalse(_contains_key(assignment, "research_sufficiency_requirements"))
             self.assertFalse(_contains_key(assignment, "canonical_url"))
             self.assertFalse(_contains_key(assignment, "evidence_body"))
+
+    def test_missing_qdt_contract_fields_block_assignment_compilation(self) -> None:
+        packet = self._certifiable_packet()
+
+        missing_targets = copy.deepcopy(self.qdt)
+        missing_targets["required_leaf_questions"][0]["classification_targets"] = []
+        with self.assertRaisesRegex(LeafResearchAssignmentError, "classification_targets"):
+            build_leaf_research_assignments(qdt=missing_targets, retrieval_packet=packet)
+
+        missing_criteria = copy.deepcopy(self.qdt)
+        missing_criteria["required_leaf_questions"][0].pop("sufficiency_criteria", None)
+        with self.assertRaisesRegex(LeafResearchAssignmentError, "sufficiency_criteria"):
+            build_leaf_research_assignments(qdt=missing_criteria, retrieval_packet=packet)
+
+    def test_terminal_verification_leaf_is_not_compiled_for_unresolved_forecast_assignment(self) -> None:
+        packet = self._certifiable_packet()
+        qdt = copy.deepcopy(self.qdt)
+        terminal_id = qdt["required_leaf_questions"][0]["leaf_id"]
+        qdt["required_leaf_questions"][0]["leaf_temporal_role"] = "terminal_verification"
+        graph = qdt["research_coverage_graph"]
+        graph["terminal_verification_leaf_ids"] = [terminal_id]
+        graph["dispatchable_pre_resolution_leaf_ids"] = [
+            leaf_id
+            for leaf_id in graph["dispatchable_pre_resolution_leaf_ids"]
+            if leaf_id != terminal_id
+        ]
+        for factor in graph["research_factors"]:
+            if factor["leaf_id"] == terminal_id:
+                factor["leaf_temporal_role"] = "terminal_verification"
+
+        assignments = build_leaf_research_assignments(qdt=qdt, retrieval_packet=packet)
+
+        self.assertNotIn(terminal_id, {assignment["leaf_id"] for assignment in assignments})
+        self.assertTrue(all(validate_leaf_research_assignment(assignment).valid for assignment in assignments))
+
+    def test_terminal_verification_leaf_in_unresolved_dispatch_fails_closed(self) -> None:
+        packet = self._certifiable_packet()
+        qdt = copy.deepcopy(self.qdt)
+        terminal_id = qdt["required_leaf_questions"][0]["leaf_id"]
+        qdt["required_leaf_questions"][0]["leaf_temporal_role"] = "terminal_verification"
+        graph = qdt["research_coverage_graph"]
+        graph["terminal_verification_leaf_ids"] = [terminal_id]
+        self.assertIn(terminal_id, graph["dispatchable_pre_resolution_leaf_ids"])
+
+        with self.assertRaisesRegex(LeafResearchAssignmentError, "terminal_verification_leaf_not_dispatchable"):
+            build_leaf_research_assignments(qdt=qdt, retrieval_packet=packet)
+
+    def test_missing_pre_resolution_forecast_driver_coverage_blocks_assignment_handoff(self) -> None:
+        packet = self._certifiable_packet()
+        qdt = copy.deepcopy(self.qdt)
+        qdt["research_coverage_graph"]["dispatchable_pre_resolution_leaf_ids"] = [
+            leaf["leaf_id"]
+            for leaf in qdt["required_leaf_questions"]
+            if leaf["leaf_temporal_role"] in {"resolution_mechanics", "current_status", "material_unknown"}
+        ]
+
+        with self.assertRaisesRegex(LeafResearchAssignmentError, "missing_pre_resolution_forecast_driver_coverage"):
+            build_leaf_research_assignments(qdt=qdt, retrieval_packet=packet)
 
     def test_fails_closed_when_certified_snippet_artifacts_are_missing(self) -> None:
         packet = self._certifiable_packet()
