@@ -459,6 +459,7 @@ class ResearcherPersistenceTest(unittest.TestCase):
                 "visible_artifact_ref_allowlist": [
                     "artifact:leaf-research-assignment/leaf-assignment-fixture",
                     "artifact:question-decomposition/qdt-1",
+                    "artifact:browser-capture/snippet-1",
                     "artifact:retrieval-snippet/snippet-1",
                     "evidence-1",
                     "prompt-template:researcher-leaf-nli/v1",
@@ -488,6 +489,15 @@ class ResearcherPersistenceTest(unittest.TestCase):
                     "source_class": "official_or_primary",
                     "snippet_ref": "artifact:retrieval-snippet/snippet-1",
                     "snippet_sha256": SHA,
+                    "certified_snippet": {
+                        "access_mode": "bounded_certified_snippet",
+                        "snippet_ref": "artifact:retrieval-snippet/snippet-1",
+                        "content_artifact_ref": "artifact:browser-capture/snippet-1",
+                        "text_sha256": SHA,
+                        "char_range": {"start": 0, "end": 12},
+                        "excerpt_char_count": 12,
+                        "excerpt_policy": "bounded_excerpt",
+                    },
                 }
             ],
             "required_value_field_ids": ["value-field-1"],

@@ -151,6 +151,7 @@ class SupplementalEvidenceNormalizationTest(unittest.TestCase):
                 _base_raw_ref(
                     supplemental_evidence_ref="supplemental:second",
                     source_family_id="source-family:shared",
+                    content="Independent follow-up says the example status is confirmed.",
                 ),
             ],
             DISPATCH_CONTEXT,
@@ -159,6 +160,29 @@ class SupplementalEvidenceNormalizationTest(unittest.TestCase):
         self.assertEqual(batch["normalization_summary"]["normalized"], 2)
         self.assertEqual(batch["records"][0]["independence_status"], "independent")
         self.assertEqual(batch["records"][1]["independence_status"], "same_claim_family")
+        duplicate_content = normalize_supplemental_evidence_batch(
+            [
+                _base_raw_ref(
+                    supplemental_evidence_ref="supplemental:content-first",
+                    source_family_id="source-family:first",
+                ),
+                _base_raw_ref(
+                    supplemental_evidence_ref="supplemental:content-second",
+                    source_family_id="source-family:second",
+                    claim_tuple={
+                        "subject": "example",
+                        "predicate": "status",
+                        "object_or_value": "pending",
+                        "event_time": "2026-06-24",
+                        "entity_or_jurisdiction": "global",
+                        "condition_scope": "unconditional",
+                        "polarity": "uncertain",
+                    },
+                ),
+            ],
+            DISPATCH_CONTEXT,
+        )
+        self.assertEqual(duplicate_content["records"][1]["independence_status"], "syndicated_copy")
 
 
 class SupplementalMatrixIntegrationTest(unittest.TestCase):

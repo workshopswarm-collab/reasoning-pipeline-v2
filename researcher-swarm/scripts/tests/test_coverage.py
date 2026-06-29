@@ -43,6 +43,7 @@ from researcher_swarm.coverage import (  # noqa: E402
 from researcher_swarm.isolation import build_researcher_context_isolation_audit  # noqa: E402
 from researcher_swarm.model_context import resolve_researcher_leaf_nli_model_context  # noqa: E402
 from researcher_swarm.retrieval import (  # noqa: E402
+    build_evidence_chunk,
     build_retrieval_evidence_item,
     build_retrieval_packet,
     build_retrieval_query_contexts,
@@ -136,6 +137,7 @@ class ResearcherEvidenceReviewCoverageProofTest(unittest.TestCase):
     def _packet(self) -> dict[str, Any]:
         contexts = build_retrieval_query_contexts(self.qdt, evidence_packet=self.evidence_packet)
         selected = []
+        chunks = []
         for context in contexts:
             selected.append(
                 self._evidence(
@@ -157,6 +159,19 @@ class ResearcherEvidenceReviewCoverageProofTest(unittest.TestCase):
                     claim_family_id=f"claim-family-{context['leaf_id']}-secondary",
                 )
             )
+        for item in selected:
+            text = f"Coverage certified excerpt for {item['transport_attempt_ref']}"
+            chunk = build_evidence_chunk(
+                evidence_ref=item["evidence_ref"],
+                content_artifact_ref=f"artifact:browser-capture/{item['transport_attempt_ref']}",
+                chunk_index=0,
+                char_start=0,
+                char_end=len(text),
+                text=text,
+                excerpt_policy="bounded_excerpt",
+            )
+            item["chunk_refs"] = [chunk["chunk_ref"]]
+            chunks.append(chunk)
         packet = build_retrieval_packet(
             self.qdt,
             evidence_packet=self.evidence_packet,
@@ -164,6 +179,7 @@ class ResearcherEvidenceReviewCoverageProofTest(unittest.TestCase):
             question_decomposition_artifact_id="artifact:qdt-1",
             policy_context_ref="artifact:profile-1",
         )
+        packet["evidence_chunks"] = chunks
         finalized = finalize_retrieval_packet_for_dispatch(packet)
         self.assertEqual(finalized["research_sufficiency_summary"]["classification_dispatch_status"], "allowed")
         return finalized

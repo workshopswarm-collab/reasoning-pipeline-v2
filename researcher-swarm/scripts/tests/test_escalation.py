@@ -32,6 +32,7 @@ from researcher_swarm.escalation import (  # noqa: E402
     validate_researcher_escalation_decision,
 )
 from researcher_swarm.retrieval import (  # noqa: E402
+    build_evidence_chunk,
     build_retrieval_evidence_item,
     build_retrieval_packet,
     build_retrieval_query_contexts,
@@ -268,6 +269,7 @@ class ResearcherEscalationContractTest(unittest.TestCase):
             },
         )
         selected = []
+        chunks = []
         for context in contexts:
             selected.append(
                 self._evidence(
@@ -289,24 +291,37 @@ class ResearcherEscalationContractTest(unittest.TestCase):
                     claim_family_id=f"claim-family-{context['leaf_id']}-secondary",
                 )
             )
-        packet = finalize_retrieval_packet_for_dispatch(
-            build_retrieval_packet(
-                qdt,
-                evidence_packet={
-                    "artifact_type": "evidence_packet",
-                    "schema_version": "evidence-packet/v2",
-                    "case_id": "case-1",
-                    "dispatch_id": "dispatch-1",
-                    "forecast_timestamp": "2026-06-24T12:00:00+00:00",
-                    "source_cutoff_timestamp": "2026-06-24T12:00:00+00:00",
-                    "market_rules": {"resolution_url": "https://example.com/rules"},
-                    "official_source_hints": ["https://example.com/official"],
-                },
-                selected_evidence=selected,
-                question_decomposition_artifact_id="artifact:qdt-1",
-                policy_context_ref="artifact:profile-1",
+        for item in selected:
+            text = f"Escalation certified excerpt for {item['transport_attempt_ref']}"
+            chunk = build_evidence_chunk(
+                evidence_ref=item["evidence_ref"],
+                content_artifact_ref=f"artifact:browser-capture/{item['transport_attempt_ref']}",
+                chunk_index=0,
+                char_start=0,
+                char_end=len(text),
+                text=text,
+                excerpt_policy="bounded_excerpt",
             )
+            item["chunk_refs"] = [chunk["chunk_ref"]]
+            chunks.append(chunk)
+        packet = build_retrieval_packet(
+            qdt,
+            evidence_packet={
+                "artifact_type": "evidence_packet",
+                "schema_version": "evidence-packet/v2",
+                "case_id": "case-1",
+                "dispatch_id": "dispatch-1",
+                "forecast_timestamp": "2026-06-24T12:00:00+00:00",
+                "source_cutoff_timestamp": "2026-06-24T12:00:00+00:00",
+                "market_rules": {"resolution_url": "https://example.com/rules"},
+                "official_source_hints": ["https://example.com/official"],
+            },
+            selected_evidence=selected,
+            question_decomposition_artifact_id="artifact:qdt-1",
+            policy_context_ref="artifact:profile-1",
         )
+        packet["evidence_chunks"] = chunks
+        packet = finalize_retrieval_packet_for_dispatch(packet)
         self.assertEqual(packet["research_sufficiency_summary"]["classification_dispatch_status"], "allowed")
         assignments = build_leaf_research_assignments(qdt=qdt, retrieval_packet=packet)
         return qdt, packet, assignments

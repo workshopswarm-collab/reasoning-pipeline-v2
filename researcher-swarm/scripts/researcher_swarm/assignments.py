@@ -277,21 +277,58 @@ def _first_claim_family_id(item: dict[str, Any]) -> str | None:
     return None
 
 
-def _snippet_ref(item: dict[str, Any]) -> str | None:
-    for field in ("snippet_ref", "evidence_span_ref", "content_artifact_ref"):
-        if _is_non_empty_string(item.get(field)):
-            return str(item[field])
+def _chunk_lookup(retrieval_packet: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    chunks = retrieval_packet.get("evidence_chunks")
+    if not isinstance(chunks, list):
+        return {}
+    return {
+        str(chunk["chunk_ref"]): chunk
+        for chunk in chunks
+        if isinstance(chunk, dict) and _is_non_empty_string(chunk.get("chunk_ref"))
+    }
+
+
+def _certified_snippet_descriptor(
+    item: dict[str, Any],
+    chunks_by_ref: dict[str, dict[str, Any]],
+) -> dict[str, Any] | None:
     chunk_refs = item.get("chunk_refs")
     if isinstance(chunk_refs, list):
         for ref in chunk_refs:
-            if _is_non_empty_string(ref):
-                return str(ref)
+            if not _is_non_empty_string(ref):
+                continue
+            chunk = chunks_by_ref.get(str(ref))
+            if not isinstance(chunk, dict):
+                continue
+            if chunk.get("evidence_ref") != item.get("evidence_ref"):
+                continue
+            if not _is_non_empty_string(chunk.get("content_artifact_ref")):
+                continue
+            if not _is_sha256_ref(chunk.get("text_sha256")):
+                continue
+            excerpt_count = chunk.get("excerpt_char_count")
+            if not isinstance(excerpt_count, int) or isinstance(excerpt_count, bool) or excerpt_count <= 0:
+                continue
+            return {
+                "access_mode": "bounded_certified_snippet",
+                "snippet_ref": str(chunk["chunk_ref"]),
+                "content_artifact_ref": str(chunk["content_artifact_ref"]),
+                "text_sha256": str(chunk["text_sha256"]),
+                "char_range": {
+                    "start": int(chunk.get("char_start") or 0),
+                    "end": int(chunk.get("char_end") or 0),
+                },
+                "excerpt_char_count": int(excerpt_count),
+                "excerpt_policy": str(chunk.get("excerpt_policy") or "bounded_excerpt"),
+            }
     return None
 
 
 def _compact_assigned_evidence_refs(
     result: dict[str, Any] | None,
     certificate: dict[str, Any],
+    *,
+    chunks_by_ref: dict[str, dict[str, Any]],
 ) -> list[dict[str, Any]]:
     certified_refs = {
         str(ref)
@@ -306,13 +343,19 @@ def _compact_assigned_evidence_refs(
         evidence_ref = str(item["evidence_ref"])
         if certified_refs and evidence_ref not in certified_refs:
             continue
+        certified_snippet = _certified_snippet_descriptor(item, chunks_by_ref)
+        if certified_snippet is None:
+            raise LeafResearchAssignmentError(
+                f"{evidence_ref}: certified bounded snippet or artifact access is required"
+            )
         compact_item = {
             "evidence_ref": evidence_ref,
             "claim_family_id": _first_claim_family_id(item),
             "source_family_id": item.get("source_family_id"),
             "source_class": item.get("source_class", "unknown"),
-            "snippet_ref": _snippet_ref(item),
-            "snippet_sha256": item.get("snippet_sha256") or item.get("content_sha256"),
+            "snippet_ref": certified_snippet["snippet_ref"],
+            "snippet_sha256": certified_snippet["text_sha256"],
+            "certified_snippet": certified_snippet,
         }
         if isinstance(item.get("byte_range"), dict):
             compact_item["byte_range"] = copy.deepcopy(item["byte_range"])
@@ -420,6 +463,11 @@ def _visible_allowlist(
     ]
     refs.extend(item.get("snippet_ref") for item in assigned_evidence_refs if isinstance(item, dict))
     refs.extend(item.get("evidence_ref") for item in assigned_evidence_refs if isinstance(item, dict))
+    refs.extend(
+        item.get("certified_snippet", {}).get("content_artifact_ref")
+        for item in assigned_evidence_refs
+        if isinstance(item, dict) and isinstance(item.get("certified_snippet"), dict)
+    )
     return sorted(_unique_strings(refs))
 
 
@@ -522,6 +570,51 @@ def _validate_evidence_refs(value: Any, errors: list[str]) -> None:
             errors.append(f"{path}.claim_family_id must be a string or null")
         if item.get("snippet_ref") is not None and not _is_non_empty_string(item.get("snippet_ref")):
             errors.append(f"{path}.snippet_ref must be a string or null")
+        _validate_certified_snippet(item.get("certified_snippet"), errors, path, expected_snippet_ref=item.get("snippet_ref"))
+
+
+def _validate_certified_snippet(
+    value: Any,
+    errors: list[str],
+    path: str,
+    *,
+    expected_snippet_ref: Any,
+) -> None:
+    snippet_path = f"{path}.certified_snippet"
+    if not isinstance(value, dict):
+        errors.append(f"{snippet_path} is required")
+        return
+    expected = {
+        "access_mode": "bounded_certified_snippet",
+    }
+    for field, expected_value in expected.items():
+        if value.get(field) != expected_value:
+            errors.append(f"{snippet_path}.{field} must be {expected_value}")
+    for field in ("snippet_ref", "content_artifact_ref", "text_sha256", "excerpt_policy"):
+        if not _is_non_empty_string(value.get(field)):
+            errors.append(f"{snippet_path}.{field} is required")
+    if _is_non_empty_string(value.get("snippet_ref")) and value.get("snippet_ref") != expected_snippet_ref:
+        errors.append(f"{snippet_path}.snippet_ref must match {path}.snippet_ref")
+    if _is_non_empty_string(value.get("text_sha256")) and not _is_sha256_ref(value.get("text_sha256")):
+        errors.append(f"{snippet_path}.text_sha256 must be a sha256 ref")
+    char_range = value.get("char_range")
+    if not isinstance(char_range, dict):
+        errors.append(f"{snippet_path}.char_range must be an object")
+    else:
+        for field in ("start", "end"):
+            if not isinstance(char_range.get(field), int) or isinstance(char_range.get(field), bool) or char_range.get(field) < 0:
+                errors.append(f"{snippet_path}.char_range.{field} must be a non-negative integer")
+        if (
+            isinstance(char_range.get("start"), int)
+            and not isinstance(char_range.get("start"), bool)
+            and isinstance(char_range.get("end"), int)
+            and not isinstance(char_range.get("end"), bool)
+            and char_range["end"] < char_range["start"]
+        ):
+            errors.append(f"{snippet_path}.char_range.end must be >= start")
+    excerpt_count = value.get("excerpt_char_count")
+    if not isinstance(excerpt_count, int) or isinstance(excerpt_count, bool) or excerpt_count <= 0:
+        errors.append(f"{snippet_path}.excerpt_char_count must be a positive integer")
 
 
 def _validate_output_contract(value: Any, errors: list[str]) -> None:
@@ -741,7 +834,11 @@ def build_leaf_research_assignment(
         raise LeafResearchAssignmentError(f"leaf {leaf.get('leaf_id')} missing retrieval breadth coverage ref")
 
     leaf_ref = _leaf_ref(qdt, leaf, leaf_index, retrieval_packet)
-    assigned_evidence_refs = _compact_assigned_evidence_refs(retrieval_result, certificate)
+    assigned_evidence_refs = _compact_assigned_evidence_refs(
+        retrieval_result,
+        certificate,
+        chunks_by_ref=_chunk_lookup(retrieval_packet),
+    )
     seed = {
         "schema_version": LEAF_RESEARCH_ASSIGNMENT_SCHEMA_VERSION,
         "case_id": qdt.get("case_id"),

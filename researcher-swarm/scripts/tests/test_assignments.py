@@ -42,6 +42,7 @@ from researcher_swarm.model_context import (  # noqa: E402
 )
 from researcher_swarm.openclaw_runtime import parse_openclaw_researcher_swarm_stdout  # noqa: E402
 from researcher_swarm.retrieval import (  # noqa: E402
+    build_evidence_chunk,
     build_retrieval_evidence_item,
     build_retrieval_packet,
     build_retrieval_query_contexts,
@@ -143,6 +144,7 @@ class LeafResearchAssignmentContractTest(unittest.TestCase):
     def _certifiable_packet(self) -> dict[str, Any]:
         contexts = build_retrieval_query_contexts(self.qdt, evidence_packet=self.evidence_packet)
         selected = []
+        chunks = []
         for context in contexts:
             official = self._evidence(
                 context,
@@ -163,6 +165,19 @@ class LeafResearchAssignmentContractTest(unittest.TestCase):
                 claim_family_id=f"claim-family-{context['leaf_id']}-secondary",
             )
             selected.extend([official, secondary])
+        for item in selected:
+            text = f"Certified source excerpt for {item['transport_attempt_ref']}"
+            chunk = build_evidence_chunk(
+                evidence_ref=item["evidence_ref"],
+                content_artifact_ref=f"artifact:browser-capture/{item['transport_attempt_ref']}",
+                chunk_index=0,
+                char_start=0,
+                char_end=len(text),
+                text=text,
+                excerpt_policy="bounded_excerpt",
+            )
+            item["chunk_refs"] = [chunk["chunk_ref"]]
+            chunks.append(chunk)
         packet = build_retrieval_packet(
             self.qdt,
             evidence_packet=self.evidence_packet,
@@ -170,6 +185,7 @@ class LeafResearchAssignmentContractTest(unittest.TestCase):
             question_decomposition_artifact_id="artifact:qdt-1",
             policy_context_ref="artifact:profile-1",
         )
+        packet["evidence_chunks"] = chunks
         finalized = finalize_retrieval_packet_for_dispatch(packet)
         self.assertEqual(finalized["research_sufficiency_summary"]["classification_dispatch_status"], "allowed")
         return finalized
@@ -198,6 +214,9 @@ class LeafResearchAssignmentContractTest(unittest.TestCase):
             self.assertTrue(assignment["required_value_field_ids"])
             self.assertTrue(assignment["required_negative_check_ids"])
             self.assertTrue(assignment["assigned_evidence_refs"])
+            certified_snippet = assignment["assigned_evidence_refs"][0]["certified_snippet"]
+            self.assertEqual(certified_snippet["access_mode"], "bounded_certified_snippet")
+            self.assertTrue(certified_snippet["content_artifact_ref"].startswith("artifact:browser-capture/"))
             self.assertEqual(assignment["output_contract"]["forbidden_fields"], list(FORBIDDEN_OUTPUT_FIELDS))
             self.assertFalse(assignment["context_isolation"]["peer_context_allowed"])
             self.assertEqual(
@@ -206,6 +225,10 @@ class LeafResearchAssignmentContractTest(unittest.TestCase):
             )
             self.assertIn(
                 assignment["assigned_evidence_refs"][0]["evidence_ref"],
+                assignment["context_isolation"]["visible_artifact_ref_allowlist"],
+            )
+            self.assertIn(
+                certified_snippet["content_artifact_ref"],
                 assignment["context_isolation"]["visible_artifact_ref_allowlist"],
             )
 
@@ -231,6 +254,23 @@ class LeafResearchAssignmentContractTest(unittest.TestCase):
             self.assertFalse(_contains_key(assignment, "research_sufficiency_requirements"))
             self.assertFalse(_contains_key(assignment, "canonical_url"))
             self.assertFalse(_contains_key(assignment, "evidence_body"))
+
+    def test_fails_closed_when_certified_snippet_artifacts_are_missing(self) -> None:
+        packet = self._certifiable_packet()
+        missing_chunks = copy.deepcopy(packet)
+        missing_chunks["evidence_chunks"] = []
+
+        with self.assertRaisesRegex(LeafResearchAssignmentError, "certified bounded snippet"):
+            build_leaf_research_assignments(qdt=self.qdt, retrieval_packet=missing_chunks)
+
+        assignment = build_leaf_research_assignments(qdt=self.qdt, retrieval_packet=packet)[0]
+        broken = copy.deepcopy(assignment)
+        broken["assigned_evidence_refs"][0].pop("certified_snippet", None)
+        broken["assignment_digest"] = compute_leaf_research_assignment_digest(broken)
+
+        validation = validate_leaf_research_assignment(broken)
+        self.assertFalse(validation.valid)
+        self.assertIn("certified_snippet is required", "; ".join(validation.errors))
 
     def test_assignment_id_and_digest_are_stable(self) -> None:
         packet = self._certifiable_packet()

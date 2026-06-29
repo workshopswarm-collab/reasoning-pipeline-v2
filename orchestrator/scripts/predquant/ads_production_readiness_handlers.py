@@ -70,6 +70,7 @@ from researcher_swarm.retrieval import (  # noqa: E402
     RETRIEVAL_PACKET_SCHEMA_VERSION,
     attach_native_research_transport_diagnostics,
     build_browser_search_provider_diagnostic,
+    build_evidence_chunk,
     build_live_retrieval_packet_from_candidates,
     build_retrieval_evidence_item,
     build_retrieval_packet,
@@ -474,7 +475,7 @@ def _structured_market_metadata_evidence(
     qdt: dict[str, Any],
     case_contract: dict[str, Any],
     source_cutoff_timestamp: str,
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Build narrow deterministic evidence from market metadata and snapshot state.
 
     This does not perform external web research. It is a production-pilot lane
@@ -493,6 +494,7 @@ def _structured_market_metadata_evidence(
     title = str(identity.get("title") or qdt.get("macro_question") or "market question")
     description = str(identity.get("description") or "")
     selected: list[dict[str, Any]] = []
+    chunks: list[dict[str, Any]] = []
     for leaf in qdt.get("required_leaf_questions", []):
         if not isinstance(leaf, dict) or not leaf.get("leaf_id"):
             continue
@@ -541,6 +543,18 @@ def _structured_market_metadata_evidence(
         selected[-1]["source_family_resolution_method"] = "structured_market_metadata_feed"
         selected[-1]["claim_family_resolution_method"] = "structured_market_metadata_pilot"
         selected[-1]["claim_family_ids"] = [f"claim-family:market-rules:{leaf_id}"]
+        rules_text = f"Market rules metadata for {leaf_id}: {title}. {description}".strip()
+        rules_chunk = build_evidence_chunk(
+            evidence_ref=selected[-1]["evidence_ref"],
+            content_artifact_ref=f"artifact:structured-market-metadata/{case_contract['case_id']}/{leaf_id}/rules",
+            chunk_index=0,
+            char_start=0,
+            char_end=len(rules_text),
+            text=rules_text,
+            excerpt_policy="bounded_structured_metadata_excerpt",
+        )
+        selected[-1]["chunk_refs"] = [rules_chunk["chunk_ref"]]
+        chunks.append(rules_chunk)
         selected.append(
             build_retrieval_evidence_item(
                 **common,
@@ -568,7 +582,23 @@ def _structured_market_metadata_evidence(
         selected[-1]["source_family_resolution_method"] = "structured_market_snapshot_feed"
         selected[-1]["claim_family_resolution_method"] = "structured_market_metadata_pilot"
         selected[-1]["claim_family_ids"] = [f"claim-family:market-state:{leaf_id}"]
-    return selected
+        snapshot_text = (
+            f"Market snapshot metadata for {leaf_id}: "
+            f"best bid {baseline.get('best_bid')}; best ask {baseline.get('best_ask')}; "
+            f"snapshot {baseline.get('market_snapshot_id') or 'unknown'}."
+        )
+        snapshot_chunk = build_evidence_chunk(
+            evidence_ref=selected[-1]["evidence_ref"],
+            content_artifact_ref=f"artifact:structured-market-metadata/{case_contract['case_id']}/{leaf_id}/snapshot",
+            chunk_index=0,
+            char_start=0,
+            char_end=len(snapshot_text),
+            text=snapshot_text,
+            excerpt_policy="bounded_structured_metadata_excerpt",
+        )
+        selected[-1]["chunk_refs"] = [snapshot_chunk["chunk_ref"]]
+        chunks.append(snapshot_chunk)
+    return selected, chunks
 
 
 def _live_fixture_direct_candidates(
@@ -1615,7 +1645,7 @@ def build_stage_handlers(
                     unavailable_reason="native_research_transport_not_configured",
                 )
         elif scoreable_pilot:
-            selected_evidence = _structured_market_metadata_evidence(
+            selected_evidence, evidence_chunks = _structured_market_metadata_evidence(
                 qdt=qdt_payload,
                 case_contract=case_contract,
                 source_cutoff_timestamp=source_cutoff,
@@ -1638,6 +1668,7 @@ def build_stage_handlers(
                 live_retrieval_allowlist=["browser", "native_gpt_research", "structured_feed"],
                 live_policy_overlay=live_policy_overlay,
             )
+            packet["evidence_chunks"] = evidence_chunks
             packet = finalize_retrieval_packet_for_dispatch(packet)
             packet = _mark_structured_market_metadata_pilot_retrieval(
                 packet,

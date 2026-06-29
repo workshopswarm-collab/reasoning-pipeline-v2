@@ -1235,11 +1235,26 @@ class RetrievalPacketContractTest(unittest.TestCase):
             source_family_id="source-family-expanded-secondary",
             claim_family_id="claim-family-expanded-secondary",
         )
+        expanded_chunks = []
+        for item in (official, secondary):
+            text = f"Expanded certified excerpt for {item['transport_attempt_ref']}"
+            chunk = build_evidence_chunk(
+                evidence_ref=item["evidence_ref"],
+                content_artifact_ref=f"artifact:browser-capture/{item['transport_attempt_ref']}",
+                chunk_index=0,
+                char_start=0,
+                char_end=len(text),
+                text=text,
+                excerpt_policy="bounded_excerpt",
+            )
+            item["chunk_refs"] = [chunk["chunk_ref"]]
+            expanded_chunks.append(chunk)
         expanded_packet = build_retrieval_packet(
             qdt,
             evidence_packet=self.evidence_packet,
             selected_evidence=[official, secondary],
         )
+        expanded_packet["evidence_chunks"] = expanded_chunks
 
         certified = finalize_retrieval_packet_for_dispatch(expanded_packet)
         assignments = build_leaf_research_assignments(qdt=qdt, retrieval_packet=certified)
