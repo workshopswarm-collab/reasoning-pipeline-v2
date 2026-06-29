@@ -64,6 +64,13 @@ class OpenClawRuntimeBoundaryTest(unittest.TestCase):
             self.assertFalse(any(sibling_id in serialized for sibling_id in sibling_ids))
             self.assertFalse(_contains_key(child_input, forbidden_keys))
             self.assertTrue(child_input["allowed_evidence_refs"])
+            self.assertTrue(child_input["allowed_snippet_refs"])
+            self.assertTrue(child_input["allowed_content_artifact_refs"])
+            self.assertEqual(child_input["runtime_authority"]["role"], "classifier_only")
+            self.assertFalse(child_input["runtime_authority"]["retrieval_expansion_allowed"])
+            self.assertFalse(child_input["runtime_authority"]["browser_search_allowed"])
+            self.assertFalse(child_input["runtime_authority"]["direct_url_fetch_allowed"])
+            self.assertFalse(child_input["runtime_authority"]["native_research_candidate_discovery_allowed"])
             self.assertIn("schema:researcher-sidecar/v2", child_input["schema_refs"])
             self.assertTrue(request["forbidden_context"]["probability_context"] is False)
 
@@ -81,6 +88,7 @@ class OpenClawRuntimeBoundaryTest(unittest.TestCase):
         self.assertIn("leaf_runtime_requests", prompt)
         self.assertIn(LEAF_RUNTIME_REQUEST_SCHEMA_VERSION, prompt)
         self.assertIn("use only the matching leaf_runtime_requests[].child_session_input", prompt)
+        self.assertIn("do not browse, search, fetch direct URLs", prompt)
 
 
 if __name__ == "__main__":

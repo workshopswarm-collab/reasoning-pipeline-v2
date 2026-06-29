@@ -65,17 +65,27 @@ DEFAULT_BUDGET = {
     "deadline_seconds": 900,
     "retry_budget": 1,
     "follow_up_research": {
-        "max_direct_url_fetches": 5,
-        "max_native_candidate_urls": 4,
-        "max_supplemental_evidence_refs": 3,
+        "max_direct_url_fetches": 0,
+        "max_native_candidate_urls": 0,
+        "max_supplemental_evidence_refs": 0,
         "allowed_transports": [
             "assigned_evidence_refs",
-            "direct_url_from_assigned_evidence",
-            "browser_retrieval",
-            "native_research_candidate_discovery",
+            "certified_snippet_artifacts",
         ],
+        "retrieval_expansion_authority": "upstream_retrieval_only",
         "supplemental_evidence_requires_deterministic_admission": True,
     },
+}
+ASSIGNMENT_ALLOWED_EVIDENCE_TRANSPORTS = {
+    "assigned_evidence_refs",
+    "certified_snippet_artifacts",
+}
+ASSIGNMENT_FORBIDDEN_RETRIEVAL_TRANSPORTS = {
+    "browser_retrieval",
+    "direct_url_from_assigned_evidence",
+    "direct_url_fetch",
+    "native_research_candidate_discovery",
+    "web_search",
 }
 
 FORBIDDEN_ASSIGNMENT_FIELD_NAMES = {
@@ -683,12 +693,27 @@ def _validate_budget(value: Any, errors: list[str]) -> None:
             or follow_up.get(field) < 0
         ):
             errors.append(f"budget.follow_up_research.{field} must be a non-negative integer")
+        elif follow_up.get(field) != 0:
+            errors.append(f"budget.follow_up_research.{field} must be 0 for classifier-only researchers")
     _validate_string_list(
         follow_up.get("allowed_transports"),
         errors,
         "budget.follow_up_research.allowed_transports",
         allow_empty=False,
     )
+    transports = _string_list(follow_up.get("allowed_transports"))
+    if set(transports) != ASSIGNMENT_ALLOWED_EVIDENCE_TRANSPORTS:
+        errors.append(
+            "budget.follow_up_research.allowed_transports must be assigned evidence and certified snippet artifacts only"
+        )
+    forbidden_transports = sorted(set(transports) & ASSIGNMENT_FORBIDDEN_RETRIEVAL_TRANSPORTS)
+    if forbidden_transports:
+        errors.append(
+            "budget.follow_up_research.allowed_transports includes forbidden retrieval transports: "
+            + ", ".join(forbidden_transports)
+        )
+    if follow_up.get("retrieval_expansion_authority") != "upstream_retrieval_only":
+        errors.append("budget.follow_up_research.retrieval_expansion_authority must be upstream_retrieval_only")
     if follow_up.get("supplemental_evidence_requires_deterministic_admission") is not True:
         errors.append(
             "budget.follow_up_research.supplemental_evidence_requires_deterministic_admission must be true"

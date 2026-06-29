@@ -12,7 +12,11 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
-from .assignments import validate_leaf_research_assignment
+from .assignments import (
+    ASSIGNMENT_ALLOWED_EVIDENCE_TRANSPORTS,
+    ASSIGNMENT_FORBIDDEN_RETRIEVAL_TRANSPORTS,
+    validate_leaf_research_assignment,
+)
 from .classification import (
     validate_researcher_sidecar_against_retrieval_packet,
     validate_researcher_sidecar_v2,
@@ -104,6 +108,23 @@ def _validate_string_list(value: Any, field: str, errors: list[str]) -> list[str
     return [str(item) for item in value]
 
 
+def _validate_classifier_only_follow_up(value: Any, field: str, errors: list[str]) -> None:
+    if not isinstance(value, dict):
+        errors.append(f"{field} must be an object")
+        return
+    for quota in ("max_direct_url_fetches", "max_native_candidate_urls", "max_supplemental_evidence_refs"):
+        if value.get(quota) != 0:
+            errors.append(f"{field}.{quota} must be 0")
+    transports = _validate_string_list(value.get("allowed_transports"), f"{field}.allowed_transports", errors)
+    if set(transports) != ASSIGNMENT_ALLOWED_EVIDENCE_TRANSPORTS:
+        errors.append(f"{field}.allowed_transports must be assigned evidence and certified snippet artifacts only")
+    forbidden = sorted(set(transports) & ASSIGNMENT_FORBIDDEN_RETRIEVAL_TRANSPORTS)
+    if forbidden:
+        errors.append(f"{field}.allowed_transports includes forbidden retrieval transports: " + ", ".join(forbidden))
+    if value.get("retrieval_expansion_authority") != "upstream_retrieval_only":
+        errors.append(f"{field}.retrieval_expansion_authority must be upstream_retrieval_only")
+
+
 def _result_digest_payload(result: dict[str, Any]) -> dict[str, Any]:
     payload = copy.deepcopy(result)
     payload.pop("result_digest", None)
@@ -154,7 +175,9 @@ def build_leaf_subagent_execution_policy(*, max_concurrent: int = 5) -> dict[str
         "launch_authority": "control_plane_only",
         "control_plane_adapter_ref": LEAF_SUBAGENT_CONTROL_PLANE_ADAPTER_REF,
         "required_runtime_provider_model_id": RESEARCHER_PROVIDER_MODEL_KEY,
-        "leaf_scoped_follow_up_research_allowed": True,
+        "leaf_scoped_follow_up_research_allowed": False,
+        "retrieval_expansion_authority": "upstream_retrieval_only",
+        "researcher_runtime_role": "classifier_only",
         "supplemental_evidence_resolver_required": True,
     }
 
@@ -187,8 +210,12 @@ def validate_leaf_subagent_execution_policy(policy: Any) -> LeafSubagentContract
         errors.append(f"control_plane_adapter_ref must be {LEAF_SUBAGENT_CONTROL_PLANE_ADAPTER_REF}")
     if policy.get("required_runtime_provider_model_id") != RESEARCHER_PROVIDER_MODEL_KEY:
         errors.append(f"required_runtime_provider_model_id must be {RESEARCHER_PROVIDER_MODEL_KEY}")
-    if policy.get("leaf_scoped_follow_up_research_allowed") is not True:
-        errors.append("leaf_scoped_follow_up_research_allowed must be true")
+    if policy.get("leaf_scoped_follow_up_research_allowed") is not False:
+        errors.append("leaf_scoped_follow_up_research_allowed must be false")
+    if policy.get("retrieval_expansion_authority") != "upstream_retrieval_only":
+        errors.append("retrieval_expansion_authority must be upstream_retrieval_only")
+    if policy.get("researcher_runtime_role") != "classifier_only":
+        errors.append("researcher_runtime_role must be classifier_only")
     if policy.get("supplemental_evidence_resolver_required") is not True:
         errors.append("supplemental_evidence_resolver_required must be true")
     return LeafSubagentContractValidationResult(not errors, tuple(errors))
@@ -331,8 +358,11 @@ def validate_leaf_researcher_spawn_plan(
             )
         if row.get("assignment_input_ref") != expected_ref:
             errors.append(f"launch_queue[{idx}].assignment_input_ref must match assignment_ref")
-        if not isinstance(row.get("leaf_scoped_follow_up_research"), dict):
-            errors.append(f"launch_queue[{idx}].leaf_scoped_follow_up_research must be an object")
+        _validate_classifier_only_follow_up(
+            row.get("leaf_scoped_follow_up_research"),
+            f"launch_queue[{idx}].leaf_scoped_follow_up_research",
+            errors,
+        )
         timeout_state = row.get("timeout_state")
         if not isinstance(timeout_state, dict):
             errors.append(f"launch_queue[{idx}].timeout_state must be an object")
@@ -393,6 +423,9 @@ def build_leaf_subagent_result(
     summary.setdefault("leaf_scoped_only", True)
     summary.setdefault("approved_transports_only", True)
     summary.setdefault("candidate_supplemental_evidence_requires_resolver_admission", True)
+    summary.setdefault("retrieval_expansion_performed", False)
+    summary.setdefault("free_browsing_performed", False)
+    summary.setdefault("browser_search_performed", False)
     summary.setdefault("summary_available", False)
     policy = build_leaf_subagent_execution_policy()
     result = {
@@ -494,6 +527,12 @@ def validate_leaf_subagent_result(
             errors.append(
                 "tool_use_summary.candidate_supplemental_evidence_requires_resolver_admission must be true"
             )
+        if tool_use_summary.get("retrieval_expansion_performed") is not False:
+            errors.append("tool_use_summary.retrieval_expansion_performed must be false")
+        if tool_use_summary.get("free_browsing_performed") is not False:
+            errors.append("tool_use_summary.free_browsing_performed must be false")
+        if tool_use_summary.get("browser_search_performed") is not False:
+            errors.append("tool_use_summary.browser_search_performed must be false")
     if not isinstance(result.get("runtime_provenance"), dict):
         errors.append("runtime_provenance must be an object")
     if result.get("model_executed") is not True and result.get("model_executed") is not False:

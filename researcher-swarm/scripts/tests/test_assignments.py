@@ -243,11 +243,19 @@ class LeafResearchAssignmentContractTest(unittest.TestCase):
             self.assertEqual(model_context["prompt_template_sha256"], RESEARCHER_NLI_PROMPT_TEMPLATE_SHA256)
             self.assertNotIn("authority_boundary", model_context)
             self.assertNotIn("forbidden_outputs", model_context)
-            self.assertIn("browser_retrieval", assignment["budget"]["follow_up_research"]["allowed_transports"])
+            follow_up = assignment["budget"]["follow_up_research"]
+            self.assertEqual(follow_up["max_direct_url_fetches"], 0)
+            self.assertEqual(follow_up["max_native_candidate_urls"], 0)
+            self.assertEqual(follow_up["max_supplemental_evidence_refs"], 0)
+            self.assertEqual(
+                sorted(follow_up["allowed_transports"]),
+                ["assigned_evidence_refs", "certified_snippet_artifacts"],
+            )
+            self.assertEqual(follow_up["retrieval_expansion_authority"], "upstream_retrieval_only")
+            self.assertNotIn("browser_retrieval", follow_up["allowed_transports"])
+            self.assertNotIn("native_research_candidate_discovery", follow_up["allowed_transports"])
             self.assertTrue(
-                assignment["budget"]["follow_up_research"][
-                    "supplemental_evidence_requires_deterministic_admission"
-                ]
+                follow_up["supplemental_evidence_requires_deterministic_admission"]
             )
 
             self.assertFalse(_contains_key(assignment, "question_text"))
@@ -271,6 +279,19 @@ class LeafResearchAssignmentContractTest(unittest.TestCase):
         validation = validate_leaf_research_assignment(broken)
         self.assertFalse(validation.valid)
         self.assertIn("certified_snippet is required", "; ".join(validation.errors))
+
+    def test_assignment_budget_forbids_researcher_side_retrieval(self) -> None:
+        assignment = build_leaf_research_assignments(qdt=self.qdt, retrieval_packet=self._certifiable_packet())[0]
+        broken = copy.deepcopy(assignment)
+        broken["budget"]["follow_up_research"]["max_direct_url_fetches"] = 1
+        broken["budget"]["follow_up_research"]["allowed_transports"].append("browser_retrieval")
+        broken["assignment_digest"] = compute_leaf_research_assignment_digest(broken)
+
+        validation = validate_leaf_research_assignment(broken)
+        self.assertFalse(validation.valid)
+        joined = "; ".join(validation.errors)
+        self.assertIn("max_direct_url_fetches must be 0", joined)
+        self.assertIn("forbidden retrieval transports", joined)
 
     def test_assignment_id_and_digest_are_stable(self) -> None:
         packet = self._certifiable_packet()
@@ -385,7 +406,12 @@ class LeafResearchAssignmentContractTest(unittest.TestCase):
         )
         self.assertEqual(plan["launch_queue"][0]["required_runtime_provider_model_id"], RESEARCHER_PROVIDER_MODEL_KEY)
         self.assertEqual(plan["launch_queue"][0]["assignment_input_ref"], assignments[0]["assignment_id"])
-        self.assertIn("allowed_transports", plan["launch_queue"][0]["leaf_scoped_follow_up_research"])
+        self.assertFalse(plan["execution_policy"]["leaf_scoped_follow_up_research_allowed"])
+        self.assertEqual(plan["execution_policy"]["researcher_runtime_role"], "classifier_only")
+        self.assertEqual(
+            sorted(plan["launch_queue"][0]["leaf_scoped_follow_up_research"]["allowed_transports"]),
+            ["assigned_evidence_refs", "certified_snippet_artifacts"],
+        )
         self.assertEqual(plan["queued_assignment_refs"], [assignments[2]["assignment_id"]])
         validation = validate_leaf_researcher_spawn_plan(plan, assignments)
         self.assertTrue(validation.valid, validation.errors)
@@ -400,6 +426,13 @@ class LeafResearchAssignmentContractTest(unittest.TestCase):
 
         self.assertFalse(validation.valid)
         self.assertIn("launch_allowed must reflect the concurrency cap", "; ".join(validation.errors))
+        broken_follow_up = copy.deepcopy(plan)
+        broken_follow_up["launch_queue"][0]["leaf_scoped_follow_up_research"]["allowed_transports"].append(
+            "browser_retrieval"
+        )
+        validation = validate_leaf_researcher_spawn_plan(broken_follow_up, assignments)
+        self.assertFalse(validation.valid)
+        self.assertIn("forbidden retrieval transports", "; ".join(validation.errors))
 
     def test_leaf_research_barrier_blocks_until_all_subagent_results_exist(self) -> None:
         assignments = build_leaf_research_assignments(qdt=self.qdt, retrieval_packet=self._certifiable_packet())
@@ -450,6 +483,33 @@ class LeafResearchAssignmentContractTest(unittest.TestCase):
         self.assertEqual(barrier["blocker_reason_codes"], [])
         validation = validate_leaf_research_barrier(barrier, assignments=assignments, true_production_mode=True)
         self.assertTrue(validation.valid, validation.errors)
+
+    def test_leaf_subagent_result_rejects_researcher_side_retrieval_expansion(self) -> None:
+        assignment = build_leaf_research_assignments(qdt=self.qdt, retrieval_packet=self._certifiable_packet())[0]
+        result = build_leaf_subagent_result(
+            assignment,
+            terminal_status="accepted_classification",
+            subagent_session_ref="session:retrieval-expansion",
+            sidecar_refs=["sidecar:leaf"],
+            classification_refs=["classification:leaf"],
+            runtime_provenance={
+                "model_executed": True,
+                "resolved_model_id": RESEARCHER_PROVIDER_MODEL_KEY,
+                "runtime_call_ref": "model-runtime-call:retrieval-expansion",
+            },
+            tool_use_summary={
+                "leaf_scoped_only": True,
+                "approved_transports_only": True,
+                "candidate_supplemental_evidence_requires_resolver_admission": True,
+                "retrieval_expansion_performed": True,
+                "free_browsing_performed": False,
+                "browser_search_performed": False,
+            },
+        )
+
+        validation = validate_leaf_subagent_result(result, assignment=assignment, true_production_mode=True)
+        self.assertFalse(validation.valid)
+        self.assertIn("retrieval_expansion_performed must be false", "; ".join(validation.errors))
 
     def test_runtime_bundle_requires_accepted_sidecar_coverage_before_downstream_advance(self) -> None:
         assignments = build_leaf_research_assignments(qdt=self.qdt, retrieval_packet=self._certifiable_packet())

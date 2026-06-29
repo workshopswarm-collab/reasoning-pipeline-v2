@@ -113,6 +113,13 @@ def build_leaf_scoped_runtime_requests(assignments: list[dict[str, Any]]) -> lis
                         for item in assigned_refs
                         if isinstance(item, dict) and item.get("snippet_ref")
                     ],
+                    "allowed_content_artifact_refs": [
+                        item.get("certified_snippet", {}).get("content_artifact_ref")
+                        for item in assigned_refs
+                        if isinstance(item, dict)
+                        and isinstance(item.get("certified_snippet"), dict)
+                        and item["certified_snippet"].get("content_artifact_ref")
+                    ],
                     "schema_refs": [
                         "schema:researcher-sidecar/v2",
                         "schema:researcher-classification/v1",
@@ -124,6 +131,14 @@ def build_leaf_scoped_runtime_requests(assignments: list[dict[str, Any]]) -> lis
                     if model_context.get("prompt_template_id")
                     else [],
                     "output_contract": copy.deepcopy(output_contract),
+                    "runtime_authority": {
+                        "role": "classifier_only",
+                        "retrieval_expansion_allowed": False,
+                        "browser_search_allowed": False,
+                        "direct_url_fetch_allowed": False,
+                        "native_research_candidate_discovery_allowed": False,
+                        "supplemental_evidence_requires_upstream_revalidation": True,
+                    },
                 },
                 "forbidden_context": {
                     "sibling_assignments": False,
@@ -183,6 +198,10 @@ def build_researcher_swarm_openclaw_prompt(
         "leaf assignments. For each child session, use only the matching "
         "leaf_runtime_requests[].child_session_input. Each leaf subagent may see "
         "only its own assignment, allowed artifact refs, and admitted evidence refs. "
+        "Leaf subagents are classifiers only: do not browse, search, fetch direct URLs, "
+        "run native research candidate discovery, or expand sources inside child sessions. "
+        "Any supplemental source proposal must return as a blocked/ref-only proposal for "
+        "upstream retrieval revalidation before it can count. "
         "Do not expose sibling assignments, peer outputs, aggregate summaries, SCAE refs, forecasts, "
         "decisions, scoring, replay, or outcomes. Clean up leaf sessions after "
         "their handoff where the runtime supports cleanup.\n\n"
