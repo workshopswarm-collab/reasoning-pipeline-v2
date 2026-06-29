@@ -672,6 +672,15 @@ class QDTContractTest(unittest.TestCase):
         self.assertEqual(selected["question_specificity_check"]["status"], "passed")
         self.assertEqual(selected["research_coverage_check"]["status"], "passed")
         graph = selected["research_coverage_graph"]
+        self.assertEqual(graph["market_temporal_state"], "unresolved")
+        self.assertIn("forecast_research_objective", graph)
+        self.assertIn("terminal_verification_leaf_ids", graph)
+        self.assertIn("dispatchable_pre_resolution_leaf_ids", graph)
+        self.assertFalse(graph["terminal_verification_leaf_ids"])
+        self.assertEqual(
+            sorted(graph["dispatchable_pre_resolution_leaf_ids"]),
+            sorted(leaf["leaf_id"] for leaf in selected["required_leaf_questions"]),
+        )
         for dimension in (
             "resolution_mechanics",
             "current_direct_evidence",
@@ -683,6 +692,7 @@ class QDTContractTest(unittest.TestCase):
         ):
             self.assertIn(dimension, graph["required_leaf_ids_by_dimension"])
         for leaf in selected["required_leaf_questions"]:
+            self.assertIn("leaf_temporal_role", leaf)
             self.assertIn("coverage_dimension", leaf)
             self.assertIn("research_factor", leaf)
             self.assertIn("evidence_requirements", leaf)
@@ -691,6 +701,44 @@ class QDTContractTest(unittest.TestCase):
             self.assertIn("why_this_must_be_investigated", leaf["specificity_evidence"])
             self.assertIn("probability", leaf["forbidden_outputs"])
             self.assertIn("final_forecast", leaf["forbidden_outputs"])
+
+    def test_missing_leaf_temporal_role_is_rejected(self):
+        selected = select_qdt_candidate([build_fixture_qdt_candidate(self.handoff)])
+        broken = copy.deepcopy(selected)
+        broken["required_leaf_questions"][0].pop("leaf_temporal_role")
+
+        result = validate_question_decomposition(broken)
+
+        self.assertFalse(result.valid)
+        self.assertIn("leaf_temporal_role", "; ".join(result.errors))
+
+    def test_terminal_verification_graph_refs_must_match_leaf_role(self):
+        selected = select_qdt_candidate([build_fixture_qdt_candidate(self.handoff)])
+        broken = copy.deepcopy(selected)
+        non_terminal_leaf_id = broken["required_leaf_questions"][0]["leaf_id"]
+        broken["research_coverage_graph"]["terminal_verification_leaf_ids"] = [non_terminal_leaf_id]
+
+        result = validate_question_decomposition(broken)
+
+        self.assertFalse(result.valid)
+        self.assertIn("terminal_verification_leaf_ids references non-terminal leaf", "; ".join(result.errors))
+
+    def test_unresolved_qdt_cannot_dispatch_terminal_verification_leaf(self):
+        selected = select_qdt_candidate([build_fixture_qdt_candidate(self.handoff)])
+        broken = copy.deepcopy(selected)
+        leaf = broken["required_leaf_questions"][0]
+        leaf["leaf_temporal_role"] = "terminal_verification"
+        leaf_id = leaf["leaf_id"]
+        graph = broken["research_coverage_graph"]
+        graph["terminal_verification_leaf_ids"] = [leaf_id]
+        graph["dispatchable_pre_resolution_leaf_ids"] = list(
+            {leaf_id, *graph["dispatchable_pre_resolution_leaf_ids"]}
+        )
+
+        result = validate_question_decomposition(broken)
+
+        self.assertFalse(result.valid)
+        self.assertIn("dispatchable_pre_resolution_leaf_ids contains terminal verification", "; ".join(result.errors))
 
     def test_generic_mad_lib_leaf_is_rejected(self):
         selected = select_qdt_candidate([build_fixture_qdt_candidate(self.handoff)])

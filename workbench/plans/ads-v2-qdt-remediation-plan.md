@@ -338,6 +338,8 @@ Success criteria:
 
 Goal: make the target QDT shape explicit and machine-checkable.
 
+Status: completed on 2026-06-29. QDT artifacts now mechanically require `leaf_temporal_role`, `research_coverage_graph.market_temporal_state`, `forecast_research_objective`, `terminal_verification_leaf_ids`, and `dispatchable_pre_resolution_leaf_ids`; validator tests cover missing roles and invalid terminal/dispatchable cross-references.
+
 Implementation:
 
 1. Add required `market_resolution_contract` validation.

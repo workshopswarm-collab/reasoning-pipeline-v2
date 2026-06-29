@@ -85,6 +85,14 @@ ALLOWED_UNANSWERABLE_POLICY_CONSEQUENCES = {
     "requires_unanswerability_proof_before_dispatch",
     "block_classification_until_sufficiency_certificate",
 }
+ALLOWED_MARKET_TEMPORAL_STATES = {"unresolved", "resolved_or_settlement_audit"}
+ALLOWED_LEAF_TEMPORAL_ROLES = {
+    "pre_resolution_forecast_driver",
+    "current_status",
+    "resolution_mechanics",
+    "terminal_verification",
+    "material_unknown",
+}
 CONDITION_SCOPES_REQUIRING_ANCHOR_CONTRACT = {"target_given_upstream", "target_given_not_upstream"}
 APPROVED_WAIVER_STATUS = "approved"
 ALLOWED_ANCHOR_MODES = {"diagnostic_only", "anchor_optional", "anchor_required"}
@@ -187,6 +195,7 @@ REQUIRED_LEAF_FIELDS = (
     "leaf_id",
     "parent_branch_id",
     "question_text",
+    "leaf_temporal_role",
     "purpose",
     "research_priority",
     "leaf_dependency_group_id",
@@ -219,10 +228,14 @@ REQUIRED_MARKET_RESOLUTION_CONTRACT_FIELDS = (
 )
 REQUIRED_RESEARCH_COVERAGE_GRAPH_FIELDS = (
     "target_event_description",
+    "forecast_research_objective",
+    "market_temporal_state",
     "coverage_dimensions",
     "research_factors",
     "contract_guard_leaf_ids",
     "material_question_leaf_ids",
+    "terminal_verification_leaf_ids",
+    "dispatchable_pre_resolution_leaf_ids",
     "required_leaf_ids_by_dimension",
     "overlap_groups",
     "unanswered_material_questions",
@@ -531,11 +544,43 @@ def _leaf_research_priority(leaf: dict[str, Any]) -> str:
     return "medium"
 
 
+def _market_temporal_state_from_handoff(handoff: dict[str, Any]) -> str:
+    market_context = handoff.get("market_context") if isinstance(handoff.get("market_context"), dict) else {}
+    raw_status = str(
+        handoff.get("market_temporal_state")
+        or handoff.get("resolution_status")
+        or market_context.get("market_temporal_state")
+        or market_context.get("resolution_status")
+        or ""
+    ).lower()
+    if any(term in raw_status for term in ("resolved", "settled", "closed_final", "finalized")):
+        return "resolved_or_settlement_audit"
+    return "unresolved"
+
+
+def _leaf_temporal_role(leaf: dict[str, Any]) -> str:
+    explicit = leaf.get("leaf_temporal_role")
+    if explicit in ALLOWED_LEAF_TEMPORAL_ROLES:
+        return str(explicit)
+    dimension = _coverage_dimension_for_leaf(leaf)
+    purpose = leaf.get("purpose")
+    if dimension == "material_unknowns":
+        return "material_unknown"
+    if dimension == "resolution_mechanics":
+        return "resolution_mechanics"
+    if dimension == "current_direct_evidence":
+        return "current_status"
+    if purpose == "source_of_truth":
+        return "resolution_mechanics"
+    return "pre_resolution_forecast_driver"
+
+
 def _enrich_leaf_research_contract(leaf: dict[str, Any], handoff: dict[str, Any]) -> dict[str, Any]:
     enriched = copy.deepcopy(leaf)
     enriched["research_priority"] = _leaf_research_priority(enriched)
     enriched.pop("bayesian_weighting", None)
     enriched["coverage_dimension"] = _coverage_dimension_for_leaf(enriched)
+    enriched["leaf_temporal_role"] = _leaf_temporal_role(enriched)
     enriched["research_factor"] = _research_factor_for_leaf(enriched)
     enriched["leaf_question"] = str(enriched.get("leaf_question") or enriched.get("question_text") or "")
     enriched["evidence_requirements"] = _default_evidence_requirements(enriched)
@@ -596,17 +641,26 @@ def _build_research_coverage_graph(handoff: dict[str, Any], leaves: list[dict[st
     research_factors: list[dict[str, str]] = []
     guard_leaf_ids: list[str] = []
     material_leaf_ids: list[str] = []
+    terminal_verification_leaf_ids: list[str] = []
+    dispatchable_pre_resolution_leaf_ids: list[str] = []
+    market_temporal_state = _market_temporal_state_from_handoff(handoff)
     for leaf in leaves:
         leaf_id = str(leaf.get("leaf_id") or "")
         dimension = str(leaf.get("coverage_dimension") or _coverage_dimension_for_leaf(leaf))
+        temporal_role = str(leaf.get("leaf_temporal_role") or _leaf_temporal_role(leaf))
         by_dimension.setdefault(dimension, []).append(leaf_id)
         research_factors.append(
             {
                 "leaf_id": leaf_id,
                 "coverage_dimension": dimension,
                 "research_factor": str(leaf.get("research_factor") or _research_factor_for_leaf(leaf)),
+                "leaf_temporal_role": temporal_role,
             }
         )
+        if temporal_role == "terminal_verification":
+            terminal_verification_leaf_ids.append(leaf_id)
+        if market_temporal_state != "unresolved" or temporal_role != "terminal_verification":
+            dispatchable_pre_resolution_leaf_ids.append(leaf_id)
         if dimension in CONTRACT_GUARD_COVERAGE_DIMENSIONS and leaf.get("purpose") in {
             "source_of_truth",
             "resolution_mechanics",
@@ -625,10 +679,17 @@ def _build_research_coverage_graph(handoff: dict[str, Any], leaves: list[dict[st
     ]
     return {
         "target_event_description": str(handoff.get("macro_question") or ""),
+        "forecast_research_objective": (
+            "Classify pre-resolution evidence, drivers, blockers, source quality, timing constraints, "
+            "and material unknowns before SCAE estimates the market outcome."
+        ),
+        "market_temporal_state": market_temporal_state,
         "coverage_dimensions": sorted(by_dimension),
         "research_factors": research_factors,
         "contract_guard_leaf_ids": guard_leaf_ids,
         "material_question_leaf_ids": material_leaf_ids,
+        "terminal_verification_leaf_ids": terminal_verification_leaf_ids,
+        "dispatchable_pre_resolution_leaf_ids": dispatchable_pre_resolution_leaf_ids,
         "required_leaf_ids_by_dimension": {key: sorted(value) for key, value in sorted(by_dimension.items())},
         "overlap_groups": [],
         "unanswered_material_questions": unanswered,
@@ -1433,6 +1494,8 @@ def _validate_specificity_evidence(value: Any, path: str, errors: list[str]) -> 
 
 
 def _validate_leaf_research_contract(leaf: dict[str, Any], path: str, errors: list[str]) -> None:
+    if leaf.get("leaf_temporal_role") not in ALLOWED_LEAF_TEMPORAL_ROLES:
+        errors.append(f"{path}.leaf_temporal_role is invalid")
     dimension = leaf.get("coverage_dimension")
     if dimension not in ALLOWED_COVERAGE_DIMENSIONS:
         errors.append(f"{path}.coverage_dimension is invalid")
@@ -1847,6 +1910,11 @@ def _validate_research_coverage_graph(
             errors.append(f"research_coverage_graph missing {field}")
     if not _is_non_empty_string(value.get("target_event_description")):
         errors.append("research_coverage_graph.target_event_description is required")
+    if not _is_non_empty_string(value.get("forecast_research_objective")):
+        errors.append("research_coverage_graph.forecast_research_objective is required")
+    market_temporal_state = value.get("market_temporal_state")
+    if market_temporal_state not in ALLOWED_MARKET_TEMPORAL_STATES:
+        errors.append("research_coverage_graph.market_temporal_state is invalid")
     coverage_dimensions = value.get("coverage_dimensions")
     if not isinstance(coverage_dimensions, list) or not coverage_dimensions:
         errors.append("research_coverage_graph.coverage_dimensions must be non-empty")
@@ -1870,7 +1938,12 @@ def _validate_research_coverage_graph(
         unknown_ids = sorted(str(item) for item in ids if str(item) not in leaf_ids)
         if unknown_ids:
             errors.append(f"research_coverage_graph.required_leaf_ids_by_dimension.{dimension} references unknown leaves")
-    for list_field in ("contract_guard_leaf_ids", "material_question_leaf_ids"):
+    for list_field in (
+        "contract_guard_leaf_ids",
+        "material_question_leaf_ids",
+        "terminal_verification_leaf_ids",
+        "dispatchable_pre_resolution_leaf_ids",
+    ):
         ids = value.get(list_field)
         if not isinstance(ids, list):
             errors.append(f"research_coverage_graph.{list_field} must be a list")
@@ -1880,8 +1953,21 @@ def _validate_research_coverage_graph(
                 errors.append(f"research_coverage_graph.{list_field} references unknown leaves")
     guard = set(str(item) for item in value.get("contract_guard_leaf_ids") or [])
     material = set(str(item) for item in value.get("material_question_leaf_ids") or [])
+    terminal = set(str(item) for item in value.get("terminal_verification_leaf_ids") or [])
+    dispatchable = set(str(item) for item in value.get("dispatchable_pre_resolution_leaf_ids") or [])
     if guard & material:
         errors.append("research_coverage_graph guard and material leaf ids must be disjoint")
+    for leaf_id in terminal:
+        leaf = leaves_by_id.get(leaf_id)
+        if leaf and leaf.get("leaf_temporal_role") != "terminal_verification":
+            errors.append("research_coverage_graph.terminal_verification_leaf_ids references non-terminal leaf")
+    if market_temporal_state == "unresolved":
+        terminal_dispatch = sorted(terminal & dispatchable)
+        if terminal_dispatch:
+            errors.append(
+                "research_coverage_graph.dispatchable_pre_resolution_leaf_ids contains terminal verification leaves: "
+                + ", ".join(terminal_dispatch)
+            )
     if len(material) < _minimum_material_leaf_count(artifact.get("leaf_budget_decision")):
         errors.append("insufficient_material_leaf_count")
     if guard and len(guard) >= len(material):
@@ -1896,6 +1982,8 @@ def _validate_research_coverage_graph(
             ids = by_dimension.get(dimension, [])
             if isinstance(ids, list) and leaf_id not in ids:
                 errors.append(f"research_coverage_graph.required_leaf_ids_by_dimension omits {leaf_id}")
+        if leaf.get("leaf_temporal_role") == "terminal_verification" and leaf_id not in terminal:
+            errors.append("research_coverage_graph.terminal_verification_leaf_ids omits terminal verification leaf")
     if _evidence_packet_suggests_market_family(evidence_packet):
         contract = artifact.get("market_resolution_contract")
         context = contract.get("platform_family_context") if isinstance(contract, dict) else None
