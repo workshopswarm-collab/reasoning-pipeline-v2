@@ -346,6 +346,19 @@ def _retrieval_runtime_evidence(manifests: list[dict[str, Any]]) -> dict[str, An
             continue
         payload = _load_manifest_payload(manifest) or {}
         runtime_summary = payload.get("retrieval_runtime_summary") if isinstance(payload.get("retrieval_runtime_summary"), dict) else {}
+        adapter_mode = str(payload.get("adapter_mode") or "")
+        structured_market_metadata_pilot = bool(
+            adapter_mode == "structured_market_metadata_pilot_retrieval"
+            or runtime_summary.get("runtime_mode") == "structured_market_metadata_pilot"
+            or runtime_summary.get("structured_market_metadata_pilot") is True
+            or (
+                isinstance(payload.get("structured_market_metadata_pilot_proof_boundary"), dict)
+                and payload["structured_market_metadata_pilot_proof_boundary"].get(
+                    "counts_as_real_retrieval_canary_proof"
+                )
+                is False
+            )
+        )
         transport = (
             payload.get("ads_retrieval_transport_diagnostics")
             if isinstance(payload.get("ads_retrieval_transport_diagnostics"), dict)
@@ -475,6 +488,17 @@ def _retrieval_runtime_evidence(manifests: list[dict[str, Any]]) -> dict[str, An
                 else "not_executed"
             )
         )
+        external_source_discovery_proven = bool(
+            not structured_market_metadata_pilot
+            and real_candidate_count > 0
+            and (
+                direct_url_capture_executed
+                or browser_search_executed
+                or native_research_model_executed
+            )
+        )
+        if runtime_summary.get("external_source_discovery_proven") is True:
+            external_source_discovery_proven = not structured_market_metadata_pilot
         leaf_result_admitted_refs: set[str] = set()
         selected_refs: set[str] = _evidence_refs_from(payload.get("selected_evidence_refs"))
         for row in leaf_results:
@@ -512,9 +536,11 @@ def _retrieval_runtime_evidence(manifests: list[dict[str, Any]]) -> dict[str, An
         retrieval_packets.append(
             {
                 "artifact_id": manifest.get("artifact_id"),
-                "adapter_mode": payload.get("adapter_mode"),
+                "adapter_mode": adapter_mode,
                 "runtime_mode": runtime_summary.get("runtime_mode"),
                 "classification_dispatch_status": sufficiency.get("classification_dispatch_status"),
+                "structured_market_metadata_pilot": structured_market_metadata_pilot,
+                "external_source_discovery_proven": external_source_discovery_proven,
                 "source_attempt_count": source_attempt_count,
                 "direct_url_candidate_count": direct_url_candidate_count,
                 "search_candidate_url_count": search_candidate_url_count,
@@ -546,6 +572,7 @@ def _retrieval_runtime_evidence(manifests: list[dict[str, Any]]) -> dict[str, An
                         retrieval_has_real_candidates
                         and retrieval_has_fetch_attempts
                         and retrieval_has_admitted_evidence
+                        and external_source_discovery_proven
                     )
                     or structural_unanswerability_certified
                 ),
@@ -560,6 +587,12 @@ def _retrieval_runtime_evidence(manifests: list[dict[str, Any]]) -> dict[str, An
         "fetched_attempt_count": sum(int(item["fetched_attempt_count"]) for item in retrieval_packets),
         "admitted_evidence_ref_count": sum(
             int(item["admitted_evidence_ref_count"]) for item in retrieval_packets
+        ),
+        "external_source_discovery_proven_count": sum(
+            1 for item in retrieval_packets if item["external_source_discovery_proven"]
+        ),
+        "structured_market_metadata_pilot_packet_count": sum(
+            1 for item in retrieval_packets if item["structured_market_metadata_pilot"]
         ),
         "browser_search_executed_count": sum(
             1 for item in retrieval_packets if item["browser_search_executed"]
@@ -824,6 +857,14 @@ def _build_runtime_criteria(
             detail={
                 "retrieval_packet_count": retrieval_evidence.get("retrieval_packet_count", 0),
                 "source_populated_count": retrieval_evidence.get("source_populated_count", 0),
+                "external_source_discovery_proven_count": retrieval_evidence.get(
+                    "external_source_discovery_proven_count",
+                    0,
+                ),
+                "structured_market_metadata_pilot_packet_count": retrieval_evidence.get(
+                    "structured_market_metadata_pilot_packet_count",
+                    0,
+                ),
             },
         ),
         _criterion(

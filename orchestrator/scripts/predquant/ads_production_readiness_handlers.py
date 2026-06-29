@@ -434,6 +434,41 @@ def _attach_live_retrieval_transport_metadata(
     return packet
 
 
+def _mark_structured_market_metadata_pilot_retrieval(
+    packet: dict[str, Any],
+    *,
+    selected_evidence_count: int,
+) -> dict[str, Any]:
+    packet["retrieval_runtime_summary"] = {
+        "schema_version": "retrieval-runtime-summary/v1",
+        "runtime_mode": "structured_market_metadata_pilot",
+        "structured_market_metadata_pilot": True,
+        "external_source_discovery_proven": False,
+        "source_discovery_proof_status": "not_proven_structured_market_metadata_pilot",
+        "direct_url_capture_executed": False,
+        "direct_url_capture_status": "not_executed",
+        "browser_search_executed": False,
+        "browser_search_status": "not_executed",
+        "native_research_model_executed": False,
+        "native_research_status": "disabled",
+        "metadata_classifier_assist_executed": False,
+        "metadata_classifier_assist_status": "not_executed",
+        "admitted_initial_evidence_count": selected_evidence_count,
+        "admitted_supplemental_evidence_count": 0,
+        "web_fetch_is_url_fetch_not_search": True,
+        "deterministic_admission_authority": "structured_market_metadata_pilot_only",
+    }
+    packet["structured_market_metadata_pilot_proof_boundary"] = {
+        "external_source_discovery_proven": False,
+        "counts_as_real_retrieval_canary_proof": False,
+        "reason_code": "structured_market_metadata_pilot_is_not_external_source_discovery",
+    }
+    packet.setdefault("validation_summary", {}).setdefault("reason_codes", []).append(
+        "structured_market_metadata_pilot_not_external_source_discovery_proof"
+    )
+    return packet
+
+
 def _structured_market_metadata_evidence(
     *,
     qdt: dict[str, Any],
@@ -1602,6 +1637,10 @@ def build_stage_handlers(
                 live_policy_overlay=live_policy_overlay,
             )
             packet = finalize_retrieval_packet_for_dispatch(packet)
+            packet = _mark_structured_market_metadata_pilot_retrieval(
+                packet,
+                selected_evidence_count=len(selected_evidence),
+            )
         else:
             packet = build_retrieval_packet(
                 qdt_payload,

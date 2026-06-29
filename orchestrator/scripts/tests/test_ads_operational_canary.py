@@ -1081,6 +1081,8 @@ class AdsOperationalCanaryTest(unittest.TestCase):
         self.assertGreater(retrieval["real_candidate_count"], 0)
         self.assertGreater(retrieval["fetched_attempt_count"], 0)
         self.assertGreater(retrieval["admitted_evidence_ref_count"], 0)
+        self.assertEqual(retrieval["external_source_discovery_proven_count"], 1)
+        self.assertEqual(retrieval["structured_market_metadata_pilot_packet_count"], 0)
         self.assertEqual(retrieval["browser_search_executed_count"], 1)
         self.assertEqual(retrieval["direct_url_capture_executed_count"], 0)
         self.assertEqual(retrieval["native_research_model_executed_count"], 0)
@@ -1090,6 +1092,8 @@ class AdsOperationalCanaryTest(unittest.TestCase):
         self.assertGreater(packet["search_candidate_url_count"], 0)
         self.assertGreater(packet["fetched_attempt_count"], 0)
         self.assertGreater(packet["admitted_evidence_ref_count"], 0)
+        self.assertTrue(packet["external_source_discovery_proven"])
+        self.assertFalse(packet["structured_market_metadata_pilot"])
         self.assertTrue(packet["browser_search_executed"])
         self.assertEqual(packet["browser_search_status"], "executed")
         self.assertFalse(packet["direct_url_capture_executed"])
@@ -1221,6 +1225,59 @@ class AdsOperationalCanaryTest(unittest.TestCase):
         self.assertEqual(packet["selected_evidence_ref_count"], 2)
         self.assertEqual(packet["reported_evidence_ref_count"], 3)
         self.assertFalse(packet["source_populated_or_structural_unanswerability"])
+        self.assertFalse(evidence["ok"])
+
+    def test_structured_metadata_pilot_does_not_prove_external_source_discovery(self):
+        packet_path = Path(self.tempdir.name) / "retrieval-packet.json"
+        packet_path.write_text(
+            json.dumps(
+                {
+                    "adapter_mode": "structured_market_metadata_pilot_retrieval",
+                    "retrieval_runtime_summary": {
+                        "runtime_mode": "structured_market_metadata_pilot",
+                        "structured_market_metadata_pilot": True,
+                        "external_source_discovery_proven": False,
+                    },
+                    "research_sufficiency_summary": {
+                        "classification_dispatch_status": "allowed"
+                    },
+                    "leaf_retrieval_results": [
+                        {
+                            "leaf_id": "leaf-a",
+                            "admitted_evidence_refs": ["evidence:pilot-a"],
+                            "selected_evidence_refs": ["evidence:pilot-a"],
+                        }
+                    ],
+                    "leaf_evidence_dockets": [
+                        {
+                            "leaf_id": "leaf-a",
+                            "admitted_evidence_refs": ["evidence:pilot-a"],
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        evidence = _retrieval_runtime_evidence(
+            [
+                {
+                    "artifact_id": "artifact:retrieval",
+                    "artifact_type": "retrieval-packet",
+                    "path": str(packet_path),
+                }
+            ]
+        )
+
+        packet = evidence["retrieval_packets"][0]
+        self.assertTrue(packet["structured_market_metadata_pilot"])
+        self.assertFalse(packet["external_source_discovery_proven"])
+        self.assertTrue(packet["classification_dispatch_allowed"])
+        self.assertEqual(packet["admitted_evidence_ref_count"], 1)
+        self.assertFalse(packet["source_populated_or_structural_unanswerability"])
+        self.assertEqual(evidence["structured_market_metadata_pilot_packet_count"], 1)
+        self.assertEqual(evidence["external_source_discovery_proven_count"], 0)
+        self.assertEqual(evidence["source_populated_count"], 0)
         self.assertFalse(evidence["ok"])
 
     def test_phase3_fixture_certified_retrieval_writes_runtime_bundle_manifest(self):
@@ -1529,6 +1586,15 @@ class AdsOperationalCanaryTest(unittest.TestCase):
                 FROM market_predictions
                 """
             ).fetchone()
+            retrieval_row = conn.execute(
+                """
+                SELECT artifact_path
+                FROM case_artifact_manifest
+                WHERE artifact_type = 'retrieval-packet'
+                ORDER BY id DESC
+                LIMIT 1
+                """
+            ).fetchone()
             self.assertEqual(decision[0], "production_forecast_persisted_from_scae")
             self.assertEqual(decision[1], 1)
             self.assertIsNotNone(decision[2])
@@ -1536,6 +1602,16 @@ class AdsOperationalCanaryTest(unittest.TestCase):
             self.assertEqual(prediction[0], "ads_pipeline")
             self.assertEqual(prediction[1], "v2_scae")
             self.assertIsNotNone(prediction[2])
+            self.assertIsNotNone(retrieval_row)
+
+        retrieval_payload = json.loads(Path(retrieval_row[0]).read_text(encoding="utf-8"))
+        boundary = retrieval_payload["structured_market_metadata_pilot_proof_boundary"]
+        runtime_summary = retrieval_payload["retrieval_runtime_summary"]
+        self.assertEqual(retrieval_payload["adapter_mode"], "structured_market_metadata_pilot_retrieval")
+        self.assertFalse(boundary["external_source_discovery_proven"])
+        self.assertFalse(boundary["counts_as_real_retrieval_canary_proof"])
+        self.assertFalse(runtime_summary["external_source_discovery_proven"])
+        self.assertEqual(runtime_summary["source_discovery_proof_status"], "not_proven_structured_market_metadata_pilot")
 
         report = build_handoff_report(self.db_path)
         self.assertTrue(report["ok"], report["unresolved_output_manifest_refs"])
