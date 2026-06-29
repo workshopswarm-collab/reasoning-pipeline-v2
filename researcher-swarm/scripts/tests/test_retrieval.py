@@ -1161,6 +1161,11 @@ class RetrievalPacketContractTest(unittest.TestCase):
             finalized["research_sufficiency_summary"]["classification_dispatch_status"],
             "allowed",
         )
+        self.assertEqual(finalized["retrieval_outcome_state"]["retrieval_outcome"], "evidence_sufficient")
+        self.assertEqual(
+            finalized["retrieval_outcome_state"]["downstream_action"],
+            "dispatch_researcher_classification",
+        )
         self.assertTrue(finalized["research_sufficiency_summary"]["all_required_leaves_certified"])
         self.assertEqual(
             sorted(cert["leaf_id"] for cert in finalized["leaf_research_sufficiency_certificates"]),
@@ -1202,6 +1207,16 @@ class RetrievalPacketContractTest(unittest.TestCase):
             blocked["research_sufficiency_summary"]["classification_dispatch_status"],
             "blocked_insufficient_research",
         )
+        self.assertEqual(blocked["retrieval_outcome_state"]["retrieval_outcome"], "insufficient_evidence")
+        self.assertEqual(
+            blocked["retrieval_outcome_state"]["downstream_action"],
+            "block_retrieval_until_upstream_expansion_or_unanswerability_proof",
+        )
+        self.assertTrue(blocked["retrieval_outcome_state"]["terminal_blocked"])
+        self.assertTrue(blocked["retrieval_outcome_state"]["thin_retrieval_blocked"])
+        missing_outcome = copy.deepcopy(blocked)
+        missing_outcome.pop("retrieval_outcome_state", None)
+        self.assertFalse(validate_retrieval_packet(missing_outcome).valid)
         self.assertFalse(
             blocked["leaf_research_sufficiency_certificates"][0]["classification_dispatch_allowed"]
         )
@@ -2981,6 +2996,15 @@ class RetrievalPacketContractTest(unittest.TestCase):
         self.assertEqual(
             finalized["research_sufficiency_summary"]["classification_dispatch_status"],
             "allowed",
+        )
+        self.assertEqual(finalized["retrieval_outcome_state"]["retrieval_outcome"], "structural_unanswerability")
+        self.assertEqual(
+            finalized["retrieval_outcome_state"]["downstream_action"],
+            "dispatch_unanswerability_confirmation",
+        )
+        self.assertEqual(
+            finalized["retrieval_outcome_state"]["structural_unanswerability_proof_refs"],
+            ["artifact:unanswerable-proof-1"],
         )
 
     def test_native_transport_unavailability_is_diagnostic_and_resolver_owns_metadata(self) -> None:

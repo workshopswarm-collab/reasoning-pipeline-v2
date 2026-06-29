@@ -4194,6 +4194,65 @@ def build_blocked_retrieval_stage_contract_records(
     }
 
 
+def build_retrieval_outcome_state(
+    *,
+    certificates: list[dict[str, Any]],
+    classification_dispatch_status: str,
+    blocked_reason_codes: list[str],
+    unsatisfied_requirement_codes: list[str],
+) -> dict[str, Any]:
+    certificate_statuses = [
+        str(cert.get("status"))
+        for cert in certificates
+        if isinstance(cert, dict) and _is_non_empty_string(cert.get("status"))
+    ]
+    structurally_unanswerable = [
+        cert for cert in certificates if isinstance(cert, dict) and cert.get("status") == "structurally_unanswerable"
+    ]
+    if classification_dispatch_status == "allowed" and certificate_statuses and len(structurally_unanswerable) == len(certificates):
+        retrieval_outcome = "structural_unanswerability"
+        downstream_action = "dispatch_unanswerability_confirmation"
+        terminal_blocked = False
+    elif classification_dispatch_status == "allowed":
+        retrieval_outcome = "evidence_sufficient"
+        downstream_action = "dispatch_researcher_classification"
+        terminal_blocked = False
+    else:
+        retrieval_outcome = "insufficient_evidence"
+        downstream_action = "block_retrieval_until_upstream_expansion_or_unanswerability_proof"
+        terminal_blocked = True
+    thin_retrieval_blocked = retrieval_outcome == "insufficient_evidence" and any(
+        code in {"empty_retrieval", "thin_retrieval", "breadth_not_certified", "no_admitted_evidence"}
+        for code in set(blocked_reason_codes) | set(unsatisfied_requirement_codes)
+    )
+    return {
+        "artifact_type": "retrieval_outcome_state",
+        "schema_version": "retrieval-outcome-state/v1",
+        "retrieval_outcome": retrieval_outcome,
+        "classification_dispatch_status": classification_dispatch_status,
+        "downstream_action": downstream_action,
+        "terminal_blocked": terminal_blocked,
+        "thin_retrieval_blocked": thin_retrieval_blocked,
+        "requires_upstream_retrieval_expansion": retrieval_outcome == "insufficient_evidence",
+        "structural_unanswerability_proof_refs": sorted(
+            {
+                str(cert["structural_unanswerability_proof_ref"])
+                for cert in structurally_unanswerable
+                if _is_non_empty_string(cert.get("structural_unanswerability_proof_ref"))
+            }
+        ),
+        "certificate_statuses": sorted(set(certificate_statuses)),
+        "blocking_reason_codes": sorted(set(blocked_reason_codes)),
+        "unsatisfied_requirement_codes": sorted(set(unsatisfied_requirement_codes)),
+        "authority_boundary": {
+            "retrieval_sufficiency_authority": True,
+            "researcher_classification_authority": False,
+            "forecast_authority": False,
+            "scae_authority": False,
+        },
+    }
+
+
 def finalize_retrieval_packet_for_dispatch(
     packet: dict[str, Any],
     *,
@@ -4281,24 +4340,35 @@ def finalize_retrieval_packet_for_dispatch(
         }
     )
     all_allowed = bool(certificates) and all(cert.get("classification_dispatch_allowed") is True for cert in certificates)
+    classification_dispatch_status = "allowed" if all_allowed else "blocked_insufficient_research"
+    unsatisfied_requirement_codes = sorted(
+        {
+            code
+            for cert in certificates
+            for code in cert.get("unsatisfied_requirement_codes", [])
+            if _is_non_empty_string(code)
+        }
+    )
+    outcome_state = build_retrieval_outcome_state(
+        certificates=certificates,
+        classification_dispatch_status=classification_dispatch_status,
+        blocked_reason_codes=blocked_codes or ([] if all_allowed else ["research_sufficiency_not_met"]),
+        unsatisfied_requirement_codes=unsatisfied_requirement_codes,
+    )
     packet_copy["leaf_research_sufficiency_certificates"] = certificates
     packet_copy["research_sufficiency_summary"] = {
         "all_required_leaves_certified": all_allowed,
-        "classification_dispatch_status": "allowed" if all_allowed else "blocked_insufficient_research",
+        "classification_dispatch_status": classification_dispatch_status,
         "leaf_certificate_refs": cert_refs,
         "feature_id": "RET-008",
         "certificate_status": "complete" if all_allowed else "blocked",
-        "unsatisfied_requirement_codes": sorted(
-            {
-                code
-                for cert in certificates
-                for code in cert.get("unsatisfied_requirement_codes", [])
-                if _is_non_empty_string(code)
-            }
-        ),
+        "retrieval_outcome": outcome_state["retrieval_outcome"],
+        "retrieval_downstream_action": outcome_state["downstream_action"],
+        "unsatisfied_requirement_codes": unsatisfied_requirement_codes,
         "blocking_reason_codes": blocked_codes or ([] if all_allowed else ["research_sufficiency_not_met"]),
         "certifier_version": RESEARCH_SUFFICIENCY_CERTIFIER_VERSION,
     }
+    packet_copy["retrieval_outcome_state"] = outcome_state
     packet_copy.setdefault("schema_feature_gates", {})["RET-008"] = "implemented"
     packet_copy.setdefault("schema_feature_gates", {})["RET-006"] = "implemented"
     packet_copy.setdefault("validation_summary", {}).setdefault("reason_codes", []).append(
@@ -6340,6 +6410,57 @@ def validate_research_sufficiency_dispatch_gate(packet: dict[str, Any], errors: 
     if status in {"allowed", "blocked_insufficient_research"}:
         if sorted(summary.get("leaf_certificate_refs", [])) != sorted(cert_refs):
             errors.append("research_sufficiency_summary.leaf_certificate_refs must match certificate ids")
+        _validate_retrieval_outcome_state(packet.get("retrieval_outcome_state"), summary, certificates, errors)
+
+
+def _validate_retrieval_outcome_state(
+    value: Any,
+    summary: dict[str, Any],
+    certificates_by_leaf: dict[Any, dict[str, Any]],
+    errors: list[str],
+) -> None:
+    if not isinstance(value, dict):
+        errors.append("retrieval_outcome_state is required for terminal retrieval sufficiency summaries")
+        return
+    if value.get("artifact_type") != "retrieval_outcome_state":
+        errors.append("retrieval_outcome_state.artifact_type must be retrieval_outcome_state")
+    if value.get("schema_version") != "retrieval-outcome-state/v1":
+        errors.append("retrieval_outcome_state.schema_version must be retrieval-outcome-state/v1")
+    status = summary.get("classification_dispatch_status")
+    if value.get("classification_dispatch_status") != status:
+        errors.append("retrieval_outcome_state.classification_dispatch_status must match summary")
+    allowed_outcomes = {"evidence_sufficient", "structural_unanswerability", "insufficient_evidence"}
+    if value.get("retrieval_outcome") not in allowed_outcomes:
+        errors.append("retrieval_outcome_state.retrieval_outcome is invalid")
+    if summary.get("retrieval_outcome") != value.get("retrieval_outcome"):
+        errors.append("research_sufficiency_summary.retrieval_outcome must match retrieval_outcome_state")
+    if summary.get("retrieval_downstream_action") != value.get("downstream_action"):
+        errors.append("research_sufficiency_summary.retrieval_downstream_action must match retrieval_outcome_state")
+    certificate_statuses = {
+        str(cert.get("status"))
+        for cert in certificates_by_leaf.values()
+        if isinstance(cert, dict) and _is_non_empty_string(cert.get("status"))
+    }
+    if status == "blocked_insufficient_research":
+        if value.get("retrieval_outcome") != "insufficient_evidence":
+            errors.append("blocked retrieval must have insufficient_evidence outcome")
+        if value.get("terminal_blocked") is not True:
+            errors.append("blocked retrieval outcome must be terminal_blocked")
+        if value.get("requires_upstream_retrieval_expansion") is not True:
+            errors.append("blocked retrieval outcome must require upstream retrieval expansion")
+    if status == "allowed" and certificate_statuses == {"structurally_unanswerable"}:
+        if value.get("retrieval_outcome") != "structural_unanswerability":
+            errors.append("structurally unanswerable retrieval must have structural_unanswerability outcome")
+        if value.get("downstream_action") != "dispatch_unanswerability_confirmation":
+            errors.append("structural unanswerability outcome must dispatch unanswerability confirmation")
+    if status == "allowed" and "structurally_unanswerable" not in certificate_statuses:
+        if value.get("retrieval_outcome") != "evidence_sufficient":
+            errors.append("evidence-certified retrieval must have evidence_sufficient outcome")
+    boundary = value.get("authority_boundary")
+    if not isinstance(boundary, dict):
+        errors.append("retrieval_outcome_state.authority_boundary must be an object")
+    elif boundary.get("forecast_authority") is not False or boundary.get("scae_authority") is not False:
+        errors.append("retrieval_outcome_state.authority_boundary must not grant forecast or SCAE authority")
 
 
 def validate_retrieval_packet(packet: dict[str, Any]) -> RetrievalValidationResult:
