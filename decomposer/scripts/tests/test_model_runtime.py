@@ -23,6 +23,7 @@ from ads_decomposer.model_runtime import (  # noqa: E402
     _openclaw_agent_prompt,
     _parse_openclaw_agent_stdout,
     resolve_model_runtime_lane,
+    scan_forbidden_model_outputs,
 )
 
 
@@ -174,6 +175,37 @@ class ModelRuntimeContractTest(unittest.TestCase):
         self.assertEqual(runtime["execution_status"], "failed_forbidden_output")
         self.assertEqual(runtime["forbidden_output_scan"]["status"], "failed")
         self.assertEqual(runtime["forbidden_output_scan"]["matches"][0]["match_type"], "key")
+
+    def test_declarative_forbidden_outputs_list_does_not_fail_scan(self) -> None:
+        scan = scan_forbidden_model_outputs(
+            {
+                "ok": True,
+                "required_leaf_questions": [
+                    {
+                        "leaf_id": "leaf-a",
+                        "forbidden_outputs": ["probability", "fair_value", "final_forecast"],
+                    }
+                ],
+            }
+        )
+
+        self.assertEqual(scan["status"], "passed")
+
+    def test_active_forbidden_values_still_fail_scan(self) -> None:
+        scan = scan_forbidden_model_outputs(
+            {
+                "ok": True,
+                "required_leaf_questions": [
+                    {
+                        "leaf_id": "leaf-a",
+                        "classification_target": "probability",
+                    }
+                ],
+            }
+        )
+
+        self.assertEqual(scan["status"], "failed")
+        self.assertEqual(scan["matches"][0]["path"], "response.required_leaf_questions[0].classification_target")
 
     def test_schema_repair_is_bounded_and_records_repair_count(self) -> None:
         def repairer(_value: Any, _errors: list[str]) -> dict[str, Any]:

@@ -33,6 +33,7 @@ from ads_decomposer.model_runtime import (  # noqa: E402
 from ads_decomposer.qdt import (  # noqa: E402
     ALLOWED_CONDITION_SCOPES,
     ALLOWED_PURPOSES,
+    ALLOWED_RELATED_CONTEXT_USAGE_STATUS,
     ALLOWED_RESEARCH_PRIORITIES,
     COMPACT_DEFAULT_LEAF_BUDGET,
     QUESTION_DECOMPOSITION_SCHEMA_VERSION,
@@ -565,6 +566,45 @@ def _response_repairer(response: Any, _errors: list[str]) -> Any:
     return _ensure_model_candidate_contract_shape(repaired)
 
 
+def _handoff_related_context_usage(handoff: dict[str, Any]) -> dict[str, Any]:
+    ref = handoff.get("artifact_refs", {}).get("related_market_context", {})
+    artifact_type = ref.get("artifact_type") if isinstance(ref, dict) else None
+    if artifact_type == "related-live-market-context":
+        status = "related_context_used"
+    elif artifact_type == "no-related-context-waiver":
+        status = "no_related_context_waiver"
+    else:
+        status = "not_used"
+    return {
+        "usage_status": status,
+        "related_context_artifact_ref": ref.get("artifact_id") if isinstance(ref, dict) else None,
+        "amrg_usage_refs": [],
+        "weak_context_only": status != "related_context_used",
+        "anchor_dependency_status": "not_declared_phase2",
+    }
+
+
+def _model_related_context_usage(
+    handoff: dict[str, Any],
+    model_payload: dict[str, Any],
+) -> dict[str, Any] | None:
+    usage = model_payload.get("related_market_context_usage")
+    if not isinstance(usage, dict):
+        return None
+    usage_status = usage.get("usage_status")
+    if usage_status in ALLOWED_RELATED_CONTEXT_USAGE_STATUS:
+        return usage
+    fallback = _handoff_related_context_usage(handoff)
+    repaired = dict(fallback)
+    if isinstance(usage.get("amrg_usage_refs"), list):
+        repaired["amrg_usage_refs"] = [
+            str(ref) for ref in usage["amrg_usage_refs"] if isinstance(ref, str) and ref.strip()
+        ]
+    if isinstance(usage.get("anchor_dependency_status"), str) and usage["anchor_dependency_status"].strip():
+        repaired["anchor_dependency_status"] = usage["anchor_dependency_status"]
+    return repaired
+
+
 def _candidate_from_model_payload(
     handoff: dict[str, Any],
     model_payload: dict[str, Any],
@@ -580,9 +620,7 @@ def _candidate_from_model_payload(
         branches=model_payload["branches"],
         required_leaf_questions=model_payload["required_leaf_questions"],
         market_complexity_score=float(model_payload.get("market_complexity_score", 0.62)),
-        related_market_context_usage=model_payload.get("related_market_context_usage")
-        if isinstance(model_payload.get("related_market_context_usage"), dict)
-        else None,
+        related_market_context_usage=_model_related_context_usage(handoff, model_payload),
         amrg_anchor_dependency_contracts=model_payload.get("amrg_anchor_dependency_contracts")
         if isinstance(model_payload.get("amrg_anchor_dependency_contracts"), list)
         else None,

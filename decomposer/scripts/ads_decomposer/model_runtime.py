@@ -68,6 +68,9 @@ FORBIDDEN_OUTPUT_VALUES = {
     "macro_probability",
     "sub_forecast_probability",
 }
+DECLARATIVE_FORBIDDEN_OUTPUT_LIST_KEYS = {
+    "forbidden_outputs",
+}
 NON_REPAIRABLE_VALIDATION_ERROR_MARKERS = (
     "ambiguous_terms_not_decomposed",
     "insufficient_material_leaf_count",
@@ -219,17 +222,33 @@ def _normalized_field_name(value: Any) -> str:
     return normalized.strip("_")
 
 
-def _collect_forbidden_outputs(value: Any, matches: list[dict[str, str]], path: str = "response") -> None:
+def _collect_forbidden_outputs(
+    value: Any,
+    matches: list[dict[str, str]],
+    path: str = "response",
+    *,
+    declarative_forbidden_list: bool = False,
+) -> None:
     if isinstance(value, dict):
         for key, child in value.items():
             normalized = _normalized_field_name(key)
             if any(fragment in normalized for fragment in FORBIDDEN_OUTPUT_KEY_FRAGMENTS):
                 matches.append({"path": f"{path}.{key}", "match_type": "key", "matched": normalized})
-            _collect_forbidden_outputs(child, matches, f"{path}.{key}")
+            _collect_forbidden_outputs(
+                child,
+                matches,
+                f"{path}.{key}",
+                declarative_forbidden_list=normalized in DECLARATIVE_FORBIDDEN_OUTPUT_LIST_KEYS,
+            )
     elif isinstance(value, list):
         for idx, child in enumerate(value):
-            _collect_forbidden_outputs(child, matches, f"{path}[{idx}]")
-    elif isinstance(value, str):
+            _collect_forbidden_outputs(
+                child,
+                matches,
+                f"{path}[{idx}]",
+                declarative_forbidden_list=declarative_forbidden_list,
+            )
+    elif isinstance(value, str) and not declarative_forbidden_list:
         normalized = _normalized_field_name(value)
         if normalized in FORBIDDEN_OUTPUT_VALUES:
             matches.append({"path": path, "match_type": "value", "matched": normalized})

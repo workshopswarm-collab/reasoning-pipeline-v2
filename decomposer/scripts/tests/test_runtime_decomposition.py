@@ -284,6 +284,31 @@ class RuntimeDecompositionEntrypointTest(unittest.TestCase):
             )
         )
 
+    def test_invalid_related_context_usage_status_falls_back_to_handoff(self) -> None:
+        handoff = self._handoff()
+        repairable = build_question_specific_fixture_response(handoff)
+        repairable["related_market_context_usage"] = {
+            "usage_status": "used_as_weak_context",
+            "related_context_artifact_ref": "artifact:model-drift-ref",
+            "amrg_usage_refs": [],
+            "weak_context_only": True,
+            "anchor_dependency_status": "model_declared",
+        }
+        repairable["related_market_context_usage"]["amrg_usage_refs"] = ["hint-a"]
+
+        qdt, runtime = build_question_decomposition_from_handoff(
+            handoff,
+            runtime_mode="fixture",
+            fixture_response=repairable,
+        )
+
+        self.assertTrue(validate_question_decomposition(qdt).valid)
+        self.assertEqual(runtime["execution_status"], "succeeded")
+        usage = qdt["related_market_context_usage"]
+        self.assertEqual(usage["usage_status"], "related_context_used")
+        self.assertEqual(usage["related_context_artifact_ref"], "artifact:amrg-runtime-1")
+        self.assertEqual(usage["amrg_usage_refs"], ["hint-a"])
+
     def test_schema_repair_unwraps_nested_model_candidate_payload(self) -> None:
         handoff = self._handoff()
         nested = {

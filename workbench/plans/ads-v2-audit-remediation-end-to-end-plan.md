@@ -57,16 +57,16 @@ The following items are implemented and removed from active implementation scope
 | AMRG optional-policy readiness signal | Implemented for the current default policy. Readiness already reports `assist_not_requested_by_policy` when `default_requested=false`; active work is policy proof/sign-off, not rebuilding the AMRG assist lane. | `orchestrator/scripts/predquant/ads_live_readiness.py`, `orchestrator/scripts/tests/test_ads_live_readiness.py`. |
 | Canary/report harnesses | Implemented. Existing scripts should be reused for clone-only proof and compact reports; do not add another harness unless a specific missing summary blocks Phase 2 or Phase 5 proof. | `orchestrator/scripts/bin/run_ads_one_case_canary.py`, `report_ads_real_runtime_canary.py`, `report_ads_handoffs.py`, `report_ads_operator_review.py`, `check_ads_live_readiness.py`. |
 | QDT coverage repair truthfulness | Implemented. Repair-required coverage summaries and repair-needed unanswered material questions now fail `research_coverage_check`, while explicit structural unanswerability remains allowed. Candidate scoring penalizes repair-required coverage. | Phase 1 change; `decomposer/scripts/tests/test_qdt.py`, `test_runtime_decomposition.py`, full decomposer discovery, and `orchestrator/scripts/tests/test_ads_operational_canary.py`. |
+| Representative retrieval blocker proof | Implemented for Phase 2. Two clone-only representative runs reached live retrieval with real candidates/fetches, failed strict acceptance on specific source/freshness/protected-primary/admitted-evidence dimensions, and blocked researcher dispatch with `acceptance_unmet_not_blocked_count=0`. | Phase 2 change; run `ads-pipeline-run:9f5fe6d27a39163ef2a2ec95b5c29fc536643b015dc0c8386463ff2e748e87dd` for Bank of Israel decrease and run `ads-pipeline-run:a863dbde06f469d22a53d2407dc9c7309d9c14a060adfa394af334050a21dbc1` for RBNZ increase. |
 
 ## What Is Still Not Implemented Or Not Yet Proven
 
 These are the only active plan items.
 
-1. Representative live retrieval acceptance is not yet proven beyond controlled fixtures. The repo has strong controlled tests, acceptance gates, and canary/report scripts, but the post-push clone run still failed live acceptance on source family, freshness, and protected-primary dimensions.
-2. AMRG model assist runtime proof remains a policy sign-off item. The model lane exists and is contract-tested, and current optional readiness already reports `assist_not_requested_by_policy`; do not build a new AMRG lane unless VM changes the policy to require live assist.
-3. Readiness display semantics still need tightening. `true_runtime_cutover_status` exists, but `build_live_readiness_report()` can still emit top-level `status: ready` when `true_runtime_cutover_ready=false` if no other issues are present.
-4. Orchestrator test discovery is still cwd-sensitive. From `/Users/agent2/.openclaw/orchestrator`, `python3 -m unittest discover -s scripts/tests -p 'test_*.py'` fails because two tests invoke `orchestrator/scripts/bin/...` from inside the `orchestrator/` directory.
-5. The final representative clone-only batch has not been run after the QDT phase-6 work. End-to-end remediation should not be declared complete until that batch has no unexpected failures and at least one scoreable success.
+1. AMRG model assist runtime proof remains a policy sign-off item. The model lane exists and is contract-tested, and current optional readiness already reports `assist_not_requested_by_policy`; do not build a new AMRG lane unless VM changes the policy to require live assist.
+2. Readiness display semantics still need tightening. `true_runtime_cutover_status` exists, but `build_live_readiness_report()` can still emit top-level `status: ready` when `true_runtime_cutover_ready=false` if no other issues are present.
+3. Orchestrator test discovery is still cwd-sensitive. From `/Users/agent2/.openclaw/orchestrator`, `python3 -m unittest discover -s scripts/tests -p 'test_*.py'` fails because two tests invoke `orchestrator/scripts/bin/...` from inside the `orchestrator/` directory.
+4. The final representative clone-only batch has not been run after the Phase 2 blocker proof. End-to-end remediation should not be declared complete until that batch has no unexpected failures and at least one scoreable success.
 
 ## Non-Negotiable Runtime Invariants
 
@@ -160,6 +160,8 @@ Success criteria:
 
 ## Phase 2 - Representative Live Retrieval Acceptance
 
+Status: completed as representative live insufficiency proof. Preserve the tests and clone-run pattern as regression coverage while continuing with Phase 3.
+
 Goal: prove retrieval acceptance on representative real clone-only cases, or produce a precise insufficiency/unanswerability blocker without unblocked downstream advancement.
 
 Why this remains:
@@ -167,6 +169,27 @@ Why this remains:
 - The 21 source/retrieval implementation items are complete.
 - The controlled search canary proves the positive path.
 - The post-push real clone canary still failed live acceptance with zero independent non-market source families, zero freshness satisfaction, and zero protected-primary satisfaction.
+
+Phase result:
+
+- `ads-pipeline-run:9f5fe6d27a39163ef2a2ec95b5c29fc536643b015dc0c8386463ff2e748e87dd`, Bank of Israel decrease market:
+  - QDT model executed, retrieval reached live runtime, and external source discovery was proven.
+  - Retrieval found `6` real candidates, made `10` fetch attempts, and admitted `3` evidence refs.
+  - Strict acceptance remained false because freshness, protected-primary, independent non-market source family, source/claim family diversity, and related breadth dimensions were unmet.
+  - `classification_dispatch_allowed=false`, `blocked_when_acceptance_unmet_count=1`, and `acceptance_unmet_not_blocked_count=0`.
+- `ads-pipeline-run:a863dbde06f469d22a53d2407dc9c7309d9c14a060adfa394af334050a21dbc1`, RBNZ increase market:
+  - QDT end-to-end quality passed, retrieval reached live runtime, and external source discovery was proven.
+  - Retrieval found `6` real candidates and made `10` fetch attempts, but admitted `0` evidence refs.
+  - Strict acceptance remained false because admitted evidence, freshness, protected-primary, independent non-market source family, and source/claim family breadth were unmet.
+  - `classification_dispatch_allowed=false`, `blocked_when_acceptance_unmet_count=1`, and `acceptance_unmet_not_blocked_count=0`.
+- Phase 2 therefore closes as a blocker-proof phase, not as scoreable positive proof. The remaining need for at least one `scoreable_success` stays in Phase 5.
+
+Implementation note:
+
+- During Phase 2, live QDT execution exposed two pre-retrieval runtime-shape bugs that would have prevented representative retrieval proof:
+  - Declarative `forbidden_outputs` values such as `probability` and `fair_value` were incorrectly treated as active forbidden model outputs.
+  - Model-supplied `related_market_context_usage.usage_status` enum drift could block QDT materialization even though the handoff contains deterministic AMRG usage state.
+- Both are fixed as deterministic runtime/schema handling. This is not a relaxation of retrieval acceptance.
 
 Implementation:
 
