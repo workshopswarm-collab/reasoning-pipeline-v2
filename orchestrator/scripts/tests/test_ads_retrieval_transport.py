@@ -238,8 +238,27 @@ class AdsRetrievalTransportTest(unittest.TestCase):
         self.assertEqual(diagnostics["direct_url_capture_status"], "executed")
         self.assertTrue(diagnostics["browser_search_executed"])
         self.assertEqual(diagnostics["browser_search_status"], "executed")
+        self.assertEqual(diagnostics["search_candidate_discovery_status"], "executed_with_candidates")
+        self.assertFalse(diagnostics["search_failure_blocks_sufficiency"])
         self.assertFalse(diagnostics["native_research_model_executed"])
         self.assertEqual(diagnostics["native_research_status"], "disabled")
+        self.assertEqual(diagnostics["search_candidate_url_count"], 1)
+        search_candidate = transport.search_candidate_urls[0]
+        self.assertEqual(search_candidate["schema_version"], "search-candidate-url/v1")
+        self.assertEqual(search_candidate["artifact_type"], "search_candidate_url")
+        self.assertEqual(search_candidate["url"], "https://secondary.example/report")
+        self.assertEqual(search_candidate["canonical_url"], "https://secondary.example/report")
+        self.assertEqual(search_candidate["leaf_id"], "leaf-resolution-mechanics")
+        self.assertTrue(search_candidate["query_variant_id"])
+        self.assertEqual(search_candidate["rank"], 1)
+        self.assertEqual(search_candidate["provider_id"], "openclaw_web_fetch_browser")
+        self.assertEqual(search_candidate["searched_at"], FORECAST_AT)
+        self.assertFalse(search_candidate["web_fetch_used_for_search"])
+        self.assertTrue(search_candidate["fetch_required_before_admission"])
+        self.assertEqual(
+            transport.fetched_candidates[-1]["search_candidate_url_ref"],
+            search_candidate["search_candidate_url_id"],
+        )
 
     def test_market_url_does_not_satisfy_event_protected_primary(self) -> None:
         provider = FakeBrowserProvider()
@@ -262,6 +281,15 @@ class AdsRetrievalTransportTest(unittest.TestCase):
         self.assertEqual(candidate["direct_url_source_ref"], "case_contract.market_url")
         self.assertEqual(candidate["source_class"], "market_rules_or_resolution_source")
         self.assertEqual(candidate["source_class_resolution_method"], "market_platform_resolution_url")
+        diagnostics = transport.transport_diagnostics
+        self.assertEqual(diagnostics["direct_url_candidate_count"], 1)
+        self.assertEqual(diagnostics["direct_url_fetch_attempt_count"], 1)
+        self.assertEqual(diagnostics["search_candidate_url_count"], 0)
+        self.assertEqual(diagnostics["search_call_count"], 0)
+        self.assertFalse(diagnostics["browser_search_executed"])
+        self.assertEqual(diagnostics["browser_search_status"], "disabled")
+        self.assertEqual(diagnostics["search_candidate_discovery_status"], "disabled")
+        self.assertFalse(diagnostics["search_failure_blocks_sufficiency"])
 
         packet = build_live_retrieval_packet_from_candidates(
             self._source_of_truth_qdt(),
@@ -418,6 +446,17 @@ class AdsRetrievalTransportTest(unittest.TestCase):
         self.assertEqual(diagnostics["browser_provider_status"], "available")
         self.assertTrue(diagnostics["browser_fetch_configured"])
         self.assertFalse(diagnostics["browser_search_configured"])
+        self.assertFalse(diagnostics["browser_search_executed"])
+        self.assertEqual(diagnostics["browser_search_status"], "not_configured")
+        self.assertEqual(diagnostics["search_candidate_discovery_status"], "search_transport_unavailable")
+        self.assertEqual(diagnostics["search_call_count"], 0)
+        self.assertGreater(diagnostics["search_call_skipped_count"], 0)
+        self.assertEqual(
+            diagnostics["search_skipped_diagnostics"][0]["reason_code"],
+            "search_transport_unavailable",
+        )
+        self.assertTrue(diagnostics["search_failure_blocks_sufficiency"])
+        self.assertIn("search_transport_unavailable", diagnostics["bounded_retrieval_reason_codes"])
         self.assertEqual(diagnostics["browser_provider_diagnostics"]["provider_id"], "diagnostics-provider")
         self.assertEqual(
             diagnostics["browser_provider_diagnostics"]["provider_authority_status"],
@@ -903,8 +942,16 @@ class AdsRetrievalTransportTest(unittest.TestCase):
         )
 
         self.assertEqual(transport.transport_diagnostics["search_failure_count"], 1)
+        self.assertEqual(transport.transport_diagnostics["search_candidate_url_count"], 0)
+        self.assertEqual(
+            transport.transport_diagnostics["search_candidate_discovery_status"],
+            "executed_with_failures",
+        )
+        self.assertTrue(transport.transport_diagnostics["search_failure_blocks_sufficiency"])
+        self.assertEqual(transport.transport_diagnostics["browser_search_status"], "executed_with_failures")
         self.assertIn("search_provider_failure_recorded", transport.transport_diagnostics["bounded_retrieval_reason_codes"])
         self.assertEqual(transport.transport_diagnostics["search_failure_diagnostics"][0]["reason_code"], "browser_provider_search_exception")
+        self.assertEqual(transport.transport_diagnostics["search_failure_diagnostics"][0]["error_class"], "TimeoutError")
         self.assertEqual(
             packet["research_sufficiency_summary"]["classification_dispatch_status"],
             "blocked_insufficient_research",

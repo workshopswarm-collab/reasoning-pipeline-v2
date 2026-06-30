@@ -4996,7 +4996,7 @@ def _materialize_search_candidate_url_records(
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     records: list[dict[str, Any]] = []
     diagnostics: list[dict[str, Any]] = []
-    seen_by_variant: dict[str, set[str]] = {}
+    seen_by_leaf_url: dict[str, dict[str, str]] = {}
     for raw in search_candidate_urls or []:
         if not isinstance(raw, dict):
             raise RetrievalPacketError("search_candidate_urls must contain objects")
@@ -5026,8 +5026,9 @@ def _materialize_search_candidate_url_records(
             )
             continue
         canonical_url = canonicalize_source_url(raw.get("canonical_url"), raw.get("url"))
-        seen_urls = seen_by_variant.setdefault(variant_key, set())
-        if canonical_url in seen_urls:
+        seen_urls = seen_by_leaf_url.setdefault(leaf_id, {})
+        duplicate_ref = seen_urls.get(canonical_url)
+        if duplicate_ref:
             diagnostics.append(
                 {
                     "schema_version": "search-candidate-url-omission/v1",
@@ -5037,28 +5038,30 @@ def _materialize_search_candidate_url_records(
                     "rank": rank,
                     "url": raw.get("url"),
                     "canonical_url": canonical_url,
+                    "duplicate_of_search_candidate_url_ref": duplicate_ref,
                     "omission_reason_codes": ["duplicate_search_candidate_url"],
                 }
             )
             continue
-        seen_urls.add(canonical_url)
         if raw.get("schema_version") == SEARCH_CANDIDATE_URL_SCHEMA_VERSION:
-            records.append(copy.deepcopy(raw))
+            record = copy.deepcopy(raw)
+            records.append(record)
+            seen_urls[canonical_url] = str(record.get("search_candidate_url_id") or "")
             continue
-        records.append(
-            build_search_candidate_url(
-                context,
-                variant,
-                rank=rank,
-                url=str(raw.get("url") or raw.get("canonical_url") or ""),
-                title=str(raw.get("title") or ""),
-                snippet=str(raw.get("snippet") or ""),
-                provider_id=str(raw.get("provider_id") or OPENCLAW_BROWSER_PROVIDER_ID),
-                searched_at=str(raw.get("searched_at") or searched_at),
-                result_source=str(raw.get("result_source") or "configured_browser_search_provider"),
-                query_role=role,
-            )
+        record = build_search_candidate_url(
+            context,
+            variant,
+            rank=rank,
+            url=str(raw.get("url") or raw.get("canonical_url") or ""),
+            title=str(raw.get("title") or ""),
+            snippet=str(raw.get("snippet") or ""),
+            provider_id=str(raw.get("provider_id") or OPENCLAW_BROWSER_PROVIDER_ID),
+            searched_at=str(raw.get("searched_at") or searched_at),
+            result_source=str(raw.get("result_source") or "configured_browser_search_provider"),
+            query_role=role,
         )
+        records.append(record)
+        seen_urls[canonical_url] = str(record.get("search_candidate_url_id") or "")
     return records, diagnostics
 
 
@@ -5488,6 +5491,10 @@ def build_live_retrieval_packet_from_candidates(
         "browser_search_status": "executed"
         if web_search_attempt_count > 0 or search_candidate_records
         else "not_executed",
+        "search_candidate_discovery_status": "executed_with_candidates"
+        if search_candidate_records
+        else "not_executed",
+        "search_failure_blocks_sufficiency": False,
         "native_research_model_executed": native_candidate_discovery_count > 0,
         "native_research_status": "executed" if native_candidate_discovery_count > 0 else "not_executed",
         "metadata_classifier_assist_executed": metadata_classifier_slice_count > 0,

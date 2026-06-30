@@ -171,6 +171,27 @@ def _browser_search_status(
     return "executed"
 
 
+def _search_candidate_discovery_status(
+    *,
+    policy: RetrievalProviderPolicy,
+    browser_search_configured: bool,
+    search_call_count: int,
+    search_failure_count: int,
+    search_candidate_url_count: int,
+) -> str:
+    if not policy.broad_search_enabled:
+        return "disabled"
+    if not browser_search_configured:
+        return "search_transport_unavailable"
+    if search_call_count <= 0:
+        return "not_executed"
+    if search_failure_count > 0:
+        return "executed_with_failures"
+    if search_candidate_url_count > 0:
+        return "executed_with_candidates"
+    return "executed_no_candidates"
+
+
 def _native_research_status(
     *,
     policy: RetrievalProviderPolicy,
@@ -265,6 +286,17 @@ def collect_live_retrieval_candidates(
         for context in contexts:
             variants = context.get("query_variants") if isinstance(context.get("query_variants"), list) else []
             for variant in variants[: policy.max_search_variants_per_leaf]:
+                if not browser_search_configured:
+                    search_call_skipped_count += 1
+                    search_skipped_diagnostics.append(
+                        _search_query_diagnostic(
+                            context,
+                            variant,
+                            reason_code="search_transport_unavailable",
+                            detail="browser_search_provider_not_configured",
+                        )
+                    )
+                    continue
                 skip_reason = _search_skip_reason(
                     search_call_count=search_call_count,
                     max_total_search_calls=max(0, policy.max_total_search_calls),
@@ -294,6 +326,7 @@ def collect_live_retrieval_candidates(
                             variant,
                             reason_code="browser_provider_search_exception",
                             detail=str(exc)[:500] or exc.__class__.__name__,
+                            error_class=exc.__class__.__name__,
                         )
                     )
                     search_exception_recorded = True
@@ -307,6 +340,7 @@ def collect_live_retrieval_candidates(
                             reason_code="browser_provider_search_failed",
                             detail=provider_error,
                             elapsed_seconds=elapsed_seconds,
+                            error_class="ProviderReportedSearchError",
                         )
                     )
                 result.search_candidate_urls.extend(search_records)
@@ -317,7 +351,7 @@ def collect_live_retrieval_candidates(
                     search_result_fetch_count += 1
                     hint = {
                         "url": record.get("url") or record.get("canonical_url"),
-                        "source_ref": record.get("candidate_url_ref"),
+                        "source_ref": record.get("search_candidate_url_id") or record.get("candidate_url_ref"),
                         "source_class": None,
                         "source_class_resolution_method": None,
                         "deterministic_source_class_proof": False,
@@ -330,7 +364,7 @@ def collect_live_retrieval_candidates(
                             source_cutoff_timestamp=source_cutoff_timestamp,
                             browser_provider=browser_provider,
                             navigation_mode="web_search",
-                            search_candidate_url_ref=record.get("candidate_url_ref"),
+                            search_candidate_url_ref=record.get("search_candidate_url_id") or record.get("candidate_url_ref"),
                             deterministic_direct_url_source_classes=False,
                         )
                     )
@@ -365,6 +399,27 @@ def collect_live_retrieval_candidates(
     packet_safe_browser_provider_diagnostics = _packet_safe_provider_diagnostics(
         final_browser_provider_diagnostics
     )
+    search_candidate_discovery_status = _search_candidate_discovery_status(
+        policy=policy,
+        browser_search_configured=browser_search_configured,
+        search_call_count=search_call_count,
+        search_failure_count=len(search_failure_diagnostics),
+        search_candidate_url_count=len(result.search_candidate_urls),
+    )
+    search_failure_blocks_sufficiency = bool(
+        policy.broad_search_enabled
+        and (
+            search_failure_diagnostics
+            or (
+                len(result.search_candidate_urls) <= 0
+                and (
+                    not browser_search_configured
+                    or search_call_count > 0
+                    or search_call_skipped_count > 0
+                )
+            )
+        )
+    )
     result.transport_diagnostics = {
         "schema_version": "ads-retrieval-transport-diagnostics/v1",
         "browser_provider_status": "available"
@@ -389,6 +444,8 @@ def collect_live_retrieval_candidates(
             search_call_count=search_call_count,
             search_failure_count=len(search_failure_diagnostics),
         ),
+        "search_candidate_discovery_status": search_candidate_discovery_status,
+        "search_failure_blocks_sufficiency": search_failure_blocks_sufficiency,
         "native_research_model_executed": native_research_call_count > 0,
         "native_research_status": _native_research_status(
             policy=policy,
@@ -803,6 +860,7 @@ def _search_query_diagnostic(
     reason_code: str,
     detail: str | None = None,
     elapsed_seconds: float | None = None,
+    error_class: str | None = None,
 ) -> dict[str, Any]:
     diagnostic = {
         "leaf_id": context.get("leaf_id"),
@@ -813,6 +871,8 @@ def _search_query_diagnostic(
     }
     if detail:
         diagnostic["detail"] = detail[:500]
+    if error_class:
+        diagnostic["error_class"] = str(error_class)[:160]
     if elapsed_seconds is not None:
         diagnostic["elapsed_seconds"] = round(float(elapsed_seconds), 3)
     return diagnostic
@@ -824,7 +884,57 @@ def _search_candidate_urls(browser_provider: Any | None, context: dict[str, Any]
     records = browser_provider.search_candidate_urls(context, variant, searched_at=searched_at)
     if not isinstance(records, list):
         return []
-    return [record for record in records if isinstance(record, dict)]
+    return [
+        _materialize_search_candidate_record(
+            context,
+            variant,
+            record,
+            fallback_rank=index,
+            searched_at=searched_at,
+            provider_id=_search_provider_id(browser_provider),
+        )
+        for index, record in enumerate(records, start=1)
+        if isinstance(record, dict)
+    ]
+
+
+def _search_provider_id(browser_provider: Any | None) -> str:
+    from researcher_swarm.retrieval import OPENCLAW_BROWSER_PROVIDER_ID
+
+    diagnostics = _provider_diagnostics(browser_provider)
+    provider_id = str(
+        diagnostics.get("provider_id")
+        or getattr(browser_provider, "provider_id", "")
+        or OPENCLAW_BROWSER_PROVIDER_ID
+    ).strip()
+    return provider_id or OPENCLAW_BROWSER_PROVIDER_ID
+
+
+def _materialize_search_candidate_record(
+    context: dict[str, Any],
+    variant: dict[str, Any],
+    record: dict[str, Any],
+    *,
+    fallback_rank: int,
+    searched_at: str,
+    provider_id: str,
+) -> dict[str, Any]:
+    from researcher_swarm.retrieval import SEARCH_CANDIDATE_URL_SCHEMA_VERSION, build_search_candidate_url
+
+    if record.get("schema_version") == SEARCH_CANDIDATE_URL_SCHEMA_VERSION:
+        return dict(record)
+    return build_search_candidate_url(
+        context,
+        variant,
+        rank=int(record.get("rank") or record.get("result_rank") or fallback_rank),
+        url=str(record.get("url") or record.get("canonical_url") or ""),
+        title=str(record.get("title") or ""),
+        snippet=str(record.get("snippet") or ""),
+        provider_id=str(record.get("provider_id") or provider_id),
+        searched_at=str(record.get("searched_at") or searched_at),
+        result_source=str(record.get("result_source") or "configured_browser_search_provider"),
+        query_role=str(record.get("query_role") or variant.get("query_role") or "primary_leaf_retrieval"),
+    )
 
 
 def _strip_authority_fields(value: dict[str, Any]) -> dict[str, Any]:

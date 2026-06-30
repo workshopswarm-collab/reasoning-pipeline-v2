@@ -358,10 +358,10 @@ def _attach_live_retrieval_transport_metadata(
             transport_diagnostics.get("direct_url_capture_executed")
             or direct_url_candidate_count > 0
         )
-        browser_search_executed = bool(
-            transport_diagnostics.get("browser_search_executed")
-            or int(transport_diagnostics.get("search_call_count") or 0) > 0
-        )
+        if "browser_search_executed" in transport_diagnostics:
+            browser_search_executed = bool(transport_diagnostics.get("browser_search_executed"))
+        else:
+            browser_search_executed = bool(int(transport_diagnostics.get("search_call_count") or 0) > 0)
         native_research_executed = bool(
             transport_diagnostics.get("native_research_model_executed")
             or int(transport_diagnostics.get("native_research_call_count") or 0) > 0
@@ -395,6 +395,13 @@ def _attach_live_retrieval_transport_metadata(
                 "browser_search_call_count": int(transport_diagnostics.get("search_call_count") or 0),
                 "browser_search_failure_count": int(
                     transport_diagnostics.get("search_failure_count") or 0
+                ),
+                "search_candidate_discovery_status": str(
+                    transport_diagnostics.get("search_candidate_discovery_status")
+                    or ("executed" if browser_search_executed else "not_executed")
+                ),
+                "search_failure_blocks_sufficiency": bool(
+                    transport_diagnostics.get("search_failure_blocks_sufficiency")
                 ),
                 "native_research_model_executed": native_research_executed,
                 "native_research_status": str(

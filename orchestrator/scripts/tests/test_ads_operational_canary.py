@@ -1564,6 +1564,8 @@ class AdsOperationalCanaryTest(unittest.TestCase):
                         "search_candidate_url_count": 0,
                         "browser_search_executed": True,
                         "browser_search_status": "executed_with_failures",
+                        "search_candidate_discovery_status": "executed_with_failures",
+                        "search_failure_blocks_sufficiency": True,
                         "direct_url_capture_executed": True,
                         "direct_url_capture_status": "executed",
                         "duplicate_canonical_url_omissions": 1,
@@ -1573,6 +1575,8 @@ class AdsOperationalCanaryTest(unittest.TestCase):
                         "search_candidate_url_count": 0,
                         "browser_search_executed": True,
                         "browser_search_status": "executed_with_failures",
+                        "search_candidate_discovery_status": "executed_with_failures",
+                        "search_failure_blocks_sufficiency": True,
                     },
                     "ads_retrieval_direct_url_candidates": [
                         {"url": "https://boi.org.il/en/markets/schedule"},
@@ -1680,6 +1684,9 @@ class AdsOperationalCanaryTest(unittest.TestCase):
         self.assertEqual(packet["classification_dispatch_status"], "blocked_insufficient_research")
         self.assertTrue(packet["blocked_when_acceptance_unmet"])
         self.assertIn("independent_non_market_source_family", packet["acceptance_unmet_dimension_codes"])
+        self.assertIn("search_candidate_discovery", packet["acceptance_unmet_dimension_codes"])
+        self.assertEqual(packet["search_candidate_discovery_status"], "executed_with_failures")
+        self.assertTrue(packet["search_candidate_discovery_blocked"])
         self.assertEqual(evidence["search_candidates_materialized_count"], 0)
         self.assertEqual(evidence["planned_not_executed_expansion_count"], 2)
         self.assertEqual(evidence["hash_only_admitted_count"], 1)

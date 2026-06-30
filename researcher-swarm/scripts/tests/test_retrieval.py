@@ -2035,6 +2035,27 @@ class RetrievalPacketContractTest(unittest.TestCase):
         )
         self.assertEqual(packet["retrieval_runtime_summary"]["search_candidate_omission_count"], 2)
         self.assertEqual(packet["retrieval_runtime_summary"]["duplicate_canonical_url_omissions"], 1)
+        self.assertEqual(
+            packet["retrieval_runtime_summary"]["search_candidate_discovery_status"],
+            "executed_with_candidates",
+        )
+        duplicate_omissions = [
+            item
+            for item in packet["search_candidate_url_omissions"]
+            if "duplicate_search_candidate_url" in item.get("omission_reason_codes", [])
+        ]
+        self.assertEqual(len(duplicate_omissions), 1)
+        duplicate_omission = duplicate_omissions[0]
+        self.assertEqual(duplicate_omission["leaf_id"], context["leaf_id"])
+        self.assertEqual(
+            duplicate_omission["query_variant_id"],
+            context["query_variants"][0]["query_variant_id"],
+        )
+        self.assertTrue(duplicate_omission["canonical_url"])
+        self.assertIn(
+            duplicate_omission["duplicate_of_search_candidate_url_ref"],
+            {item["search_candidate_url_id"] for item in packet["search_candidate_urls"]},
+        )
         self.assertTrue(packet["retrieval_runtime_summary"]["web_fetch_is_url_fetch_not_search"])
         with self.assertRaisesRegex(RetrievalPacketError, "exceeds cap"):
             build_search_candidate_url(

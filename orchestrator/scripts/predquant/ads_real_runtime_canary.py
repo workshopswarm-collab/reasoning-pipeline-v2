@@ -799,6 +799,7 @@ def _source_collation_acceptance(
     admitted_ref_count: int,
     sufficiency: dict[str, Any],
     structural_unanswerability_certified: bool,
+    search_candidate_discovery_blocked: bool,
 ) -> dict[str, Any]:
     coverage_slices = _list_of_dicts(payload.get("retrieval_breadth_coverage_slices"))
     requirement_counts = _coverage_requirement_counts(payload, coverage_slices)
@@ -816,6 +817,8 @@ def _source_collation_acceptance(
         unmet.append("fetch_attempts")
     if admitted_ref_count <= 0:
         unmet.append("admitted_evidence")
+    if search_candidate_discovery_blocked:
+        unmet.append("search_candidate_discovery")
     if not non_market_family_ids:
         unmet.append("independent_non_market_source_family")
     if (
@@ -953,11 +956,13 @@ def _retrieval_runtime_evidence(manifests: list[dict[str, Any]]) -> dict[str, An
             or transport.get("direct_url_capture_executed") is True
             or direct_url_candidate_count > 0
         )
-        browser_search_executed = bool(
-            runtime_summary.get("browser_search_executed") is True
-            or transport.get("browser_search_executed") is True
-            or int(transport.get("search_call_count") or 0) > 0
-        )
+        if "browser_search_executed" in transport or "browser_search_executed" in runtime_summary:
+            browser_search_executed = bool(
+                runtime_summary.get("browser_search_executed") is True
+                or transport.get("browser_search_executed") is True
+            )
+        else:
+            browser_search_executed = bool(int(transport.get("search_call_count") or 0) > 0)
         native_research_model_executed = bool(
             runtime_summary.get("native_research_model_executed") is True
             or transport.get("native_research_model_executed") is True
@@ -977,6 +982,18 @@ def _retrieval_runtime_evidence(manifests: list[dict[str, Any]]) -> dict[str, An
             transport.get("browser_search_status")
             or runtime_summary.get("browser_search_status")
             or ("executed" if browser_search_executed else "not_executed")
+        )
+        search_candidate_discovery_status = str(
+            transport.get("search_candidate_discovery_status")
+            or runtime_summary.get("search_candidate_discovery_status")
+            or ("executed_with_candidates" if search_candidate_url_count > 0 else "not_executed")
+        )
+        search_candidate_discovery_blocked = bool(
+            transport.get("search_failure_blocks_sufficiency")
+            or runtime_summary.get("search_failure_blocks_sufficiency")
+            or browser_search_status == "executed_with_failures"
+            or search_candidate_discovery_status
+            in {"search_transport_unavailable", "executed_with_failures", "executed_no_candidates"}
         )
         native_research_status = str(
             transport.get("native_research_status")
@@ -1045,6 +1062,7 @@ def _retrieval_runtime_evidence(manifests: list[dict[str, Any]]) -> dict[str, An
             admitted_ref_count=len(admitted_refs),
             sufficiency=sufficiency,
             structural_unanswerability_certified=structural_unanswerability_certified,
+            search_candidate_discovery_blocked=search_candidate_discovery_blocked,
         )
         retrieval_gap = summarize_retrieval_gap(payload, admitted_refs=admitted_refs)
         source_populated_or_structural_unanswerability = bool(
@@ -1072,6 +1090,8 @@ def _retrieval_runtime_evidence(manifests: list[dict[str, Any]]) -> dict[str, An
                 "fetched_attempt_count": fetched_attempt_count,
                 "browser_search_executed": browser_search_executed,
                 "browser_search_status": browser_search_status,
+                "search_candidate_discovery_status": search_candidate_discovery_status,
+                "search_candidate_discovery_blocked": search_candidate_discovery_blocked,
                 "direct_url_capture_executed": direct_url_capture_executed,
                 "direct_url_capture_status": direct_url_capture_status,
                 "native_research_model_executed": native_research_model_executed,
