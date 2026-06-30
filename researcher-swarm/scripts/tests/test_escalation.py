@@ -291,8 +291,23 @@ class ResearcherEscalationContractTest(unittest.TestCase):
                     claim_family_id=f"claim-family-{context['leaf_id']}-secondary",
                 )
             )
+            if "expert_or_specialist" in context["sufficiency_requirements"].get("required_source_classes", []):
+                selected.append(
+                    self._evidence(
+                        context,
+                        attempt_ref=f"{context['leaf_id']}-expert",
+                        canonical_url=f"https://expert.example/{context['leaf_id']}",
+                        source_class="expert_or_specialist",
+                        source_family_id=f"source-family-{context['leaf_id']}-expert",
+                        claim_family_id=f"claim-family-{context['leaf_id']}-expert",
+                    )
+                )
         for item in selected:
-            text = f"Escalation certified excerpt for {item['transport_attempt_ref']}"
+            text = (
+                f"Escalation certified excerpt for {item['transport_attempt_ref']} with enough bounded "
+                "source detail for researcher classification. "
+                * 8
+            )
             chunk = build_evidence_chunk(
                 evidence_ref=item["evidence_ref"],
                 content_artifact_ref=f"artifact:browser-capture/{item['transport_attempt_ref']}",

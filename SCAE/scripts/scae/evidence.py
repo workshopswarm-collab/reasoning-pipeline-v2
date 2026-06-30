@@ -298,10 +298,17 @@ def _classification_certified_lineage_reasons(classification: dict[str, Any]) ->
         "evidence_ref": "evidence_ref_missing",
         "research_sufficiency_certificate_ref": "research_sufficiency_certificate_ref_missing",
         "retrieval_breadth_coverage_ref": "retrieval_breadth_coverage_ref_missing",
+        "certified_snippet_ref": "certified_snippet_ref_missing",
+        "certified_snippet_sha256": "certified_snippet_sha256_missing",
     }
     for field, reason in required_refs.items():
         if not _is_non_empty_string(classification.get(field)):
             reasons.append(reason)
+    snippet_sha = classification.get("certified_snippet_sha256")
+    if _is_non_empty_string(snippet_sha) and not str(snippet_sha).startswith("sha256:"):
+        reasons.append("certified_snippet_sha256_invalid")
+    if classification.get("certified_snippet_access_mode") != "bounded_certified_snippet":
+        reasons.append("certified_snippet_not_bounded")
 
     source_class = str(classification.get("source_class") or "").strip()
     if not source_class or source_class == "unknown":
@@ -365,7 +372,12 @@ def _candidate_status(
         if not classification_scoreable:
             if any(reason.startswith("temporal_gate_status") for reason in classification_reasons):
                 return "rejected_temporal_gate", classification_reasons
-            if any("not_certified" in reason or reason.endswith("_missing") for reason in classification_reasons):
+            if any(
+                "not_certified" in reason
+                or reason.endswith("_missing")
+                or reason.startswith("certified_snippet_")
+                for reason in classification_reasons
+            ):
                 return "rejected_uncertified_evidence", classification_reasons
             return "rejected_classification_not_accepted", classification_reasons
         if not quality_accepted:
@@ -378,7 +390,12 @@ def _candidate_status(
     if not classification_scoreable:
         if any(reason.startswith("temporal_gate_status") for reason in classification_reasons):
             return "rejected_temporal_gate", classification_reasons
-        if any("not_certified" in reason or reason.endswith("_missing") for reason in classification_reasons):
+        if any(
+            "not_certified" in reason
+            or reason.endswith("_missing")
+            or reason.startswith("certified_snippet_")
+            for reason in classification_reasons
+        ):
             return "rejected_uncertified_evidence", classification_reasons
         return "rejected_classification_not_accepted", classification_reasons
     if not quality_accepted:
@@ -551,6 +568,10 @@ def build_evidence_delta_candidate_slices(
             "claim_family_id": classification.get("claim_family_id"),
             "retrieval_breadth_coverage_ref": classification.get("retrieval_breadth_coverage_ref"),
             "research_sufficiency_certificate_ref": classification.get("research_sufficiency_certificate_ref"),
+            "certified_snippet_ref": classification.get("certified_snippet_ref"),
+            "certified_snippet_sha256": classification.get("certified_snippet_sha256"),
+            "certified_snippet_access_mode": classification.get("certified_snippet_access_mode"),
+            "certified_snippet_content_artifact_ref": classification.get("certified_snippet_content_artifact_ref"),
             "temporal_gate_status": classification.get("temporal_gate_status"),
             "certified_lineage_reason_codes": [
                 reason
@@ -558,6 +579,7 @@ def build_evidence_delta_candidate_slices(
                 if reason.startswith("temporal_gate_status")
                 or "not_certified" in reason
                 or reason.endswith("_missing")
+                or reason.startswith("certified_snippet_")
             ],
             "claimed_impact_direction": claimed_direction,
             "verified_direction": verified_direction,

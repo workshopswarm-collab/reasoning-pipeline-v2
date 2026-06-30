@@ -43,6 +43,7 @@ class ClassificationMatrixError(ValueError):
 @dataclass(frozen=True)
 class RetrievalLookups:
     evidence_by_ref: dict[str, dict[str, Any]]
+    chunks_by_ref: dict[str, dict[str, Any]]
     provenance_by_id: dict[str, dict[str, Any]]
     provenance_by_evidence_ref: dict[str, dict[str, Any]]
     certificate_by_id: dict[str, dict[str, Any]]
@@ -145,6 +146,12 @@ def _build_retrieval_lookups(retrieval_packet: dict[str, Any]) -> RetrievalLooku
                 raise ClassificationMatrixError(f"duplicate retrieval evidence ref: {evidence_ref}")
             evidence_by_ref[evidence_ref] = evidence
 
+    chunks_by_ref = {
+        str(chunk["chunk_ref"]): chunk
+        for chunk in retrieval_packet.get("evidence_chunks", [])
+        if isinstance(chunk, dict) and _is_non_empty_string(chunk.get("chunk_ref"))
+    }
+
     provenance_by_id: dict[str, dict[str, Any]] = {}
     provenance_by_evidence_ref: dict[str, dict[str, Any]] = {}
     for provenance in retrieval_packet.get("retrieval_evidence_provenance_slices", []):
@@ -167,6 +174,7 @@ def _build_retrieval_lookups(retrieval_packet: dict[str, Any]) -> RetrievalLooku
     }
     return RetrievalLookups(
         evidence_by_ref=evidence_by_ref,
+        chunks_by_ref=chunks_by_ref,
         provenance_by_id=provenance_by_id,
         provenance_by_evidence_ref=provenance_by_evidence_ref,
         certificate_by_id=certificate_by_id,
@@ -385,6 +393,34 @@ def _claim_family_resolution_ref(evidence: dict[str, Any], claim_family_id: str)
     return None
 
 
+def _certified_snippet_lineage(evidence: dict[str, Any], lookups: RetrievalLookups) -> dict[str, Any]:
+    chunk_refs = evidence.get("chunk_refs")
+    if not isinstance(chunk_refs, list):
+        return {}
+    for ref in chunk_refs:
+        if not _is_non_empty_string(ref):
+            continue
+        chunk = lookups.chunks_by_ref.get(str(ref))
+        if not isinstance(chunk, dict):
+            continue
+        if chunk.get("evidence_ref") != evidence.get("evidence_ref"):
+            continue
+        if str(chunk.get("excerpt_policy") or "") == "hash_only":
+            continue
+        if not _is_non_empty_string(chunk.get("content_artifact_ref")):
+            continue
+        if not _is_non_empty_string(chunk.get("text_sha256")):
+            continue
+        return {
+            "certified_snippet_ref": str(chunk["chunk_ref"]),
+            "certified_snippet_sha256": str(chunk["text_sha256"]),
+            "certified_snippet_access_mode": "bounded_certified_snippet",
+            "certified_snippet_content_artifact_ref": str(chunk["content_artifact_ref"]),
+            "certified_snippet_excerpt_policy": str(chunk.get("excerpt_policy") or "bounded_excerpt"),
+        }
+    return {}
+
+
 def _claim_family_ids_for_row(
     *,
     classification: dict[str, Any],
@@ -454,6 +490,7 @@ def _classification_slice(
     evidence: dict[str, Any],
     certificate: dict[str, Any],
     proof: dict[str, Any],
+    lookups: RetrievalLookups,
     claim_family_id: str,
     claim_split_status: str,
     claim_family_resolution_ref: str | None,
@@ -464,6 +501,7 @@ def _classification_slice(
     source_class = evidence.get("source_class")
     if not _is_non_empty_string(source_class) or source_class == "unknown":
         raise ClassificationMatrixError(f"{classification.get('classification_id')}: missing source_class")
+    snippet_lineage = _certified_snippet_lineage(evidence, lookups)
 
     row_seed = {
         "sidecar_id": sidecar.get("sidecar_id"),
@@ -502,6 +540,7 @@ def _classification_slice(
         "source_ref": evidence.get("canonical_source_id") or evidence.get("source_metadata_resolution_ref"),
         "canonical_source_id": evidence.get("canonical_source_id"),
         "source_metadata_resolution_ref": evidence.get("source_metadata_resolution_ref"),
+        **snippet_lineage,
         "source_class": source_class,
         "source_family_id": source_family_id,
         "claim_family_id": claim_family_id,
@@ -779,6 +818,7 @@ def materialize_classification_matrix(
                         evidence=evidence,
                         certificate=certificate,
                         proof=proof,
+                        lookups=lookups,
                         claim_family_id=claim_family_id,
                         claim_split_status=claim_split_status,
                         claim_family_resolution_ref=claim_family_resolution_ref,
@@ -853,6 +893,7 @@ def materialize_classification_matrix(
                         evidence=supplemental_evidence,
                         certificate=certificate,
                         proof=proof,
+                        lookups=lookups,
                         claim_family_id=claim_family_id,
                         claim_split_status=claim_split_status,
                         claim_family_resolution_ref=claim_family_resolution_ref,

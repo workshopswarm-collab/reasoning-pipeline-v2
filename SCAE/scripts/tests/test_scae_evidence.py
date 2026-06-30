@@ -48,6 +48,10 @@ class ScaeEvidenceDeltaTest(unittest.TestCase):
             "claim_family_id": "claim-family-1",
             "retrieval_breadth_coverage_ref": "coverage-1",
             "research_sufficiency_certificate_ref": "certificate-1",
+            "certified_snippet_ref": f"chunk-{slice_id}",
+            "certified_snippet_sha256": "sha256:" + "7" * 64,
+            "certified_snippet_access_mode": "bounded_certified_snippet",
+            "certified_snippet_content_artifact_ref": f"artifact:browser-capture/{slice_id}",
             "temporal_gate_status": temporal_gate_status,
             "impact_direction": direction,
             "evidence_strength": strength,
@@ -125,6 +129,8 @@ class ScaeEvidenceDeltaTest(unittest.TestCase):
         self.assertEqual(candidate["ledger_input_authority"], NO_LIVE_AUTHORITY)
         self.assertFalse(candidate["writes_scae_ledger"])
         self.assertFalse(candidate["writes_production_forecast"])
+        self.assertEqual(candidate["certified_snippet_ref"], "chunk-classification-slice-1")
+        self.assertEqual(candidate["certified_snippet_access_mode"], "bounded_certified_snippet")
 
     def test_runtime_sidecar_materialized_row_creates_candidate_with_no_probability_authority(self):
         classification = self.classification(strength="moderate")
@@ -266,6 +272,26 @@ class ScaeEvidenceDeltaTest(unittest.TestCase):
         self.assertFalse(candidate["accepted_for_ledger_input"])
         self.assertIn("research_sufficiency_certificate_ref_missing", candidate["rejection_reason_codes"])
         self.assertIn("research_sufficiency_certificate_ref_missing", candidate["certified_lineage_reason_codes"])
+
+    def test_unbounded_or_missing_certified_snippet_is_rejected_before_ledger_input(self):
+        for field, value, expected_reason in (
+            ("certified_snippet_ref", None, "certified_snippet_ref_missing"),
+            ("certified_snippet_access_mode", "raw_full_text", "certified_snippet_not_bounded"),
+        ):
+            with self.subTest(field=field):
+                classification = self.classification(direction="supports_yes")
+                if value is None:
+                    classification.pop(field)
+                else:
+                    classification[field] = value
+
+                candidate = self.build_one(classification, quality=self.quality(classification, multiplier=1.0))
+
+                self.assertEqual(candidate["candidate_status"], "rejected_uncertified_evidence")
+                self.assertEqual(candidate["signed_log_odds_delta"], 0.0)
+                self.assertFalse(candidate["accepted_for_ledger_input"])
+                self.assertIn(expected_reason, candidate["rejection_reason_codes"])
+                self.assertIn(expected_reason, candidate["certified_lineage_reason_codes"])
 
     def test_post_cutoff_or_unknown_temporal_gate_rejects_delta_candidate(self):
         for temporal_status in ("fail", "unknown_not_counted"):

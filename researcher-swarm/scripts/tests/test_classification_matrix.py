@@ -31,6 +31,7 @@ from researcher_swarm.classification_matrix import (  # noqa: E402
 )
 from researcher_swarm.model_context import resolve_researcher_leaf_nli_model_context  # noqa: E402
 from researcher_swarm.retrieval import (  # noqa: E402
+    build_evidence_chunk,
     build_retrieval_evidence_item,
     build_retrieval_packet,
     build_retrieval_query_contexts,
@@ -139,6 +140,17 @@ class ClassificationMatrixMaterializationTest(unittest.TestCase):
                     claim_family_id=f"claim-family-{context['leaf_id']}-secondary",
                 )
             )
+            if "expert_or_specialist" in context["sufficiency_requirements"].get("required_source_classes", []):
+                selected.append(
+                    self._evidence(
+                        context,
+                        attempt_ref=f"{context['leaf_id']}-expert",
+                        canonical_url=f"https://expert.example/{context['leaf_id']}",
+                        source_class="expert_or_specialist",
+                        source_family_id=f"source-family-{context['leaf_id']}-expert",
+                        claim_family_id=f"claim-family-{context['leaf_id']}-expert",
+                    )
+                )
         packet = build_retrieval_packet(
             self.qdt,
             evidence_packet=self.evidence_packet,
@@ -146,6 +158,26 @@ class ClassificationMatrixMaterializationTest(unittest.TestCase):
             question_decomposition_artifact_id="artifact:qdt-1",
             policy_context_ref="artifact:profile-1",
         )
+        chunks = []
+        for result in packet["leaf_retrieval_results"]:
+            for item in result["selected_evidence"]:
+                text = (
+                    f"Certified source excerpt for {item['transport_attempt_ref']} with enough bounded "
+                    "source detail for researcher classification. "
+                    * 8
+                )
+                chunk = build_evidence_chunk(
+                    evidence_ref=item["evidence_ref"],
+                    content_artifact_ref=f"artifact:browser-capture/{item['transport_attempt_ref']}",
+                    chunk_index=0,
+                    char_start=0,
+                    char_end=len(text),
+                    text=text,
+                    excerpt_policy="bounded_excerpt",
+                )
+                item["chunk_refs"] = [chunk["chunk_ref"]]
+                chunks.append(chunk)
+        packet["evidence_chunks"] = chunks
         finalized = finalize_retrieval_packet_for_dispatch(packet)
         self.assertEqual(finalized["research_sufficiency_summary"]["classification_dispatch_status"], "allowed")
         return finalized
@@ -280,6 +312,10 @@ class ClassificationMatrixMaterializationTest(unittest.TestCase):
         self.assertTrue(first["claim_family_id"].startswith("claim-family-"))
         self.assertEqual(first["research_sufficiency_certificate_ref"], self._certificate_by_leaf_id(packet)[first["leaf_id"]]["certificate_id"])
         self.assertEqual(first["coverage_proof_ref"], f"coverage-proof:{first['leaf_id']}")
+        self.assertTrue(first["certified_snippet_ref"])
+        self.assertTrue(first["certified_snippet_sha256"].startswith("sha256:"))
+        self.assertEqual(first["certified_snippet_access_mode"], "bounded_certified_snippet")
+        self.assertTrue(first["certified_snippet_content_artifact_ref"].startswith("artifact:browser-capture/"))
         self.assertEqual(first["model_execution_context_ref"], sidecar["model_execution_context_ref"])
         self.assertEqual(first["model_execution_context_sha256"], sidecar["model_execution_context_sha256"])
         self.assertEqual(first["evidence_quality_dimensions"]["source_authority"], "high")

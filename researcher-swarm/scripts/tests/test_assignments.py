@@ -167,6 +167,16 @@ class LeafResearchAssignmentContractTest(unittest.TestCase):
                 claim_family_id=f"claim-family-{context['leaf_id']}-secondary",
             )
             selected.extend([official, secondary])
+            if "expert_or_specialist" in context["sufficiency_requirements"].get("required_source_classes", []):
+                expert = self._evidence(
+                    context,
+                    attempt_ref=f"{context['leaf_id']}-expert",
+                    canonical_url=f"https://expert.example/{context['leaf_id']}",
+                    source_class="expert_or_specialist",
+                    source_family_id=f"source-family-{context['leaf_id']}-expert",
+                    claim_family_id=f"claim-family-{context['leaf_id']}-expert",
+                )
+                selected.append(expert)
         for item in selected:
             text = (
                 f"Certified source excerpt for {item['transport_attempt_ref']} with enough bounded "
@@ -237,7 +247,12 @@ class LeafResearchAssignmentContractTest(unittest.TestCase):
             self.assertTrue(assignment["required_value_field_ids"])
             self.assertTrue(assignment["required_negative_check_ids"])
             self.assertTrue(assignment["assigned_evidence_refs"])
-            certified_snippet = assignment["assigned_evidence_refs"][0]["certified_snippet"]
+            assigned_evidence = assignment["assigned_evidence_refs"][0]
+            certified_snippet = assigned_evidence["certified_snippet"]
+            self.assertTrue(assigned_evidence["source_metadata_resolution_ref"])
+            self.assertIn(assigned_evidence["source_metadata_resolution_ref"], assigned_evidence["source_metadata_refs"])
+            self.assertTrue(assigned_evidence["claim_family_ids"])
+            self.assertTrue(assigned_evidence["claim_family_resolution_refs"])
             self.assertEqual(certified_snippet["access_mode"], "bounded_certified_snippet")
             self.assertEqual(certified_snippet["excerpt_policy"], "bounded_excerpt")
             self.assertGreaterEqual(
@@ -365,6 +380,20 @@ class LeafResearchAssignmentContractTest(unittest.TestCase):
         validation = validate_leaf_research_assignment(broken)
         self.assertFalse(validation.valid)
         self.assertIn("certified_snippet is required", "; ".join(validation.errors))
+
+        missing_source_metadata = copy.deepcopy(assignment)
+        missing_source_metadata["assigned_evidence_refs"][0].pop("source_metadata_resolution_ref", None)
+        missing_source_metadata["assignment_digest"] = compute_leaf_research_assignment_digest(missing_source_metadata)
+        validation = validate_leaf_research_assignment(missing_source_metadata)
+        self.assertFalse(validation.valid)
+        self.assertIn("source_metadata_resolution_ref is required", "; ".join(validation.errors))
+
+        missing_claim_families = copy.deepcopy(assignment)
+        missing_claim_families["assigned_evidence_refs"][0]["claim_family_ids"] = []
+        missing_claim_families["assignment_digest"] = compute_leaf_research_assignment_digest(missing_claim_families)
+        validation = validate_leaf_research_assignment(missing_claim_families)
+        self.assertFalse(validation.valid)
+        self.assertIn("claim_family_ids must be non-empty", "; ".join(validation.errors))
 
     def test_assignment_budget_forbids_researcher_side_retrieval(self) -> None:
         assignment = build_leaf_research_assignments(qdt=self.qdt, retrieval_packet=self._certifiable_packet())[0]

@@ -304,6 +304,7 @@ class RetrievalPersistenceTest(unittest.TestCase):
             first_context,
             attempt_index=1,
             unsatisfied_requirement_codes=["fixture_targeted_expansion_probe"],
+            attempt_status="executed",
         )
         fallback = build_retrieval_fallback_state(first_context, [expansion["attempt_id"]])
         packet["retrieval_expansion_attempts"].append(expansion)
@@ -525,8 +526,15 @@ class ResearcherPersistenceTest(unittest.TestCase):
                 {
                     "evidence_ref": "evidence-1",
                     "claim_family_id": "claim-family-1",
+                    "claim_family_ids": ["claim-family-1"],
+                    "claim_family_resolution_refs": ["claim-family-resolution-1"],
                     "source_family_id": "source-family-1",
                     "source_class": "official_or_primary",
+                    "source_metadata_resolution_ref": "source-metadata-resolution-1",
+                    "source_metadata_refs": ["source-metadata-resolution-1"],
+                    "canonical_fetch_ref": "canonical-fetch-1",
+                    "source_content_artifact_ref": "artifact:browser-capture/snippet-1",
+                    "source_relevance_mapping_refs": ["source-relevance-1"],
                     "snippet_ref": "artifact:retrieval-snippet/snippet-1",
                     "snippet_sha256": SHA,
                     "certified_snippet": {

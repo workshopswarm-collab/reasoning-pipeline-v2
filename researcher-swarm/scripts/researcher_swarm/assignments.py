@@ -312,6 +312,17 @@ def _first_claim_family_id(item: dict[str, Any]) -> str | None:
     return None
 
 
+def _string_refs_from_item(item: dict[str, Any], *fields: str) -> list[str]:
+    refs: list[str] = []
+    for field in fields:
+        value = item.get(field)
+        if _is_non_empty_string(value):
+            refs.append(str(value))
+        elif isinstance(value, list):
+            refs.extend(str(ref) for ref in value if _is_non_empty_string(ref))
+    return list(dict.fromkeys(refs))
+
+
 def _chunk_lookup(retrieval_packet: dict[str, Any]) -> dict[str, dict[str, Any]]:
     chunks = retrieval_packet.get("evidence_chunks")
     if not isinstance(chunks, list):
@@ -389,11 +400,25 @@ def _compact_assigned_evidence_refs(
             raise LeafResearchAssignmentError(
                 f"{evidence_ref}: certified bounded snippet or artifact access is required"
             )
+        claim_family_ids = _string_refs_from_item(item, "claim_family_ids", "claim_family_id")
+        claim_family_resolution_refs = _string_refs_from_item(item, "claim_family_resolution_refs")
+        source_metadata_refs = _string_refs_from_item(
+            item,
+            "source_metadata_resolution_ref",
+            "source_metadata_classifier_ref",
+        )
         compact_item = {
             "evidence_ref": evidence_ref,
             "claim_family_id": _first_claim_family_id(item),
+            "claim_family_ids": claim_family_ids,
+            "claim_family_resolution_refs": claim_family_resolution_refs,
             "source_family_id": item.get("source_family_id"),
             "source_class": item.get("source_class", "unknown"),
+            "source_metadata_resolution_ref": item.get("source_metadata_resolution_ref"),
+            "source_metadata_refs": source_metadata_refs,
+            "canonical_fetch_ref": item.get("canonical_fetch_ref"),
+            "source_content_artifact_ref": item.get("source_content_artifact_ref"),
+            "source_relevance_mapping_refs": _string_refs_from_item(item, "leaf_source_relevance_refs"),
             "snippet_ref": certified_snippet["snippet_ref"],
             "snippet_sha256": certified_snippet["text_sha256"],
             "certified_snippet": certified_snippet,
@@ -858,12 +883,21 @@ def _validate_evidence_refs(value: Any, errors: list[str]) -> None:
         for field in ("evidence_ref", "source_family_id", "source_class", "snippet_sha256"):
             if not _is_non_empty_string(item.get(field)):
                 errors.append(f"{path}.{field} is required")
+        if not _is_non_empty_string(item.get("source_metadata_resolution_ref")):
+            errors.append(f"{path}.source_metadata_resolution_ref is required")
         if item.get("source_class") not in ALLOWED_SOURCE_CLASSES:
             errors.append(f"{path}.source_class is invalid")
         if item.get("snippet_sha256") and not _is_sha256_ref(item.get("snippet_sha256")):
             errors.append(f"{path}.snippet_sha256 must be a sha256 ref")
         if item.get("claim_family_id") is not None and not _is_non_empty_string(item.get("claim_family_id")):
             errors.append(f"{path}.claim_family_id must be a string or null")
+        _validate_string_list(item.get("claim_family_ids"), errors, f"{path}.claim_family_ids", allow_empty=False)
+        _validate_string_list(item.get("claim_family_resolution_refs"), errors, f"{path}.claim_family_resolution_refs")
+        _validate_string_list(item.get("source_metadata_refs"), errors, f"{path}.source_metadata_refs", allow_empty=False)
+        _validate_string_list(item.get("source_relevance_mapping_refs"), errors, f"{path}.source_relevance_mapping_refs")
+        for optional_ref in ("canonical_fetch_ref", "source_content_artifact_ref"):
+            if item.get(optional_ref) is not None and not _is_non_empty_string(item.get(optional_ref)):
+                errors.append(f"{path}.{optional_ref} must be a string or null")
         if item.get("snippet_ref") is not None and not _is_non_empty_string(item.get("snippet_ref")):
             errors.append(f"{path}.snippet_ref must be a string or null")
         _validate_certified_snippet(item.get("certified_snippet"), errors, path, expected_snippet_ref=item.get("snippet_ref"))
