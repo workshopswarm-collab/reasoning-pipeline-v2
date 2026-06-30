@@ -37,6 +37,7 @@ Current commit evidence reviewed:
 - QDT remediation: `9ed3b24`, `bb03c09`, `857cc2e`, `b962d9f`, `987f767`, `dd692d7`, `2b38419`
 - One-shot ADS remediation: `7fbaffc`
 - Phase 2 retrieval proof: `032d438`
+- Phase 3 AMRG signoff: `012a3db`
 - Retrieval/source 21-item tranche: `eeb2a03` through `e3ba9e0`
 - Researcher assignment contract hardening: `d7a2383`, `2c966b0`, `dd692d7`
 - Controlled retrieval-to-SCAE proof: `2b38419`
@@ -60,14 +61,13 @@ The following items are implemented and removed from active implementation scope
 | QDT coverage repair truthfulness | Implemented. Repair-required coverage summaries and repair-needed unanswered material questions now fail `research_coverage_check`, while explicit structural unanswerability remains allowed. Candidate scoring penalizes repair-required coverage. | Phase 1 change; `decomposer/scripts/tests/test_qdt.py`, `test_runtime_decomposition.py`, full decomposer discovery, and `orchestrator/scripts/tests/test_ads_operational_canary.py`. |
 | Representative retrieval blocker proof | Implemented for Phase 2. Two clone-only representative runs reached live retrieval with real candidates/fetches, failed strict acceptance on specific source/freshness/protected-primary/admitted-evidence dimensions, and blocked researcher dispatch with `acceptance_unmet_not_blocked_count=0`. | Phase 2 change; run `ads-pipeline-run:9f5fe6d27a39163ef2a2ec95b5c29fc536643b015dc0c8386463ff2e748e87dd` for Bank of Israel decrease and run `ads-pipeline-run:a863dbde06f469d22a53d2407dc9c7309d9c14a060adfa394af334050a21dbc1` for RBNZ increase. |
 | AMRG assist policy signoff | Implemented for Phase 3. AMRG dependency readiness now exposes a first-class assist policy signoff, the readiness report surfaces it, and the readiness CLI can prove optional, required-missing, and required-validated modes without adding a new AMRG lane. | Phase 3 change; `orchestrator/scripts/tests/test_amrg_context.py`, `test_ads_live_readiness.py`, `test_ads_operator_review.py`, and `scripts/bin/check_ads_live_readiness.py --help`. |
+| Readiness semantics and cwd-safe tests | Implemented for Phase 4. Live readiness top-level `status` now reports `blocked_true_runtime_cutover` when true-runtime cutover is blocked even if general readiness checks pass, while `general_issue_status` and `base_infrastructure_status` preserve the narrower health signals. The documented orchestrator test discovery command now passes from `orchestrator/`. | Phase 4 change; `orchestrator/scripts/tests/test_ads_live_readiness.py`, `test_decision_gate.py`, `test_synthesis_annotation.py`, and full orchestrator discovery from both repo root and `orchestrator/`. |
 
 ## What Is Still Not Implemented Or Not Yet Proven
 
 These are the only active plan items.
 
-1. Readiness display semantics still need tightening. `true_runtime_cutover_status` exists, but `build_live_readiness_report()` can still emit top-level `status: ready` when `true_runtime_cutover_ready=false` if no other issues are present.
-2. Orchestrator test discovery is still cwd-sensitive. From `/Users/agent2/.openclaw/orchestrator`, `python3 -m unittest discover -s scripts/tests -p 'test_*.py'` fails because two tests invoke `orchestrator/scripts/bin/...` from inside the `orchestrator/` directory.
-3. The final representative clone-only batch has not been run after the Phase 2 blocker proof. End-to-end remediation should not be declared complete until that batch has no unexpected failures and at least one scoreable success.
+1. The final representative clone-only batch has not been run after the Phase 4 readiness/test cleanup. End-to-end remediation should not be declared complete until that batch has no unexpected failures and at least one scoreable success.
 
 ## Non-Negotiable Runtime Invariants
 
@@ -368,6 +368,8 @@ Success criteria:
 
 ## Phase 4 - Readiness Semantics And Cwd-Safe Tests
 
+Status: completed. Preserve this as regression coverage while continuing with Phase 5.
+
 Goal: make the existing human-facing readiness report impossible to misread, and make documented test commands pass from their documented working directory.
 
 Why this remains:
@@ -377,6 +379,16 @@ Why this remains:
 - Running orchestrator tests from `/Users/agent2/.openclaw/orchestrator` currently fails two tests because they invoke repo-root-relative paths:
   - `orchestrator/scripts/bin/run_decision_gate.py`
   - `orchestrator/scripts/bin/run_synthesis_annotation.py`
+
+Phase result:
+
+- `build_live_readiness_report()` now distinguishes:
+  - top-level `status`, which reports `blocked_true_runtime_cutover` whenever true-runtime cutover is blocked and no general issue would otherwise make the report `blocked`
+  - `general_issue_status`, which preserves the previous general-issue readiness signal
+  - `base_infrastructure_status`, which remains the health/infrastructure signal
+- Non-scoreable readiness guard paths can still have `ok=true` when general checks pass, but the report can no longer be read as true-runtime cutover-ready while `true_runtime_cutover_ready=false`.
+- The decision-gate and synthesis-annotation CLI tests now resolve script paths from `Path(__file__).resolve().parents[1] / "bin"` instead of repo-root-relative strings.
+- Full orchestrator test discovery passes from both `/Users/agent2/.openclaw` and `/Users/agent2/.openclaw/orchestrator`.
 
 Implementation:
 

@@ -252,7 +252,8 @@ class AdsLiveReadinessTest(unittest.TestCase):
         )
 
         self.assertTrue(report["ok"], report["issues"])
-        self.assertEqual(report["status"], "ready")
+        self.assertEqual(report["status"], "blocked_true_runtime_cutover")
+        self.assertEqual(report["general_issue_status"], "ready")
         self.assertEqual(report["base_infrastructure_status"], "ready")
         self.assertEqual(report["true_runtime_cutover_status"], "blocked_missing_strict_canary")
         self.assertFalse(report["require_scoreable_live"])
@@ -552,6 +553,7 @@ class AdsLiveReadinessTest(unittest.TestCase):
 
         self.assertTrue(report["ok"], report["issues"])
         self.assertEqual(report["status"], "ready")
+        self.assertEqual(report["general_issue_status"], "ready")
         self.assertEqual(report["true_runtime_cutover_status"], "ready")
         self.assertTrue(report["true_runtime_cutover_ready"])
         self.assertTrue(report["require_scoreable_live"])

@@ -268,6 +268,18 @@ def _true_runtime_cutover_status(
     return "ready"
 
 
+def _live_readiness_status(
+    *,
+    issues: list[str],
+    true_runtime_cutover_status: str,
+) -> str:
+    if issues:
+        return "blocked"
+    if true_runtime_cutover_status != "ready":
+        return "blocked_true_runtime_cutover"
+    return "ready"
+
+
 def build_live_readiness_report(
     db_path: Path | str,
     *,
@@ -478,11 +490,16 @@ def build_live_readiness_report(
         scae_evidence_signals=scae_evidence_signals,
         operator_review=operator_review,
     )
+    status = _live_readiness_status(
+        issues=issues,
+        true_runtime_cutover_status=true_runtime_cutover_status,
+    )
 
     return {
         "schema_version": LIVE_READINESS_SCHEMA_VERSION,
         "ok": not issues,
-        "status": "ready" if not issues else "blocked",
+        "status": status,
+        "general_issue_status": "ready" if not issues else "blocked",
         "base_infrastructure_status": "ready" if not base_infrastructure_issues else "blocked",
         "base_infrastructure_issues": base_infrastructure_issues,
         "true_runtime_cutover_status": true_runtime_cutover_status,

@@ -194,7 +194,7 @@ class SynthesisAnnotationTest(unittest.TestCase):
             subprocess.run(
                 [
                     sys.executable,
-                    "orchestrator/scripts/bin/run_synthesis_annotation.py",
+                    str(Path(__file__).resolve().parents[1] / "bin" / "run_synthesis_annotation.py"),
                     "--scae-ledger",
                     str(ledger_path),
                     "--classification-summary",
