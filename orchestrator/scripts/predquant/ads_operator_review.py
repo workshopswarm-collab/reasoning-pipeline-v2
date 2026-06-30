@@ -15,7 +15,11 @@ from predquant.ads_pipeline_runner import (
     ensure_pipeline_runner_schema,
     read_pipeline_control_state,
 )
-from predquant.ads_real_runtime_canary import phase9_leaf_retrieval_statuses, summarize_retrieval_gap
+from predquant.ads_real_runtime_canary import (
+    phase9_leaf_retrieval_statuses,
+    summarize_retrieval_gap,
+    summarize_retrieval_transport_diagnostics,
+)
 from predquant.ads_stage_logging import ensure_stage_logging_schema
 from predquant.ads_storage_maintenance import build_storage_maintenance_plan
 from predquant.amrg import build_amrg_operator_report
@@ -380,12 +384,43 @@ def _qdt_summary(manifests: list[dict[str, Any]]) -> dict[str, Any]:
         for m in runtime_manifests
     }
     leaf_ids = []
+    coverage_dimensions = []
+    required_coverage_dimensions = []
+    missing_coverage_dimensions = []
     if isinstance(qdt, dict):
         leaf_ids = [
             str(leaf.get("leaf_id"))
             for leaf in qdt.get("required_leaf_questions", [])
             if isinstance(leaf, dict) and leaf.get("leaf_id")
         ]
+        graph = qdt.get("research_coverage_graph") if isinstance(qdt.get("research_coverage_graph"), dict) else {}
+        coverage_check = (
+            qdt.get("research_coverage_check")
+            if isinstance(qdt.get("research_coverage_check"), dict)
+            else {}
+        )
+        coverage_dimensions = [
+            str(item)
+            for item in (
+                coverage_check.get("coverage_dimensions")
+                if isinstance(coverage_check.get("coverage_dimensions"), list)
+                else graph.get("coverage_dimensions")
+                if isinstance(graph.get("coverage_dimensions"), list)
+                else []
+            )
+            if isinstance(item, str) and item
+        ]
+        if graph.get("market_temporal_state") == "unresolved":
+            required_coverage_dimensions = [
+                "counterevidence_negative_checks",
+                "current_direct_evidence",
+                "key_drivers",
+                "material_unknowns",
+                "resolution_mechanics",
+                "source_quality",
+                "timing_deadline_constraints",
+            ]
+        missing_coverage_dimensions = sorted(set(required_coverage_dimensions) - set(coverage_dimensions))
     generic_leaf_ids = sorted(
         set(leaf_ids) & {"leaf-source-of-truth", "leaf-direct-evidence", "leaf-resolution-mechanics"}
     )
@@ -410,6 +445,9 @@ def _qdt_summary(manifests: list[dict[str, Any]]) -> dict[str, Any]:
         "leaf_count": len(leaf_ids),
         "generic_leaf_ids_present": generic_leaf_ids,
         "question_specific": bool(leaf_ids) and not generic_leaf_ids,
+        "coverage_dimensions": sorted(set(coverage_dimensions)),
+        "required_coverage_dimensions": required_coverage_dimensions,
+        "missing_coverage_dimensions": missing_coverage_dimensions,
         "model_executed": model_executed,
     }
 
@@ -476,6 +514,7 @@ def _retrieval_summary(manifests: list[dict[str, Any]]) -> dict[str, Any]:
         if isinstance(docket, dict)
     )
     gap_diagnostics = summarize_retrieval_gap(payload)
+    transport_diagnostics = summarize_retrieval_transport_diagnostics(payload)
     return {
         "artifact_id": manifest.get("artifact_id") if manifest else None,
         "adapter_mode": payload.get("adapter_mode"),
@@ -488,6 +527,7 @@ def _retrieval_summary(manifests: list[dict[str, Any]]) -> dict[str, Any]:
         "admitted_evidence_ref_count": admitted,
         "leaf_retrieval_statuses": phase9_leaf_retrieval_statuses(payload),
         **gap_diagnostics,
+        **transport_diagnostics,
     }
 
 

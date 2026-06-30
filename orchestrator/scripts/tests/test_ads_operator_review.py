@@ -7,7 +7,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from predquant.ads_operator_review import _build_alerts, _retrieval_summary, _true_runtime_cutover_status
+from predquant.ads_operator_review import (
+    _build_alerts,
+    _qdt_summary,
+    _retrieval_summary,
+    _true_runtime_cutover_status,
+)
 
 
 class AdsOperatorReviewTest(unittest.TestCase):
@@ -56,6 +61,30 @@ class AdsOperatorReviewTest(unittest.TestCase):
                         "retrieval_runtime_summary": {
                             "search_candidate_url_count": 0,
                             "duplicate_canonical_url_omissions": 1,
+                            "native_research_status": "disabled",
+                        },
+                        "ads_retrieval_transport_diagnostics": {
+                            "search_call_count": 2,
+                            "search_failure_count": 1,
+                            "search_call_skipped_count": 1,
+                            "native_research_status": "disabled",
+                            "search_failure_diagnostics": [
+                                {
+                                    "leaf_id": "leaf-a",
+                                    "query_variant_id": "query:a:2",
+                                    "reason_code": "browser_provider_search_exception",
+                                    "error_class": "TimeoutError",
+                                    "elapsed_seconds": 2.5,
+                                    "detail": "provider timeout",
+                                }
+                            ],
+                            "search_skipped_diagnostics": [
+                                {
+                                    "leaf_id": "leaf-b",
+                                    "query_variant_id": "query:b:1",
+                                    "reason_code": "search_call_limit_reached",
+                                }
+                            ],
                         },
                         "research_sufficiency_summary": {
                             "classification_dispatch_status": "blocked_insufficient_research",
@@ -83,6 +112,13 @@ class AdsOperatorReviewTest(unittest.TestCase):
                                 "excerpt_char_count": 12,
                             }
                         ],
+                        "retrieval_evidence_provenance_slices": [
+                            {
+                                "evidence_ref": "evidence:short",
+                                "claim_family_ids": [],
+                                "unknown_reason_codes": ["claim_family_unknown_not_counted"],
+                            }
+                        ],
                     },
                     sort_keys=True,
                 ),
@@ -105,6 +141,51 @@ class AdsOperatorReviewTest(unittest.TestCase):
         self.assertEqual(summary["short_chunk_admitted_count"], 1)
         self.assertEqual(summary["meaningful_snippet_admitted_count"], 0)
         self.assertEqual(summary["canonical_fetch_duplicate_count"], 1)
+        self.assertEqual(summary["search_call_count"], 2)
+        self.assertEqual(summary["search_succeeded_count"], 1)
+        self.assertEqual(summary["search_failure_count"], 1)
+        self.assertEqual(summary["search_skipped_by_cap_count"], 1)
+        self.assertEqual(summary["native_research_status"], "disabled")
+        self.assertEqual(summary["claim_family_extraction_attempted_count"], 1)
+        self.assertEqual(summary["claim_family_accepted_count"], 0)
+        self.assertEqual(summary["provider_failure_summaries"][0]["error_class"], "TimeoutError")
+        self.assertEqual(summary["provider_failure_summaries"][0]["safe_detail_excerpt"], "provider timeout")
+
+    def test_qdt_summary_exposes_required_and_missing_coverage_dimensions(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            qdt_path = Path(tempdir) / "qdt.json"
+            qdt_path.write_text(
+                json.dumps(
+                    {
+                        "adapter_mode": "decomposer_model_runtime_live",
+                        "runtime_call_ref": "runtime-call:qdt",
+                        "research_coverage_graph": {
+                            "market_temporal_state": "unresolved",
+                            "coverage_dimensions": ["current_direct_evidence"],
+                        },
+                        "required_leaf_questions": [
+                            {"leaf_id": "leaf-boi", "leaf_question": "What is current BOI evidence?"}
+                        ],
+                    },
+                    sort_keys=True,
+                ),
+                encoding="utf-8",
+            )
+
+            summary = _qdt_summary(
+                [
+                    {
+                        "stage": "decomposition",
+                        "artifact_id": "qdt-manifest:1",
+                        "artifact_type": "question-decomposition",
+                        "artifact_path": str(qdt_path),
+                    }
+                ]
+            )
+
+        self.assertIn("current_direct_evidence", summary["coverage_dimensions"])
+        self.assertIn("timing_deadline_constraints", summary["required_coverage_dimensions"])
+        self.assertIn("timing_deadline_constraints", summary["missing_coverage_dimensions"])
 
     def test_true_production_non_scoreable_alerts_are_warnings(self):
         alerts = self._true_production_alerts_for_run(

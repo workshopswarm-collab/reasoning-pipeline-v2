@@ -52,6 +52,17 @@ QDT_UNRESOLVED_DISPATCHABLE_ROLES = {
     "resolution_mechanics",
     "material_unknown",
 }
+REQUIRED_UNRESOLVED_QDT_COVERAGE_DIMENSIONS = {
+    "resolution_mechanics",
+    "current_direct_evidence",
+    "key_drivers",
+    "counterevidence_negative_checks",
+    "source_quality",
+    "material_unknowns",
+    "timing_deadline_constraints",
+}
+SEARCH_CAP_SKIP_REASON_CODES = {"search_call_limit_reached", "search_call_cap_zero"}
+SEARCH_ELAPSED_SKIP_REASON_CODES = {"search_elapsed_budget_exhausted"}
 FORBIDDEN_QDT_FIELD_NAMES = {
     "bayesian_weighting",
     "probability",
@@ -316,6 +327,23 @@ def _qdt_end_to_end_quality(payload: dict[str, Any]) -> dict[str, Any]:
         if isinstance(payload.get("research_coverage_check"), dict)
         else {}
     )
+    coverage_dimensions = [
+        str(item)
+        for item in (
+            research_coverage.get("coverage_dimensions")
+            if isinstance(research_coverage.get("coverage_dimensions"), list)
+            else graph.get("coverage_dimensions")
+            if isinstance(graph.get("coverage_dimensions"), list)
+            else []
+        )
+        if isinstance(item, str) and item
+    ]
+    required_coverage_dimensions = sorted(
+        REQUIRED_UNRESOLVED_QDT_COVERAGE_DIMENSIONS
+        if market_temporal_state == "unresolved"
+        else set()
+    )
+    missing_coverage_dimensions = sorted(set(required_coverage_dimensions) - set(coverage_dimensions))
     specificity_passed = question_specificity.get("status") == "passed"
     coverage_passed = research_coverage.get("status") == "passed"
     forbidden_paths = _forbidden_qdt_field_paths(payload)
@@ -377,6 +405,9 @@ def _qdt_end_to_end_quality(payload: dict[str, Any]) -> dict[str, Any]:
         "question_specificity_status": question_specificity.get("status"),
         "research_coverage_status": research_coverage.get("status"),
         "market_temporal_state": market_temporal_state,
+        "coverage_dimensions": sorted(set(coverage_dimensions)),
+        "required_coverage_dimensions": required_coverage_dimensions,
+        "missing_coverage_dimensions": missing_coverage_dimensions,
         "leaf_count": len(leaves),
         "generic_leaf_ids_present": generic_leaf_ids,
         "dispatchable_pre_resolution_leaf_count": len(dispatchable_ids),
@@ -421,6 +452,9 @@ def _model_runtime_evidence(manifests: list[dict[str, Any]]) -> dict[str, Any]:
                 "question_specificity_status": quality["question_specificity_status"],
                 "research_coverage_status": quality["research_coverage_status"],
                 "market_temporal_state": quality["market_temporal_state"],
+                "coverage_dimensions": quality["coverage_dimensions"],
+                "required_coverage_dimensions": quality["required_coverage_dimensions"],
+                "missing_coverage_dimensions": quality["missing_coverage_dimensions"],
                 "dispatchable_pre_resolution_leaf_count": quality["dispatchable_pre_resolution_leaf_count"],
                 "terminal_verification_leaf_count": quality["terminal_verification_leaf_count"],
                 "forbidden_field_count": len(quality["forbidden_field_paths"]),
@@ -440,6 +474,14 @@ def _model_runtime_evidence(manifests: list[dict[str, Any]]) -> dict[str, Any]:
                 "mode": payload.get("mode"),
                 "fixture_mode": payload.get("fixture_mode"),
                 "execution_status": payload.get("execution_status"),
+                "retry_count": _int_value(payload.get("retry_count")),
+                "runtime_reason_codes": [
+                    str(code)
+                    for code in payload.get("runtime_reason_codes", [])
+                    if isinstance(code, str) and code
+                ]
+                if isinstance(payload.get("runtime_reason_codes"), list)
+                else [],
                 "ok": (
                     payload.get("resolved_model_id") == REQUIRED_RUNTIME_MODEL_ID
                     and payload.get("mode") == "live"
@@ -589,6 +631,101 @@ def _int_value(value: Any) -> int:
         return int(value or 0)
     except (TypeError, ValueError):
         return 0
+
+
+def _string_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item) for item in value if isinstance(item, str) and item]
+
+
+def _safe_excerpt(value: Any, *, limit: int = 500) -> str | None:
+    text = " ".join(str(value or "").split())
+    if not text:
+        return None
+    return text[:limit]
+
+
+def summarize_retrieval_transport_diagnostics(packet: dict[str, Any]) -> dict[str, Any]:
+    runtime_summary = (
+        packet.get("retrieval_runtime_summary")
+        if isinstance(packet.get("retrieval_runtime_summary"), dict)
+        else {}
+    )
+    transport = (
+        packet.get("ads_retrieval_transport_diagnostics")
+        if isinstance(packet.get("ads_retrieval_transport_diagnostics"), dict)
+        else {}
+    )
+    search_failures = _list_of_dicts(transport.get("search_failure_diagnostics"))
+    search_skips = _list_of_dicts(transport.get("search_skipped_diagnostics"))
+    search_call_count = max(
+        _int_value(transport.get("search_call_count")),
+        _int_value(runtime_summary.get("browser_search_call_count")),
+    )
+    search_failure_count = max(_int_value(transport.get("search_failure_count")), len(search_failures))
+    search_skipped_count = max(_int_value(transport.get("search_call_skipped_count")), len(search_skips))
+    provider_failures = []
+    for item in search_failures:
+        summary = {
+            "leaf_id": item.get("leaf_id"),
+            "query_variant_id": item.get("query_variant_id"),
+            "reason_code": item.get("reason_code"),
+            "error_class": item.get("error_class"),
+            "elapsed_seconds": item.get("elapsed_seconds"),
+            "return_code": item.get("return_code"),
+            "safe_detail_ref": item.get("bounded_log_artifact_ref") or item.get("safe_detail_ref"),
+        }
+        excerpt = _safe_excerpt(item.get("detail") or item.get("safe_detail_excerpt"))
+        if excerpt:
+            summary["safe_detail_excerpt"] = excerpt
+        provider_failures.append(summary)
+
+    cap_skips = [
+        item for item in search_skips if str(item.get("reason_code") or "") in SEARCH_CAP_SKIP_REASON_CODES
+    ]
+    elapsed_skips = [
+        item for item in search_skips if str(item.get("reason_code") or "") in SEARCH_ELAPSED_SKIP_REASON_CODES
+    ]
+    provenance_rows = _list_of_dicts(packet.get("retrieval_evidence_provenance_slices"))
+    claim_attempted_count = 0
+    claim_accepted_count = 0
+    accepted_claim_family_ids: set[str] = set()
+    for row in provenance_rows:
+        claim_ids = _string_list(row.get("claim_family_ids")) or _string_list(
+            row.get("claim_family_resolution_refs")
+        )
+        unknown_codes = set(_string_list(row.get("unknown_reason_codes")))
+        if claim_ids or "claim_family_unknown_not_counted" in unknown_codes or "claim_extraction_not_attempted" in unknown_codes:
+            claim_attempted_count += 1
+        if claim_ids:
+            claim_accepted_count += 1
+            accepted_claim_family_ids.update(claim_ids)
+
+    return {
+        "search_call_count": search_call_count,
+        "search_succeeded_count": max(0, search_call_count - search_failure_count),
+        "search_failure_count": search_failure_count,
+        "search_call_skipped_count": search_skipped_count,
+        "search_skipped_by_cap_count": len(cap_skips),
+        "search_skipped_by_elapsed_budget_count": len(elapsed_skips),
+        "search_failure_diagnostics": search_failures,
+        "search_skipped_diagnostics": search_skips,
+        "provider_failure_summaries": provider_failures,
+        "native_research_status": str(
+            transport.get("native_research_status")
+            or runtime_summary.get("native_research_status")
+            or "not_executed"
+        ),
+        "native_research_call_count": max(
+            _int_value(transport.get("native_research_call_count")),
+            _int_value(runtime_summary.get("native_research_call_count")),
+        ),
+        "claim_family_extraction_attempted_count": claim_attempted_count,
+        "claim_family_accepted_count": claim_accepted_count,
+        "accepted_claim_family_count": len(accepted_claim_family_ids),
+        "accepted_claim_family_ids": sorted(accepted_claim_family_ids),
+    }
 
 
 def _expansion_status_counts(packet: dict[str, Any], *, leaf_id: str | None = None) -> dict[str, int]:
@@ -1193,6 +1330,7 @@ def _retrieval_runtime_evidence(manifests: list[dict[str, Any]]) -> dict[str, An
         retrieval_has_fetch_attempts = fetched_attempt_count > 0
         retrieval_has_admitted_evidence = len(admitted_refs) > 0
         retrieval_gap = summarize_retrieval_gap(payload, admitted_refs=admitted_refs)
+        transport_gap = summarize_retrieval_transport_diagnostics(payload)
         leaf_retrieval_statuses = phase9_leaf_retrieval_statuses(payload)
         source_collation_acceptance = _source_collation_acceptance(
             payload,
@@ -1239,6 +1377,7 @@ def _retrieval_runtime_evidence(manifests: list[dict[str, Any]]) -> dict[str, An
                 "metadata_classifier_assist_status": metadata_classifier_assist_status,
                 "metadata_classifier_slice_count": len(metadata_classifier_slices),
                 "metadata_classifier_unavailable_count": len(metadata_classifier_unavailable),
+                **transport_gap,
                 "admitted_evidence_ref_count": len(admitted_refs),
                 "leaf_result_admitted_evidence_ref_count": len(leaf_result_admitted_refs),
                 "docket_admitted_evidence_ref_count": len(docket_admitted_refs),
@@ -1298,6 +1437,41 @@ def _retrieval_runtime_evidence(manifests: list[dict[str, Any]]) -> dict[str, An
         "search_candidates_materialized_count": sum(
             int(item["search_candidates_materialized_count"]) for item in retrieval_packets
         ),
+        "search_call_count": sum(int(item["search_call_count"]) for item in retrieval_packets),
+        "search_succeeded_count": sum(int(item["search_succeeded_count"]) for item in retrieval_packets),
+        "search_failure_count": sum(int(item["search_failure_count"]) for item in retrieval_packets),
+        "search_call_skipped_count": sum(int(item["search_call_skipped_count"]) for item in retrieval_packets),
+        "search_skipped_by_cap_count": sum(
+            int(item["search_skipped_by_cap_count"]) for item in retrieval_packets
+        ),
+        "search_skipped_by_elapsed_budget_count": sum(
+            int(item["search_skipped_by_elapsed_budget_count"]) for item in retrieval_packets
+        ),
+        "provider_failure_summaries": [
+            failure
+            for item in retrieval_packets
+            for failure in item["provider_failure_summaries"]
+        ],
+        "native_research_statuses": sorted(
+            {
+                str(item["native_research_status"])
+                for item in retrieval_packets
+                if item.get("native_research_status")
+            }
+        ),
+        "claim_family_extraction_attempted_count": sum(
+            int(item["claim_family_extraction_attempted_count"]) for item in retrieval_packets
+        ),
+        "claim_family_accepted_count": sum(
+            int(item["claim_family_accepted_count"]) for item in retrieval_packets
+        ),
+        "accepted_claim_family_count": len(
+            {
+                claim_family_id
+                for item in retrieval_packets
+                for claim_family_id in item["accepted_claim_family_ids"]
+            }
+        ),
         "canonical_fetch_duplicate_count": sum(
             int(item["canonical_fetch_duplicate_count"]) for item in retrieval_packets
         ),
@@ -1344,6 +1518,145 @@ def _retrieval_runtime_evidence(manifests: list[dict[str, Any]]) -> dict[str, An
         "source_populated_ok": source_populated_ok,
         "live_acceptance_ok": live_acceptance_ok,
         "ok": source_populated_ok and live_acceptance_ok,
+    }
+
+
+def _retry_summary(
+    qdt_evidence: dict[str, Any],
+    errors: dict[str, Any],
+) -> dict[str, Any]:
+    error_events = _list_of_dicts(errors.get("events"))
+    retryable_events = [event for event in error_events if event.get("retryability") == "retryable"]
+    terminal_events = [event for event in error_events if event.get("retryability") == "terminal"]
+    qdt_runtime_retry_count = sum(
+        _int_value(item.get("retry_count"))
+        for item in _list_of_dicts(qdt_evidence.get("runtime_results"))
+    )
+    retry_backoff_seconds = []
+    retry_policy_refs = []
+    for event in retryable_events:
+        metadata = event.get("safe_metadata") if isinstance(event.get("safe_metadata"), dict) else {}
+        if "retry_after_seconds" in metadata:
+            retry_backoff_seconds.append(_int_value(metadata.get("retry_after_seconds")))
+        if metadata.get("retry_policy_ref"):
+            retry_policy_refs.append(str(metadata["retry_policy_ref"]))
+    components = sorted(
+        {
+            str(event.get("stage"))
+            for event in error_events
+            if event.get("stage")
+        }
+        | (
+            {"qdt_model_runtime"}
+            if qdt_runtime_retry_count > 0
+            else set()
+        )
+    )
+    return {
+        "retry_attempt_count": len(retryable_events) + qdt_runtime_retry_count,
+        "retryable_failure_count": len(retryable_events),
+        "non_retryable_failure_count": len(terminal_events),
+        "terminal_retry_exhausted_count": 0,
+        "stage_retry_scheduled_count": len(retryable_events),
+        "qdt_model_transport_retry_count": qdt_runtime_retry_count,
+        "retry_backoff_seconds": retry_backoff_seconds,
+        "retry_policy_refs": sorted(set(retry_policy_refs)),
+        "components": components,
+        "final_retry_outcome": "retry_recorded" if retryable_events or qdt_runtime_retry_count else "no_retries_recorded",
+    }
+
+
+def build_current_audit_gap_summary(
+    *,
+    qdt_evidence: dict[str, Any],
+    retrieval_evidence: dict[str, Any],
+    errors: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    qdt_results = _list_of_dicts(qdt_evidence.get("qdt_results"))
+    required_dimensions = sorted(
+        {
+            dimension
+            for result in qdt_results
+            for dimension in _string_list(result.get("required_coverage_dimensions"))
+        }
+    )
+    observed_dimensions = sorted(
+        {
+            dimension
+            for result in qdt_results
+            for dimension in _string_list(result.get("coverage_dimensions"))
+        }
+    )
+    missing_dimensions = sorted(
+        {
+            dimension
+            for result in qdt_results
+            for dimension in _string_list(result.get("missing_coverage_dimensions"))
+        }
+    )
+    per_leaf_blockers = []
+    for packet in _list_of_dicts(retrieval_evidence.get("retrieval_packets")):
+        for leaf in _list_of_dicts(packet.get("leaf_retrieval_statuses")):
+            blockers = []
+            if leaf.get("source_status") == "source_missing":
+                blockers.append("source_missing")
+            if leaf.get("protected_primary_status") not in {None, "", "not_required", "satisfied"}:
+                blockers.append("protected_primary")
+            if leaf.get("freshness_status") == "blocked":
+                blockers.append("freshness")
+            blockers.extend(
+                f"breadth:{code}"
+                for code in _string_list(leaf.get("unsatisfied_breadth_dimensions"))
+            )
+            blockers.extend(
+                f"expansion:{code}"
+                for code in (
+                    "planned_not_executed_expansion_count",
+                    "expansion_exhausted_count",
+                    "expansion_exhausted_transport_unavailable_count",
+                    "expansion_exhausted_no_admissible_candidates_count",
+                )
+                if _int_value(leaf.get(code)) > 0
+            )
+            if blockers:
+                per_leaf_blockers.append(
+                    {
+                        "leaf_id": leaf.get("leaf_id"),
+                        "coverage_dimension": leaf.get("coverage_dimension"),
+                        "blocker_codes": sorted(set(blockers)),
+                    }
+                )
+    return {
+        "schema_version": "ads-current-audit-gap-summary/v1",
+        "qdt_required_coverage_dimensions": required_dimensions,
+        "qdt_observed_coverage_dimensions": observed_dimensions,
+        "qdt_missing_coverage_dimensions": missing_dimensions,
+        "search_attempted_count": _int_value(retrieval_evidence.get("search_call_count")),
+        "search_succeeded_count": _int_value(retrieval_evidence.get("search_succeeded_count")),
+        "search_failed_count": _int_value(retrieval_evidence.get("search_failure_count")),
+        "search_skipped_count": _int_value(retrieval_evidence.get("search_call_skipped_count")),
+        "search_skipped_by_cap_count": _int_value(retrieval_evidence.get("search_skipped_by_cap_count")),
+        "search_skipped_by_elapsed_budget_count": _int_value(
+            retrieval_evidence.get("search_skipped_by_elapsed_budget_count")
+        ),
+        "retry_summary": _retry_summary(qdt_evidence, errors or {}),
+        "provider_failure_summaries": _list_of_dicts(retrieval_evidence.get("provider_failure_summaries")),
+        "native_research_statuses": _string_list(retrieval_evidence.get("native_research_statuses")),
+        "native_research_model_executed_count": _int_value(
+            retrieval_evidence.get("native_research_model_executed_count")
+        ),
+        "meaningful_snippet_admitted_count": _int_value(
+            retrieval_evidence.get("meaningful_snippet_admitted_count")
+        ),
+        "short_chunk_admitted_count": _int_value(retrieval_evidence.get("short_chunk_admitted_count")),
+        "hash_only_admitted_count": _int_value(retrieval_evidence.get("hash_only_admitted_count")),
+        "claim_family_extraction_attempted_count": _int_value(
+            retrieval_evidence.get("claim_family_extraction_attempted_count")
+        ),
+        "claim_family_accepted_count": _int_value(retrieval_evidence.get("claim_family_accepted_count")),
+        "accepted_claim_family_count": _int_value(retrieval_evidence.get("accepted_claim_family_count")),
+        "classification_dispatch_allowed": bool(retrieval_evidence.get("classification_dispatch_allowed")),
+        "per_leaf_sufficiency_blockers": per_leaf_blockers,
     }
 
 
@@ -1897,6 +2210,11 @@ def build_real_runtime_canary_report(
         handoff_report=handoff_report,
         errors=errors,
     )
+    current_audit_gap_summary = build_current_audit_gap_summary(
+        qdt_evidence=qdt_evidence,
+        retrieval_evidence=retrieval_evidence,
+        errors=errors,
+    )
     return {
         "schema_version": REAL_RUNTIME_CANARY_REPORT_SCHEMA_VERSION,
         "criteria_schema_version": REAL_RUNTIME_CANARY_CRITERIA_SCHEMA_VERSION,
@@ -1924,6 +2242,7 @@ def build_real_runtime_canary_report(
         },
         "run": run,
         "run_duration_seconds": run_duration,
+        "current_audit_gap_summary": current_audit_gap_summary,
         "phase9_representative_case": phase9_case,
         "active_work": active,
         "pipeline_control": control,
@@ -2142,6 +2461,8 @@ def _phase9_representative_case(
 __all__ = [
     "REAL_RUNTIME_CANARY_CRITERIA_SCHEMA_VERSION",
     "REAL_RUNTIME_CANARY_REPORT_SCHEMA_VERSION",
+    "build_current_audit_gap_summary",
     "build_real_runtime_canary_report",
     "phase9_leaf_retrieval_statuses",
+    "summarize_retrieval_transport_diagnostics",
 ]

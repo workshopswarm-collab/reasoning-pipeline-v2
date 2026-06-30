@@ -32,6 +32,7 @@ from predquant.ads_real_runtime_canary import (
     _first_failing_gate,
     _model_runtime_evidence,
     _retrieval_runtime_evidence,
+    build_current_audit_gap_summary,
     build_real_runtime_canary_report,
 )
 from predquant.ads_retrieval_transport import RetrievalProviderPolicy
@@ -1413,6 +1414,7 @@ class AdsOperationalCanaryTest(unittest.TestCase):
                     },
                     "research_coverage_graph": {
                         "market_temporal_state": "unresolved",
+                        "coverage_dimensions": ["current_direct_evidence"],
                         "dispatchable_pre_resolution_leaf_ids": ["leaf-victor-final-result"],
                         "terminal_verification_leaf_ids": ["leaf-victor-final-result"],
                     },
@@ -1491,7 +1493,227 @@ class AdsOperationalCanaryTest(unittest.TestCase):
         self.assertIn("research_coverage_check_failed", qdt_quality["issue_codes"])
         self.assertIn("terminal_verification_leaf_dispatched_for_unresolved_market", qdt_quality["issue_codes"])
         self.assertIn("forbidden_qdt_fields_present", qdt_quality["issue_codes"])
+        self.assertIn("timing_deadline_constraints", qdt_quality["missing_coverage_dimensions"])
+        self.assertIn("source_quality", qdt_quality["missing_coverage_dimensions"])
         self.assertEqual(_first_failing_gate(criteria), "qdt_end_to_end_quality")
+
+    def test_current_audit_gap_summary_captures_qdt_retrieval_and_retry_shape(self):
+        qdt_path = Path(self.tempdir.name) / "current-audit-qdt.json"
+        runtime_path = Path(self.tempdir.name) / "current-audit-runtime.json"
+        retrieval_path = Path(self.tempdir.name) / "current-audit-retrieval.json"
+        qdt_path.write_text(
+            json.dumps(
+                {
+                    "artifact_type": "question_decomposition",
+                    "schema_version": "question-decomposition/v1",
+                    "adapter_mode": "decomposer_model_runtime_live",
+                    "runtime_call_ref": "runtime-call:qdt-current-audit",
+                    "question_specificity_check": {"status": "passed", "reason_codes": []},
+                    "research_coverage_check": {
+                        "status": "failed",
+                        "coverage_dimensions": ["current_direct_evidence", "source_quality"],
+                        "reason_codes": ["required_coverage_dimension_missing:timing_deadline_constraints"],
+                    },
+                    "research_coverage_graph": {
+                        "market_temporal_state": "unresolved",
+                        "coverage_dimensions": ["current_direct_evidence", "source_quality"],
+                        "dispatchable_pre_resolution_leaf_ids": ["leaf-boi-current"],
+                        "terminal_verification_leaf_ids": [],
+                    },
+                    "required_leaf_questions": [
+                        {
+                            "leaf_id": "leaf-boi-current",
+                            "leaf_question": "What current Bank of Israel evidence bears on the July rate decision?",
+                            "leaf_temporal_role": "pre_resolution_forecast_driver",
+                            "coverage_dimension": "current_direct_evidence",
+                            "research_factor": "current_rate_decision_evidence",
+                            "required_evidence_fields": ["current_direct_evidence"],
+                            "evidence_requirements": [
+                                {"required_evidence_field": "current_direct_evidence", "pre_cutoff_required": True}
+                            ],
+                            "classification_targets": ["current_direct_evidence"],
+                            "research_sufficiency_requirements": {"requirement_id": "qdt-sufficiency:boi"},
+                            "sufficiency_criteria": {
+                                "classification_dispatch_requires_sufficiency_certificate": True
+                            },
+                            "missingness_interpretation": "current evidence may be insufficient before cutoff",
+                            "forbidden_outputs": ["probability", "final_forecast"],
+                        }
+                    ],
+                },
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+        runtime_path.write_text(
+            json.dumps(
+                {
+                    "runtime_call_id": "runtime-call:qdt-current-audit",
+                    "resolved_model_id": "gpt-5.5-high",
+                    "mode": "live",
+                    "fixture_mode": False,
+                    "execution_status": "succeeded",
+                    "retry_count": 0,
+                    "runtime_reason_codes": ["model_executed"],
+                },
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+        retrieval_path.write_text(
+            json.dumps(
+                {
+                    "adapter_mode": "source_populated_live_retrieval_runtime",
+                    "retrieval_runtime_summary": {
+                        "runtime_mode": "live_retrieval_runtime",
+                        "browser_search_executed": True,
+                        "browser_search_status": "executed_with_failures",
+                        "search_candidate_discovery_status": "executed_with_failures",
+                        "search_failure_blocks_sufficiency": True,
+                        "native_research_status": "not_configured",
+                    },
+                    "ads_retrieval_transport_diagnostics": {
+                        "search_call_count": 2,
+                        "search_failure_count": 1,
+                        "search_call_skipped_count": 2,
+                        "browser_search_status": "executed_with_failures",
+                        "search_candidate_discovery_status": "executed_with_failures",
+                        "search_failure_blocks_sufficiency": True,
+                        "native_research_status": "not_configured",
+                        "search_failure_diagnostics": [
+                            {
+                                "leaf_id": "leaf-boi-current",
+                                "query_variant_id": "query:boi:2",
+                                "reason_code": "browser_provider_search_exception",
+                                "error_class": "TimeoutError",
+                                "elapsed_seconds": 3.25,
+                                "detail": "OpenClaw search subprocess timed out after 3.25s",
+                            }
+                        ],
+                        "search_skipped_diagnostics": [
+                            {
+                                "leaf_id": "leaf-boi-timing",
+                                "query_variant_id": "query:boi:3",
+                                "reason_code": "search_call_limit_reached",
+                            },
+                            {
+                                "leaf_id": "leaf-boi-staleness",
+                                "query_variant_id": "query:boi:4",
+                                "reason_code": "search_call_limit_reached",
+                            },
+                        ],
+                    },
+                    "search_candidate_urls": [{"url": "https://boi.org.il/en/markets/schedule"}],
+                    "browser_retrieval_attempts": [
+                        {"navigation_mode": "web_search", "url": "https://boi.org.il/en/markets/schedule"}
+                    ],
+                    "research_sufficiency_summary": {
+                        "classification_dispatch_status": "blocked_insufficient_research",
+                        "retrieval_outcome": "insufficient_evidence",
+                    },
+                    "retrieval_outcome_state": {
+                        "retrieval_outcome": "insufficient_evidence",
+                        "classification_dispatch_status": "blocked_insufficient_research",
+                        "terminal_blocked": True,
+                    },
+                    "leaf_query_contexts": [
+                        {
+                            "leaf_id": "leaf-boi-current",
+                            "coverage_dimension": "current_direct_evidence",
+                            "breadth_targets": {"min_temporally_fresh_sources": 1},
+                        },
+                        {
+                            "leaf_id": "leaf-boi-timing",
+                            "coverage_dimension": "timing_deadline_constraints",
+                            "breadth_targets": {"protected_primary_required": True},
+                        },
+                    ],
+                    "leaf_retrieval_results": [
+                        {
+                            "leaf_id": "leaf-boi-current",
+                            "admitted_evidence_refs": ["evidence:boi-short"],
+                            "selected_evidence_refs": ["evidence:boi-short"],
+                        }
+                    ],
+                    "leaf_evidence_dockets": [
+                        {"leaf_id": "leaf-boi-current", "admitted_evidence_refs": ["evidence:boi-short"]}
+                    ],
+                    "retrieval_evidence_provenance_slices": [
+                        {
+                            "evidence_ref": "evidence:boi-short",
+                            "claim_family_ids": [],
+                            "unknown_reason_codes": ["claim_family_unknown_not_counted"],
+                        }
+                    ],
+                    "evidence_chunks": [
+                        {
+                            "evidence_ref": "evidence:boi-short",
+                            "excerpt_policy": "redacted_snippet",
+                            "excerpt_char_count": 140,
+                        }
+                    ],
+                    "retrieval_breadth_coverage_slices": [],
+                },
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+
+        qdt_evidence = _model_runtime_evidence(
+            [
+                {"artifact_id": "artifact:qdt", "artifact_type": "question-decomposition", "path": str(qdt_path)},
+                {"artifact_id": "artifact:runtime", "artifact_type": "model-runtime-call", "path": str(runtime_path)},
+            ]
+        )
+        retrieval_evidence = _retrieval_runtime_evidence(
+            [
+                {
+                    "artifact_id": "artifact:retrieval",
+                    "artifact_type": "retrieval-packet",
+                    "path": str(retrieval_path),
+                }
+            ]
+        )
+        summary = build_current_audit_gap_summary(
+            qdt_evidence=qdt_evidence,
+            retrieval_evidence=retrieval_evidence,
+            errors={
+                "events": [
+                    {
+                        "stage": "retrieval",
+                        "retryability": "retryable",
+                        "safe_metadata": {
+                            "retry_after_seconds": 60,
+                            "retry_policy_ref": "auto004-transient-stage-retry/v1",
+                        },
+                    }
+                ]
+            },
+        )
+
+        self.assertIn("timing_deadline_constraints", summary["qdt_missing_coverage_dimensions"])
+        self.assertEqual(summary["search_attempted_count"], 2)
+        self.assertEqual(summary["search_succeeded_count"], 1)
+        self.assertEqual(summary["search_failed_count"], 1)
+        self.assertEqual(summary["search_skipped_by_cap_count"], 2)
+        self.assertEqual(summary["native_research_statuses"], ["not_configured"])
+        self.assertEqual(summary["short_chunk_admitted_count"], 1)
+        self.assertEqual(summary["meaningful_snippet_admitted_count"], 0)
+        self.assertEqual(summary["claim_family_extraction_attempted_count"], 1)
+        self.assertEqual(summary["claim_family_accepted_count"], 0)
+        self.assertFalse(summary["classification_dispatch_allowed"])
+        self.assertEqual(summary["retry_summary"]["retry_attempt_count"], 1)
+        self.assertEqual(summary["retry_summary"]["retry_backoff_seconds"], [60])
+        self.assertEqual(summary["provider_failure_summaries"][0]["error_class"], "TimeoutError")
+        self.assertIn("timed out", summary["provider_failure_summaries"][0]["safe_detail_excerpt"])
+        self.assertTrue(
+            any(
+                item["leaf_id"] == "leaf-boi-timing"
+                and "source_missing" in item["blocker_codes"]
+                and "protected_primary" in item["blocker_codes"]
+                for item in summary["per_leaf_sufficiency_blockers"]
+            )
+        )
 
     def test_real_runtime_report_counts_docket_and_selected_evidence_refs_without_certifying_retrieval(self):
         packet_path = Path(self.tempdir.name) / "retrieval-packet.json"
