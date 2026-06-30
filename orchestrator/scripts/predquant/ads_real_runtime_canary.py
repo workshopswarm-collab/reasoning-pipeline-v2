@@ -42,6 +42,10 @@ MARKET_SOURCE_CLASSES = {
 UNKNOWN_SOURCE_FAMILY_IDS = {"", "source-family-unknown"}
 GENERIC_QDT_LEAF_IDS = {"leaf-source-of-truth", "leaf-direct-evidence", "leaf-resolution-mechanics"}
 MEANINGFUL_SNIPPET_MIN_CHARS = 280
+EXPANSION_EXHAUSTED_STATUSES = {
+    "expansion_exhausted_no_admissible_candidates",
+    "expansion_exhausted_transport_unavailable",
+}
 QDT_UNRESOLVED_DISPATCHABLE_ROLES = {
     "pre_resolution_forecast_driver",
     "current_status",
@@ -587,6 +591,34 @@ def _int_value(value: Any) -> int:
         return 0
 
 
+def _expansion_status_counts(packet: dict[str, Any], *, leaf_id: str | None = None) -> dict[str, int]:
+    attempts = [
+        attempt
+        for attempt in _list_of_dicts(packet.get("retrieval_expansion_attempts"))
+        if leaf_id is None or str(attempt.get("leaf_id") or "") == leaf_id
+    ]
+    exhausted = [
+        attempt
+        for attempt in attempts
+        if str(attempt.get("attempt_status") or "") in EXPANSION_EXHAUSTED_STATUSES
+        or attempt.get("expansion_exhausted") is True
+    ]
+    return {
+        "expansion_attempt_count": len(attempts),
+        "expansion_executed_count": sum(1 for item in attempts if item.get("attempt_status") == "executed"),
+        "expansion_exhausted_count": len(exhausted),
+        "expansion_exhausted_transport_unavailable_count": sum(
+            1 for item in attempts if item.get("attempt_status") == "expansion_exhausted_transport_unavailable"
+        ),
+        "expansion_exhausted_no_admissible_candidates_count": sum(
+            1 for item in attempts if item.get("attempt_status") == "expansion_exhausted_no_admissible_candidates"
+        ),
+        "planned_not_executed_expansion_count": sum(
+            1 for item in attempts if item.get("attempt_status") == "planned_not_executed"
+        ),
+    }
+
+
 def summarize_retrieval_gap(
     packet: dict[str, Any],
     *,
@@ -648,11 +680,7 @@ def summarize_retrieval_gap(
         ),
     )
     return {
-        "planned_not_executed_expansion_count": sum(
-            1
-            for item in _list_of_dicts(packet.get("retrieval_expansion_attempts"))
-            if item.get("attempt_status") == "planned_not_executed"
-        ),
+        **_expansion_status_counts(packet),
         "meaningful_snippet_admitted_count": meaningful_snippet_admitted_count,
         "hash_only_admitted_count": hash_only_admitted_count,
         "short_chunk_admitted_count": short_chunk_admitted_count,
@@ -776,6 +804,112 @@ def _coverage_requirement_counts(
         "freshness_satisfied_count": freshness_satisfied,
         "coverage_unsatisfied_breadth_dimensions": sorted(unsatisfied),
     }
+
+
+def phase9_leaf_retrieval_statuses(
+    payload: dict[str, Any],
+    coverage_slices: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    contexts = _leaf_contexts_by_id(payload)
+    results = {
+        str(item.get("leaf_id")): item
+        for item in _list_of_dicts(payload.get("leaf_retrieval_results"))
+        if item.get("leaf_id")
+    }
+    dockets = {
+        str(item.get("leaf_id")): item
+        for item in _list_of_dicts(payload.get("leaf_evidence_dockets"))
+        if item.get("leaf_id")
+    }
+    coverages = {
+        str(item.get("leaf_id")): item
+        for item in (coverage_slices if coverage_slices is not None else _list_of_dicts(payload.get("retrieval_breadth_coverage_slices")))
+        if item.get("leaf_id")
+    }
+    certificates = {
+        str(item.get("leaf_id")): item
+        for item in _list_of_dicts(payload.get("leaf_research_sufficiency_certificates"))
+        if item.get("leaf_id")
+    }
+    leaf_ids = sorted(set(contexts) | set(results) | set(dockets) | set(coverages) | set(certificates))
+    rows: list[dict[str, Any]] = []
+    for leaf_id in leaf_ids:
+        context = contexts.get(leaf_id, {})
+        result = results.get(leaf_id, {})
+        docket = dockets.get(leaf_id, {})
+        coverage = coverages.get(leaf_id, {})
+        certificate = certificates.get(leaf_id, {})
+        targets = context.get("breadth_targets") if isinstance(context.get("breadth_targets"), dict) else {}
+        selected_refs = sorted(
+            {
+                str(item.get("evidence_ref"))
+                for item in _list_of_dicts(result.get("selected_evidence"))
+                if item.get("evidence_ref")
+            }
+        )
+        admitted_refs = sorted(
+            _evidence_refs_from(result.get("admitted_evidence_refs"))
+            | _evidence_refs_from(docket.get("admitted_evidence_refs"))
+        )
+        unsatisfied = sorted(
+            {
+                str(code)
+                for code in coverage.get("unsatisfied_breadth_dimensions", [])
+                if isinstance(code, str) and code
+            }
+        )
+        protected_required = bool(
+            targets.get("protected_primary_required")
+            or str(coverage.get("protected_primary_status") or "") not in {"", "not_required"}
+        )
+        protected_status = str(
+            coverage.get("protected_primary_status")
+            or ("not_required" if not protected_required else "missing")
+        )
+        min_fresh_sources = _int_value(targets.get("min_temporally_fresh_sources"))
+        fresh_source_count = _int_value(coverage.get("fresh_source_count"))
+        freshness_required = min_fresh_sources > 0 or "freshness" in unsatisfied
+        if not freshness_required:
+            freshness_status = "not_required"
+        elif fresh_source_count >= min_fresh_sources and "freshness" not in unsatisfied:
+            freshness_status = "satisfied"
+        else:
+            freshness_status = "blocked"
+        source_status = "source_populated" if selected_refs or admitted_refs else "source_missing"
+        if certificate.get("status") == "structurally_unanswerable_certified":
+            source_status = "structural_unanswerability_certified"
+        rows.append(
+            {
+                "leaf_id": leaf_id,
+                "purpose": context.get("purpose"),
+                "coverage_dimension": context.get("coverage_dimension"),
+                "source_status": source_status,
+                "selected_evidence_ref_count": len(selected_refs),
+                "admitted_evidence_ref_count": len(admitted_refs),
+                "selected_evidence_refs": selected_refs,
+                "admitted_evidence_refs": admitted_refs,
+                "protected_primary_required": protected_required,
+                "protected_primary_status": protected_status,
+                "protected_primary_resolution_basis": coverage.get("protected_primary_resolution_basis"),
+                "freshness_required": freshness_required,
+                "freshness_status": freshness_status,
+                "fresh_source_count": fresh_source_count,
+                "min_temporally_fresh_sources": min_fresh_sources,
+                "freshness_policy": coverage.get("freshness_policy"),
+                "source_family_count": _int_value(coverage.get("source_family_count")),
+                "claim_family_count": _int_value(coverage.get("claim_family_count")),
+                "unsatisfied_breadth_dimensions": unsatisfied,
+                "classification_dispatch_allowed": certificate.get("classification_dispatch_allowed") is True,
+                "certificate_status": certificate.get("status") or certificate.get("certificate_status"),
+                "structural_unanswerability_certified": bool(
+                    certificate.get("status") == "structurally_unanswerable_certified"
+                    or certificate.get("certificate_status") == "structurally_unanswerable_certified"
+                    or coverage.get("structural_unanswerability_proof_ref")
+                ),
+                **_expansion_status_counts(payload, leaf_id=leaf_id),
+            }
+        )
+    return rows
 
 
 def _retrieval_blocked_status(
@@ -1059,6 +1193,7 @@ def _retrieval_runtime_evidence(manifests: list[dict[str, Any]]) -> dict[str, An
         retrieval_has_fetch_attempts = fetched_attempt_count > 0
         retrieval_has_admitted_evidence = len(admitted_refs) > 0
         retrieval_gap = summarize_retrieval_gap(payload, admitted_refs=admitted_refs)
+        leaf_retrieval_statuses = phase9_leaf_retrieval_statuses(payload)
         source_collation_acceptance = _source_collation_acceptance(
             payload,
             real_candidate_count=real_candidate_count,
@@ -1110,6 +1245,7 @@ def _retrieval_runtime_evidence(manifests: list[dict[str, Any]]) -> dict[str, An
                 "selected_evidence_ref_count": len(selected_refs),
                 "reported_evidence_ref_count": len(reported_refs),
                 **retrieval_gap,
+                "leaf_retrieval_statuses": leaf_retrieval_statuses,
                 "structural_unanswerability_certified": structural_unanswerability_certified,
                 "classification_dispatch_allowed": dispatch_allowed,
                 "retrieval_has_real_candidates": retrieval_has_real_candidates,
@@ -1135,6 +1271,21 @@ def _retrieval_runtime_evidence(manifests: list[dict[str, Any]]) -> dict[str, An
         "fetched_attempt_count": sum(int(item["fetched_attempt_count"]) for item in retrieval_packets),
         "admitted_evidence_ref_count": sum(
             int(item["admitted_evidence_ref_count"]) for item in retrieval_packets
+        ),
+        "expansion_attempt_count": sum(
+            int(item["expansion_attempt_count"]) for item in retrieval_packets
+        ),
+        "expansion_executed_count": sum(
+            int(item["expansion_executed_count"]) for item in retrieval_packets
+        ),
+        "expansion_exhausted_count": sum(
+            int(item["expansion_exhausted_count"]) for item in retrieval_packets
+        ),
+        "expansion_exhausted_transport_unavailable_count": sum(
+            int(item["expansion_exhausted_transport_unavailable_count"]) for item in retrieval_packets
+        ),
+        "expansion_exhausted_no_admissible_candidates_count": sum(
+            int(item["expansion_exhausted_no_admissible_candidates_count"]) for item in retrieval_packets
         ),
         "planned_not_executed_expansion_count": sum(
             int(item["planned_not_executed_expansion_count"]) for item in retrieval_packets
@@ -1226,6 +1377,43 @@ def _scae_runtime_evidence(manifests: list[dict[str, Any]]) -> dict[str, Any]:
         "delta_ref_count": sum(int(item["scae_evidence_delta_ref_count"]) for item in ledgers),
         "ledgers": ledgers,
         "ok": all(item["ok"] for item in ledgers),
+    }
+
+
+def _classification_verification_evidence(manifests: list[dict[str, Any]]) -> dict[str, Any]:
+    verifications = []
+    for manifest in manifests:
+        if manifest.get("stage") != "classification_verification":
+            continue
+        payload = _load_manifest_payload(manifest) or {}
+        rows = _list_of_dicts(payload.get("research_sufficiency_reconciliation_slices"))
+        scae_ready_count = sum(
+            1
+            for row in rows
+            if row.get("reconciled_status") == "scae_ready_high_certainty"
+            or row.get("research_sufficiency_reconciliation_status") == "scae_ready_high_certainty"
+        )
+        verification_status = str(payload.get("verification_status") or "unknown")
+        ok = bool(
+            verification_status in {"runtime_bundle_scae_ready", "structured_market_metadata_certified"}
+            or (rows and scae_ready_count == len(rows))
+        )
+        verifications.append(
+            {
+                "artifact_id": manifest.get("artifact_id"),
+                "verification_status": verification_status,
+                "reconciliation_slice_count": len(rows),
+                "scae_ready_reconciliation_count": scae_ready_count,
+                "ok": ok,
+            }
+        )
+    return {
+        "verification_artifact_count": len(verifications),
+        "scae_ready_reconciliation_count": sum(
+            int(item["scae_ready_reconciliation_count"]) for item in verifications
+        ),
+        "verifications": verifications,
+        "ok": bool(verifications) and all(item["ok"] for item in verifications),
     }
 
 
@@ -1620,6 +1808,7 @@ def build_real_runtime_canary_report(
     qdt_evidence = _model_runtime_evidence(manifests)
     retrieval_evidence = _retrieval_runtime_evidence(manifests)
     researcher_evidence = _researcher_runtime_evidence(manifests)
+    verification_evidence = _classification_verification_evidence(manifests)
     scae_evidence = _scae_runtime_evidence(manifests)
     storage = build_storage_maintenance_plan(path, retention_days=storage_retention_days)
     scoring = brier_score_report(path, prediction_source=prediction_source, prediction_label=prediction_label, evaluation_cluster_id=evaluation_cluster_id)
@@ -1696,6 +1885,18 @@ def build_real_runtime_canary_report(
         "skipped_count": sum(1 for item in runtime_criteria if item.get("status") == "skipped"),
         "gate_order": [str(item.get("gate")) for item in runtime_criteria],
     }
+    phase9_case = _phase9_representative_case(
+        run=run,
+        qdt_evidence=qdt_evidence,
+        retrieval_evidence=retrieval_evidence,
+        researcher_evidence=researcher_evidence,
+        verification_evidence=verification_evidence,
+        scae_evidence=scae_evidence,
+        prediction_deltas=prediction_deltas,
+        active=active,
+        handoff_report=handoff_report,
+        errors=errors,
+    )
     return {
         "schema_version": REAL_RUNTIME_CANARY_REPORT_SCHEMA_VERSION,
         "criteria_schema_version": REAL_RUNTIME_CANARY_CRITERIA_SCHEMA_VERSION,
@@ -1723,6 +1924,7 @@ def build_real_runtime_canary_report(
         },
         "run": run,
         "run_duration_seconds": run_duration,
+        "phase9_representative_case": phase9_case,
         "active_work": active,
         "pipeline_control": control,
         "stage_error_events": errors,
@@ -1731,6 +1933,7 @@ def build_real_runtime_canary_report(
         "model_runtime_evidence": qdt_evidence,
         "retrieval_runtime_evidence": retrieval_evidence,
         "researcher_runtime_evidence": researcher_evidence,
+        "classification_verification_evidence": verification_evidence,
         "scae_runtime_evidence": scae_evidence,
         "prediction_delta_evidence": prediction_deltas,
         "storage_maintenance_plan": storage,
@@ -1805,8 +2008,140 @@ def _check_resource_gates(
         warnings.append("case_wall_time_warning_threshold_exceeded")
 
 
+def _phase9_representative_case(
+    *,
+    run: dict[str, Any] | None,
+    qdt_evidence: dict[str, Any],
+    retrieval_evidence: dict[str, Any],
+    researcher_evidence: dict[str, Any],
+    verification_evidence: dict[str, Any],
+    scae_evidence: dict[str, Any],
+    prediction_deltas: dict[str, Any],
+    active: dict[str, int],
+    handoff_report: dict[str, Any],
+    errors: dict[str, Any],
+) -> dict[str, Any]:
+    reason_codes: list[str] = []
+    metadata = run.get("metadata") if isinstance(run, dict) and isinstance(run.get("metadata"), dict) else {}
+    clone_only = metadata.get("live_db_mutation") == "clone_only"
+    unexpected_blockers = {
+        "active_work_not_drained": bool(active.get("active_runs") or active.get("active_leases")),
+        "unresolved_handoff_refs": not bool(handoff_report.get("ok")),
+        "unexpected_stage_failures": int(errors.get("unexpected_count") or 0) > 0,
+        "acceptance_unmet_not_blocked": int(retrieval_evidence.get("acceptance_unmet_not_blocked_count") or 0) > 0,
+        "forecast_decision_delta_mismatch": (
+            prediction_deltas.get("expected_forecast_decision_records") is not None
+            and prediction_deltas.get("forecast_decision_records_delta")
+            != prediction_deltas.get("expected_forecast_decision_records")
+        ),
+        "market_prediction_delta_mismatch": (
+            prediction_deltas.get("expected_market_predictions") is not None
+            and prediction_deltas.get("market_predictions_delta")
+            != prediction_deltas.get("expected_market_predictions")
+        ),
+        "non_scae_decision_authority": bool(prediction_deltas.get("non_scae_decision_ids")),
+        "non_scae_prediction_authority": bool(prediction_deltas.get("non_scae_prediction_ids")),
+        "duplicate_market_predictions": bool(prediction_deltas.get("duplicate_prediction_keys")),
+    }
+    reason_codes.extend(code for code, failed in unexpected_blockers.items() if failed)
+    scoreable_requirements = {
+        "qdt_quality_passed": bool(qdt_evidence.get("qdt_end_to_end_quality_ok")),
+        "retrieval_acceptance_passed": bool(retrieval_evidence.get("live_acceptance_ok")),
+        "researcher_model_executed": int(researcher_evidence.get("model_executed_count") or 0) > 0,
+        "classification_verification_passed": bool(verification_evidence.get("ok")),
+        "scae_valid_forecast_has_delta_refs": (
+            int(scae_evidence.get("valid_forecast_count") or 0) > 0
+            and int(scae_evidence.get("delta_ref_count") or 0) > 0
+            and bool(scae_evidence.get("ok"))
+        ),
+        "decision_authorized_prediction_persisted": (
+            int(prediction_deltas.get("market_predictions_delta") or 0) > 0
+            and not prediction_deltas.get("non_scae_decision_ids")
+            and not prediction_deltas.get("non_scae_prediction_ids")
+        ),
+    }
+    structural_unanswerability = any(
+        packet.get("structural_unanswerability_certified") is True
+        for packet in retrieval_evidence.get("retrieval_packets", [])
+        if isinstance(packet, dict)
+    )
+    blocked_non_scoreable = bool(
+        int(retrieval_evidence.get("blocked_when_acceptance_unmet_count") or 0) > 0
+        or researcher_evidence.get("blocked_non_scoreable") is True
+        or (
+            int(scae_evidence.get("valid_forecast_count") or 0) == 0
+            and int(prediction_deltas.get("market_predictions_delta") or 0) == 0
+        )
+    )
+    if reason_codes:
+        classification = "unexpected_failure"
+    elif all(scoreable_requirements.values()):
+        classification = "scoreable_success"
+        reason_codes.append("all_scoreable_runtime_gates_passed")
+    elif structural_unanswerability:
+        classification = "structural_unanswerability"
+        reason_codes.append("retrieval_structural_unanswerability_certified")
+    elif blocked_non_scoreable:
+        classification = "structured_non_scoreable_insufficiency"
+        reason_codes.append("blocked_without_scoreable_prediction")
+    else:
+        classification = "unexpected_failure"
+        reason_codes.append("phase9_outcome_unclassified")
+    blocked_case = classification in {
+        "structured_non_scoreable_insufficiency",
+        "structural_unanswerability",
+    }
+    return {
+        "schema_version": "ads-phase9-representative-case-classification/v1",
+        "classification": classification,
+        "reason_codes": sorted(set(reason_codes)),
+        "clone_only": clone_only,
+        "no_scoreable_write_when_blocked": (
+            not blocked_case
+            or (
+                int(prediction_deltas.get("market_predictions_delta") or 0) == 0
+                and not prediction_deltas.get("non_scoreable_prediction_ids")
+            )
+        ),
+        "scoreable_success_requirements": scoreable_requirements,
+        "unexpected_blockers": unexpected_blockers,
+        "reporting_counters": {
+            "search_candidates_materialized_count": retrieval_evidence.get(
+                "search_candidates_materialized_count",
+                0,
+            ),
+            "expansion_attempt_count": retrieval_evidence.get("expansion_attempt_count", 0),
+            "expansion_executed_count": retrieval_evidence.get("expansion_executed_count", 0),
+            "expansion_exhausted_count": retrieval_evidence.get("expansion_exhausted_count", 0),
+            "meaningful_snippet_admitted_count": retrieval_evidence.get(
+                "meaningful_snippet_admitted_count",
+                0,
+            ),
+            "hash_only_admitted_count": retrieval_evidence.get("hash_only_admitted_count", 0),
+            "short_chunk_admitted_count": retrieval_evidence.get("short_chunk_admitted_count", 0),
+            "protected_primary_required_count": retrieval_evidence.get("protected_primary_required_count", 0),
+            "protected_primary_satisfied_count": retrieval_evidence.get("protected_primary_satisfied_count", 0),
+            "freshness_required_count": retrieval_evidence.get("freshness_required_count", 0),
+            "freshness_satisfied_count": retrieval_evidence.get("freshness_satisfied_count", 0),
+            "classification_dispatch_allowed": bool(retrieval_evidence.get("classification_dispatch_allowed")),
+            "researcher_model_executed_count": researcher_evidence.get("model_executed_count", 0),
+            "classification_verification_artifact_count": verification_evidence.get(
+                "verification_artifact_count",
+                0,
+            ),
+            "scae_ready_reconciliation_count": verification_evidence.get(
+                "scae_ready_reconciliation_count",
+                0,
+            ),
+            "scae_valid_forecast_count": scae_evidence.get("valid_forecast_count", 0),
+            "scae_delta_ref_count": scae_evidence.get("delta_ref_count", 0),
+        },
+    }
+
+
 __all__ = [
     "REAL_RUNTIME_CANARY_CRITERIA_SCHEMA_VERSION",
     "REAL_RUNTIME_CANARY_REPORT_SCHEMA_VERSION",
     "build_real_runtime_canary_report",
+    "phase9_leaf_retrieval_statuses",
 ]

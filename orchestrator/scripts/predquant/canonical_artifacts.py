@@ -209,6 +209,8 @@ def _build_retrieval_packet(qdt: dict[str, Any], evidence_packet: dict[str, Any]
     for context in build_retrieval_query_contexts(qdt, evidence_packet=evidence_packet):
         selected.append(_evidence(context, suffix="official", source_class="official_or_primary"))
         selected.append(_evidence(context, suffix="independent", source_class="independent_secondary"))
+        if "expert_or_specialist" in context.get("sufficiency_requirements", {}).get("required_source_classes", []):
+            selected.append(_evidence(context, suffix="expert", source_class="expert_or_specialist"))
     packet = build_retrieval_packet(
         qdt,
         evidence_packet=evidence_packet,

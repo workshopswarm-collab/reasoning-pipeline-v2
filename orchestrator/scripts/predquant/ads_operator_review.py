@@ -15,7 +15,7 @@ from predquant.ads_pipeline_runner import (
     ensure_pipeline_runner_schema,
     read_pipeline_control_state,
 )
-from predquant.ads_real_runtime_canary import summarize_retrieval_gap
+from predquant.ads_real_runtime_canary import phase9_leaf_retrieval_statuses, summarize_retrieval_gap
 from predquant.ads_stage_logging import ensure_stage_logging_schema
 from predquant.ads_storage_maintenance import build_storage_maintenance_plan
 from predquant.amrg import build_amrg_operator_report
@@ -486,6 +486,7 @@ def _retrieval_summary(manifests: list[dict[str, Any]]) -> dict[str, Any]:
         "browser_retrieval_attempt_count": len(browser),
         "leaf_evidence_docket_count": len(dockets),
         "admitted_evidence_ref_count": admitted,
+        "leaf_retrieval_statuses": phase9_leaf_retrieval_statuses(payload),
         **gap_diagnostics,
     }
 

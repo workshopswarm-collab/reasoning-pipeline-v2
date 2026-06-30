@@ -933,13 +933,30 @@ class AdsOperationalCanaryTest(unittest.TestCase):
             criteria_report["first_failing_gate"],
             "retrieval_source_populated_or_structural_unanswerability",
         )
+        phase9_case = criteria_report["phase9_representative_case"]
+        self.assertEqual(phase9_case["classification"], "structured_non_scoreable_insufficiency")
+        self.assertTrue(phase9_case["no_scoreable_write_when_blocked"])
+        self.assertIn("blocked_without_scoreable_prediction", phase9_case["reason_codes"])
         self.assertIn("retrieval_runtime_evidence", criteria_report)
         self.assertEqual(criteria_report["retrieval_runtime_evidence"]["source_populated_count"], 0)
         self.assertEqual(criteria_report["retrieval_runtime_evidence"]["admitted_evidence_ref_count"], 0)
+        self.assertIn(
+            "expansion_executed_count",
+            criteria_report["retrieval_runtime_evidence"],
+        )
+        self.assertIn(
+            "expansion_exhausted_count",
+            criteria_report["retrieval_runtime_evidence"],
+        )
         self.assertEqual(
             criteria_report["retrieval_runtime_evidence"]["planned_not_executed_expansion_count"],
             0,
         )
+        self.assertTrue(criteria_report["retrieval_runtime_evidence"]["retrieval_packets"])
+        blocked_packet = criteria_report["retrieval_runtime_evidence"]["retrieval_packets"][0]
+        self.assertTrue(blocked_packet["leaf_retrieval_statuses"])
+        self.assertIn("freshness_status", blocked_packet["leaf_retrieval_statuses"][0])
+        self.assertIn("protected_primary_status", blocked_packet["leaf_retrieval_statuses"][0])
         runtime_gate_statuses = {
             item["gate"]: item["status"]
             for item in criteria_report["criteria"]["runtime_gates"]
@@ -995,6 +1012,7 @@ class AdsOperationalCanaryTest(unittest.TestCase):
         operator_case = operator_report["cases"][0]
         self.assertEqual(operator_case["qdt_model_provenance"]["resolved_model_id"], "gpt-5.5-high")
         self.assertTrue(operator_case["qdt_model_provenance"]["question_specific"])
+        self.assertTrue(operator_case["retrieval_sufficiency"]["leaf_retrieval_statuses"])
         self.assertTrue(operator_case["researcher_model_provenance"]["blocked_non_scoreable"])
         self.assertEqual(
             operator_case["scae_readiness"]["forecast_validity_status"],
@@ -1189,6 +1207,18 @@ class AdsOperationalCanaryTest(unittest.TestCase):
         criteria_report = result["real_runtime_canary_report"]
         self.assertTrue(criteria_report["ok"], criteria_report["issues"])
         self.assertIsNone(criteria_report["first_failing_gate"])
+        phase9_case = criteria_report["phase9_representative_case"]
+        self.assertEqual(phase9_case["classification"], "scoreable_success")
+        self.assertIn("all_scoreable_runtime_gates_passed", phase9_case["reason_codes"])
+        self.assertTrue(all(phase9_case["scoreable_success_requirements"].values()))
+        self.assertGreater(
+            phase9_case["reporting_counters"]["search_candidates_materialized_count"],
+            0,
+        )
+        self.assertGreater(
+            phase9_case["reporting_counters"]["scae_delta_ref_count"],
+            0,
+        )
         qdt_evidence = criteria_report["model_runtime_evidence"]
         self.assertTrue(qdt_evidence["model_runtime_ok"])
         self.assertTrue(qdt_evidence["qdt_end_to_end_quality_ok"])
@@ -1257,13 +1287,26 @@ class AdsOperationalCanaryTest(unittest.TestCase):
             packet["protected_primary_satisfied_count"],
         )
         self.assertEqual(packet["freshness_required_count"], packet["freshness_satisfied_count"])
+        self.assertTrue(packet["leaf_retrieval_statuses"])
+        self.assertTrue(all("freshness_status" in row for row in packet["leaf_retrieval_statuses"]))
+        self.assertTrue(all("protected_primary_status" in row for row in packet["leaf_retrieval_statuses"]))
         researcher = criteria_report["researcher_runtime_evidence"]
         self.assertGreater(researcher["model_executed_count"], 0)
         self.assertGreater(researcher["runtime_bundle_count"], 0)
+        verification = criteria_report["classification_verification_evidence"]
+        self.assertTrue(verification["ok"], verification)
+        self.assertGreater(verification["verification_artifact_count"], 0)
         scae = criteria_report["scae_runtime_evidence"]
         self.assertGreater(scae["valid_forecast_count"], 0)
         self.assertGreater(scae["delta_ref_count"], 0)
         self.assertEqual(result["protected_count_deltas"]["market_predictions"], 1)
+        operator_report = build_ads_operator_review_report(
+            self.db_path,
+            pipeline_run_id=result["result"]["pipeline_run_id"],
+            max_market_snapshot_age_seconds=10_000_000_000,
+            max_resolution_sync_age_seconds=10_000_000_000,
+        )
+        self.assertTrue(operator_report["cases"][0]["retrieval_sufficiency"]["leaf_retrieval_statuses"])
 
     def test_phase6_runtime_criteria_reports_first_failing_gate(self):
         base = {
