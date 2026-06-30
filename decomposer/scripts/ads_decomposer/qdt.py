@@ -93,6 +93,13 @@ ALLOWED_LEAF_TEMPORAL_ROLES = {
     "terminal_verification",
     "material_unknown",
 }
+QDT_COVERAGE_REPAIR_REQUIRED_STATUSES = {"requires_repair", "requires_decomposer_repair"}
+QDT_STRUCTURAL_UNANSWERABILITY_STATUSES = {
+    "structural_unanswerability",
+    "structural_unanswerability_certified",
+    "structurally_unanswerable",
+    "structurally_unavailable_before_cutoff",
+}
 CONDITION_SCOPES_REQUIRING_ANCHOR_CONTRACT = {"target_given_upstream", "target_given_not_upstream"}
 APPROVED_WAIVER_STATUS = "approved"
 ALLOWED_ANCHOR_MODES = {"diagnostic_only", "anchor_optional", "anchor_required"}
@@ -2357,6 +2364,39 @@ def require_valid_question_decomposition(
         raise QDTError("; ".join(result.errors))
 
 
+def _unanswered_material_question_is_structural(item: dict[str, Any]) -> bool:
+    for field in (
+        "status",
+        "unanswerability_type",
+        "unanswerability_status",
+        "coverage_status",
+        "resolution_status",
+    ):
+        if str(item.get(field) or "") in QDT_STRUCTURAL_UNANSWERABILITY_STATUSES:
+            return True
+    return _is_non_empty_string(item.get("structural_unanswerability_proof_ref"))
+
+
+def _coverage_repair_reason_codes(graph: dict[str, Any]) -> list[str]:
+    reasons: list[str] = []
+    summary = graph.get("coverage_summary") if isinstance(graph.get("coverage_summary"), dict) else {}
+    if summary.get("status") in QDT_COVERAGE_REPAIR_REQUIRED_STATUSES:
+        reasons.append("research_coverage_requires_repair")
+
+    unanswered = graph.get("unanswered_material_questions")
+    if isinstance(unanswered, list):
+        for item in unanswered:
+            if not isinstance(item, dict):
+                continue
+            if (
+                str(item.get("status") or "") in QDT_COVERAGE_REPAIR_REQUIRED_STATUSES
+                and not _unanswered_material_question_is_structural(item)
+            ):
+                reasons.append("unanswered_material_questions_require_repair")
+                break
+    return sorted(set(reasons))
+
+
 def compute_qdt_quality_checks(
     artifact: dict[str, Any],
     *,
@@ -2404,6 +2444,7 @@ def compute_qdt_quality_checks(
             )
         )
     ]
+    coverage_errors.extend(_coverage_repair_reason_codes(graph))
     question_errors = [
         error
         for error in validation.errors

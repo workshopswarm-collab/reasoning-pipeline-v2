@@ -851,6 +851,74 @@ class QDTContractTest(unittest.TestCase):
             5,
         )
 
+    def test_coverage_summary_requires_repair_fails_research_coverage_check(self):
+        selected = select_qdt_candidate([build_fixture_qdt_candidate(self.handoff)])
+        selected["research_coverage_graph"]["coverage_summary"]["status"] = "requires_repair"
+
+        checks = compute_qdt_quality_checks(selected)
+
+        self.assertEqual(checks["research_coverage_check"]["status"], "failed")
+        self.assertIn(
+            "research_coverage_requires_repair",
+            checks["research_coverage_check"]["reason_codes"],
+        )
+
+    def test_repair_needed_unanswered_material_question_fails_unless_structural(self):
+        selected = select_qdt_candidate([build_fixture_qdt_candidate(self.handoff)])
+        graph = selected["research_coverage_graph"]
+        graph["coverage_summary"]["status"] = "coverage_ready"
+        graph["unanswered_material_questions"] = [
+            {
+                "coverage_dimension": "current_direct_evidence",
+                "question": "Current evidence was too thin for dispatch.",
+                "status": "requires_decomposer_repair",
+            }
+        ]
+
+        checks = compute_qdt_quality_checks(selected)
+
+        self.assertEqual(checks["research_coverage_check"]["status"], "failed")
+        self.assertIn(
+            "unanswered_material_questions_require_repair",
+            checks["research_coverage_check"]["reason_codes"],
+        )
+
+        graph["unanswered_material_questions"][0][
+            "unanswerability_type"
+        ] = "structurally_unavailable_before_cutoff"
+        structural_checks = compute_qdt_quality_checks(selected)
+        self.assertEqual(structural_checks["research_coverage_check"]["status"], "passed")
+
+    def test_candidate_selection_penalizes_repair_required_coverage(self):
+        repair_required = build_fixture_qdt_candidate(
+            self.handoff,
+            candidate_id="aaa-repair-required",
+        )
+        coverage_ready = build_fixture_qdt_candidate(
+            self.handoff,
+            candidate_id="zzz-coverage-ready",
+        )
+        repair_required["research_coverage_graph"]["coverage_summary"]["status"] = "requires_repair"
+
+        selected = select_qdt_candidate([repair_required, coverage_ready])
+        scored = {
+            item["candidate_id"]: item
+            for item in selected["candidate_selection_audit"]["scored_candidates"]
+        }
+
+        self.assertEqual(
+            selected["candidate_selection_audit"]["selected_candidate_id"],
+            "zzz-coverage-ready",
+        )
+        self.assertGreater(
+            scored["aaa-repair-required"]["penalty_components"]["failed_quality_checks"],
+            0,
+        )
+        self.assertIn(
+            "research_coverage_requires_repair",
+            scored["aaa-repair-required"]["diagnostics"]["failed_quality_reason_codes"],
+        )
+
     def _market_specific_candidate(self, handoff: dict, candidate_id: str) -> dict:
         candidate = build_fixture_qdt_candidate(handoff, candidate_id=candidate_id)
         question = str(handoff["macro_question"])
