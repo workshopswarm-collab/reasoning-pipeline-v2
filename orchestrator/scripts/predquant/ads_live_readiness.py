@@ -508,6 +508,7 @@ def build_live_readiness_report(
             "strict_non_scoreable_canary_status": strict_canary_signals["status"],
         },
         "amrg_dependency_readiness": amrg_dependency_readiness,
+        "amrg_assist_policy_signoff": amrg_dependency_readiness["assist_policy_signoff"],
         "scae_evidence_signal_report": scae_evidence_signals,
         "strict_non_scoreable_canary_signal_report": strict_canary_signals,
         "allow_canary_handler": allow_canary_handler,

@@ -421,6 +421,60 @@ class AdsLiveReadinessTest(unittest.TestCase):
             "assist_not_requested_by_policy",
         )
 
+    def test_amrg_assist_optional_policy_signoff_does_not_claim_execution(self):
+        report = build_live_readiness_report(
+            self.db_path,
+            runner_mode="calibration_debt_production",
+            handler_factory="predquant.ads_production_readiness_handlers:build_stage_handlers",
+        )
+
+        self.assertTrue(report["ok"], report["issues"])
+        signoff = report["amrg_assist_policy_signoff"]
+        self.assertEqual(signoff["signoff_status"], "optional_not_requested")
+        self.assertEqual(signoff["assist_readiness_status"], "assist_not_requested_by_policy")
+        self.assertFalse(signoff["assist_requested_by_policy"])
+        self.assertFalse(signoff["policy_default_requested"])
+        self.assertFalse(signoff["model_executed"])
+        self.assertEqual(signoff["model_execution_claim"], "not_claimed")
+        self.assertTrue(signoff["non_blocking_when_not_requested"])
+        self.assertEqual(signoff["model_lane_id"], "amrg_model_assist")
+        self.assertEqual(signoff["resolved_model_id"], "gpt-5.4-high")
+        self.assertEqual(signoff["provider_route"], "openclaw_codex_oauth/amrg")
+        self.assertTrue(signoff["oauth_route_required"])
+        self.assertEqual(signoff["runtime_agent_id"], "amrg")
+
+    def test_required_amrg_assist_blocks_until_accepted_execution(self):
+        report = build_live_readiness_report(
+            self.db_path,
+            runner_mode="calibration_debt_production",
+            handler_factory="predquant.ads_production_readiness_handlers:build_stage_handlers",
+            amrg_assist_requested_by_policy=True,
+        )
+
+        self.assertFalse(report["ok"])
+        self.assertIn("amrg_assist_failed", report["issues"])
+        signoff = report["amrg_assist_policy_signoff"]
+        self.assertEqual(signoff["signoff_status"], "required_assist_missing_or_failed")
+        self.assertTrue(signoff["assist_requested_by_policy"])
+        self.assertFalse(signoff["required_execution_accepted"])
+
+    def test_required_amrg_assist_validated_satisfies_policy_gate(self):
+        report = build_live_readiness_report(
+            self.db_path,
+            runner_mode="calibration_debt_production",
+            handler_factory="predquant.ads_production_readiness_handlers:build_stage_handlers",
+            amrg_assist_requested_by_policy=True,
+            amrg_model_assist_status="advisory_validated",
+        )
+
+        self.assertTrue(report["ok"], report["issues"])
+        self.assertNotIn("amrg_assist_failed", report["issues"])
+        signoff = report["amrg_assist_policy_signoff"]
+        self.assertEqual(signoff["signoff_status"], "required_assist_validated")
+        self.assertTrue(signoff["model_executed"])
+        self.assertEqual(signoff["model_execution_claim"], "proven")
+        self.assertTrue(signoff["required_execution_accepted"])
+
     def test_amrg_vector_required_unavailable_blocks_readiness(self):
         report = build_live_readiness_report(
             self.db_path,

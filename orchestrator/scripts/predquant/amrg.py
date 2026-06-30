@@ -144,6 +144,13 @@ ASSIST_READINESS_STATUSES = {
     "assist_ready",
     "assist_failed",
 }
+AMRG_ASSIST_POLICY_SIGNOFF_STATUSES = {
+    "optional_not_requested",
+    "optional_assist_validated",
+    "optional_assist_failed",
+    "required_assist_validated",
+    "required_assist_missing_or_failed",
+}
 AMRG_ALLOWED_EFFECTS_BY_STATUS = {
     WEAK_CONTEXT_ONLY: ["decomposition_context_hint"],
     "model_assisted_weak_context_only": ["decomposition_context_hint"],
@@ -891,6 +898,46 @@ def amrg_assist_readiness_status(
     return "assist_failed"
 
 
+def build_amrg_assist_policy_signoff(readiness: dict[str, Any]) -> dict[str, Any]:
+    assist_requested = bool(readiness.get("assist_requested_by_policy"))
+    assist_status = str(readiness.get("assist_status") or "assist_failed")
+    model_assist_status = str(readiness.get("model_assist_status") or "not_requested")
+    model_assist = readiness.get("model_assist") if isinstance(readiness.get("model_assist"), dict) else {}
+    model_executed = model_assist_status in {"advisory_validated", "advisory_rejected_forbidden_output"}
+
+    if assist_requested:
+        signoff_status = (
+            "required_assist_validated"
+            if assist_status == "assist_ready"
+            else "required_assist_missing_or_failed"
+        )
+    elif assist_status == "assist_not_requested_by_policy":
+        signoff_status = "optional_not_requested"
+    elif assist_status == "assist_ready":
+        signoff_status = "optional_assist_validated"
+    else:
+        signoff_status = "optional_assist_failed"
+
+    return {
+        "schema_version": "amrg-assist-policy-signoff/v1",
+        "signoff_status": signoff_status,
+        "assist_requested_by_policy": assist_requested,
+        "policy_default_requested": bool((model_assist.get("runtime_policy") or {}).get("default_requested")),
+        "model_assist_status": model_assist_status,
+        "assist_readiness_status": assist_status,
+        "model_execution_claim": "proven" if model_executed else "not_claimed",
+        "model_executed": model_executed,
+        "required_execution_accepted": assist_requested and assist_status == "assist_ready",
+        "non_blocking_when_not_requested": not assist_requested and signoff_status == "optional_not_requested",
+        "model_lane_id": model_assist.get("model_lane_id"),
+        "resolved_model_id": model_assist.get("resolved_model_id"),
+        "provider_route": model_assist.get("provider_route"),
+        "oauth_route_required": model_assist.get("oauth_route_required"),
+        "runtime_agent_id": model_assist.get("runtime_agent_id"),
+        "authority": "policy_signoff_only_no_probability_or_evidence_authority",
+    }
+
+
 def build_amrg_dependency_readiness(
     *,
     policy: dict[str, Any] | None = None,
@@ -951,12 +998,16 @@ def build_amrg_dependency_readiness(
         "model_assist": {
             "model_lane_id": AMRG_MODEL_ASSIST_LANE_ID,
             "resolved_model_id": assist_lane.get("default_model_id"),
+            "provider_route": assist_lane.get("provider_route"),
+            "oauth_route_required": bool(assist_lane.get("oauth_route_required")),
+            "runtime_agent_id": assist_lane.get("runtime_agent_id"),
             "runtime_policy": runtime_policy,
             "forbidden_outputs": sorted(assist_lane.get("forbidden_outputs", [])),
             "authority": "advisory_only_no_promotion",
         },
         "authority": "dependency_readiness_only_no_probability_or_scae_authority",
     }
+    readiness["assist_policy_signoff"] = build_amrg_assist_policy_signoff(readiness)
     ensure_no_raw_amrg_fields(readiness, "amrg_dependency_readiness")
     return readiness
 

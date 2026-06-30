@@ -839,6 +839,22 @@ class AMRGContextTest(unittest.TestCase):
             with self.assertRaisesRegex(Exception, error):
                 resolve_amrg_model_assist_lane({"lanes": {"amrg_model_assist": mutated_lane}})
 
+    def test_operator_report_signs_off_optional_model_assist_policy(self):
+        report = build_amrg_operator_report(self.build_artifact([self.market(2)]))
+
+        self.assertEqual(report["assist_readiness_status"], "assist_not_requested_by_policy")
+        signoff = report["dependency_readiness"]["assist_policy_signoff"]
+        self.assertEqual(signoff["signoff_status"], "optional_not_requested")
+        self.assertFalse(signoff["assist_requested_by_policy"])
+        self.assertFalse(signoff["model_executed"])
+        self.assertEqual(signoff["model_execution_claim"], "not_claimed")
+        self.assertTrue(signoff["non_blocking_when_not_requested"])
+        self.assertEqual(signoff["model_lane_id"], "amrg_model_assist")
+        self.assertEqual(signoff["resolved_model_id"], "gpt-5.4-high")
+        self.assertEqual(signoff["provider_route"], "openclaw_codex_oauth/amrg")
+        self.assertTrue(signoff["oauth_route_required"])
+        self.assertEqual(signoff["runtime_agent_id"], "amrg")
+
     def test_model_assist_forbidden_probability_output_is_rejected(self):
         artifact = self.build_artifact([self.market(2)])
         packet = build_amrg_model_assist_packet(artifact)

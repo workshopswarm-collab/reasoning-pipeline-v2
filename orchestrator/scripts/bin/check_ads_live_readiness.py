@@ -53,6 +53,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--protected-component-diagnostics-json", type=Path)
     parser.add_argument("--pointer-stability-evidence-json", type=Path)
     parser.add_argument("--amrg-refresh-status")
+    parser.add_argument("--amrg-model-assist-status")
+    parser.add_argument("--amrg-assist-requested-by-policy", action="store_true")
     parser.add_argument("--scae-evidence-delta-ref", action="append", default=[])
     parser.add_argument("--strict-non-scoreable-canary-report-json", type=Path)
     parser.add_argument("--require-fresh-storage-maintenance-plan", action="store_true")
@@ -92,6 +94,8 @@ def main() -> int:
         protected_component_diagnostics=load_json(args.protected_component_diagnostics_json, None),
         pointer_stability_evidence=load_json(args.pointer_stability_evidence_json, None),
         amrg_refresh_status=args.amrg_refresh_status,
+        amrg_model_assist_status=args.amrg_model_assist_status,
+        amrg_assist_requested_by_policy=args.amrg_assist_requested_by_policy or None,
         scae_evidence_delta_refs=tuple(args.scae_evidence_delta_ref),
         strict_non_scoreable_canary_report=load_json(args.strict_non_scoreable_canary_report_json, None),
         require_fresh_storage_maintenance_plan=args.require_fresh_storage_maintenance_plan,

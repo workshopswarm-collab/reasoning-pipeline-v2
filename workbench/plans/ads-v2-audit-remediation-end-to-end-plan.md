@@ -2,7 +2,7 @@
 
 Date: 2026-06-30
 Author: Workbench
-Scope: Current active remediation plan for ADS v2 after cross-referencing the original audit plan, the post-push audit, the existing repo, and commits through `2b38419 Add QDT phase 6 end-to-end proof`.
+Scope: Current active remediation plan for ADS v2 after cross-referencing the original audit plan, the post-push audit, the existing repo, and completed remediation through Phase 3 AMRG assist policy signoff.
 
 ## Guiding Purpose
 
@@ -36,6 +36,7 @@ Current commit evidence reviewed:
 
 - QDT remediation: `9ed3b24`, `bb03c09`, `857cc2e`, `b962d9f`, `987f767`, `dd692d7`, `2b38419`
 - One-shot ADS remediation: `7fbaffc`
+- Phase 2 retrieval proof: `032d438`
 - Retrieval/source 21-item tranche: `eeb2a03` through `e3ba9e0`
 - Researcher assignment contract hardening: `d7a2383`, `2c966b0`, `dd692d7`
 - Controlled retrieval-to-SCAE proof: `2b38419`
@@ -58,15 +59,15 @@ The following items are implemented and removed from active implementation scope
 | Canary/report harnesses | Implemented. Existing scripts should be reused for clone-only proof and compact reports; do not add another harness unless a specific missing summary blocks Phase 2 or Phase 5 proof. | `orchestrator/scripts/bin/run_ads_one_case_canary.py`, `report_ads_real_runtime_canary.py`, `report_ads_handoffs.py`, `report_ads_operator_review.py`, `check_ads_live_readiness.py`. |
 | QDT coverage repair truthfulness | Implemented. Repair-required coverage summaries and repair-needed unanswered material questions now fail `research_coverage_check`, while explicit structural unanswerability remains allowed. Candidate scoring penalizes repair-required coverage. | Phase 1 change; `decomposer/scripts/tests/test_qdt.py`, `test_runtime_decomposition.py`, full decomposer discovery, and `orchestrator/scripts/tests/test_ads_operational_canary.py`. |
 | Representative retrieval blocker proof | Implemented for Phase 2. Two clone-only representative runs reached live retrieval with real candidates/fetches, failed strict acceptance on specific source/freshness/protected-primary/admitted-evidence dimensions, and blocked researcher dispatch with `acceptance_unmet_not_blocked_count=0`. | Phase 2 change; run `ads-pipeline-run:9f5fe6d27a39163ef2a2ec95b5c29fc536643b015dc0c8386463ff2e748e87dd` for Bank of Israel decrease and run `ads-pipeline-run:a863dbde06f469d22a53d2407dc9c7309d9c14a060adfa394af334050a21dbc1` for RBNZ increase. |
+| AMRG assist policy signoff | Implemented for Phase 3. AMRG dependency readiness now exposes a first-class assist policy signoff, the readiness report surfaces it, and the readiness CLI can prove optional, required-missing, and required-validated modes without adding a new AMRG lane. | Phase 3 change; `orchestrator/scripts/tests/test_amrg_context.py`, `test_ads_live_readiness.py`, `test_ads_operator_review.py`, and `scripts/bin/check_ads_live_readiness.py --help`. |
 
 ## What Is Still Not Implemented Or Not Yet Proven
 
 These are the only active plan items.
 
-1. AMRG model assist runtime proof remains a policy sign-off item. The model lane exists and is contract-tested, and current optional readiness already reports `assist_not_requested_by_policy`; do not build a new AMRG lane unless VM changes the policy to require live assist.
-2. Readiness display semantics still need tightening. `true_runtime_cutover_status` exists, but `build_live_readiness_report()` can still emit top-level `status: ready` when `true_runtime_cutover_ready=false` if no other issues are present.
-3. Orchestrator test discovery is still cwd-sensitive. From `/Users/agent2/.openclaw/orchestrator`, `python3 -m unittest discover -s scripts/tests -p 'test_*.py'` fails because two tests invoke `orchestrator/scripts/bin/...` from inside the `orchestrator/` directory.
-4. The final representative clone-only batch has not been run after the Phase 2 blocker proof. End-to-end remediation should not be declared complete until that batch has no unexpected failures and at least one scoreable success.
+1. Readiness display semantics still need tightening. `true_runtime_cutover_status` exists, but `build_live_readiness_report()` can still emit top-level `status: ready` when `true_runtime_cutover_ready=false` if no other issues are present.
+2. Orchestrator test discovery is still cwd-sensitive. From `/Users/agent2/.openclaw/orchestrator`, `python3 -m unittest discover -s scripts/tests -p 'test_*.py'` fails because two tests invoke `orchestrator/scripts/bin/...` from inside the `orchestrator/` directory.
+3. The final representative clone-only batch has not been run after the Phase 2 blocker proof. End-to-end remediation should not be declared complete until that batch has no unexpected failures and at least one scoreable success.
 
 ## Non-Negotiable Runtime Invariants
 
@@ -279,12 +280,24 @@ Success criteria:
 
 ## Phase 3 - AMRG Assist Policy And Runtime Proof
 
+Status: completed as optional-policy signoff proof. Preserve the signoff/report tests and continue with Phase 4.
+
 Goal: remove any remaining ambiguity around AMRG model assist by proving the current optional policy is visible end to end, or by proving live execution only if VM explicitly changes the policy to require it.
 
 Why this remains:
 
 - AMRG assist contracts, provenance validation, and optional-policy readiness status exist.
 - The policy currently has `default_requested=false`, so live assist execution is not required and should not be claimed.
+
+Phase result:
+
+- The current policy remains optional with `default_requested=false`; Phase 3 did not add a new AMRG adapter, lane, or trigger path.
+- `amrg_dependency_readiness.assist_policy_signoff` now makes the distinction explicit:
+  - optional not requested: `signoff_status=optional_not_requested`, `model_execution_claim=not_claimed`
+  - required but missing/failed: `signoff_status=required_assist_missing_or_failed`, readiness blocks with `amrg_assist_failed`
+  - required and validated: `signoff_status=required_assist_validated`, execution is accepted only for advisory-validated assist
+- Readiness and AMRG operator reports expose the model lane, resolved model, OAuth route, runtime agent, and advisory-only authority for signoff.
+- The readiness CLI accepts AMRG assist policy/status inputs so the existing operator command can prove optional or required behavior without a new proof harness.
 
 Implementation:
 
