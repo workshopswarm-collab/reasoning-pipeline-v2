@@ -139,6 +139,12 @@ class RetrievalPacketContractTest(unittest.TestCase):
             admission_reason_codes=["manual_fixture_selected"],
         )
 
+    def _context_requires_source_class(self, context: dict, source_class: str) -> bool:
+        requirements = context.get("sufficiency_requirements")
+        return isinstance(requirements, dict) and source_class in set(
+            requirements.get("required_source_classes") or []
+        )
+
     def _certifiable_packet(self, qdt: dict | None = None) -> dict:
         qdt = copy.deepcopy(qdt or self.qdt)
         contexts = build_retrieval_query_contexts(qdt, evidence_packet=self.evidence_packet)
@@ -164,6 +170,17 @@ class RetrievalPacketContractTest(unittest.TestCase):
                 claim_family_id=f"claim-family-{context['leaf_id']}-secondary",
             )
             selected.extend([official, secondary])
+            if self._context_requires_source_class(context, "expert_or_specialist"):
+                selected.append(
+                    self._evidence(
+                        context,
+                        attempt_ref=f"{context['leaf_id']}-specialist",
+                        canonical_url=f"https://gartner.com/{context['leaf_id']}",
+                        source_class="expert_or_specialist",
+                        source_family_id=f"source-family-{context['leaf_id']}-specialist",
+                        claim_family_id=f"claim-family-{context['leaf_id']}-specialist",
+                    )
+                )
         for item in selected:
             text = (
                 f"Certified source excerpt for {item['transport_attempt_ref']} with enough bounded "
@@ -191,14 +208,24 @@ class RetrievalPacketContractTest(unittest.TestCase):
         packet["evidence_chunks"] = chunks
         return packet
 
-    def _live_candidate(self, context: dict, index: int, *, direct: bool = False, official: bool = False) -> dict:
+    def _live_candidate(
+        self,
+        context: dict,
+        index: int,
+        *,
+        direct: bool = False,
+        official: bool = False,
+        source_class: str | None = None,
+    ) -> dict:
         leaf_id = context["leaf_id"]
-        source_class = "official_or_primary" if official else "independent_secondary"
-        url = (
-            f"https://example.com/official/{leaf_id}"
-            if direct
-            else f"https://independent{index}.example/{leaf_id}"
-        )
+        if source_class is None:
+            source_class = "official_or_primary" if official else "independent_secondary"
+        if direct:
+            url = f"https://example.com/official/{leaf_id}"
+        elif source_class == "expert_or_specialist":
+            url = f"https://gartner.com/{leaf_id}/{index}"
+        else:
+            url = f"https://independent{index}.example/{leaf_id}"
         supporting_text = f"Live-shaped candidate {index} for {leaf_id} supports the required evidence field."
         content = (
             supporting_text
@@ -216,7 +243,7 @@ class RetrievalPacketContractTest(unittest.TestCase):
             "claim_family_id": f"claim-family-live-{leaf_id}-{index % 3}",
             "source_published_at": "2026-06-24T11:30:00+00:00",
             "captured_at": "2026-06-24T11:59:00+00:00",
-            "deterministic_source_class_proof": official,
+            "deterministic_source_class_proof": official or source_class == "expert_or_specialist",
             "source_class_resolution_method": "manual_fixture" if official else "deterministic_url_registry",
             "source_family_resolution_method": "deterministic_url_registry",
             "result_rank": index + 1,
@@ -244,6 +271,8 @@ class RetrievalPacketContractTest(unittest.TestCase):
             start = 1
         for index in range(start, count):
             candidates.append(self._live_candidate(context, index))
+        if self._context_requires_source_class(context, "expert_or_specialist"):
+            candidates.append(self._live_candidate(context, count, source_class="expert_or_specialist"))
         return candidates
 
     def _search_candidates_for_context(self, context: dict, candidates: list[dict]) -> list[dict]:
@@ -1628,6 +1657,20 @@ class RetrievalPacketContractTest(unittest.TestCase):
                 direct_attempt["attempt_id"],
                 search_attempt["attempt_id"],
             ]
+            expert_attempt = None
+            if self._context_requires_source_class(context, "expert_or_specialist"):
+                expert_attempt = build_browser_retrieval_attempt(
+                    context,
+                    variant,
+                    navigation_mode="web_search",
+                    requested_url=f"https://search.example/?q={context['leaf_id']}+specialist",
+                    final_url=f"https://gartner.com/{context['leaf_id']}",
+                    canonical_url=f"https://gartner.com/{context['leaf_id']}",
+                    extraction_status="accepted",
+                    result_rank=3,
+                )
+                browser_attempts.append(expert_attempt)
+                attempt_refs_by_leaf[context["leaf_id"]].append(expert_attempt["attempt_id"])
 
             official = self._evidence(
                 context,
@@ -1647,7 +1690,20 @@ class RetrievalPacketContractTest(unittest.TestCase):
                 source_family_id=f"source-family-{context['leaf_id']}-secondary",
                 claim_family_id=f"claim-family-{context['leaf_id']}-secondary",
             )
-            for offset, evidence in enumerate([official, secondary]):
+            evidence_items = [official, secondary]
+            if expert_attempt is not None:
+                expert = self._evidence(
+                    context,
+                    attempt_ref=expert_attempt["attempt_id"],
+                    canonical_url=f"https://gartner.com/{context['leaf_id']}",
+                    source_class="expert_or_specialist",
+                    source_family_id=f"source-family-{context['leaf_id']}-specialist",
+                    claim_family_id=f"claim-family-{context['leaf_id']}-specialist",
+                )
+                expert["deterministic_source_class_proof"] = True
+                expert["source_class_resolution_method"] = "manual_fixture"
+                evidence_items.append(expert)
+            for offset, evidence in enumerate(evidence_items):
                 text = (
                     f"Bounded browser evidence for {context['leaf_id']} {offset} with enough source "
                     "detail for researcher classification and certified snippet assignment. "
@@ -1671,7 +1727,7 @@ class RetrievalPacketContractTest(unittest.TestCase):
                 evidence["chunk_refs"] = [chunk["chunk_ref"]]
                 chunks.append(chunk)
                 spans.append(span)
-            selected.extend([official, secondary])
+            selected.extend(evidence_items)
 
         packet = build_retrieval_packet(
             self.qdt,

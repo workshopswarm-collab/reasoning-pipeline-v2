@@ -386,6 +386,17 @@ class ResearcherVerificationTest(unittest.TestCase):
         self.assertEqual(quality["accepted_quality_fields"]["source_authority"], "unknown")
         self.assertIn("source_authority_claim_downgraded", quality["reason_codes"])
 
+    def test_expert_source_authority_normalizes_to_medium(self) -> None:
+        row = self._classification(source_class="expert_or_specialist")
+
+        result = build_quality_verification_slices(self._matrix([row]))
+
+        quality = result.quality_verification_slices[0]
+        self.assertEqual(quality["machine_normalized_quality_fields"]["source_authority"], "medium")
+        self.assertEqual(quality["accepted_quality_fields"]["source_authority"], "medium")
+        self.assertEqual(quality["quality_status"], "accepted")
+        self.assertIn("source_authority_claim_downgraded", quality["reason_codes"])
+
     def test_directness_disagreement_produces_reason_code(self) -> None:
         row = self._classification(evidence_strength="weak")
 

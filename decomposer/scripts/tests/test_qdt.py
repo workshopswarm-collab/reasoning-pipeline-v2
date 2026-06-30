@@ -81,6 +81,7 @@ class QDTContractTest(unittest.TestCase):
             research_priority=leaf["research_priority"],
             condition_scope=leaf["leaf_condition_scope"],
             required_value_fields=leaf["required_evidence_fields"],
+            research_factor=leaf.get("research_factor"),
         )
 
     def _condition_scoped_qdt_with_anchor_contract(self, *, edge_id: str, edge_status: str) -> dict:
@@ -201,6 +202,100 @@ class QDTContractTest(unittest.TestCase):
 
         self.assertFalse(result.valid)
         self.assertIn("required_source_classes must match canonical purpose template", "; ".join(result.errors))
+
+    def test_analyst_consensus_resolution_mechanics_leaf_fails_validation(self):
+        selected = select_qdt_candidate([build_fixture_qdt_candidate(self.handoff)])
+        broken = copy.deepcopy(selected)
+        valid_score = score_qdt_candidate(selected)
+        leaf = next(item for item in broken["required_leaf_questions"] if item["leaf_id"] == "leaf-resolution-mechanics")
+        leaf.update(
+            {
+                "question_text": "What is the analyst consensus or market expectation for the target outcome?",
+                "leaf_question": "What is the analyst consensus or market expectation for the target outcome?",
+                "purpose": "resolution_mechanics",
+                "coverage_dimension": "resolution_mechanics",
+                "research_factor": "external_expectations_and_source_quality",
+                "leaf_temporal_role": "resolution_mechanics",
+                "required_evidence_fields": ["analyst_consensus", "market_expectations"],
+                "market_component_terms": ["analyst consensus", "market expectations"],
+            }
+        )
+        self._refresh_leaf_sufficiency(leaf)
+
+        result = validate_question_decomposition(broken)
+        checks = compute_qdt_quality_checks(broken)
+
+        self.assertFalse(result.valid)
+        joined = "; ".join(result.errors)
+        self.assertIn("analyst_consensus_leaf_wrong_temporal_role", joined)
+        self.assertLess(score_qdt_candidate(broken), valid_score)
+        self.assertEqual(checks["research_coverage_check"]["status"], "failed")
+        self.assertIn("analyst_consensus_leaf_wrong_temporal_role", "; ".join(checks["research_coverage_check"]["reason_codes"]))
+
+    def test_valid_analyst_consensus_leaf_uses_pre_resolution_source_quality_role(self):
+        selected = select_qdt_candidate([build_fixture_qdt_candidate(self.handoff)])
+        qdt = copy.deepcopy(selected)
+        leaf = next(item for item in qdt["required_leaf_questions"] if item["leaf_id"] == "leaf-source-quality")
+        leaf.update(
+            {
+                "question_text": "What is the credible analyst consensus or expectation for the target outcome before resolution?",
+                "leaf_question": "What is the credible analyst consensus or expectation for the target outcome before resolution?",
+                "purpose": "direct_evidence",
+                "coverage_dimension": "source_quality",
+                "research_factor": "external_expectations_and_source_quality",
+                "leaf_temporal_role": "pre_resolution_forecast_driver",
+                "required_evidence_fields": ["analyst_consensus", "market_expectations", "source_quality"],
+                "market_component_terms": ["analyst consensus", "market expectations", "source quality"],
+            }
+        )
+        self._refresh_leaf_sufficiency(leaf)
+
+        result = validate_question_decomposition(qdt)
+        requirements = leaf["research_sufficiency_requirements"]
+
+        self.assertTrue(result.valid, result.errors)
+        self.assertEqual(leaf["leaf_temporal_role"], "pre_resolution_forecast_driver")
+        self.assertEqual(leaf["coverage_dimension"], "source_quality")
+        self.assertEqual(requirements["required_source_classes"], ["independent_secondary", "expert_or_specialist"])
+
+    def test_expectation_leaf_template_does_not_require_protected_primary_by_default(self):
+        requirements = build_research_sufficiency_requirements(
+            purpose="direct_evidence",
+            research_priority="medium",
+            condition_scope="unconditional",
+            required_value_fields=["analyst_consensus", "market_expectations"],
+            research_factor="external_expectations_and_source_quality",
+        )
+
+        self.assertEqual(requirements["required_source_classes"], ["independent_secondary", "expert_or_specialist"])
+        self.assertFalse(requirements["protected_primary_required"])
+
+    def test_bank_of_israel_expectation_leaf_passes_with_corrected_role(self):
+        boi_handoff = copy.deepcopy(self.handoff)
+        boi_handoff["case_id"] = "case-bank-of-israel-expectations"
+        boi_handoff["case_key"] = "polymarket:bank-of-israel-expectations"
+        boi_handoff["dispatch_id"] = "dispatch-bank-of-israel-expectations"
+        boi_handoff["macro_question"] = "Will the Bank of Israel cut interest rates at the next meeting?"
+        qdt = select_qdt_candidate([build_fixture_qdt_candidate(boi_handoff)])
+        leaf = next(item for item in qdt["required_leaf_questions"] if item["leaf_id"] == "leaf-source-quality")
+        leaf.update(
+            {
+                "question_text": "What is the analyst consensus or expert expectation for the Bank of Israel rate decision?",
+                "leaf_question": "What is the analyst consensus or expert expectation for the Bank of Israel rate decision?",
+                "purpose": "direct_evidence",
+                "coverage_dimension": "source_quality",
+                "research_factor": "external_expectations_and_source_quality",
+                "leaf_temporal_role": "pre_resolution_forecast_driver",
+                "required_evidence_fields": ["analyst_consensus", "expert_expectations", "source_quality"],
+                "market_component_terms": ["Bank of Israel", "analyst consensus", "rate decision"],
+            }
+        )
+        self._refresh_leaf_sufficiency(leaf)
+
+        result = validate_question_decomposition(qdt)
+
+        self.assertTrue(result.valid, result.errors)
+        self.assertFalse(leaf["research_sufficiency_requirements"]["protected_primary_required"])
 
     def test_depth_three_tree_is_rejected_without_waiver(self):
         selected = select_qdt_candidate([build_fixture_qdt_candidate(self.handoff)])

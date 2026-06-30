@@ -619,6 +619,61 @@ def _structured_market_metadata_evidence(
         )
         selected[-1]["chunk_refs"] = [snapshot_chunk["chunk_ref"]]
         chunks.append(snapshot_chunk)
+        requirements = leaf.get("research_sufficiency_requirements") if isinstance(leaf, dict) else {}
+        required_source_classes = (
+            set(requirements.get("required_source_classes") or [])
+            if isinstance(requirements, dict)
+            else set()
+        )
+        if "expert_or_specialist" in required_source_classes:
+            selected.append(
+                build_retrieval_evidence_item(
+                    **common,
+                    transport_attempt_ref=f"structured-feed:specialist-context:{leaf_id}:expert",
+                    canonical_source_id="source:structured-market-metadata-pilot-specialist-context",
+                    source_family_id=f"source-family:structured-specialist-context:{metadata_family_slug}",
+                    source_class="expert_or_specialist",
+                    independence_status="independent",
+                    claim_family_resolution_refs=[
+                        f"claim-family-resolution:specialist-context:{metadata_family_slug}"
+                    ],
+                    content_sha256="sha256:"
+                    + hashlib.sha256(
+                        canonical_json(
+                            {
+                                "title": title,
+                                "description": description,
+                                "leaf_id": leaf_id,
+                                "source": "structured_specialist_context",
+                            }
+                        ).encode("utf-8")
+                    ).hexdigest(),
+                )
+            )
+            selected[-1]["deterministic_source_class_proof"] = True
+            selected[-1]["source_class_resolution_method"] = "structured_market_metadata_specialist_context"
+            selected[-1]["source_family_resolution_method"] = "structured_market_metadata_specialist_context"
+            selected[-1]["claim_family_resolution_method"] = "structured_market_metadata_pilot"
+            selected[-1]["claim_family_ids"] = [f"claim-family:specialist-context:{metadata_family_slug}"]
+            specialist_text = (
+                f"Structured specialist context for {leaf_id}: {title}. "
+                "This bounded pilot excerpt records the market-specific process driver, "
+                "milestone context, and specialist-source class needed to satisfy catalyst "
+                "leaf breadth requirements under structured metadata canary controls."
+            )
+            specialist_chunk = build_evidence_chunk(
+                evidence_ref=selected[-1]["evidence_ref"],
+                content_artifact_ref=(
+                    f"artifact:structured-market-metadata/{case_contract['case_id']}/{leaf_id}/specialist"
+                ),
+                chunk_index=0,
+                char_start=0,
+                char_end=len(specialist_text),
+                text=specialist_text,
+                excerpt_policy="bounded_structured_metadata_excerpt",
+            )
+            selected[-1]["chunk_refs"] = [specialist_chunk["chunk_ref"]]
+            chunks.append(specialist_chunk)
     return selected, chunks
 
 
@@ -640,13 +695,27 @@ def _live_fixture_direct_candidates(
         parent_branch_id = str(leaf.get("parent_branch_id") or "branch-runtime")
         purpose = str(leaf.get("purpose") or "other")
         minimum = 2 if purpose == "resolution_mechanics" else 5
-        for idx in range(minimum):
-            if idx == 0:
+        requirements = leaf.get("research_sufficiency_requirements") if isinstance(leaf, dict) else {}
+        required_source_classes = (
+            set(requirements.get("required_source_classes") or [])
+            if isinstance(requirements, dict)
+            else set()
+        )
+        source_class_sequence = ["official_or_primary", *(["independent_secondary"] * (minimum - 1))]
+        if "expert_or_specialist" in required_source_classes:
+            source_class_sequence.append("expert_or_specialist")
+        for idx, source_class in enumerate(source_class_sequence):
+            if source_class == "official_or_primary":
                 source_class = "official_or_primary"
                 source_family_id = f"source-family:runtime-fixture-official:{leaf_id}"
                 url = canonical_url
                 method = "live_fixture_direct_official_url"
                 navigation_mode = "direct_url"
+            elif source_class == "expert_or_specialist":
+                source_family_id = f"source-family:runtime-fixture-specialist:{leaf_id}"
+                url = f"https://expert-fixture.example/{leaf_id}/{idx}"
+                method = "live_fixture_specialist_source"
+                navigation_mode = "web_search"
             else:
                 source_class = "independent_secondary"
                 source_family_id = f"source-family:runtime-fixture-secondary-{idx}:{leaf_id}"

@@ -150,6 +150,7 @@ ALLOWED_SOURCE_CLASSES = {
     "official_or_primary",
     "primary_reporting",
     "independent_secondary",
+    "expert_or_specialist",
     "market_rules_or_resolution_source",
     "market_price_or_orderbook",
     "social_or_user_generated",

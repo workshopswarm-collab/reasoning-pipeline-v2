@@ -59,7 +59,7 @@ HIGH_AUTHORITY_SOURCE_CLASSES = {
     "market_rules_or_resolution_source",
     "market_price_or_orderbook",
 }
-MEDIUM_AUTHORITY_SOURCE_CLASSES = {"primary_reporting", "independent_secondary"}
+MEDIUM_AUTHORITY_SOURCE_CLASSES = {"primary_reporting", "independent_secondary", "expert_or_specialist"}
 LOW_AUTHORITY_SOURCE_CLASSES = {"social_or_user_generated"}
 NON_CRITICAL_WEIGHTS = {"low", "medium", "normal"}
 HIGH_CERTAINTY_SUFFICIENCY_STATUSES = {"scae_ready_high_certainty"}

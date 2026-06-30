@@ -43,6 +43,20 @@ REQUIRED_SUFFICIENCY_FIELDS = (
 )
 
 FRESHNESS_PURPOSES = {"direct_evidence", "source_of_truth", "catalyst", "market_pricing"}
+EXPECTATION_CONSENSUS_TERMS = {
+    "analyst",
+    "analysts",
+    "consensus",
+    "expectation",
+    "expectations",
+    "survey",
+}
+OFFICIAL_SURVEY_TERMS = {
+    "official_survey",
+    "official survey",
+    "central_bank_survey",
+    "central bank survey",
+}
 
 
 def _canonical_json(value: Any) -> str:
@@ -82,7 +96,47 @@ def _dedupe(values: list[str] | None) -> list[str]:
     return result
 
 
-def source_classes_for_purpose(purpose: str) -> list[str]:
+def _semantic_template_text(required_value_fields: list[str] | None, research_factor: str | None = None) -> str:
+    values = list(required_value_fields or [])
+    if _is_non_empty_string(research_factor):
+        values.append(str(research_factor))
+    return " ".join(values).replace("-", "_").lower()
+
+
+def is_expectation_consensus_template(
+    *,
+    required_value_fields: list[str] | None = None,
+    research_factor: str | None = None,
+) -> bool:
+    text = _semantic_template_text(required_value_fields, research_factor)
+    return any(term in text for term in EXPECTATION_CONSENSUS_TERMS)
+
+
+def is_official_survey_template(
+    *,
+    required_value_fields: list[str] | None = None,
+    research_factor: str | None = None,
+) -> bool:
+    text = _semantic_template_text(required_value_fields, research_factor)
+    return any(term in text for term in OFFICIAL_SURVEY_TERMS)
+
+
+def source_classes_for_purpose(
+    purpose: str,
+    *,
+    required_value_fields: list[str] | None = None,
+    research_factor: str | None = None,
+) -> list[str]:
+    if is_expectation_consensus_template(
+        required_value_fields=required_value_fields,
+        research_factor=research_factor,
+    ):
+        if is_official_survey_template(
+            required_value_fields=required_value_fields,
+            research_factor=research_factor,
+        ):
+            return ["official_or_primary", "independent_secondary", "expert_or_specialist"]
+        return ["independent_secondary", "expert_or_specialist"]
     if purpose == "market_pricing":
         return ["market_or_exchange", "independent_secondary"]
     if purpose in {"source_of_truth", "resolution_mechanics"}:
@@ -141,11 +195,23 @@ def build_research_sufficiency_requirements(
     condition_scope: str,
     required_value_fields: list[str] | None = None,
     required_negative_checks: list[str] | None = None,
+    research_factor: str | None = None,
 ) -> dict[str, Any]:
     """Build the canonical QDT high-certainty sufficiency requirement block."""
 
     value_fields = _dedupe(required_value_fields)
     negative_checks = _dedupe(required_negative_checks) or negative_checks_for_purpose(purpose)
+    expectation_template = is_expectation_consensus_template(
+        required_value_fields=value_fields,
+        research_factor=research_factor,
+    )
+    official_survey_template = is_official_survey_template(
+        required_value_fields=value_fields,
+        research_factor=research_factor,
+    )
+    protected_primary_required = purpose == "source_of_truth" and (
+        not expectation_template or official_survey_template
+    )
     critical_or_source = research_priority == "critical" or purpose == "source_of_truth"
     family_minimum = 2 if research_priority in {"critical", "high"} else 1
     fresh_sources = 1 if purpose in FRESHNESS_PURPOSES else 0
@@ -169,8 +235,12 @@ def build_research_sufficiency_requirements(
             research_priority=research_priority,
             condition_scope=condition_scope,
         ),
-        "required_source_classes": source_classes_for_purpose(purpose),
-        "protected_primary_required": purpose == "source_of_truth",
+        "required_source_classes": source_classes_for_purpose(
+            purpose,
+            required_value_fields=value_fields,
+            research_factor=research_factor,
+        ),
+        "protected_primary_required": protected_primary_required,
         "min_independent_claim_families": family_minimum,
         "min_independent_source_families": family_minimum,
         "min_temporally_fresh_sources": fresh_sources,
@@ -198,6 +268,7 @@ def validate_research_sufficiency_requirements(
     research_priority: str,
     condition_scope: str,
     required_evidence_fields: list[str],
+    research_factor: str | None = None,
 ) -> list[str]:
     """Return deterministic validation errors for a per-leaf requirement block."""
 
@@ -233,7 +304,11 @@ def validate_research_sufficiency_requirements(
     if requirements.get("retrieval_breadth_profile_ref") != expected_breadth_ref:
         errors.append("retrieval_breadth_profile_ref must match canonical leaf template")
 
-    expected_source_classes = source_classes_for_purpose(purpose)
+    expected_source_classes = source_classes_for_purpose(
+        purpose,
+        required_value_fields=required_evidence_fields,
+        research_factor=research_factor,
+    )
     if requirements.get("required_source_classes") != expected_source_classes:
         errors.append("required_source_classes must match canonical purpose template")
 
@@ -246,7 +321,18 @@ def validate_research_sufficiency_requirements(
     expected_fresh_sources = 1 if purpose in FRESHNESS_PURPOSES else 0
     if requirements.get("min_temporally_fresh_sources") != expected_fresh_sources:
         errors.append("min_temporally_fresh_sources must match leaf purpose")
-    if requirements.get("protected_primary_required") != (purpose == "source_of_truth"):
+    expectation_template = is_expectation_consensus_template(
+        required_value_fields=required_evidence_fields,
+        research_factor=research_factor,
+    )
+    official_survey_template = is_official_survey_template(
+        required_value_fields=required_evidence_fields,
+        research_factor=research_factor,
+    )
+    expected_protected_primary = purpose == "source_of_truth" and (
+        not expectation_template or official_survey_template
+    )
+    if requirements.get("protected_primary_required") != expected_protected_primary:
         errors.append("protected_primary_required must match leaf purpose")
 
     required_value_fields = requirements.get("required_value_fields")

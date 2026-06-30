@@ -72,6 +72,11 @@ DETERMINISTIC_SOURCE_CLASS_URL_REGISTRY = (
         "source_class": "independent_secondary",
     },
     {
+        "registry_id": "ads-static-specialist-source-registry/gartner",
+        "domain_suffixes": ("gartner.com",),
+        "source_class": "expert_or_specialist",
+    },
+    {
         "registry_id": "ads-static-secondary-source-registry/associated-press-hosted",
         "domain_suffixes": ("hosted.ap.org",),
         "source_class": "independent_secondary",
@@ -809,7 +814,12 @@ def _deterministic_source_class_registry_match(url: str) -> dict[str, str] | Non
         return None
     for entry in DETERMINISTIC_SOURCE_CLASS_URL_REGISTRY:
         source_class = str(entry.get("source_class") or "")
-        if source_class not in {"official_or_primary", "independent_secondary", "primary_reporting"}:
+        if source_class not in {
+            "official_or_primary",
+            "independent_secondary",
+            "expert_or_specialist",
+            "primary_reporting",
+        }:
             continue
         for suffix in entry.get("domain_suffixes", ()):
             normalized_suffix = str(suffix).lower().removeprefix("www.")

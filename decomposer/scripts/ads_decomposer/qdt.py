@@ -179,6 +179,17 @@ TERMINAL_RESULT_VERIFICATION_PATTERNS = (
     r"\bfinal\b.{0,80}\bresult\b",
     r"\bresolved\b",
 )
+ANALYST_CONSENSUS_PATTERNS = (
+    r"\banalyst(?:s)?\b",
+    r"\bconsensus\b",
+    r"\bexpectation(?:s)?\b",
+    r"\bsurvey(?:s)?\b",
+)
+OFFICIAL_SURVEY_PATTERNS = (
+    r"\bofficial\b.{0,80}\bsurvey\b",
+    r"\bsurvey\b.{0,80}\bofficial\b",
+    r"\bcentral bank\b.{0,80}\bsurvey\b",
+)
 FORBIDDEN_LEAF_OUTPUTS = {
     "probability",
     "odds",
@@ -430,9 +441,20 @@ def _leaf_semantic_text(leaf: dict[str, Any]) -> str:
         leaf.get("question_text"),
         leaf.get("leaf_question"),
         leaf.get("research_factor"),
+        " ".join(str(item) for item in leaf.get("required_evidence_fields") or []),
         " ".join(str(item) for item in leaf.get("market_component_terms") or []),
     ]
     return " ".join(str(value or "") for value in values).lower()
+
+
+def _leaf_is_analyst_consensus_expectation(leaf: dict[str, Any]) -> bool:
+    text = _leaf_semantic_text(leaf)
+    return any(re.search(pattern, text) for pattern in ANALYST_CONSENSUS_PATTERNS)
+
+
+def _leaf_requires_official_survey_primary(leaf: dict[str, Any]) -> bool:
+    text = _leaf_semantic_text(leaf).replace("_", " ")
+    return any(re.search(pattern, text) for pattern in OFFICIAL_SURVEY_PATTERNS)
 
 
 def _leaf_looks_like_terminal_verification(leaf: dict[str, Any]) -> bool:
@@ -485,6 +507,8 @@ def _coverage_dimension_for_leaf(leaf: dict[str, Any]) -> str:
         )
     ).lower()
     purpose = leaf.get("purpose")
+    if any(re.search(pattern, text) for pattern in ANALYST_CONSENSUS_PATTERNS):
+        return "source_quality"
     if any(term in text for term in ("rumor", "quality", "source class", "claim family", "syndicat")):
         return "source_quality"
     if any(term in text for term in ("timing", "deadline", "cutoff", "window", "time remaining")):
@@ -1045,6 +1069,7 @@ def build_research_sufficiency_requirements(
     condition_scope: str,
     required_value_fields: list[str] | None = None,
     required_negative_checks: list[str] | None = None,
+    research_factor: str | None = None,
 ) -> dict[str, Any]:
     return _build_research_sufficiency_requirements(
         purpose=purpose,
@@ -1052,6 +1077,7 @@ def build_research_sufficiency_requirements(
         condition_scope=condition_scope,
         required_value_fields=required_value_fields,
         required_negative_checks=required_negative_checks,
+        research_factor=research_factor,
     )
 
 
@@ -1106,6 +1132,7 @@ def build_qdt_candidate(
                 required_value_fields=leaf.get("required_evidence_fields")
                 if isinstance(leaf.get("required_evidence_fields"), list)
                 else None,
+                research_factor=leaf.get("research_factor") if isinstance(leaf.get("research_factor"), str) else None,
             )
     leaves = [_enrich_leaf_research_contract(leaf, handoff) for leaf in leaves]
     purposes = sorted({leaf.get("purpose") for leaf in leaves if leaf.get("purpose")})
@@ -1490,6 +1517,9 @@ def _validate_sufficiency(requirements: Any, leaf: dict[str, Any], path: str, er
             required_evidence_fields=list(required_evidence_fields)
             if _string_list(required_evidence_fields)
             else [],
+            research_factor=str(leaf.get("research_factor"))
+            if _is_non_empty_string(leaf.get("research_factor"))
+            else None,
         )
         for error in template_errors:
             errors.append(f"{path}.{error}")
@@ -1546,6 +1576,34 @@ def _validate_specificity_evidence(value: Any, path: str, errors: list[str]) -> 
             errors.append(f"{path}.specificity_evidence.{text_field} is required")
 
 
+def _validate_leaf_role_semantics(leaf: dict[str, Any], path: str, errors: list[str]) -> None:
+    if not _leaf_is_analyst_consensus_expectation(leaf):
+        return
+    role = str(leaf.get("leaf_temporal_role") or "")
+    purpose = str(leaf.get("purpose") or "")
+    dimension = str(leaf.get("coverage_dimension") or "")
+    official_survey = _leaf_requires_official_survey_primary(leaf)
+    requirements = leaf.get("research_sufficiency_requirements")
+    source_classes = (
+        list(requirements.get("required_source_classes") or [])
+        if isinstance(requirements, dict)
+        else []
+    )
+    protected_primary_required = (
+        bool(requirements.get("protected_primary_required"))
+        if isinstance(requirements, dict)
+        else False
+    )
+    if role == "resolution_mechanics" or purpose == "resolution_mechanics" or dimension == "resolution_mechanics":
+        errors.append(f"{path}.analyst_consensus_leaf_wrong_temporal_role")
+    if role != "pre_resolution_forecast_driver" and dimension != "source_quality":
+        errors.append(f"{path}.analyst_consensus_leaf_must_be_pre_resolution_or_source_quality")
+    if protected_primary_required and not official_survey:
+        errors.append(f"{path}.analyst_consensus_overclaims_source_of_truth")
+    if "official_or_primary" in source_classes and not official_survey:
+        errors.append(f"{path}.analyst_consensus_source_classes_must_be_independent_or_expert")
+
+
 def _validate_leaf_research_contract(leaf: dict[str, Any], path: str, errors: list[str]) -> None:
     if leaf.get("leaf_temporal_role") not in ALLOWED_LEAF_TEMPORAL_ROLES:
         errors.append(f"{path}.leaf_temporal_role is invalid")
@@ -1580,6 +1638,7 @@ def _validate_leaf_research_contract(leaf: dict[str, Any], path: str, errors: li
     similarity = _max_template_similarity(str(leaf.get("leaf_question") or leaf.get("question_text") or ""))
     if similarity > 0.82:
         errors.append(f"{path}:template_mad_lib_leaf")
+    _validate_leaf_role_semantics(leaf, path, errors)
 
 
 def _validate_leaves(
@@ -2438,6 +2497,7 @@ def compute_qdt_quality_checks(
                 "missing_pre_resolution_forecast_dimensions",
                 "terminal_verification_leaf_misclassified_as_pre_resolution",
                 "terminal_verification_dominates_unresolved_forecast_qdt",
+                "analyst_consensus",
                 "classification_targets",
                 "evidence_requirements",
                 "specificity_evidence",
@@ -2457,6 +2517,7 @@ def compute_qdt_quality_checks(
                 "market_family_context_not_analyzed",
                 "terminal_verification_leaf_misclassified_as_pre_resolution",
                 "terminal_verification_dominates_unresolved_forecast_qdt",
+                "analyst_consensus",
                 "specificity_evidence",
                 "leaf_question",
             )

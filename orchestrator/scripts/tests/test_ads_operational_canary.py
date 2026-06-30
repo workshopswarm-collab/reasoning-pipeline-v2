@@ -105,8 +105,11 @@ class _SearchProofRetrievalProvider:
     ) -> list[dict[str, Any]]:
         leaf_id = str(query_context["leaf_id"])
         required_count = 2 if query_context.get("purpose") == "resolution_mechanics" else 5
+        domains = list(self._domains)
+        if query_context.get("purpose") == "catalyst":
+            domains = ["ir.tesla.com", "reuters.com", "gartner.com", "apnews.com", "bloomberg.com"]
         records: list[dict[str, Any]] = []
-        for index, domain in enumerate(self._domains[:required_count], start=1):
+        for index, domain in enumerate(domains[:required_count], start=1):
             path_leaf = leaf_id.replace("_", "-")
             url = f"https://{domain}/ads-search-proof/{path_leaf}/{index}"
             produced = 10_000 + (index * 101)
