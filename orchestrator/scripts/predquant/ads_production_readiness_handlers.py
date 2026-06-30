@@ -382,6 +382,14 @@ def _attach_live_retrieval_transport_metadata(
                 "direct_url_fetch_attempt_count": int(
                     transport_diagnostics.get("direct_url_fetch_attempt_count") or 0
                 ),
+                "canonical_fetch_cache": transport_diagnostics.get("canonical_fetch_cache")
+                or {
+                    "schema_version": "canonical-fetch-cache-summary/v1",
+                    "cache_key": "canonical_url_plus_cutoff",
+                    "unique_fetch_count": 0,
+                    "cache_hit_count": 0,
+                    "cached_fetch_refs": [],
+                },
                 "direct_url_capture_executed": direct_url_capture_executed,
                 "direct_url_capture_status": str(
                     transport_diagnostics.get("direct_url_capture_status")

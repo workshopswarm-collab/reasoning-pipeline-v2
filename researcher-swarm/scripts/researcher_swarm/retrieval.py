@@ -49,6 +49,7 @@ LEAF_RETRIEVAL_RESULT_SCHEMA_VERSION = "leaf-retrieval-result/v1"
 RETRIEVAL_EVIDENCE_SCHEMA_VERSION = "retrieval-evidence/v1"
 RETRIEVAL_EVIDENCE_CHUNK_SCHEMA_VERSION = "retrieval-evidence-chunk/v1"
 RETRIEVAL_EVIDENCE_SPAN_SCHEMA_VERSION = "retrieval-evidence-span/v1"
+SOURCE_RELEVANCE_MAPPING_SCHEMA_VERSION = "source-relevance-mapping/v1"
 RETRIEVAL_CANDIDATE_RECORD_SCHEMA_VERSION = "retrieval-candidate-record/v1"
 NATIVE_RESEARCH_ATTEMPT_SCHEMA_VERSION = "native-research-attempt/v1"
 BROWSER_RETRIEVAL_ATTEMPT_SCHEMA_VERSION = "browser-retrieval-attempt/v1"
@@ -3310,6 +3311,21 @@ def build_leaf_evidence_dockets(packet: dict[str, Any]) -> list[dict[str, Any]]:
             "certificate": cert.get("certificate_id"),
             "supplemental": [item.get("supplemental_evidence_ref") or item.get("evidence_ref") for item in supplemental_candidates],
         }
+        relevance_refs = sorted(
+            {
+                str(ref)
+                for item in selected
+                for ref in item.get("leaf_source_relevance_refs", [])
+                if _is_non_empty_string(ref)
+            }
+        )
+        canonical_fetch_refs = sorted(
+            {
+                str(item.get("canonical_fetch_ref"))
+                for item in selected
+                if _is_non_empty_string(item.get("canonical_fetch_ref"))
+            }
+        )
         proceed = cert.get("classification_dispatch_allowed") is True and cert.get("status") == "certified_high_certainty"
         dockets.append(
             {
@@ -3319,6 +3335,8 @@ def build_leaf_evidence_dockets(packet: dict[str, Any]) -> list[dict[str, Any]]:
                 "leaf_id": leaf_id,
                 "query_context_ref": result.get("query_context_ref"),
                 "admitted_evidence_refs": [item["evidence_ref"] for item in selected if _is_non_empty_string(item.get("evidence_ref"))],
+                "source_relevance_mapping_refs": relevance_refs,
+                "canonical_fetch_refs": canonical_fetch_refs,
                 "rejected_or_omitted_candidate_refs": [
                     item["candidate_id"] for item in omitted if _is_non_empty_string(item.get("candidate_id"))
                 ],
@@ -3343,6 +3361,48 @@ def build_leaf_evidence_dockets(packet: dict[str, Any]) -> list[dict[str, Any]]:
             }
         )
     return dockets
+
+
+def build_source_relevance_mappings(packet: dict[str, Any]) -> list[dict[str, Any]]:
+    mappings: list[dict[str, Any]] = []
+    for result in packet.get("leaf_retrieval_results", []) if isinstance(packet.get("leaf_retrieval_results"), list) else []:
+        if not isinstance(result, dict):
+            continue
+        leaf_id = str(result.get("leaf_id") or "")
+        for evidence in result.get("selected_evidence", []) if isinstance(result.get("selected_evidence"), list) else []:
+            if not isinstance(evidence, dict):
+                continue
+            relevance_refs = [
+                str(ref)
+                for ref in evidence.get("leaf_source_relevance_refs", [])
+                if _is_non_empty_string(ref)
+            ]
+            if not relevance_refs:
+                continue
+            for relevance_ref in relevance_refs:
+                mappings.append(
+                    {
+                        "artifact_type": "source_relevance_mapping",
+                        "schema_version": SOURCE_RELEVANCE_MAPPING_SCHEMA_VERSION,
+                        "source_relevance_ref": relevance_ref,
+                        "leaf_id": leaf_id,
+                        "evidence_ref": evidence.get("evidence_ref"),
+                        "canonical_fetch_ref": evidence.get("canonical_fetch_ref"),
+                        "canonical_url": evidence.get("canonical_url"),
+                        "source_content_artifact_ref": evidence.get("source_content_artifact_ref"),
+                        "chunk_refs": list(evidence.get("chunk_refs") or []),
+                        "source_family_id": evidence.get("source_family_id"),
+                        "claim_family_ids": list(evidence.get("claim_family_ids") or []),
+                        "relevance_status": evidence.get("source_relevance_status") or "usable",
+                        "authority_boundary": {
+                            "source_family_breadth_authority": False,
+                            "claim_family_breadth_authority": False,
+                            "forecast_authority": False,
+                        },
+                    }
+                )
+    mappings.sort(key=lambda item: (str(item.get("source_relevance_ref")), str(item.get("leaf_id"))))
+    return mappings
 
 
 def _source_freshness_timestamp(item: dict[str, Any]) -> datetime | None:
@@ -4822,6 +4882,7 @@ def finalize_retrieval_packet_for_dispatch(
             replay_command=replay_command,
         )
         packet_copy.update(stage_records)
+    packet_copy["source_relevance_mappings"] = build_source_relevance_mappings(packet_copy)
     packet_copy["leaf_evidence_dockets"] = build_leaf_evidence_dockets(packet_copy)
 
     result = validate_retrieval_packet(packet_copy)
@@ -5027,13 +5088,32 @@ def _materialize_candidate_evidence(
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     leaf_id = str(context["leaf_id"])
     text = _candidate_text(candidate)
+    canonical_url = str(attempt.get("canonical_url") or candidate.get("canonical_url") or candidate.get("url") or "")
+    canonical_fetch_ref = str(
+        candidate.get("canonical_fetch_ref")
+        or _sha_id(
+            "canonical-fetch",
+            {
+                "canonical_url": canonical_url,
+                "source_cutoff_timestamp": source_cutoff_timestamp,
+            },
+        )
+    )
+    content_sha256 = _content_sha256(candidate, canonical_url)
     content_artifact_ref = candidate.get("content_artifact_ref") or _sha_id(
         "browser-content",
         {
+            "canonical_fetch_ref": canonical_fetch_ref,
+            "canonical_url": canonical_url,
+            "content_sha256": content_sha256,
+        },
+    )
+    leaf_source_relevance_ref = _sha_id(
+        "source-relevance",
+        {
             "leaf_id": leaf_id,
-            "attempt_id": attempt["attempt_id"],
-            "canonical_url": attempt.get("canonical_url"),
-            "text": text,
+            "canonical_fetch_ref": canonical_fetch_ref,
+            "content_artifact_ref": content_artifact_ref,
         },
     )
     source_class = str(candidate.get("source_class") or "unknown")
@@ -5067,7 +5147,7 @@ def _materialize_candidate_evidence(
         transport_attempt_ref=str(candidate.get("transport_attempt_ref") or attempt["attempt_id"]),
         requested_url=str(attempt.get("requested_url") or candidate.get("requested_url") or candidate.get("url") or ""),
         final_url=str(attempt.get("final_url") or candidate.get("final_url") or candidate.get("url") or ""),
-        canonical_url=str(attempt.get("canonical_url") or candidate.get("canonical_url") or candidate.get("url") or ""),
+        canonical_url=canonical_url,
         canonical_source_id=str(candidate.get("canonical_source_id") or f"source:{source_family_id}"),
         source_family_id=source_family_id,
         source_class=source_class,
@@ -5079,7 +5159,7 @@ def _materialize_candidate_evidence(
         captured_at=candidate.get("captured_at") or _iso_before_cutoff(source_cutoff_timestamp),
         artifact_generated_at=candidate.get("artifact_generated_at") or _iso_before_cutoff(source_cutoff_timestamp),
         retrieval_capture_for_dispatch=True,
-        content_sha256=candidate.get("content_sha256"),
+        content_sha256=content_sha256,
         retrieval_score=float(candidate.get("retrieval_score", 1.0) or 1.0),
         admission_reason_codes=[
             str(candidate.get("admission_reason_code") or evidence_source),
@@ -5095,6 +5175,10 @@ def _materialize_candidate_evidence(
         source_family_method
     )
     evidence["claim_family_ids"] = claim_family_ids
+    evidence["canonical_fetch_ref"] = canonical_fetch_ref
+    evidence["source_content_artifact_ref"] = str(content_artifact_ref)
+    evidence["leaf_source_relevance_refs"] = [leaf_source_relevance_ref]
+    evidence["source_relevance_status"] = "usable"
     if claim_family_ids and allow_candidate_claim_family_ids:
         evidence["claim_family_resolution_method"] = "explicit_candidate_claim_family_ids_allowed"
     chunk = build_evidence_chunk(
@@ -5738,6 +5822,13 @@ def build_live_retrieval_packet_from_candidates(
         if isinstance(packet.get("source_metadata_classifier_unavailable_diagnostics"), list)
         else []
     )
+    canonical_fetch_refs = sorted(
+        {
+            str(item.get("canonical_fetch_ref"))
+            for item in selected
+            if _is_non_empty_string(item.get("canonical_fetch_ref"))
+        }
+    )
     packet["retrieval_runtime_summary"] = {
         "schema_version": "retrieval-runtime-summary/v1",
         "runtime_mode": runtime_mode,
@@ -5770,6 +5861,9 @@ def build_live_retrieval_packet_from_candidates(
         "admitted_initial_evidence_count": len(selected) - sum(
             1 for item in supplemental_records if item.get("normalization_status") == "normalized"
         ),
+        "source_relevance_mapping_count": len(packet.get("source_relevance_mappings", [])),
+        "unique_canonical_fetch_ref_count": len(canonical_fetch_refs),
+        "canonical_fetch_refs": canonical_fetch_refs,
         "admitted_supplemental_evidence_count": sum(
             1 for item in supplemental_records if item.get("normalization_status") == "normalized"
         ),
@@ -6069,6 +6163,7 @@ def build_retrieval_packet(
         "atomic_claim_candidates": atomic_claim_candidates,
         "claim_family_resolutions": claim_family_resolutions,
         "retrieval_evidence_provenance_slices": provenance_slices,
+        "source_relevance_mappings": [],
         "evidence_chunks": [],
         "evidence_spans": [],
         "policy_context_ref": policy_context_ref or "artifact:effective-profile-context-unregistered",
@@ -6099,6 +6194,7 @@ def build_retrieval_packet(
     contradiction_attempts, negative_attempts = build_required_contradiction_and_negative_attempts(packet)
     packet["contradiction_search_attempts"] = contradiction_attempts
     packet["negative_check_attempts"] = negative_attempts
+    packet["source_relevance_mappings"] = build_source_relevance_mappings(packet)
     packet["retrieval_metadata_fill_diagnostics"] = build_retrieval_metadata_fill_diagnostics(packet)
     packet["retrieval_breadth_coverage_slices"] = build_retrieval_breadth_coverage_slices(packet)
     result = validate_retrieval_packet(packet)

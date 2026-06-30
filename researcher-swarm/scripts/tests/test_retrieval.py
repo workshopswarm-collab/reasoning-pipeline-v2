@@ -294,6 +294,37 @@ class RetrievalPacketContractTest(unittest.TestCase):
             )
         return records
 
+    def _two_leaf_qdt(self) -> dict:
+        qdt = copy.deepcopy(self.qdt)
+        keep = {"leaf-source-of-truth", "leaf-direct-evidence"}
+        qdt["required_leaf_questions"] = [
+            leaf for leaf in qdt["required_leaf_questions"] if leaf["leaf_id"] in keep
+        ]
+        qdt["branches"] = [
+            branch
+            for branch in qdt["branches"]
+            if set(branch.get("leaf_ids", [])) & keep
+        ]
+        return qdt
+
+    def _shared_source_candidates(self, qdt: dict) -> list[dict]:
+        contexts = build_retrieval_query_contexts(qdt, evidence_packet=self.evidence_packet)
+        candidates: list[dict] = []
+        shared_content = (
+            "Shared source content with enough bounded detail for researcher classification and "
+            "claim extraction across every mapped leaf. "
+            * 8
+        )
+        for index, context in enumerate(contexts):
+            shared = self._live_candidate(context, index, direct=True, official=True)
+            shared["canonical_url"] = "https://example.com/shared-source"
+            shared["requested_url"] = shared["canonical_url"]
+            shared["final_url"] = shared["canonical_url"]
+            shared["content"] = shared_content
+            secondary = self._live_candidate(context, index + 10, source_class="independent_secondary")
+            candidates.extend([shared, secondary])
+        return candidates
+
     def test_query_contexts_cover_every_leaf_with_sufficiency_and_breadth_targets(self) -> None:
         contexts = build_retrieval_query_contexts(self.qdt, evidence_packet=self.evidence_packet)
 
@@ -451,6 +482,59 @@ class RetrievalPacketContractTest(unittest.TestCase):
             self.assertTrue(docket["proceed_to_classification"])
             self.assertFalse(docket["classification_authority"])
             self.assertFalse(docket["scae_authority"])
+
+    def test_same_source_fans_out_to_multiple_leaves_without_new_source_families(self) -> None:
+        qdt = self._two_leaf_qdt()
+        packet = build_live_retrieval_packet_from_candidates(
+            qdt,
+            evidence_packet=self.evidence_packet,
+            fetched_candidates=self._shared_source_candidates(qdt),
+            question_decomposition_artifact_id="artifact:qdt-1",
+            policy_context_ref="artifact:profile-1",
+            live_retrieval_allowlist=["browser"],
+        )
+
+        shared_mappings = [
+            item
+            for item in packet["source_relevance_mappings"]
+            if item["canonical_url"] == "https://example.com/shared-source"
+        ]
+        self.assertEqual({item["leaf_id"] for item in shared_mappings}, {"leaf-source-of-truth", "leaf-direct-evidence"})
+        self.assertEqual(len({item["canonical_fetch_ref"] for item in shared_mappings}), 1)
+        self.assertEqual(len({item["source_content_artifact_ref"] for item in shared_mappings}), 1)
+        self.assertEqual(len({item["source_family_id"] for item in shared_mappings}), 1)
+        shared_family_id = shared_mappings[0]["source_family_id"]
+        shared_family_evidence_count = sum(
+            1
+            for result in packet["leaf_retrieval_results"]
+            for evidence in result["selected_evidence"]
+            if evidence.get("source_family_id") == shared_family_id
+        )
+        self.assertEqual(shared_family_evidence_count, 2)
+
+    def test_leaf_dockets_include_shared_source_relevance_refs(self) -> None:
+        qdt = self._two_leaf_qdt()
+        packet = build_live_retrieval_packet_from_candidates(
+            qdt,
+            evidence_packet=self.evidence_packet,
+            fetched_candidates=self._shared_source_candidates(qdt),
+            question_decomposition_artifact_id="artifact:qdt-1",
+            policy_context_ref="artifact:profile-1",
+            live_retrieval_allowlist=["browser"],
+        )
+        mapping_refs_by_leaf = {
+            item["leaf_id"]: {
+                mapping["source_relevance_ref"]
+                for mapping in packet["source_relevance_mappings"]
+                if mapping["leaf_id"] == item["leaf_id"]
+            }
+            for item in packet["leaf_evidence_dockets"]
+        }
+
+        for docket in packet["leaf_evidence_dockets"]:
+            self.assertTrue(docket["source_relevance_mapping_refs"])
+            self.assertTrue(set(docket["source_relevance_mapping_refs"]).issubset(mapping_refs_by_leaf[docket["leaf_id"]]))
+            self.assertTrue(docket["canonical_fetch_refs"])
 
     def test_browser_and_native_attempt_records_are_refs_not_metadata_authority(self) -> None:
         context = build_retrieval_query_contexts(self.qdt, evidence_packet=self.evidence_packet)[0]

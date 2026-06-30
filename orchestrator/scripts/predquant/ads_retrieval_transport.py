@@ -7,6 +7,7 @@ family, temporal safety, or research sufficiency from provider output.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import re
 import time
@@ -176,6 +177,26 @@ class RetrievalTransportResult:
     transport_diagnostics: dict[str, Any] = field(default_factory=dict)
 
 
+def _hash_suffix(value: Any, length: int = 24) -> str:
+    return hashlib.sha256(repr(value).encode("utf-8")).hexdigest()[:length]
+
+
+def _canonical_fetch_key(url: Any, source_cutoff_timestamp: str) -> tuple[str, str] | None:
+    canonical_url = _canonicalize_url(url)
+    if not canonical_url:
+        return None
+    return (canonical_url, source_cutoff_timestamp)
+
+
+def _canonical_fetch_ref(canonical_url: str, source_cutoff_timestamp: str) -> str:
+    return "canonical-fetch-" + _hash_suffix(
+        {
+            "canonical_url": canonical_url,
+            "source_cutoff_timestamp": source_cutoff_timestamp,
+        }
+    )
+
+
 def _browser_search_status(
     *,
     policy: RetrievalProviderPolicy,
@@ -271,34 +292,42 @@ def collect_live_retrieval_candidates(
     result = RetrievalTransportResult(direct_url_candidates=direct_urls)
     direct_fetch_count = 0
     direct_fetch_skipped_count = 0
+    direct_fetch_cache_hit_count = 0
     search_call_count = 0
     search_call_skipped_count = 0
     search_failure_diagnostics: list[dict[str, Any]] = []
     search_skipped_diagnostics: list[dict[str, Any]] = []
     search_result_fetch_count = 0
     search_result_fetch_skipped_count = 0
+    search_result_fetch_cache_hit_count = 0
     native_research_call_count = 0
+    fetch_cache: dict[tuple[str, str], dict[str, Any]] = {}
     collection_started_at = time.monotonic()
     direct_fetch_started_at = collection_started_at
 
     for context in contexts:
         for rank, hint in enumerate(direct_urls, start=1):
-            if direct_fetch_count >= max(0, policy.max_total_direct_fetches):
+            cache_key = _canonical_fetch_key(hint.get("url"), source_cutoff_timestamp)
+            cache_hit = cache_key is not None and cache_key in fetch_cache
+            if not cache_hit and direct_fetch_count >= max(0, policy.max_total_direct_fetches):
                 direct_fetch_skipped_count += 1
                 continue
-            direct_fetch_count += 1
-            result.fetched_candidates.append(
-                _fetch_candidate(
-                    context=context,
-                    hint=hint,
-                    rank=rank,
-                    source_cutoff_timestamp=source_cutoff_timestamp,
-                    browser_provider=browser_provider,
-                    navigation_mode="direct_url",
-                    search_candidate_url_ref=None,
-                    deterministic_direct_url_source_classes=policy.deterministic_direct_url_source_classes,
-                )
+            candidate = _fetch_candidate(
+                context=context,
+                hint=hint,
+                rank=rank,
+                source_cutoff_timestamp=source_cutoff_timestamp,
+                browser_provider=browser_provider,
+                navigation_mode="direct_url",
+                search_candidate_url_ref=None,
+                deterministic_direct_url_source_classes=policy.deterministic_direct_url_source_classes,
+                fetch_cache=fetch_cache,
             )
+            if candidate.get("canonical_fetch_cache_status") == "hit":
+                direct_fetch_cache_hit_count += 1
+            elif candidate.get("canonical_fetch_cache_status") == "miss":
+                direct_fetch_count += 1
+            result.fetched_candidates.append(candidate)
 
     direct_url_elapsed_seconds = max(0.0, time.monotonic() - direct_fetch_started_at)
     max_total_search_elapsed_seconds = max(0.0, float(policy.max_total_search_elapsed_seconds or 0.0))
@@ -368,29 +397,35 @@ def collect_live_retrieval_candidates(
                     )
                 result.search_candidate_urls.extend(search_records)
                 for search_rank, record in enumerate(search_records, start=1):
-                    if search_result_fetch_count >= max(0, policy.max_total_search_result_fetches):
+                    url = record.get("url") or record.get("canonical_url")
+                    cache_key = _canonical_fetch_key(url, source_cutoff_timestamp)
+                    cache_hit = cache_key is not None and cache_key in fetch_cache
+                    if not cache_hit and search_result_fetch_count >= max(0, policy.max_total_search_result_fetches):
                         search_result_fetch_skipped_count += 1
                         continue
-                    search_result_fetch_count += 1
                     hint = {
-                        "url": record.get("url") or record.get("canonical_url"),
+                        "url": url,
                         "source_ref": record.get("search_candidate_url_id") or record.get("candidate_url_ref"),
                         "source_class": None,
                         "source_class_resolution_method": None,
                         "deterministic_source_class_proof": False,
                     }
-                    result.fetched_candidates.append(
-                        _fetch_candidate(
-                            context=context,
-                            hint=hint,
-                            rank=int(record.get("rank") or search_rank),
-                            source_cutoff_timestamp=source_cutoff_timestamp,
-                            browser_provider=browser_provider,
-                            navigation_mode="web_search",
-                            search_candidate_url_ref=record.get("search_candidate_url_id") or record.get("candidate_url_ref"),
-                            deterministic_direct_url_source_classes=False,
-                        )
+                    candidate = _fetch_candidate(
+                        context=context,
+                        hint=hint,
+                        rank=int(record.get("rank") or search_rank),
+                        source_cutoff_timestamp=source_cutoff_timestamp,
+                        browser_provider=browser_provider,
+                        navigation_mode="web_search",
+                        search_candidate_url_ref=record.get("search_candidate_url_id") or record.get("candidate_url_ref"),
+                        deterministic_direct_url_source_classes=False,
+                        fetch_cache=fetch_cache,
                     )
+                    if candidate.get("canonical_fetch_cache_status") == "hit":
+                        search_result_fetch_cache_hit_count += 1
+                    elif candidate.get("canonical_fetch_cache_status") == "miss":
+                        search_result_fetch_count += 1
+                    result.fetched_candidates.append(candidate)
 
     if policy.native_enabled and native_candidate_provider is not None:
         for context in contexts:
@@ -497,6 +532,18 @@ def collect_live_retrieval_candidates(
         "search_skipped_diagnostics": search_skipped_diagnostics,
         "search_result_fetch_attempt_count": search_result_fetch_count,
         "search_result_fetch_skipped_count": search_result_fetch_skipped_count,
+        "canonical_fetch_cache": {
+            "schema_version": "canonical-fetch-cache-summary/v1",
+            "cache_key": "canonical_url_plus_cutoff",
+            "unique_fetch_count": len(fetch_cache),
+            "direct_url_cache_hit_count": direct_fetch_cache_hit_count,
+            "search_result_cache_hit_count": search_result_fetch_cache_hit_count,
+            "cache_hit_count": direct_fetch_cache_hit_count + search_result_fetch_cache_hit_count,
+            "cached_fetch_refs": [
+                _canonical_fetch_ref(canonical_url, cutoff)
+                for canonical_url, cutoff in sorted(fetch_cache)
+            ],
+        },
         "bounded_retrieval_reason_codes": _bounded_reason_codes(
             direct_fetch_skipped_count=direct_fetch_skipped_count,
             search_call_skipped_count=search_call_skipped_count,
@@ -642,6 +689,7 @@ def _fetch_candidate(
     navigation_mode: str,
     search_candidate_url_ref: str | None,
     deterministic_direct_url_source_classes: bool,
+    fetch_cache: dict[tuple[str, str], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     url = str(hint.get("url") or "")
     canonical_url = _canonicalize_url(url)
@@ -668,7 +716,16 @@ def _fetch_candidate(
             "omission_reason_codes": ["malformed_url"],
             "temporal_gate_status": "unknown_not_counted",
         }
-    fetched = _provider_fetch(browser_provider, url)
+    cache_key = _canonical_fetch_key(canonical_url, source_cutoff_timestamp)
+    cache_status = "disabled"
+    if fetch_cache is not None and cache_key is not None and cache_key in fetch_cache:
+        fetched = copy.deepcopy(fetch_cache[cache_key])
+        cache_status = "hit"
+    else:
+        fetched = _provider_fetch(browser_provider, url)
+        if fetch_cache is not None and cache_key is not None:
+            fetch_cache[cache_key] = copy.deepcopy(fetched)
+            cache_status = "miss"
     fetched = _strip_authority_fields(fetched)
     extraction_status = str(fetched.get("extraction_status") or fetched.get("status") or "accepted")
     if extraction_status not in {"accepted", "rejected", "paywalled", "blocked", "duplicate", "temporal_fail"}:
@@ -706,6 +763,9 @@ def _fetch_candidate(
         **base,
         "final_url": final_url,
         "canonical_url": final_url,
+        "canonical_fetch_ref": _canonical_fetch_ref(canonical_url, source_cutoff_timestamp),
+        "canonical_fetch_cache_status": cache_status,
+        "canonical_fetch_cache_key": "canonical_url_plus_cutoff",
         "extraction_status": extraction_status,
         "source_published_at": published_at,
         "source_observed_at": observed_at or inferred_observed_at,

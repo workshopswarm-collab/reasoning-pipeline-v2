@@ -198,6 +198,19 @@ class AdsRetrievalTransportTest(unittest.TestCase):
         ]
         return qdt
 
+    def _two_leaf_qdt(self) -> dict:
+        qdt = copy.deepcopy(self.qdt)
+        keep = {"leaf-source-of-truth", "leaf-direct-evidence"}
+        qdt["required_leaf_questions"] = [
+            leaf for leaf in qdt["required_leaf_questions"] if leaf["leaf_id"] in keep
+        ]
+        qdt["branches"] = [
+            branch
+            for branch in qdt["branches"]
+            if set(branch.get("leaf_ids", [])) & keep
+        ]
+        return qdt
+
     def _boi_source_of_truth_qdt(self) -> dict:
         qdt = self._source_of_truth_qdt()
         leaf = qdt["required_leaf_questions"][0]
@@ -266,6 +279,86 @@ class AdsRetrievalTransportTest(unittest.TestCase):
         self.assertEqual(
             transport.fetched_candidates[-1]["search_candidate_url_ref"],
             search_candidate["search_candidate_url_id"],
+        )
+
+    def test_duplicate_canonical_direct_url_is_fetched_once_across_leaves(self) -> None:
+        provider = FakeBrowserProvider()
+
+        transport = collect_live_retrieval_candidates(
+            qdt=self._two_leaf_qdt(),
+            evidence_packet={
+                **self.evidence_packet,
+                "official_source_hints": ["https://official.example/shared"],
+                "market_reality_constraints": {},
+                "market_rules": {},
+            },
+            case_contract=self.case_contract,
+            amrg_context=None,
+            source_cutoff_timestamp=CUTOFF_AT,
+            forecast_timestamp=FORECAST_AT,
+            provider_policy=RetrievalProviderPolicy(
+                max_direct_urls=1,
+                max_total_direct_fetches=1,
+                broad_search_enabled=False,
+            ),
+            browser_provider=provider,
+        )
+
+        self.assertEqual([event for event in provider.events if event[0] == "fetch"], [("fetch", "https://official.example/shared")])
+        self.assertEqual(len(transport.fetched_candidates), 2)
+        self.assertEqual(
+            {candidate["canonical_fetch_cache_status"] for candidate in transport.fetched_candidates},
+            {"hit", "miss"},
+        )
+        self.assertEqual(
+            len({candidate["canonical_fetch_ref"] for candidate in transport.fetched_candidates}),
+            1,
+        )
+        cache = transport.transport_diagnostics["canonical_fetch_cache"]
+        self.assertEqual(cache["unique_fetch_count"], 1)
+        self.assertEqual(cache["cache_hit_count"], 1)
+        self.assertEqual(transport.transport_diagnostics["direct_url_fetch_attempt_count"], 1)
+
+    def test_duplicate_fetch_cache_fans_out_source_failures(self) -> None:
+        provider = FakeBrowserProvider(
+            fetch_payloads={
+                "https://official.example/shared": {
+                    "url": "https://official.example/shared",
+                    "final_url": "https://official.example/shared",
+                    "extraction_status": "rejected",
+                    "reason_codes": ["unit_test_fetch_failed"],
+                }
+            }
+        )
+
+        transport = collect_live_retrieval_candidates(
+            qdt=self._two_leaf_qdt(),
+            evidence_packet={
+                **self.evidence_packet,
+                "official_source_hints": ["https://official.example/shared"],
+                "market_reality_constraints": {},
+                "market_rules": {},
+            },
+            case_contract=self.case_contract,
+            amrg_context=None,
+            source_cutoff_timestamp=CUTOFF_AT,
+            forecast_timestamp=FORECAST_AT,
+            provider_policy=RetrievalProviderPolicy(
+                max_direct_urls=1,
+                max_total_direct_fetches=1,
+                broad_search_enabled=False,
+            ),
+            browser_provider=provider,
+        )
+
+        self.assertEqual(len([event for event in provider.events if event[0] == "fetch"]), 1)
+        self.assertEqual(len(transport.omitted_candidates), 2)
+        self.assertTrue(
+            all("unit_test_fetch_failed" in candidate["omission_reason_codes"] for candidate in transport.omitted_candidates)
+        )
+        self.assertEqual(
+            {candidate["canonical_fetch_cache_status"] for candidate in transport.fetched_candidates},
+            {"hit", "miss"},
         )
 
     def test_market_url_does_not_satisfy_event_protected_primary(self) -> None:
