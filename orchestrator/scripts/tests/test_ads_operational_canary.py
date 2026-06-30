@@ -446,6 +446,77 @@ def _fake_researcher_runtime_bundle_all_evidence_accepted(
     )
 
 
+def _fake_researcher_runtime_bundle_probability_leakage(
+    *,
+    assignments: list[dict[str, Any]],
+    qdt: dict[str, Any],
+    retrieval_packet: dict[str, Any],
+    true_production_mode: bool,
+    max_concurrent: int,
+) -> dict[str, Any]:
+    model_context = resolve_researcher_leaf_nli_model_context()
+    classifications = []
+    coverage_proofs = []
+    for assignment in assignments:
+        for assigned in assignment.get("assigned_evidence_refs", []):
+            if isinstance(assigned, dict) and assigned.get("evidence_ref"):
+                classifications.append(
+                    _runtime_classification(
+                        qdt,
+                        retrieval_packet,
+                        assignment,
+                        evidence_ref=str(assigned["evidence_ref"]),
+                    )
+                )
+        coverage_proofs.append(_runtime_coverage(assignment, retrieval_packet))
+    sidecar = build_researcher_sidecar_v2(
+        qdt=qdt,
+        required_question_classifications=classifications,
+        coverage_proofs=coverage_proofs,
+        model_execution_context_ref="artifact:model-execution-context:researcher-leaf-nli",
+        model_execution_context=model_context,
+    )
+    sidecar["probability"] = 0.62
+    audits = [
+        build_researcher_context_isolation_audit(
+            assignment,
+            subagent_session_ref=f"openclaw-session:{idx}",
+        )
+        for idx, assignment in enumerate(assignments)
+    ]
+    results = [
+        build_leaf_subagent_result(
+            assignment,
+            terminal_status="accepted_classification",
+            subagent_session_ref=f"openclaw-session:{idx}",
+            sidecar_refs=[sidecar["sidecar_id"]],
+            classification_refs=[
+                f"classification:{assignment['leaf_id']}:{evidence['evidence_ref']}"
+                for evidence in assignment.get("assigned_evidence_refs", [])
+                if isinstance(evidence, dict) and evidence.get("evidence_ref")
+            ],
+            isolation_audit_ref=assignment["context_isolation"]["isolation_audit_ref"],
+            runtime_provenance={
+                "model_executed": True,
+                "resolved_model_id": RESEARCHER_PROVIDER_MODEL_KEY,
+                "runtime_call_ref": f"model-runtime-call:researcher:{idx}",
+            },
+            reason_codes=["accepted_classification"],
+        )
+        for idx, assignment in enumerate(assignments)
+    ]
+    return build_researcher_swarm_runtime_bundle(
+        assignments,
+        qdt=qdt,
+        retrieval_packet=retrieval_packet,
+        sidecars=[sidecar],
+        isolation_audits=audits,
+        subagent_results=results,
+        true_production_mode=true_production_mode,
+        max_concurrent=max_concurrent,
+    )
+
+
 class AdsOperationalCanaryTest(unittest.TestCase):
     def setUp(self):
         self.tempdir = tempfile.TemporaryDirectory()
@@ -2314,6 +2385,75 @@ class AdsOperationalCanaryTest(unittest.TestCase):
         self.assertEqual(retry_event["failure_class"], "retryable_model_transport")
         self.assertEqual(retry_event["safe_exception_class"], "RetryableStageError")
         self.assertEqual(runtime_bundle_count, 0)
+        self.assertEqual(scae_count, 0)
+        self.assertEqual(prediction_count, 0)
+
+    def test_phase6_researcher_authority_leakage_is_terminal_without_retry_or_scae_output(self):
+        config = self.config(
+            require_scoreable_prediction=False,
+            require_manifest_handoffs=True,
+        )
+        handlers = build_production_readiness_handlers(
+            db_path=config.db_path,
+            runner_mode=config.runner_mode,
+            forecast_timestamp=config.forecast_timestamp,
+            max_cases=config.max_cases,
+            metadata=config.metadata,
+            live_fixture_retrieval=True,
+            block_at_leaf_research_barrier=True,
+            researcher_swarm_runtime_runner=_fake_researcher_runtime_bundle_probability_leakage,
+        )
+        handlers["researcher_classification"] = wrap_production_stage_handler(
+            "researcher_classification",
+            handlers["researcher_classification"],
+        )
+
+        result = run_one_case_canary(config, handlers)
+
+        self.assertFalse(result["ok"])
+        self.assertIn("terminal_status was 'auto003_stage_failed'", result["errors"])
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            status = conn.execute(
+                """
+                SELECT status, reason_codes, metadata
+                FROM v2_stage_status_snapshots
+                WHERE stage = 'researcher_classification'
+                ORDER BY id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+            stage_events = conn.execute(
+                """
+                SELECT event_type, failure_class, safe_exception_class, safe_metadata
+                FROM v2_stage_execution_events
+                WHERE stage = 'researcher_classification'
+                ORDER BY id DESC
+                """
+            ).fetchall()
+            runtime_bundle_count = conn.execute(
+                "SELECT COUNT(*) FROM case_artifact_manifest WHERE artifact_type = 'researcher-swarm-runtime-bundle'"
+            ).fetchone()[0]
+            verification_count = conn.execute(
+                "SELECT COUNT(*) FROM case_artifact_manifest WHERE stage = 'classification_verification'"
+            ).fetchone()[0]
+            scae_count = conn.execute(
+                "SELECT COUNT(*) FROM case_artifact_manifest WHERE stage = 'scae'"
+            ).fetchone()[0]
+            prediction_count = conn.execute("SELECT COUNT(*) FROM market_predictions").fetchone()[0]
+
+        self.assertIsNotNone(status)
+        status_metadata = json.loads(status["metadata"])
+        self.assertEqual(status["status"], "failed")
+        self.assertEqual(json.loads(status["reason_codes"]), ["ads_production_policy_violation_quarantine"])
+        self.assertEqual(status_metadata["safe_reason_code"], "ads_production_policy_violation_quarantine")
+        self.assertTrue(stage_events)
+        self.assertEqual(stage_events[0]["event_type"], "stage_failed")
+        self.assertEqual(stage_events[0]["failure_class"], "policy_violation_quarantine")
+        self.assertEqual(stage_events[0]["safe_exception_class"], "NonRetryableStageError")
+        self.assertNotIn("retry_scheduled", {row["event_type"] for row in stage_events})
+        self.assertEqual(runtime_bundle_count, 0)
+        self.assertEqual(verification_count, 0)
         self.assertEqual(scae_count, 0)
         self.assertEqual(prediction_count, 0)
 

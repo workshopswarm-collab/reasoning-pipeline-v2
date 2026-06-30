@@ -120,6 +120,13 @@ class AdsProductionHandlersTest(unittest.TestCase):
             classify_stage_failure("verification", ValueError("forbidden output contamination")),
             "policy_violation_quarantine",
         )
+        self.assertEqual(
+            classify_stage_failure(
+                "researcher_classification",
+                ValueError("researcher swarm runtime bundle invalid: probability is forbidden"),
+            ),
+            "policy_violation_quarantine",
+        )
 
     def test_scheduler_can_pass_explicit_retrieval_browser_provider_factory(self):
         with tempfile.TemporaryDirectory() as tempdir:

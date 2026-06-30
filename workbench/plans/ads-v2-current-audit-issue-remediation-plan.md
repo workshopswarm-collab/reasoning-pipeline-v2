@@ -923,7 +923,7 @@ Completion note:
 
 ## Phase 6 - Researcher Runtime And Verification Positive Path
 
-Status: pending
+Status: complete
 
 Goal: prove that once retrieval certifies at least one case, researcher leaf classification and verification produce SCAE-ready evidence deltas.
 
@@ -1027,12 +1027,22 @@ Success criteria:
 
 Checklist:
 
-- [ ] Retrieval-blocked path still prevents researcher runtime.
-- [ ] Certified path executes researcher runtime.
-- [ ] Researcher runtime retry/backoff and idempotency tested.
-- [ ] Verification emits valid SCAE-ready slices.
-- [ ] Forbidden output scanner passes.
-- [ ] Temporary artifacts deleted.
+- [x] Retrieval-blocked path still prevents researcher runtime.
+- [x] Certified path executes researcher runtime.
+- [x] Researcher runtime retry/backoff and idempotency tested.
+- [x] Verification emits valid SCAE-ready slices.
+- [x] Forbidden output scanner passes.
+- [x] Temporary artifacts deleted.
+
+Completion note, 2026-06-30:
+
+- Current `main` already had the certified retrieval positive path, researcher runtime bundle manifest, verification matrix, SCAE-ready reconciliation refs, and retryable researcher transport coverage in `scripts.tests.test_ads_operational_canary`.
+- Added the missing terminal authority-leakage path: researcher runtime bundle validation now classifies probability/fair-value/SCAE-delta/authority leakage as `policy_violation_quarantine`, fails without retry, and writes no researcher bundle, verification, SCAE, or market prediction output.
+- Verified current-repo test placement rather than the stale plan filenames: `test_ads_real_runtime_canary.py` is covered by operational canary tests, and researcher runtime bundle coverage lives in `scripts.tests.test_assignments` plus `scripts.tests.test_verification`.
+- Verification run:
+  - `/Users/agent2/.openclaw/orchestrator`: `python3 -m unittest discover -s scripts/tests -p 'test_*.py'` passed 295 tests.
+  - `/Users/agent2/.openclaw/researcher-swarm`: `python3 -m unittest discover -s scripts/tests -p 'test_*.py'` passed 249 tests.
+  - Targeted production-handler, operational-canary, assignment, and verification tests passed.
 
 ## Phase 7 - SCAE Valid Forecast And Non-Executing Prediction Proof
 

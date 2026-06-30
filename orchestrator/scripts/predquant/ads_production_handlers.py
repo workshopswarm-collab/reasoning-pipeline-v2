@@ -164,7 +164,17 @@ def classify_stage_failure(stage: str, exc: BaseException) -> str:
     if isinstance(exc, AdsProductionStageFailure):
         return exc.failure_class
     text = _message_for(exc).lower()
-    if "policy" in text or "forbidden" in text or "contamination" in text:
+    if (
+        "policy" in text
+        or "forbidden" in text
+        or "contamination" in text
+        or "probability" in text
+        or "fair_value" in text
+        or "fair value" in text
+        or "scae_delta" in text
+        or "scae delta" in text
+        or "authority" in text
+    ):
         return "policy_violation_quarantine"
     if "thin_evidence" in text or "thin evidence" in text or "insufficient evidence" in text:
         return "thin_evidence_watch_only"
