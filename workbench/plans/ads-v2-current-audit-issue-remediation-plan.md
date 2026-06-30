@@ -276,7 +276,7 @@ Completion note:
 
 ## Phase 1 - QDT Timing And Deadline Coverage Repair
 
-Status: pending
+Status: completed on 2026-06-30
 
 Goal: ensure live QDT outputs structurally cover timing/deadline constraints for unresolved forecast markets, or fail with a targeted repair requirement before retrieval.
 
@@ -386,12 +386,19 @@ Success criteria:
 
 Checklist:
 
-- [ ] Required timing/deadline coverage dimension exists.
-- [ ] QDT model transport retry/backoff implemented and tested.
-- [ ] Repair loop is bounded and audited.
-- [ ] Terminal-only leaves remain non-dispatchable before resolution.
-- [ ] QDT tests pass.
-- [ ] No temp QDT artifacts remain.
+- [x] Required timing/deadline coverage dimension exists.
+- [x] QDT model transport retry/backoff implemented and tested.
+- [x] Repair loop is bounded and audited.
+- [x] Terminal-only leaves remain non-dispatchable before resolution.
+- [x] QDT tests pass.
+- [x] No temp QDT artifacts remain.
+
+Completion note:
+
+- Current `main` already enforced first-class timing/deadline QDT coverage, bounded repair-required coverage failure, and terminal-only leaf gating for unresolved markets.
+- Replaced the previous immediate model transport retry with the shared model transport retry policy: max 3 attempts, classified retryable/non-retryable transport failures, deterministic jittered exponential backoff, and durable `model-runtime-retry-diagnostic/v1` events on runtime call artifacts.
+- Propagated QDT model retry diagnostics into real-runtime current-audit retry summaries so retry attempts, backoff seconds, retry policy refs, components, and retry exhaustion are observable from operator-facing reports.
+- Verification passed: `python3 -m unittest scripts.tests.test_model_runtime`, `python3 -m unittest scripts.tests.test_qdt`, `python3 -m unittest scripts.tests.test_runtime_decomposition`, `python3 -m unittest discover -s scripts/tests -p 'test_*.py'` from `decomposer`; `python3 -m unittest scripts.tests.test_ads_operational_canary`, `python3 -m unittest scripts.tests.test_ads_operator_review`, and `python3 -m unittest scripts.tests.test_ads_retrieval_transport` from `orchestrator`.
 
 ## Phase 2 - Search Failure Handling And Per-Leaf Retrieval Budgets
 

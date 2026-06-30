@@ -13,9 +13,12 @@ sys.path.insert(0, str(ROOT / "decomposer" / "scripts"))
 
 from ads_decomposer.model_runtime import (  # noqa: E402
     MODEL_RUNTIME_CALL_SCHEMA_VERSION,
+    MODEL_RUNTIME_RETRY_DIAGNOSTIC_SCHEMA_VERSION,
     MODEL_RUNTIME_TIMEOUTS,
     MODEL_RUNTIME_TRANSPORT_REQUEST_SCHEMA_VERSION,
     MODEL_RUNTIME_TRANSPORT_RESPONSE_SCHEMA_VERSION,
+    MODEL_TRANSPORT_RETRY_POLICY,
+    MODEL_TRANSPORT_RETRY_POLICY_REF,
     ModelRuntimeError,
     execute_model_runtime_call,
     execute_model_runtime_call_for_lane,
@@ -87,23 +90,43 @@ class ModelRuntimeContractTest(unittest.TestCase):
 
     def test_live_transport_retries_once_then_succeeds(self) -> None:
         attempts = {"count": 0}
+        sleep_calls: list[float] = []
 
         def transport(payload: dict[str, Any]) -> dict[str, Any]:
             attempts["count"] += 1
             self.assertEqual(payload["schema_version"], MODEL_RUNTIME_TRANSPORT_REQUEST_SCHEMA_VERSION)
             self.assertEqual(payload["provider_route"], "openclaw_codex_oauth/decomposer")
             self.assertEqual(payload["timeout_seconds"], 180)
+            self.assertEqual(payload["transport_attempt"], attempts["count"])
+            self.assertEqual(payload["transport_max_attempts"], MODEL_TRANSPORT_RETRY_POLICY["max_attempts"])
+            self.assertEqual(payload["transport_retry_policy_ref"], MODEL_TRANSPORT_RETRY_POLICY_REF)
             self.assertEqual(payload["request_payload"], {"question": "Will example happen?"})
             if attempts["count"] == 1:
                 raise TimeoutError("transient")
             return {"ok": True}
 
-        result = self._call(mode="live", fixture_response=None, transport=transport)
+        result = self._call(mode="live", fixture_response=None, transport=transport, sleep_fn=sleep_calls.append)
 
         self.assertEqual(attempts["count"], 2)
         self.assertEqual(result.runtime_call["retry_count"], 1)
         self.assertEqual(result.runtime_call["execution_status"], "succeeded")
         self.assertIn("transport_retry", result.runtime_call["runtime_reason_codes"])
+        self.assertEqual(len(sleep_calls), 1)
+        self.assertGreaterEqual(sleep_calls[0], 2.0)
+        self.assertLessEqual(sleep_calls[0], 3.0)
+        diagnostics = result.runtime_call["retry_diagnostics"]
+        self.assertEqual([item["event"] for item in diagnostics], ["local_retry", "retry_succeeded"])
+        self.assertEqual(diagnostics[0]["schema_version"], MODEL_RUNTIME_RETRY_DIAGNOSTIC_SCHEMA_VERSION)
+        self.assertEqual(diagnostics[0]["component"], "qdt_model_runtime")
+        self.assertEqual(diagnostics[0]["lane"], "decomposer_qdt_generation")
+        self.assertEqual(diagnostics[0]["attempt"], 1)
+        self.assertEqual(diagnostics[0]["max_attempts"], MODEL_TRANSPORT_RETRY_POLICY["max_attempts"])
+        self.assertTrue(diagnostics[0]["failure_retryable"])
+        self.assertEqual(diagnostics[0]["failure_class"], "timeout")
+        self.assertEqual(diagnostics[0]["backoff_seconds"], sleep_calls[0])
+        self.assertTrue(diagnostics[0]["jitter_seed"])
+        self.assertEqual(diagnostics[0]["retry_policy_ref"], MODEL_TRANSPORT_RETRY_POLICY_REF)
+        self.assertEqual(diagnostics[1]["final_retry_outcome"], "succeeded_after_retry")
 
     def test_live_transport_response_records_token_usage_and_provider_status(self) -> None:
         lane = resolve_model_runtime_lane("decomposer_qdt_generation")
@@ -173,6 +196,8 @@ class ModelRuntimeContractTest(unittest.TestCase):
         runtime = raised.exception.runtime_call
         self.assertIsInstance(runtime, dict)
         self.assertEqual(runtime["execution_status"], "failed_forbidden_output")
+        self.assertEqual(runtime["retry_count"], 0)
+        self.assertEqual(runtime["retry_diagnostics"], [])
         self.assertEqual(runtime["forbidden_output_scan"]["status"], "failed")
         self.assertEqual(runtime["forbidden_output_scan"]["matches"][0]["match_type"], "key")
 
@@ -224,16 +249,42 @@ class ModelRuntimeContractTest(unittest.TestCase):
         self.assertEqual(result.runtime_call["execution_status"], "succeeded")
 
     def test_exhausted_transport_retry_returns_failed_runtime_call(self) -> None:
+        sleep_calls: list[float] = []
+
         def transport(_payload: dict[str, Any]) -> dict[str, Any]:
             raise RuntimeError("down")
 
         with self.assertRaises(ModelRuntimeError) as raised:
-            self._call(mode="live", fixture_response=None, transport=transport)
+            self._call(mode="live", fixture_response=None, transport=transport, sleep_fn=sleep_calls.append)
 
         runtime = raised.exception.runtime_call
         self.assertIsInstance(runtime, dict)
         self.assertEqual(runtime["execution_status"], "failed_transport")
-        self.assertEqual(runtime["retry_count"], 1)
+        self.assertEqual(runtime["retry_count"], 2)
+        self.assertEqual(len(sleep_calls), 2)
+        self.assertEqual(
+            [item["event"] for item in runtime["retry_diagnostics"]],
+            ["local_retry", "local_retry", "retry_exhausted"],
+        )
+        self.assertEqual(runtime["retry_diagnostics"][-1]["failure_class"], "transient_provider_error")
+        self.assertEqual(runtime["retry_diagnostics"][-1]["final_retry_outcome"], "exhausted")
+
+    def test_non_retryable_transport_failure_does_not_retry(self) -> None:
+        sleep_calls: list[float] = []
+
+        def transport(_payload: dict[str, Any]) -> dict[str, Any]:
+            raise ModelRuntimeError("policy configuration failed")
+
+        with self.assertRaises(ModelRuntimeError) as raised:
+            self._call(mode="live", fixture_response=None, transport=transport, sleep_fn=sleep_calls.append)
+
+        runtime = raised.exception.runtime_call
+        self.assertEqual(runtime["execution_status"], "failed_transport")
+        self.assertEqual(runtime["retry_count"], 0)
+        self.assertEqual(sleep_calls, [])
+        self.assertEqual([item["event"] for item in runtime["retry_diagnostics"]], ["retry_not_attempted"])
+        self.assertFalse(runtime["retry_diagnostics"][0]["failure_retryable"])
+        self.assertEqual(runtime["retry_diagnostics"][0]["failure_class"], "model_runtime_contract_error")
 
     def test_openclaw_agent_stdout_unwraps_gateway_reply(self) -> None:
         stdout = json_text = (

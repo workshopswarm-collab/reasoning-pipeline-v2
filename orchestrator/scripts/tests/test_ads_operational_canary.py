@@ -1715,6 +1715,46 @@ class AdsOperationalCanaryTest(unittest.TestCase):
             )
         )
 
+    def test_current_audit_gap_summary_uses_qdt_retry_diagnostics(self):
+        summary = build_current_audit_gap_summary(
+            qdt_evidence={
+                "qdt_results": [],
+                "runtime_results": [
+                    {
+                        "retry_count": 1,
+                        "retry_diagnostics": [
+                            {
+                                "event": "local_retry",
+                                "component": "qdt_model_runtime",
+                                "failure_retryable": True,
+                                "failure_class": "timeout",
+                                "backoff_seconds": 2.375,
+                                "retry_policy_ref": "ads-model-transport-retry/v1",
+                            },
+                            {
+                                "event": "retry_succeeded",
+                                "component": "qdt_model_runtime",
+                                "final_retry_outcome": "succeeded_after_retry",
+                                "retry_policy_ref": "ads-model-transport-retry/v1",
+                            },
+                        ],
+                    }
+                ],
+            },
+            retrieval_evidence={},
+            errors={"events": []},
+        )
+
+        retry = summary["retry_summary"]
+        self.assertEqual(retry["retry_attempt_count"], 1)
+        self.assertEqual(retry["retryable_failure_count"], 1)
+        self.assertEqual(retry["terminal_retry_exhausted_count"], 0)
+        self.assertEqual(retry["qdt_model_transport_retry_count"], 1)
+        self.assertEqual(retry["retry_backoff_seconds"], [2.375])
+        self.assertEqual(retry["retry_policy_refs"], ["ads-model-transport-retry/v1"])
+        self.assertEqual(retry["components"], ["qdt_model_runtime"])
+        self.assertEqual(retry["final_retry_outcome"], "retry_recorded")
+
     def test_real_runtime_report_counts_docket_and_selected_evidence_refs_without_certifying_retrieval(self):
         packet_path = Path(self.tempdir.name) / "retrieval-packet.json"
         packet_path.write_text(

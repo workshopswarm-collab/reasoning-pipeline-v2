@@ -475,6 +475,10 @@ def _model_runtime_evidence(manifests: list[dict[str, Any]]) -> dict[str, Any]:
                 "fixture_mode": payload.get("fixture_mode"),
                 "execution_status": payload.get("execution_status"),
                 "retry_count": _int_value(payload.get("retry_count")),
+                "transport_retry_policy": payload.get("transport_retry_policy")
+                if isinstance(payload.get("transport_retry_policy"), dict)
+                else {},
+                "retry_diagnostics": _list_of_dicts(payload.get("retry_diagnostics")),
                 "runtime_reason_codes": [
                     str(code)
                     for code in payload.get("runtime_reason_codes", [])
@@ -1528,9 +1532,33 @@ def _retry_summary(
     error_events = _list_of_dicts(errors.get("events"))
     retryable_events = [event for event in error_events if event.get("retryability") == "retryable"]
     terminal_events = [event for event in error_events if event.get("retryability") == "terminal"]
-    qdt_runtime_retry_count = sum(
-        _int_value(item.get("retry_count"))
-        for item in _list_of_dicts(qdt_evidence.get("runtime_results"))
+    qdt_runtime_results = _list_of_dicts(qdt_evidence.get("runtime_results"))
+    qdt_retry_diagnostics = [
+        event
+        for item in qdt_runtime_results
+        for event in _list_of_dicts(item.get("retry_diagnostics"))
+    ]
+    qdt_runtime_retry_count = sum(_int_value(item.get("retry_count")) for item in qdt_runtime_results)
+    qdt_retry_attempt_events = [
+        event
+        for event in qdt_retry_diagnostics
+        if event.get("event") in {"local_retry", "retry_scheduled"}
+    ]
+    qdt_retry_attempt_count = (
+        len(qdt_retry_attempt_events) if qdt_retry_diagnostics else qdt_runtime_retry_count
+    )
+    qdt_retryable_failure_count = (
+        sum(
+            1
+            for event in qdt_retry_diagnostics
+            if event.get("failure_retryable") is True
+            and event.get("event") in {"local_retry", "retry_scheduled", "retry_exhausted"}
+        )
+        if qdt_retry_diagnostics
+        else qdt_runtime_retry_count
+    )
+    qdt_terminal_retry_exhausted_count = sum(
+        1 for event in qdt_retry_diagnostics if event.get("event") == "retry_exhausted"
     )
     retry_backoff_seconds = []
     retry_policy_refs = []
@@ -1540,6 +1568,11 @@ def _retry_summary(
             retry_backoff_seconds.append(_int_value(metadata.get("retry_after_seconds")))
         if metadata.get("retry_policy_ref"):
             retry_policy_refs.append(str(metadata["retry_policy_ref"]))
+    for event in qdt_retry_attempt_events:
+        if isinstance(event.get("backoff_seconds"), (int, float)):
+            retry_backoff_seconds.append(event["backoff_seconds"])
+        if event.get("retry_policy_ref"):
+            retry_policy_refs.append(str(event["retry_policy_ref"]))
     components = sorted(
         {
             str(event.get("stage"))
@@ -1551,18 +1584,29 @@ def _retry_summary(
             if qdt_runtime_retry_count > 0
             else set()
         )
+        | {
+            str(event.get("component"))
+            for event in qdt_retry_diagnostics
+            if event.get("component")
+        }
     )
+    if qdt_terminal_retry_exhausted_count:
+        final_retry_outcome = "retry_exhausted"
+    elif retryable_events or qdt_runtime_retry_count or qdt_retry_attempt_count:
+        final_retry_outcome = "retry_recorded"
+    else:
+        final_retry_outcome = "no_retries_recorded"
     return {
-        "retry_attempt_count": len(retryable_events) + qdt_runtime_retry_count,
-        "retryable_failure_count": len(retryable_events),
+        "retry_attempt_count": len(retryable_events) + qdt_retry_attempt_count,
+        "retryable_failure_count": len(retryable_events) + qdt_retryable_failure_count,
         "non_retryable_failure_count": len(terminal_events),
-        "terminal_retry_exhausted_count": 0,
+        "terminal_retry_exhausted_count": qdt_terminal_retry_exhausted_count,
         "stage_retry_scheduled_count": len(retryable_events),
         "qdt_model_transport_retry_count": qdt_runtime_retry_count,
         "retry_backoff_seconds": retry_backoff_seconds,
         "retry_policy_refs": sorted(set(retry_policy_refs)),
         "components": components,
-        "final_retry_outcome": "retry_recorded" if retryable_events or qdt_runtime_retry_count else "no_retries_recorded",
+        "final_retry_outcome": final_retry_outcome,
     }
 
 

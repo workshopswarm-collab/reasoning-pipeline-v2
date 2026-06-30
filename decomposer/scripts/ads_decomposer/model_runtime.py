@@ -29,7 +29,16 @@ MODEL_RUNTIME_TIMEOUTS = {
     "native_research_candidate_discovery": 180,
 }
 DEFAULT_TIMEOUT_SECONDS = 180
-DEFAULT_MAX_TRANSPORT_RETRIES = 1
+MODEL_RUNTIME_RETRY_DIAGNOSTIC_SCHEMA_VERSION = "model-runtime-retry-diagnostic/v1"
+MODEL_TRANSPORT_RETRY_POLICY_REF = "ads-model-transport-retry/v1"
+MODEL_TRANSPORT_RETRY_POLICY = {
+    "policy_ref": MODEL_TRANSPORT_RETRY_POLICY_REF,
+    "max_attempts": 3,
+    "base_backoff_seconds": 2.0,
+    "max_backoff_seconds": 20.0,
+    "jitter_fraction": 0.25,
+}
+DEFAULT_MAX_TRANSPORT_RETRIES = MODEL_TRANSPORT_RETRY_POLICY["max_attempts"] - 1
 DEFAULT_MAX_SCHEMA_REPAIRS = 1
 MODEL_RUNTIME_TRANSPORT_REQUEST_SCHEMA_VERSION = "model-runtime-transport-request/v1"
 MODEL_RUNTIME_TRANSPORT_RESPONSE_SCHEMA_VERSION = "model-runtime-transport-response/v1"
@@ -309,7 +318,13 @@ def _extract_json_object_text(value: str) -> str | None:
     return None
 
 
-def _transport_request(runtime_call: dict[str, Any], request_payload: dict[str, Any]) -> dict[str, Any]:
+def _transport_request(
+    runtime_call: dict[str, Any],
+    request_payload: dict[str, Any],
+    *,
+    transport_attempt: int = 1,
+    transport_max_attempts: int = 1,
+) -> dict[str, Any]:
     return {
         "schema_version": MODEL_RUNTIME_TRANSPORT_REQUEST_SCHEMA_VERSION,
         "runtime_call_id": runtime_call["runtime_call_id"],
@@ -321,6 +336,9 @@ def _transport_request(runtime_call: dict[str, Any], request_payload: dict[str, 
         "prompt_template_sha256": runtime_call["prompt_template_sha256"],
         "output_schema_version": runtime_call["output_schema_version"],
         "timeout_seconds": runtime_call["timeout_seconds"],
+        "transport_attempt": transport_attempt,
+        "transport_max_attempts": transport_max_attempts,
+        "transport_retry_policy_ref": runtime_call.get("transport_retry_policy", {}).get("policy_ref"),
         "request_payload": copy.deepcopy(request_payload),
     }
 
@@ -337,6 +355,107 @@ def _unwrap_transport_response(raw: Any) -> tuple[Any, Any, Any]:
             copy.deepcopy(raw.get("provider_status")),
         )
     return raw, None, None
+
+
+def _model_runtime_component(model_lane_id: str) -> str:
+    if model_lane_id == "decomposer_qdt_generation":
+        return "qdt_model_runtime"
+    return "model_runtime"
+
+
+def _model_transport_max_attempts(max_transport_retries: int) -> int:
+    if isinstance(max_transport_retries, bool) or not isinstance(max_transport_retries, int):
+        raise ModelRuntimeError("max_transport_retries must be a non-negative integer")
+    if max_transport_retries < 0:
+        raise ModelRuntimeError("max_transport_retries must be a non-negative integer")
+    requested_attempts = max_transport_retries + 1
+    return max(1, min(int(MODEL_TRANSPORT_RETRY_POLICY["max_attempts"]), requested_attempts))
+
+
+def _classify_model_transport_failure(exc: Exception) -> dict[str, Any]:
+    text = str(exc).lower()
+    exc_type = type(exc).__name__
+    if isinstance(exc, ModelRuntimeError):
+        return {
+            "retryable": False,
+            "failure_class": "model_runtime_contract_error",
+            "exception_type": exc_type,
+        }
+    if isinstance(exc, (TimeoutError, subprocess.TimeoutExpired)) or "timed out" in text or "timeout" in text:
+        return {"retryable": True, "failure_class": "timeout", "exception_type": exc_type}
+    if isinstance(exc, json.JSONDecodeError):
+        return {"retryable": True, "failure_class": "malformed_model_output", "exception_type": exc_type}
+    if isinstance(exc, (ConnectionError, ConnectionResetError, BrokenPipeError)):
+        return {"retryable": True, "failure_class": "connection_reset", "exception_type": exc_type}
+    if "rate limit" in text or "429" in text or "too many requests" in text:
+        return {"retryable": True, "failure_class": "rate_limit", "exception_type": exc_type}
+    if any(marker in text for marker in ("temporar", "try again", "502", "503", "504", "gateway")):
+        return {"retryable": True, "failure_class": "transient_provider_error", "exception_type": exc_type}
+    if isinstance(exc, subprocess.SubprocessError):
+        return {"retryable": True, "failure_class": "temporary_subprocess_failure", "exception_type": exc_type}
+    if isinstance(exc, RuntimeError):
+        return {"retryable": True, "failure_class": "transient_provider_error", "exception_type": exc_type}
+    return {
+        "retryable": False,
+        "failure_class": "non_retryable_transport_failure",
+        "exception_type": exc_type,
+    }
+
+
+def _model_transport_backoff(
+    *,
+    runtime_call_id: str,
+    attempt: int,
+    failure_class: str,
+) -> tuple[float, str, list[float]]:
+    raw = min(
+        float(MODEL_TRANSPORT_RETRY_POLICY["max_backoff_seconds"]),
+        float(MODEL_TRANSPORT_RETRY_POLICY["base_backoff_seconds"]) * (2 ** max(0, attempt - 1)),
+    )
+    jitter_upper = max(1.0, raw * float(MODEL_TRANSPORT_RETRY_POLICY["jitter_fraction"]))
+    seed_material = {
+        "runtime_call_id": runtime_call_id,
+        "attempt": attempt,
+        "failure_class": failure_class,
+        "policy_ref": MODEL_TRANSPORT_RETRY_POLICY_REF,
+    }
+    digest = hashlib.sha256(canonical_json(seed_material).encode("utf-8")).hexdigest()
+    unit = int(digest[:12], 16) / float(0xFFFFFFFFFFFF)
+    backoff = raw + (unit * jitter_upper)
+    return round(backoff, 3), digest[:16], [0.0, round(jitter_upper, 3)]
+
+
+def _retry_diagnostic_event(
+    runtime_call: dict[str, Any],
+    *,
+    event: str,
+    attempt: int,
+    max_attempts: int,
+    failure: dict[str, Any] | None = None,
+    backoff_seconds: float | None = None,
+    jitter_seed: str | None = None,
+    jitter_range_seconds: list[float] | None = None,
+    final_retry_outcome: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "schema_version": MODEL_RUNTIME_RETRY_DIAGNOSTIC_SCHEMA_VERSION,
+        "event": event,
+        "component": _model_runtime_component(str(runtime_call.get("model_lane_id") or "")),
+        "lane": runtime_call.get("model_lane_id"),
+        "model_lane_id": runtime_call.get("model_lane_id"),
+        "runtime_call_ref": runtime_call.get("runtime_call_id"),
+        "attempt": attempt,
+        "max_attempts": max_attempts,
+        "failure_retryable": bool(failure.get("retryable")) if isinstance(failure, dict) else False,
+        "failure_class": failure.get("failure_class") if isinstance(failure, dict) else None,
+        "exception_type": failure.get("exception_type") if isinstance(failure, dict) else None,
+        "backoff_seconds": backoff_seconds,
+        "jitter_seed": jitter_seed,
+        "jitter_range_seconds": jitter_range_seconds or [0.0, 0.0],
+        "repair_count": runtime_call.get("repair_count", 0),
+        "retry_policy_ref": MODEL_TRANSPORT_RETRY_POLICY_REF,
+        "final_retry_outcome": final_retry_outcome,
+    }
 
 
 def _openclaw_agent_prompt(request_payload: dict[str, Any]) -> str:
@@ -631,6 +750,15 @@ def _base_runtime_call(
         },
         "latency_ms": None,
         "token_usage": None,
+        "transport_retry_policy": {
+            "policy_ref": MODEL_TRANSPORT_RETRY_POLICY_REF,
+            "component": _model_runtime_component(model_lane_id),
+            "max_attempts": MODEL_TRANSPORT_RETRY_POLICY["max_attempts"],
+            "base_backoff_seconds": MODEL_TRANSPORT_RETRY_POLICY["base_backoff_seconds"],
+            "max_backoff_seconds": MODEL_TRANSPORT_RETRY_POLICY["max_backoff_seconds"],
+            "jitter_fraction": MODEL_TRANSPORT_RETRY_POLICY["jitter_fraction"],
+        },
+        "retry_diagnostics": [],
         "runtime_reason_codes": [],
     }
 
@@ -654,6 +782,7 @@ def execute_model_runtime_call(
     timeout_seconds: int | None = None,
     max_transport_retries: int = DEFAULT_MAX_TRANSPORT_RETRIES,
     max_schema_repairs: int = DEFAULT_MAX_SCHEMA_REPAIRS,
+    sleep_fn: Callable[[float], None] | None = None,
 ) -> ModelRuntimeResult:
     """Execute a model runtime call or explicit fixture transport.
 
@@ -693,15 +822,25 @@ def execute_model_runtime_call(
 
     started = time.monotonic()
     response: Any = None
-    attempt = 0
-    while True:
+    max_attempts = 1 if mode == "fixture" else _model_transport_max_attempts(max_transport_retries)
+    runtime_call["transport_retry_policy"]["max_attempts"] = max_attempts
+    sleep = sleep_fn or time.sleep
+    attempt_number = 1
+    for attempt_number in range(1, max_attempts + 1):
         try:
             if mode == "fixture":
                 response = copy.deepcopy(fixture_response)
                 runtime_call["runtime_reason_codes"].append("fixture_response_used")
             else:
                 assert transport is not None
-                raw_response = transport(_transport_request(runtime_call, request_payload))
+                raw_response = transport(
+                    _transport_request(
+                        runtime_call,
+                        request_payload,
+                        transport_attempt=attempt_number,
+                        transport_max_attempts=max_attempts,
+                    )
+                )
                 response, token_usage, provider_status = _unwrap_transport_response(raw_response)
                 if token_usage is not None:
                     runtime_call["token_usage"] = token_usage
@@ -711,15 +850,57 @@ def execute_model_runtime_call(
             response = _json_payload(response)
             break
         except Exception as exc:  # noqa: BLE001 - runtime boundary records safe class only
-            if attempt >= max_transport_retries:
-                runtime_call["retry_count"] = attempt
+            failure = _classify_model_transport_failure(exc)
+            if not failure["retryable"] or attempt_number >= max_attempts:
+                runtime_call["retry_count"] = max(0, attempt_number - 1)
                 runtime_call["execution_status"] = "failed_transport"
                 runtime_call["latency_ms"] = int((time.monotonic() - started) * 1000)
+                runtime_call["runtime_reason_codes"].append(str(failure["failure_class"]))
                 runtime_call["runtime_reason_codes"].append(type(exc).__name__)
+                terminal_event = "retry_exhausted" if failure["retryable"] else "retry_not_attempted"
+                terminal_outcome = "exhausted" if failure["retryable"] else "non_retryable_failure"
+                runtime_call["retry_diagnostics"].append(
+                    _retry_diagnostic_event(
+                        runtime_call,
+                        event=terminal_event,
+                        attempt=attempt_number,
+                        max_attempts=max_attempts,
+                        failure=failure,
+                        final_retry_outcome=terminal_outcome,
+                    )
+                )
                 raise ModelRuntimeError("model runtime transport failed", runtime_call=runtime_call) from exc
-            attempt += 1
+            backoff_seconds, jitter_seed, jitter_range_seconds = _model_transport_backoff(
+                runtime_call_id=str(runtime_call["runtime_call_id"]),
+                attempt=attempt_number,
+                failure_class=str(failure["failure_class"]),
+            )
+            runtime_call["retry_diagnostics"].append(
+                _retry_diagnostic_event(
+                    runtime_call,
+                    event="local_retry",
+                    attempt=attempt_number,
+                    max_attempts=max_attempts,
+                    failure=failure,
+                    backoff_seconds=backoff_seconds,
+                    jitter_seed=jitter_seed,
+                    jitter_range_seconds=jitter_range_seconds,
+                    final_retry_outcome="retry_scheduled",
+                )
+            )
             runtime_call["runtime_reason_codes"].append("transport_retry")
-    runtime_call["retry_count"] = attempt
+            sleep(backoff_seconds)
+    runtime_call["retry_count"] = max(0, attempt_number - 1)
+    if runtime_call["retry_count"] > 0:
+        runtime_call["retry_diagnostics"].append(
+            _retry_diagnostic_event(
+                runtime_call,
+                event="retry_succeeded",
+                attempt=attempt_number,
+                max_attempts=max_attempts,
+                final_retry_outcome="succeeded_after_retry",
+            )
+        )
 
     forbidden_scan = scan_forbidden_model_outputs(response)
     runtime_call["forbidden_output_scan"] = forbidden_scan
@@ -783,6 +964,7 @@ def execute_model_runtime_call_for_lane(
     timeout_seconds: int | None = None,
     max_transport_retries: int = DEFAULT_MAX_TRANSPORT_RETRIES,
     max_schema_repairs: int = DEFAULT_MAX_SCHEMA_REPAIRS,
+    sleep_fn: Callable[[float], None] | None = None,
 ) -> ModelRuntimeResult:
     """Execute a runtime call from a resolved model-lane policy row."""
 
@@ -810,6 +992,7 @@ def execute_model_runtime_call_for_lane(
         else int(lane.get("timeout_seconds", DEFAULT_TIMEOUT_SECONDS)),
         max_transport_retries=max_transport_retries,
         max_schema_repairs=max_schema_repairs,
+        sleep_fn=sleep_fn,
     )
 
 
@@ -831,6 +1014,8 @@ def model_execution_context_from_runtime_call(
             "timeout_seconds": runtime_call.get("timeout_seconds"),
             "retry_count": runtime_call.get("retry_count"),
             "repair_count": runtime_call.get("repair_count"),
+            "transport_retry_policy": copy.deepcopy(runtime_call.get("transport_retry_policy")),
+            "retry_diagnostics": copy.deepcopy(runtime_call.get("retry_diagnostics", [])),
             "fixture_mode": runtime_call.get("fixture_mode"),
             "model_call_performed": runtime_call.get("model_call_performed"),
             "model_executed": runtime_call.get("model_executed"),
@@ -849,6 +1034,8 @@ def model_execution_context_from_runtime_call(
         "execution_status": runtime_call.get("execution_status"),
         "retry_count": runtime_call.get("retry_count"),
         "repair_count": runtime_call.get("repair_count"),
+        "transport_retry_policy": copy.deepcopy(runtime_call.get("transport_retry_policy")),
+        "retry_diagnostics": copy.deepcopy(runtime_call.get("retry_diagnostics", [])),
         "runtime_reason_codes": list(runtime_call.get("runtime_reason_codes", [])),
         "fallback_reason_codes": list(context.get("fallback_reason_codes", ["no_fallback_required"])),
     }
@@ -858,7 +1045,10 @@ def model_execution_context_from_runtime_call(
 __all__ = [
     "MODEL_RUNTIME_CALL_ARTIFACT_TYPE",
     "MODEL_RUNTIME_CALL_SCHEMA_VERSION",
+    "MODEL_RUNTIME_RETRY_DIAGNOSTIC_SCHEMA_VERSION",
     "MODEL_RUNTIME_TIMEOUTS",
+    "MODEL_TRANSPORT_RETRY_POLICY",
+    "MODEL_TRANSPORT_RETRY_POLICY_REF",
     "ModelRuntimeError",
     "ModelRuntimeResult",
     "execute_model_runtime_call",
