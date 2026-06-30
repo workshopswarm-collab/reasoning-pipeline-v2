@@ -667,7 +667,7 @@ Completion note:
 
 ## Phase 4 - Evidence Extraction, Claim Families, And Freshness
 
-Status: pending
+Status: complete
 
 Goal: make admitted evidence classification-useful instead of hash-only, too short, or claim-family empty.
 
@@ -778,11 +778,21 @@ Success criteria:
 
 Checklist:
 
-- [ ] Meaningful snippet gate implemented.
-- [ ] Claim-family extraction implemented or explicitly attempted.
-- [ ] BOI source rules tested.
-- [ ] Freshness remains strict.
-- [ ] Temporary artifacts deleted.
+- [x] Meaningful snippet gate implemented.
+- [x] Claim-family extraction implemented or explicitly attempted.
+- [x] BOI source rules tested.
+- [x] Freshness remains strict.
+- [x] Temporary artifacts deleted.
+
+Completion note:
+
+- Tightened final retrieval usefulness so context-only BOI schedule evidence is excluded from research-usable admitted refs and cannot satisfy protected-primary or breadth sufficiency for current driver leaves.
+- Added deterministic Researcher Swarm BOI source-family handling (`source-family:bank_of_israel`) so duplicate BOI URLs cannot inflate independent source-family diversity through candidate/provider metadata.
+- Preserved the existing meaningful snippet gate and strict freshness behavior where capture/observed time is not publication/update time.
+- Added a conservative fetched-text claim fallback for deterministic/proven official, primary-reporting, or specialist sources; it still requires the supporting sentence to appear in bounded fetched content and does not derive claim families from search snippets or unproven provider metadata.
+- Added permanent tests proving BOI schedule pages count for resolution mechanics/timing but not current inflation/guidance driver leaves.
+- Verification passed: `researcher-swarm` `scripts.tests.test_retrieval`, `scripts.tests.test_retrieval_quality`, and full discovery (`249 tests OK`); `orchestrator` `scripts.tests.test_ads_retrieval_transport`, `scripts.tests.test_ads_operational_canary`, and full discovery (`293 tests OK`); `decomposer` full discovery (`104 tests OK`); and `git diff --check`.
+- Clone proof run `ads-pipeline-run:5179afccf80d595a2f254f535b6eadfb10448d891b630d86e38712744782f8ee` used a cloned SQLite DB with a deterministic BOI provider. It recorded `meaningful_snippet_admitted_count=16`, `short_chunk_admitted_count=0`, `hash_only_admitted_count=0`, `claim_family_extraction_attempted_count=16`, `accepted_claim_family_count=8`, explicit `boi_schedule_context_only_not_counted_for_driver_leaf` blockers, and 0 market-prediction writes. The run still failed closed on fixture QDT verification and strict retrieval live acceptance, as expected.
 
 ## Phase 5 - AMRG Context Consumption And Optional Assist Clarity
 

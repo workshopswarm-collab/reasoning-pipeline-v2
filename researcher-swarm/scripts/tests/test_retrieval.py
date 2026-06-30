@@ -2042,6 +2042,11 @@ class RetrievalPacketContractTest(unittest.TestCase):
         self.assertEqual(coverage["freshness_policy"], "stable_source_identity")
         self.assertEqual(coverage["fresh_source_count"], 1)
         self.assertNotIn("freshness", coverage["unsatisfied_breadth_dimensions"])
+        self.assertEqual(provenance["source_family_id"], "source-family:bank_of_israel")
+        self.assertEqual(
+            provenance["source_metadata_resolution"]["source_family_resolution_method"],
+            "bank_of_israel_official_domain_path",
+        )
         self.assertIsNone(provenance["source_metadata_resolution"]["published_at"])
         self.assertEqual(
             packet["research_sufficiency_summary"]["classification_dispatch_status"],
@@ -2101,6 +2106,69 @@ class RetrievalPacketContractTest(unittest.TestCase):
             "blocked_insufficient_research",
         )
 
+    def test_boi_schedule_page_is_context_only_for_current_driver_leaf(self) -> None:
+        qdt = copy.deepcopy(self.qdt)
+        qdt["required_leaf_questions"] = [qdt["required_leaf_questions"][0]]
+        leaf = qdt["required_leaf_questions"][0]
+        leaf["purpose"] = "direct_evidence"
+        leaf["leaf_temporal_role"] = "current_status"
+        leaf["question_text"] = "What is the current Bank of Israel inflation guidance?"
+        leaf["required_evidence_fields"] = ["inflation_status", "current_guidance"]
+        leaf["research_sufficiency_requirements"].update(
+            {
+                "required_source_classes": ["official_or_primary"],
+                "min_independent_claim_families": 1,
+                "min_independent_source_families": 1,
+                "min_temporally_fresh_sources": 1,
+                "recency_window_seconds": 3600,
+                "protected_primary_required": True,
+                "contradiction_search_required": False,
+                "required_negative_checks": [],
+            }
+        )
+        context = build_retrieval_query_contexts(qdt, evidence_packet=self.evidence_packet)[0]
+        candidate = self._live_candidate(context, 0, direct=True, official=True)
+        boi_url = "https://boi.org.il/en/markets/schedule"
+        candidate.update(
+            {
+                "requested_url": boi_url,
+                "final_url": boi_url,
+                "canonical_url": boi_url,
+                "source_class_resolution_method": "bank_of_israel_official_domain_path",
+                "source_class_registry_match": "boi.org.il",
+            }
+        )
+
+        packet = build_live_retrieval_packet_from_candidates(
+            qdt,
+            evidence_packet=self.evidence_packet,
+            fetched_candidates=[candidate],
+            search_candidate_urls=[],
+            question_decomposition_artifact_id="artifact:qdt-1",
+            policy_context_ref="artifact:profile-1",
+            live_policy_overlay=False,
+        )
+        coverage = packet["retrieval_breadth_coverage_slices"][0]
+        provenance = packet["retrieval_evidence_provenance_slices"][0]
+
+        self.assertEqual(provenance["source_family_id"], "source-family:bank_of_israel")
+        self.assertFalse(provenance["counts_toward_breadth"])
+        self.assertIn(
+            "boi_schedule_context_only_not_counted_for_driver_leaf",
+            provenance["unknown_reason_codes"],
+        )
+        self.assertEqual(coverage["admitted_ref_count"], 0)
+        self.assertEqual(coverage["protected_primary_status"], "blocked")
+        self.assertIn(
+            "boi_schedule_context_only_not_counted_for_driver_leaf",
+            coverage["unsatisfied_breadth_dimensions"],
+        )
+        self.assertIn("protected_primary_blocked", coverage["unsatisfied_breadth_dimensions"])
+        self.assertEqual(
+            packet["research_sufficiency_summary"]["classification_dispatch_status"],
+            "blocked_insufficient_research",
+        )
+
     def test_live_candidate_without_validated_claim_family_does_not_count_toward_breadth(self) -> None:
         qdt = copy.deepcopy(self.qdt)
         qdt["required_leaf_questions"] = [qdt["required_leaf_questions"][0]]
@@ -2128,6 +2196,64 @@ class RetrievalPacketContractTest(unittest.TestCase):
         self.assertFalse(provenance["counts_toward_breadth"])
         self.assertEqual(packet["research_sufficiency_summary"]["classification_dispatch_status"], "blocked_insufficient_research")
         self.assertIn("claim_family_diversity", cert["unsatisfied_requirement_codes"])
+
+    def test_official_fetched_statement_creates_claim_family_from_supported_span(self) -> None:
+        qdt = copy.deepcopy(self.qdt)
+        qdt["required_leaf_questions"] = [qdt["required_leaf_questions"][0]]
+        leaf = qdt["required_leaf_questions"][0]
+        leaf["purpose"] = "resolution_mechanics"
+        leaf["leaf_temporal_role"] = "resolution_mechanics"
+        leaf["question_text"] = "What schedule did the Bank of Israel publish?"
+        leaf["required_evidence_fields"] = ["official_decision_schedule", "rules_text"]
+        leaf["research_sufficiency_requirements"].update(
+            {
+                "required_source_classes": ["official_or_primary"],
+                "min_independent_claim_families": 1,
+                "min_independent_source_families": 1,
+                "min_temporally_fresh_sources": 1,
+                "recency_window_seconds": 3600,
+                "protected_primary_required": True,
+                "contradiction_search_required": False,
+                "required_negative_checks": [],
+            }
+        )
+        context = build_retrieval_query_contexts(qdt, evidence_packet=self.evidence_packet)[0]
+        candidate = self._live_candidate(context, 0, direct=True, official=True)
+        statement = (
+            "The Bank of Israel published the official decision schedule and deadline for "
+            "the relevant monetary policy announcement."
+        )
+        candidate.update(
+            {
+                "requested_url": "https://boi.org.il/en/markets/schedule",
+                "final_url": "https://boi.org.il/en/markets/schedule",
+                "canonical_url": "https://boi.org.il/en/markets/schedule",
+                "source_class_resolution_method": "bank_of_israel_official_domain_path",
+                "content": statement + " Additional bounded official schedule context for researchers. " * 6,
+            }
+        )
+        candidate.pop("validated_atomic_claim_candidates", None)
+        candidate.pop("claim_family_id", None)
+        candidate.pop("claim_family_ids", None)
+        candidate.pop("claim_family_resolution_ref", None)
+        candidate.pop("claim_family_resolution_refs", None)
+
+        packet = build_live_retrieval_packet_from_candidates(
+            qdt,
+            evidence_packet=self.evidence_packet,
+            fetched_candidates=[candidate],
+            search_candidate_urls=[],
+            question_decomposition_artifact_id="artifact:qdt-1",
+            policy_context_ref="artifact:profile-1",
+            live_policy_overlay=False,
+        )
+        provenance = packet["retrieval_evidence_provenance_slices"][0]
+        claim = packet["atomic_claim_candidates"][0]
+
+        self.assertEqual(claim["validation_status"], "accepted_for_normalization")
+        self.assertEqual(claim["supporting_span_refs"], [packet["evidence_chunks"][0]["chunk_ref"]])
+        self.assertTrue(provenance["claim_family_ids"])
+        self.assertNotIn("claim_family_unknown_not_counted", provenance["unknown_reason_codes"])
 
     def test_tesla_delivery_claim_families_are_extracted_from_exact_fetched_text(self) -> None:
         qdt = copy.deepcopy(self.qdt)

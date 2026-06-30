@@ -297,6 +297,13 @@ STABLE_SOURCE_IDENTITY_EVIDENCE_FIELDS = {
     "rules_text",
     "schedule",
 }
+BOI_OFFICIAL_DOMAIN_SUFFIXES = ("boi.org.il",)
+BOI_OFFICIAL_SOURCE_FAMILY_ID = "source-family:bank_of_israel"
+BOI_SCHEDULE_ALLOWED_PURPOSES = {
+    "resolution_mechanics",
+    "timing_deadline_constraints",
+    "source_quality",
+}
 MAX_QUERY_VARIANTS = 7
 MAX_QUERY_TEXT_CHARS = 360
 MAX_REASON_CODE_LENGTH = 80
@@ -419,6 +426,53 @@ def _registrable_domain(url: str) -> str:
     if len(labels) <= 2:
         return host
     return ".".join(labels[-2:])
+
+
+def _url_host_matches_suffix(url: str, suffixes: Iterable[str]) -> bool:
+    if not url:
+        return False
+    host = urlsplit(url).netloc.lower().split("@")[-1].split(":")[0]
+    if host.startswith("www."):
+        host = host[4:]
+    return any(host == suffix or host.endswith(f".{suffix}") for suffix in suffixes)
+
+
+def _is_boi_official_url(url: str) -> bool:
+    return _url_host_matches_suffix(url, BOI_OFFICIAL_DOMAIN_SUFFIXES)
+
+
+def _is_boi_schedule_url(url: str) -> bool:
+    if not _is_boi_official_url(url):
+        return False
+    path = (urlsplit(url).path or "/").lower()
+    return "schedule" in path
+
+
+def _candidate_leaf_values(candidate: dict[str, Any]) -> set[str]:
+    values: set[str] = set()
+    for field in ("purpose", "leaf_purpose", "leaf_temporal_role", "coverage_dimension"):
+        if _is_non_empty_string(candidate.get(field)):
+            values.add(str(candidate[field]))
+    requirements = candidate.get("sufficiency_requirements")
+    if isinstance(requirements, dict):
+        for field in ("leaf_purpose", "coverage_dimension"):
+            if _is_non_empty_string(requirements.get(field)):
+                values.add(str(requirements[field]))
+    return values
+
+
+def _candidate_required_evidence_fields(candidate: dict[str, Any]) -> set[str]:
+    raw = candidate.get("required_evidence_fields")
+    return {str(item) for item in raw if _is_non_empty_string(item)} if isinstance(raw, list) else set()
+
+
+def _boi_schedule_counts_for_leaf(candidate: dict[str, Any], canonical_url: str) -> bool:
+    if not _is_boi_schedule_url(canonical_url):
+        return True
+    if _candidate_leaf_values(candidate) & BOI_SCHEDULE_ALLOWED_PURPOSES:
+        return True
+    fields = _candidate_required_evidence_fields(candidate)
+    return bool(fields & STABLE_SOURCE_IDENTITY_EVIDENCE_FIELDS)
 
 
 def _hash_suffix(value: Any, length: int = 24) -> str:
@@ -2121,6 +2175,8 @@ def _resolve_source_family(
     canonical_url: str,
     content_sha256: str,
 ) -> tuple[str, str, str]:
+    if _is_boi_official_url(canonical_url):
+        return BOI_OFFICIAL_SOURCE_FAMILY_ID, "bank_of_israel_official_domain_path", "resolved"
     explicit = candidate.get("source_family_id")
     if _is_non_empty_string(explicit) and explicit != "source-family-unknown":
         return str(explicit), str(candidate.get("source_family_resolution_method") or "candidate_field"), "resolved"
@@ -2153,6 +2209,12 @@ def _resolve_independence_status(
     if seen_source_family_ids and source_family_id in seen_source_family_ids:
         return "same_source_family"
     return "independent"
+
+
+def _source_context_only_reason(candidate: dict[str, Any], canonical_url: str) -> str | None:
+    if _is_boi_schedule_url(canonical_url) and not _boi_schedule_counts_for_leaf(candidate, canonical_url):
+        return "boi_schedule_context_only_not_counted_for_driver_leaf"
+    return None
 
 
 def _accepted_classifier_visible_date(
@@ -2753,11 +2815,13 @@ def normalize_retrieval_provenance(
         seen_claim_family_ids=seen_claim_family_ids,
         seen_content_hashes=seen_content_hashes,
     )
+    context_only_reason = _source_context_only_reason(candidate, canonical_url)
     counts_toward_breadth = (
         source_class != "unknown"
         and source_family_id != "source-family-unknown"
         and temporal_validation["temporal_gate_status"] == "pass"
         and independence_status in {"independent", "derived_from_primary"}
+        and context_only_reason is None
     )
     unknown_reason_codes = []
     if source_class == "unknown":
@@ -2768,6 +2832,8 @@ def normalize_retrieval_provenance(
         unknown_reason_codes.append("claim_family_unknown_not_counted")
     if temporal_validation["temporal_gate_status"] != "pass":
         unknown_reason_codes.append(f"temporal_{temporal_validation['temporal_gate_status']}")
+    if context_only_reason:
+        unknown_reason_codes.append(context_only_reason)
 
     classifier_ref = _classifier_slice_ref(classifier_slice)
     published_at = _iso_or_none(
@@ -3046,6 +3112,9 @@ def _research_usefulness_reason_codes(
         reason_codes.extend(chunk_rejection_codes or ["snippet_too_short_for_classification"])
     if claim_family_required and not _metadata_field_known(item, "claim_family_ids"):
         reason_codes.append("claim_extraction_not_attempted")
+    metadata_reasons = item.get("metadata_unknown_reason_codes")
+    if isinstance(metadata_reasons, list) and "boi_schedule_context_only_not_counted_for_driver_leaf" in metadata_reasons:
+        reason_codes.append("boi_schedule_context_only_not_counted_for_driver_leaf")
     return sorted(set(reason_codes))
 
 
@@ -3770,6 +3839,7 @@ def _source_class_counts_as_protected_primary(source_class: Any, context: dict[s
 def _evidence_counts_as_protected_primary(item: dict[str, Any], context: dict[str, Any]) -> bool:
     return bool(
         item.get("temporal_gate_status") == "pass"
+        and item.get("counts_toward_breadth") is True
         and _source_class_counts_as_protected_primary(item.get("source_class"), context)
     )
 
@@ -4944,7 +5014,7 @@ def _resolved_claim_candidates_from_fetched_text(
 ) -> list[dict[str, Any]]:
     raw_candidates = candidate.get("validated_atomic_claim_candidates")
     if not isinstance(raw_candidates, list):
-        raw_candidates = _deterministic_claim_candidates_from_fetched_text(text)
+        raw_candidates = _deterministic_claim_candidates_from_fetched_text(text, candidate=candidate)
     claim_candidates: list[dict[str, Any]] = []
     for raw in raw_candidates[:8]:
         if not isinstance(raw, dict):
@@ -4982,9 +5052,13 @@ def _resolved_claim_candidates_from_fetched_text(
     return claim_candidates
 
 
-def _deterministic_claim_candidates_from_fetched_text(text: str) -> list[dict[str, Any]]:
+def _deterministic_claim_candidates_from_fetched_text(
+    text: str,
+    *,
+    candidate: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
     if not _looks_like_tesla_delivery_source_text(text):
-        return []
+        return _generic_proven_source_claim_candidates(text, candidate=candidate or {})
     candidates: list[dict[str, Any]] = []
     for sentence in _tesla_delivery_candidate_sentences(text):
         event_time = _tesla_delivery_event_time(sentence)
@@ -5019,6 +5093,92 @@ def _deterministic_claim_candidates_from_fetched_text(text: str) -> list[dict[st
                 }
             )
     return candidates[:8]
+
+
+def _generic_proven_source_claim_candidates(text: str, *, candidate: dict[str, Any]) -> list[dict[str, Any]]:
+    if candidate.get("deterministic_source_class_proof") is not True:
+        return []
+    source_class = str(candidate.get("source_class") or "unknown")
+    if source_class not in {"official_or_primary", "primary_reporting", "expert_or_specialist"}:
+        return []
+    sentence = _first_claim_like_sentence(text)
+    if not sentence:
+        return []
+    subject = _generic_claim_subject(candidate)
+    predicate = _generic_claim_predicate(candidate)
+    event_time = (
+        _iso_or_none(candidate.get("source_published_at") or candidate.get("published_at") or candidate.get("source_updated_at"))
+        or "source_time_unspecified"
+    )
+    return [
+        {
+            "subject": subject,
+            "predicate": predicate,
+            "object_or_value": sentence,
+            "event_time": event_time,
+            "entity_or_jurisdiction": _generic_claim_entity(candidate),
+            "condition_scope": "unconditional",
+            "polarity": "affirmed",
+            "supporting_text": sentence,
+            "candidate_confidence": "medium",
+        }
+    ]
+
+
+def _first_claim_like_sentence(text: str) -> str:
+    normalized = _normalized_space(text)
+    for raw in re.split(r"(?<=[.!?])\s+", normalized):
+        sentence = _normalized_space(raw)
+        if len(sentence) < 60 or len(sentence) > 500:
+            continue
+        lowered = sentence.lower()
+        if not any(
+            keyword in lowered
+            for keyword in (
+                "will",
+                "expects",
+                "announced",
+                "decision",
+                "rate",
+                "inflation",
+                "guidance",
+                "schedule",
+                "deadline",
+                "published",
+            )
+        ):
+            continue
+        return sentence
+    return ""
+
+
+def _generic_claim_subject(candidate: dict[str, Any]) -> str:
+    for field in ("leaf_question", "question_text"):
+        if _is_non_empty_string(candidate.get(field)):
+            return _bounded_excerpt(str(candidate[field]), max_chars=180)
+    fields = candidate.get("required_evidence_fields")
+    if isinstance(fields, list):
+        joined = ", ".join(str(item) for item in fields if _is_non_empty_string(item))
+        if joined:
+            return _bounded_excerpt(joined, max_chars=180)
+    return "retrieved source statement"
+
+
+def _generic_claim_predicate(candidate: dict[str, Any]) -> str:
+    fields = candidate.get("required_evidence_fields")
+    if isinstance(fields, list):
+        compact = [str(item) for item in fields if _is_non_empty_string(item)]
+        if compact:
+            return "states " + _bounded_excerpt(", ".join(compact), max_chars=140)
+    return "states"
+
+
+def _generic_claim_entity(candidate: dict[str, Any]) -> str:
+    canonical_url = canonicalize_source_url(candidate.get("canonical_url"), candidate.get("final_url"), candidate.get("requested_url"))
+    if _is_boi_official_url(canonical_url):
+        return "Bank of Israel"
+    domain = _registrable_domain(canonical_url)
+    return domain or "source"
 
 
 def _looks_like_tesla_delivery_source_text(text: str) -> bool:
@@ -5130,13 +5290,17 @@ def _materialize_candidate_evidence(
             candidate.get("canonical_url"),
             candidate.get("final_url"),
         )
-        domain = _registrable_domain(canonical_for_family)
-        if domain:
-            source_family_id = "source-family-" + _hash_suffix({"domain": domain})
-            source_family_method = "registrable_domain"
+        if _is_boi_official_url(canonical_for_family):
+            source_family_id = BOI_OFFICIAL_SOURCE_FAMILY_ID
+            source_family_method = "bank_of_israel_official_domain_path"
         else:
-            source_family_id = "source-family-unknown"
-            source_family_method = "unknown"
+            domain = _registrable_domain(canonical_for_family)
+            if domain:
+                source_family_id = "source-family-" + _hash_suffix({"domain": domain})
+                source_family_method = "registrable_domain"
+            else:
+                source_family_id = "source-family-unknown"
+                source_family_method = "unknown"
     claim_family_ids = _candidate_claim_family_ids(candidate) if allow_candidate_claim_family_ids else []
     evidence = build_retrieval_evidence_item(
         case_id=str(qdt.get("case_id") or context.get("case_id")),
@@ -5175,6 +5339,10 @@ def _materialize_candidate_evidence(
         source_family_method
     )
     evidence["claim_family_ids"] = claim_family_ids
+    evidence["leaf_purpose"] = context.get("purpose")
+    evidence["leaf_temporal_role"] = context.get("leaf_temporal_role")
+    evidence["required_evidence_fields"] = list(context.get("required_evidence_fields") or [])
+    evidence["sufficiency_requirements"] = copy.deepcopy(context.get("sufficiency_requirements") or {})
     evidence["canonical_fetch_ref"] = canonical_fetch_ref
     evidence["source_content_artifact_ref"] = str(content_artifact_ref)
     evidence["leaf_source_relevance_refs"] = [leaf_source_relevance_ref]
@@ -5198,7 +5366,11 @@ def _materialize_candidate_evidence(
     )
     evidence["chunk_refs"] = [chunk["chunk_ref"]]
     evidence["atomic_claim_candidates"] = _resolved_claim_candidates_from_fetched_text(
-        candidate,
+        {
+            **candidate,
+            "leaf_question": context.get("leaf_question"),
+            "required_evidence_fields": list(context.get("required_evidence_fields") or []),
+        },
         evidence_ref=evidence["evidence_ref"],
         leaf_id=leaf_id,
         chunk_ref=chunk["chunk_ref"],
