@@ -27,7 +27,7 @@ from .model_context import (
     resolve_researcher_leaf_nli_model_context,
     validate_researcher_model_execution_context,
 )
-from .retrieval import ALLOWED_SOURCE_CLASSES, validate_retrieval_packet
+from .retrieval import ALLOWED_SOURCE_CLASSES, RESEARCH_USABLE_SNIPPET_MIN_CHARS, validate_retrieval_packet
 
 
 LEAF_RESEARCH_ASSIGNMENT_SCHEMA_VERSION = "leaf-research-assignment/v1"
@@ -341,8 +341,14 @@ def _certified_snippet_descriptor(
                 continue
             if not _is_sha256_ref(chunk.get("text_sha256")):
                 continue
+            if str(chunk.get("excerpt_policy") or "") == "hash_only":
+                continue
             excerpt_count = chunk.get("excerpt_char_count")
-            if not isinstance(excerpt_count, int) or isinstance(excerpt_count, bool) or excerpt_count <= 0:
+            if (
+                not isinstance(excerpt_count, int)
+                or isinstance(excerpt_count, bool)
+                or excerpt_count < RESEARCH_USABLE_SNIPPET_MIN_CHARS
+            ):
                 continue
             return {
                 "access_mode": "bounded_certified_snippet",

@@ -84,6 +84,8 @@ RESEARCH_SUFFICIENCY_CERTIFIER_VERSION = "ads-ret-008-research-sufficiency-dispa
 NATIVE_RESEARCH_RESOLVER_VERSION = "ads-ret-010-native-diagnostic-resolver/v1"
 SOURCE_METADATA_CLASSIFIER_VERSION = "ads-ret-011-source-metadata-classifier/v1"
 OPENCLAW_BROWSER_PROVIDER_ID = "openclaw_web_fetch_browser"
+RESEARCH_USABLE_SNIPPET_MIN_CHARS = 280
+RESEARCH_USABLE_CHUNK_MAX_CHARS = 4000
 SOURCE_METADATA_CLASSIFIER_LANE_ID = "source_metadata_classifier_assist"
 SOURCE_METADATA_CLASSIFIER_PROMPT_TEMPLATE_ID = "source-metadata-classifier/v1"
 SOURCE_METADATA_CLASSIFIER_MODEL_POLICY_REF = (
@@ -2913,6 +2915,108 @@ def _selected_from_result(result: dict[str, Any] | None) -> list[dict[str, Any]]
     return [item for item in selected if isinstance(item, dict)]
 
 
+def _chunks_by_ref(packet: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    chunks = packet.get("evidence_chunks")
+    if not isinstance(chunks, list):
+        return {}
+    return {
+        str(chunk["chunk_ref"]): chunk
+        for chunk in chunks
+        if isinstance(chunk, dict) and _is_non_empty_string(chunk.get("chunk_ref"))
+    }
+
+
+def _claim_family_required(query_context: dict[str, Any], profile: dict[str, Any] | None = None) -> bool:
+    profile_requirements = (profile or {}).get("claim_family_requirements")
+    if isinstance(profile_requirements, dict):
+        try:
+            if int(profile_requirements.get("min_independent_claim_families", 0) or 0) > 0:
+                return True
+        except (TypeError, ValueError):
+            pass
+    requirements = query_context.get("sufficiency_requirements")
+    if isinstance(requirements, dict):
+        try:
+            if int(requirements.get("min_independent_claim_families", 0) or 0) > 0:
+                return True
+        except (TypeError, ValueError):
+            pass
+        if requirements.get("claim_family_required") is True:
+            return True
+    targets = query_context.get("breadth_targets")
+    if isinstance(targets, dict):
+        try:
+            return int(targets.get("min_independent_claim_families", 0) or 0) > 0
+        except (TypeError, ValueError):
+            return False
+    return False
+
+
+def _evidence_chunk_refs(item: dict[str, Any]) -> list[str]:
+    return [
+        str(ref)
+        for ref in item.get("chunk_refs", [])
+        if _is_non_empty_string(ref)
+    ] if isinstance(item.get("chunk_refs"), list) else []
+
+
+def _research_usefulness_reason_codes(
+    item: dict[str, Any],
+    chunks_by_ref: dict[str, dict[str, Any]],
+    *,
+    claim_family_required: bool,
+) -> list[str]:
+    chunk_rejection_codes: list[str] = []
+    reason_codes: list[str] = []
+    chunks = [
+        chunks_by_ref[ref]
+        for ref in _evidence_chunk_refs(item)
+        if isinstance(chunks_by_ref.get(ref), dict)
+        and chunks_by_ref[ref].get("evidence_ref") == item.get("evidence_ref")
+    ]
+    if not chunks:
+        chunk_rejection_codes.extend(["content_artifact_missing", "snippet_too_short_for_classification"])
+    usable_chunk_seen = False
+    for chunk in chunks:
+        if not _is_non_empty_string(chunk.get("content_artifact_ref")):
+            chunk_rejection_codes.append("content_artifact_missing")
+            continue
+        if str(chunk.get("excerpt_policy") or "") == "hash_only":
+            chunk_rejection_codes.append("hash_only_excerpt_not_research_usable")
+            continue
+        excerpt_count = chunk.get("excerpt_char_count")
+        if (
+            not isinstance(excerpt_count, int)
+            or isinstance(excerpt_count, bool)
+            or excerpt_count < RESEARCH_USABLE_SNIPPET_MIN_CHARS
+        ):
+            chunk_rejection_codes.append("snippet_too_short_for_classification")
+            continue
+        usable_chunk_seen = True
+    if not usable_chunk_seen:
+        reason_codes.extend(chunk_rejection_codes or ["snippet_too_short_for_classification"])
+    if claim_family_required and not _metadata_field_known(item, "claim_family_ids"):
+        reason_codes.append("claim_extraction_not_attempted")
+    return sorted(set(reason_codes))
+
+
+def _research_usable_selected(
+    selected: list[dict[str, Any]],
+    chunks_by_ref: dict[str, dict[str, Any]],
+    *,
+    claim_family_required: bool,
+) -> list[dict[str, Any]]:
+    return [
+        item
+        for item in selected
+        if not _research_usefulness_reason_codes(
+            item,
+            chunks_by_ref,
+            claim_family_required=claim_family_required,
+        )
+    ]
+
+
 def _profile_by_leaf(packet: dict[str, Any]) -> dict[str, dict[str, Any]]:
     profiles = packet.get("retrieval_breadth_profiles", [])
     if not isinstance(profiles, list):
@@ -3248,9 +3352,27 @@ def build_retrieval_breadth_coverage_slice(
     contradiction_attempts: list[dict[str, Any]],
     negative_check_attempts: list[dict[str, Any]],
     metadata_fill_diagnostics: list[dict[str, Any]],
+    chunks_by_ref: dict[str, dict[str, Any]],
     source_cutoff_timestamp: str | None,
+    enforce_research_usefulness: bool = False,
 ) -> dict[str, Any]:
-    selected = _selected_from_result(result)
+    diagnostic_selected = _selected_from_result(result)
+    claim_required = _claim_family_required(query_context, profile)
+    content_usefulness_omissions = {
+        str(item.get("evidence_ref")): _research_usefulness_reason_codes(
+            item,
+            chunks_by_ref,
+            claim_family_required=claim_required,
+        )
+        for item in diagnostic_selected
+        if _is_non_empty_string(item.get("evidence_ref"))
+    }
+    research_usable_selected = _research_usable_selected(
+        diagnostic_selected,
+        chunks_by_ref,
+        claim_family_required=claim_required,
+    )
+    selected = research_usable_selected if enforce_research_usefulness else diagnostic_selected
     omitted = [item for item in (result or {}).get("omitted_candidates", []) if isinstance(item, dict)]
     independent = _independent_selected(selected)
     source_class_coverage: dict[str, dict[str, Any]] = {}
@@ -3342,6 +3464,13 @@ def build_retrieval_breadth_coverage_slice(
         unsatisfied.append("freshness")
     if len(selected) < min_admitted_evidence:
         unsatisfied.append("admitted_evidence_count")
+    content_reason_codes = sorted(
+        {
+            code
+            for reason_codes in content_usefulness_omissions.values()
+            for code in reason_codes
+        }
+    )
     if profile.get("contradiction_search", {}).get("required") and not contradiction_refs:
         unsatisfied.append("contradiction_search_attempt_missing")
     required_negative_checks = profile.get("negative_checks", {}).get("required_checks", [])
@@ -3351,6 +3480,8 @@ def build_retrieval_breadth_coverage_slice(
             unsatisfied.append(f"negative_check:{check}")
     if protected_status == "blocked":
         unsatisfied.append("protected_primary_blocked")
+    if enforce_research_usefulness and unsatisfied and content_reason_codes:
+        unsatisfied.extend(content_reason_codes)
 
     blocking_unknown_fields: list[str] = []
     if unknown_counts["source_class"] and any(item.startswith("source_class:") for item in unsatisfied):
@@ -3391,11 +3522,24 @@ def build_retrieval_breadth_coverage_slice(
         "protected_primary_status": protected_status,
         "protected_primary_resolution_basis": protected_basis,
         "structural_unanswerability_proof_ref": structural_unanswerability_proof_ref,
-        "raw_candidate_count": len(selected) + len(omitted),
+        "raw_candidate_count": len(diagnostic_selected) + len(omitted),
         "admitted_ref_count": len(selected),
+        "diagnostic_admitted_ref_count": len(diagnostic_selected),
         "min_admitted_evidence_items": min_admitted_evidence,
         "independent_claim_family_ids": claim_family_ids,
         "independent_source_family_ids": source_family_ids,
+        "research_usable_evidence_refs": [
+            item["evidence_ref"] for item in research_usable_selected if _is_non_empty_string(item.get("evidence_ref"))
+        ],
+        "research_usefulness_enforced": bool(enforce_research_usefulness),
+        "content_usefulness_omissions": [
+            {
+                "evidence_ref": evidence_ref,
+                "reason_codes": reason_codes,
+            }
+            for evidence_ref, reason_codes in sorted(content_usefulness_omissions.items())
+            if reason_codes
+        ],
         "metadata_fill_diagnostic_refs": metadata_refs,
         "unknown_field_counts": unknown_counts,
         "blocking_unknown_fields": sorted(set(blocking_unknown_fields)),
@@ -3407,11 +3551,16 @@ def build_retrieval_breadth_coverage_slice(
     }
 
 
-def build_retrieval_breadth_coverage_slices(packet: dict[str, Any]) -> list[dict[str, Any]]:
+def build_retrieval_breadth_coverage_slices(
+    packet: dict[str, Any],
+    *,
+    enforce_research_usefulness: bool = False,
+) -> list[dict[str, Any]]:
     profiles = _profile_by_leaf(packet)
     results = _results_by_leaf(packet)
     contradiction_by_leaf = _attempts_by_leaf(packet.get("contradiction_search_attempts", []))
     negative_by_leaf = _attempts_by_leaf(packet.get("negative_check_attempts", []))
+    chunks_by_ref = _chunks_by_ref(packet)
     metadata_fill = packet.get("retrieval_metadata_fill_diagnostics", [])
     if not isinstance(metadata_fill, list):
         metadata_fill = []
@@ -3431,7 +3580,9 @@ def build_retrieval_breadth_coverage_slices(packet: dict[str, Any]) -> list[dict
                 contradiction_attempts=contradiction_by_leaf.get(str(leaf_id), []),
                 negative_check_attempts=negative_by_leaf.get(str(leaf_id), []),
                 metadata_fill_diagnostics=metadata_fill,
+                chunks_by_ref=chunks_by_ref,
                 source_cutoff_timestamp=packet.get("source_cutoff_timestamp"),
+                enforce_research_usefulness=enforce_research_usefulness,
             )
         )
     return coverage
@@ -4158,6 +4309,18 @@ def certify_leaf_research_sufficiency(
     if not isinstance(requirements, dict):
         requirements = {}
     selected = _selected_from_result(result)
+    research_usable_refs = {
+        str(ref)
+        for ref in (coverage or {}).get("research_usable_evidence_refs", [])
+        if _is_non_empty_string(ref)
+    } if isinstance(coverage, dict) else {
+        str(item["evidence_ref"]) for item in selected if _is_non_empty_string(item.get("evidence_ref"))
+    }
+    certified_selected = [
+        item
+        for item in selected
+        if _is_non_empty_string(item.get("evidence_ref")) and str(item["evidence_ref"]) in research_usable_refs
+    ]
     expansion_attempts = expansion_attempts or []
     expansion_refs = [
         item["attempt_id"]
@@ -4240,7 +4403,7 @@ def certify_leaf_research_sufficiency(
         status = "certified_high_certainty"
         classification_allowed = True
 
-    if status == "certified_high_certainty" and not selected:
+    if status == "certified_high_certainty" and not certified_selected:
         status = "blocked_insufficient_research"
         classification_allowed = False
         blocking.add("no_admitted_evidence")
@@ -4264,7 +4427,9 @@ def certify_leaf_research_sufficiency(
         "sufficiency_profile_id": requirements.get("sufficiency_profile_id", "high-certainty-default/v1"),
         "status": status,
         "classification_dispatch_allowed": bool(classification_allowed),
-        "evidence_refs": [item["evidence_ref"] for item in selected if _is_non_empty_string(item.get("evidence_ref"))],
+        "evidence_refs": [
+            item["evidence_ref"] for item in certified_selected if _is_non_empty_string(item.get("evidence_ref"))
+        ],
         "breadth_coverage_ref": breadth_coverage_ref,
         "breadth_certified": bool(breadth_certified),
         "expansion_attempt_refs": expansion_refs,
@@ -4401,7 +4566,16 @@ def build_retrieval_outcome_state(
         downstream_action = "block_retrieval_until_upstream_expansion_or_unanswerability_proof"
         terminal_blocked = True
     thin_retrieval_blocked = retrieval_outcome == "insufficient_evidence" and any(
-        code in {"empty_retrieval", "thin_retrieval", "breadth_not_certified", "no_admitted_evidence"}
+        code in {
+            "empty_retrieval",
+            "thin_retrieval",
+            "breadth_not_certified",
+            "no_admitted_evidence",
+            "hash_only_excerpt_not_research_usable",
+            "snippet_too_short_for_classification",
+            "content_artifact_missing",
+            "claim_extraction_not_attempted",
+        }
         for code in set(blocked_reason_codes) | set(unsatisfied_requirement_codes)
     )
     return {
@@ -4438,8 +4612,10 @@ def finalize_retrieval_packet_for_dispatch(
     replay_command: str | None = None,
 ) -> dict[str, Any]:
     packet_copy = copy.deepcopy(packet)
-    if not packet_copy.get("retrieval_breadth_coverage_slices"):
-        packet_copy["retrieval_breadth_coverage_slices"] = build_retrieval_breadth_coverage_slices(packet_copy)
+    packet_copy["retrieval_breadth_coverage_slices"] = build_retrieval_breadth_coverage_slices(
+        packet_copy,
+        enforce_research_usefulness=True,
+    )
     if not packet_copy.get("retrieval_expansion_attempts"):
         expansion_plan = build_retrieval_expansion_and_fallback_plan(packet_copy)
         packet_copy["retrieval_expansion_attempts"] = expansion_plan["retrieval_expansion_attempts"]
@@ -4608,7 +4784,7 @@ def _candidate_text(candidate: dict[str, Any]) -> str:
         or candidate.get("rendered_text")
         or candidate.get("markdown")
         or "",
-        max_chars=4000,
+        max_chars=RESEARCH_USABLE_CHUNK_MAX_CHARS,
     )
 
 
@@ -4847,6 +5023,7 @@ def _materialize_candidate_evidence(
         char_start=0,
         char_end=len(text),
         text=text,
+        excerpt_policy="bounded_excerpt" if text else "hash_only",
     )
     span = build_evidence_span(
         chunk_ref=chunk["chunk_ref"],
@@ -5410,6 +5587,10 @@ def build_live_retrieval_packet_from_candidates(
                         "admission_reason_code": "supplemental_evidence_admitted_after_validation",
                         "source_class_resolution_method": record.get("source_class_resolution_method"),
                         "source_family_resolution_method": record.get("source_family_resolution_method"),
+                        "content": raw.get("content"),
+                        "extracted_text": raw.get("extracted_text"),
+                        "rendered_text": raw.get("rendered_text"),
+                        "markdown": raw.get("markdown"),
                     },
                     attempt={
                         "attempt_id": str(record["supplemental_evidence_ref"]),

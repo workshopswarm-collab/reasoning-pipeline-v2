@@ -143,6 +143,7 @@ class RetrievalPacketContractTest(unittest.TestCase):
         qdt = copy.deepcopy(qdt or self.qdt)
         contexts = build_retrieval_query_contexts(qdt, evidence_packet=self.evidence_packet)
         selected = []
+        chunks = []
         for context in contexts:
             official = self._evidence(
                 context,
@@ -163,13 +164,32 @@ class RetrievalPacketContractTest(unittest.TestCase):
                 claim_family_id=f"claim-family-{context['leaf_id']}-secondary",
             )
             selected.extend([official, secondary])
-        return build_retrieval_packet(
+        for item in selected:
+            text = (
+                f"Certified source excerpt for {item['transport_attempt_ref']} with enough bounded "
+                "source detail for researcher classification. "
+                * 8
+            )
+            chunk = build_evidence_chunk(
+                evidence_ref=item["evidence_ref"],
+                content_artifact_ref=f"artifact:browser-capture/{item['transport_attempt_ref']}",
+                chunk_index=0,
+                char_start=0,
+                char_end=len(text),
+                text=text,
+                excerpt_policy="bounded_excerpt",
+            )
+            item["chunk_refs"] = [chunk["chunk_ref"]]
+            chunks.append(chunk)
+        packet = build_retrieval_packet(
             qdt,
             evidence_packet=self.evidence_packet,
             selected_evidence=selected,
             question_decomposition_artifact_id="artifact:qdt-1",
             policy_context_ref="artifact:profile-1",
         )
+        packet["evidence_chunks"] = chunks
+        return packet
 
     def _live_candidate(self, context: dict, index: int, *, direct: bool = False, official: bool = False) -> dict:
         leaf_id = context["leaf_id"]
@@ -178,6 +198,11 @@ class RetrievalPacketContractTest(unittest.TestCase):
             f"https://example.com/official/{leaf_id}"
             if direct
             else f"https://independent{index}.example/{leaf_id}"
+        )
+        supporting_text = f"Live-shaped candidate {index} for {leaf_id} supports the required evidence field."
+        content = (
+            supporting_text
+            + " The fetched source contains bounded detail for researcher classification and claim extraction. " * 8
         )
         return {
             "leaf_id": leaf_id,
@@ -195,7 +220,7 @@ class RetrievalPacketContractTest(unittest.TestCase):
             "source_class_resolution_method": "manual_fixture" if official else "deterministic_url_registry",
             "source_family_resolution_method": "deterministic_url_registry",
             "result_rank": index + 1,
-            "content": f"Live-shaped candidate {index} for {leaf_id}",
+            "content": content,
             "validated_atomic_claim_candidates": [
                 {
                     "subject": f"Live-shaped candidate {index}",
@@ -205,7 +230,7 @@ class RetrievalPacketContractTest(unittest.TestCase):
                     "entity_or_jurisdiction": "example",
                     "condition_scope": "unconditional",
                     "polarity": "affirmed",
-                    "supporting_text": f"Live-shaped candidate {index} for {leaf_id}",
+                    "supporting_text": supporting_text,
                     "candidate_confidence": "high",
                 }
             ],
@@ -1281,7 +1306,11 @@ class RetrievalPacketContractTest(unittest.TestCase):
         )
         expanded_chunks = []
         for item in (official, secondary):
-            text = f"Expanded certified excerpt for {item['transport_attempt_ref']}"
+            text = (
+                f"Expanded certified excerpt for {item['transport_attempt_ref']} with enough bounded "
+                "source detail for researcher classification. "
+                * 8
+            )
             chunk = build_evidence_chunk(
                 evidence_ref=item["evidence_ref"],
                 content_artifact_ref=f"artifact:browser-capture/{item['transport_attempt_ref']}",
@@ -1361,6 +1390,156 @@ class RetrievalPacketContractTest(unittest.TestCase):
             finalized["retrieval_fallback_summary"]["targeted_expansion_executed_count"],
             2,
         )
+
+    def test_hash_only_chunks_do_not_certify_research_sufficiency(self) -> None:
+        qdt = copy.deepcopy(self.qdt)
+        qdt["required_leaf_questions"] = [qdt["required_leaf_questions"][0]]
+        leaf = qdt["required_leaf_questions"][0]
+        leaf["research_sufficiency_requirements"].update(
+            {
+                "required_source_classes": ["official_or_primary", "independent_secondary"],
+                "min_independent_claim_families": 2,
+                "min_independent_source_families": 2,
+                "min_temporally_fresh_sources": 0,
+                "protected_primary_required": True,
+                "required_negative_checks": [],
+            }
+        )
+        context = build_retrieval_query_contexts(qdt, evidence_packet=self.evidence_packet)[0]
+        official = self._evidence(
+            context,
+            attempt_ref="hash-only-official",
+            canonical_url="https://example.com/hash-only-official",
+            source_class="official_or_primary",
+            source_family_id="source-family-hash-official",
+            claim_family_id="claim-family-hash-official",
+        )
+        official["deterministic_source_class_proof"] = True
+        official["source_class_resolution_method"] = "manual_fixture"
+        secondary = self._evidence(
+            context,
+            attempt_ref="hash-only-secondary",
+            canonical_url="https://independent.example/hash-only-secondary",
+            source_class="independent_secondary",
+            source_family_id="source-family-hash-secondary",
+            claim_family_id="claim-family-hash-secondary",
+        )
+        chunks = []
+        for item in (official, secondary):
+            text = "Hash-only diagnostic source text is long enough but not research usable. " * 6
+            chunk = build_evidence_chunk(
+                evidence_ref=item["evidence_ref"],
+                content_artifact_ref=f"artifact:browser-capture/{item['transport_attempt_ref']}",
+                chunk_index=0,
+                char_start=0,
+                char_end=len(text),
+                text=text,
+                excerpt_policy="hash_only",
+            )
+            item["chunk_refs"] = [chunk["chunk_ref"]]
+            chunks.append(chunk)
+        packet = build_retrieval_packet(qdt, evidence_packet=self.evidence_packet, selected_evidence=[official, secondary])
+        packet["evidence_chunks"] = chunks
+
+        finalized = finalize_retrieval_packet_for_dispatch(packet)
+        coverage = finalized["retrieval_breadth_coverage_slices"][0]
+        certificate = finalized["leaf_research_sufficiency_certificates"][0]
+
+        self.assertEqual(finalized["research_sufficiency_summary"]["classification_dispatch_status"], "blocked_insufficient_research")
+        self.assertTrue(coverage["research_usefulness_enforced"])
+        self.assertEqual(coverage["diagnostic_admitted_ref_count"], 2)
+        self.assertEqual(coverage["admitted_ref_count"], 0)
+        self.assertFalse(certificate["evidence_refs"])
+        self.assertIn("hash_only_excerpt_not_research_usable", coverage["unsatisfied_breadth_dimensions"])
+
+    def test_short_chunks_do_not_certify_research_sufficiency(self) -> None:
+        qdt = copy.deepcopy(self.qdt)
+        qdt["required_leaf_questions"] = [qdt["required_leaf_questions"][0]]
+        leaf = qdt["required_leaf_questions"][0]
+        leaf["research_sufficiency_requirements"].update(
+            {
+                "required_source_classes": ["independent_secondary"],
+                "min_independent_claim_families": 1,
+                "min_independent_source_families": 1,
+                "min_temporally_fresh_sources": 0,
+                "protected_primary_required": False,
+                "required_negative_checks": [],
+            }
+        )
+        context = build_retrieval_query_contexts(qdt, evidence_packet=self.evidence_packet)[0]
+        secondary = self._evidence(
+            context,
+            attempt_ref="short-secondary",
+            canonical_url="https://independent.example/short-secondary",
+            source_class="independent_secondary",
+            source_family_id="source-family-short-secondary",
+            claim_family_id="claim-family-short-secondary",
+        )
+        text = "Too short for classification."
+        chunk = build_evidence_chunk(
+            evidence_ref=secondary["evidence_ref"],
+            content_artifact_ref="artifact:browser-capture/short-secondary",
+            chunk_index=0,
+            char_start=0,
+            char_end=len(text),
+            text=text,
+            excerpt_policy="bounded_excerpt",
+        )
+        secondary["chunk_refs"] = [chunk["chunk_ref"]]
+        packet = build_retrieval_packet(qdt, evidence_packet=self.evidence_packet, selected_evidence=[secondary])
+        packet["evidence_chunks"] = [chunk]
+
+        finalized = finalize_retrieval_packet_for_dispatch(packet)
+        coverage = finalized["retrieval_breadth_coverage_slices"][0]
+
+        self.assertEqual(finalized["research_sufficiency_summary"]["classification_dispatch_status"], "blocked_insufficient_research")
+        self.assertEqual(coverage["admitted_ref_count"], 0)
+        self.assertIn("snippet_too_short_for_classification", coverage["unsatisfied_breadth_dimensions"])
+
+    def test_claim_family_empty_evidence_blocks_claim_breadth(self) -> None:
+        qdt = copy.deepcopy(self.qdt)
+        qdt["required_leaf_questions"] = [qdt["required_leaf_questions"][0]]
+        leaf = qdt["required_leaf_questions"][0]
+        leaf["research_sufficiency_requirements"].update(
+            {
+                "required_source_classes": ["independent_secondary"],
+                "min_independent_claim_families": 1,
+                "min_independent_source_families": 1,
+                "min_temporally_fresh_sources": 0,
+                "protected_primary_required": False,
+                "required_negative_checks": [],
+            }
+        )
+        context = build_retrieval_query_contexts(qdt, evidence_packet=self.evidence_packet)[0]
+        secondary = self._evidence(
+            context,
+            attempt_ref="claim-empty-secondary",
+            canonical_url="https://independent.example/claim-empty-secondary",
+            source_class="independent_secondary",
+            source_family_id="source-family-claim-empty-secondary",
+            claim_family_id="",
+        )
+        text = "Claim-empty source has enough bounded text for classification but no extracted claim family. " * 6
+        chunk = build_evidence_chunk(
+            evidence_ref=secondary["evidence_ref"],
+            content_artifact_ref="artifact:browser-capture/claim-empty-secondary",
+            chunk_index=0,
+            char_start=0,
+            char_end=len(text),
+            text=text,
+            excerpt_policy="bounded_excerpt",
+        )
+        secondary["chunk_refs"] = [chunk["chunk_ref"]]
+        packet = build_retrieval_packet(qdt, evidence_packet=self.evidence_packet, selected_evidence=[secondary])
+        packet["evidence_chunks"] = [chunk]
+
+        finalized = finalize_retrieval_packet_for_dispatch(packet)
+        coverage = finalized["retrieval_breadth_coverage_slices"][0]
+
+        self.assertEqual(finalized["research_sufficiency_summary"]["classification_dispatch_status"], "blocked_insufficient_research")
+        self.assertEqual(coverage["claim_family_count"], 0)
+        self.assertIn("claim_family_diversity", coverage["unsatisfied_breadth_dimensions"])
+        self.assertIn("claim_extraction_not_attempted", coverage["unsatisfied_breadth_dimensions"])
 
     def test_transport_run_without_admissible_evidence_exhausts_expansion(self) -> None:
         qdt = copy.deepcopy(self.qdt)
@@ -1469,13 +1648,19 @@ class RetrievalPacketContractTest(unittest.TestCase):
                 claim_family_id=f"claim-family-{context['leaf_id']}-secondary",
             )
             for offset, evidence in enumerate([official, secondary]):
+                text = (
+                    f"Bounded browser evidence for {context['leaf_id']} {offset} with enough source "
+                    "detail for researcher classification and certified snippet assignment. "
+                    * 8
+                )
                 chunk = build_evidence_chunk(
                     evidence_ref=evidence["evidence_ref"],
                     content_artifact_ref=f"artifact:browser-capture/{index}-{offset}",
                     chunk_index=0,
                     char_start=0,
-                    char_end=32,
-                    text=f"Bounded browser evidence for {context['leaf_id']} {offset}",
+                    char_end=len(text),
+                    text=text,
+                    excerpt_policy="bounded_excerpt",
                 )
                 span = build_evidence_span(
                     chunk_ref=chunk["chunk_ref"],
@@ -1706,7 +1891,8 @@ class RetrievalPacketContractTest(unittest.TestCase):
         candidate["canonical_url"] = "https://ir.tesla.com/press"
         candidate["content"] = (
             "Tesla Q2 2025 Vehicle Production & Deliveries. "
-            "In Q2 2025, Tesla produced approximately 410,244 vehicles and delivered approximately 384,122 vehicles."
+            "In Q2 2025, Tesla produced approximately 410,244 vehicles and delivered approximately 384,122 vehicles. "
+            + "Additional bounded source detail supports researcher classification without exposing unbounded page text. " * 4
         )
         candidate.pop("claim_family_id", None)
         candidate.pop("claim_family_ids", None)
@@ -1995,7 +2181,7 @@ class RetrievalPacketContractTest(unittest.TestCase):
         self.assertTrue(provenance["claim_family_ids"])
         self.assertNotIn("claim_family_unknown_not_counted", provenance["unknown_reason_codes"])
         self.assertGreater(chunk["excerpt_char_count"], 1200)
-        self.assertEqual(chunk["excerpt_policy"], "hash_only")
+        self.assertEqual(chunk["excerpt_policy"], "bounded_excerpt")
         self.assertNotIn("text", chunk)
 
     def test_phase7_direct_url_priority_search_candidate_caps_and_dedupe(self) -> None:
@@ -3012,7 +3198,11 @@ class RetrievalPacketContractTest(unittest.TestCase):
             "source_family_resolution_method": "deterministic_url_registry",
             "claim_family_id": "claim-family-live-supplemental-official",
             "source_published_at": "2026-06-24T11:45:00+00:00",
-            "content": "Supplemental official source admitted after deterministic validation",
+            "content": (
+                "Supplemental official source admitted after deterministic validation. "
+                "It includes enough bounded detail for researcher classification and certified snippet assignment. "
+                * 4
+            ),
         }
 
         packet = build_live_retrieval_packet_from_candidates(

@@ -113,7 +113,10 @@ class _SearchProofRetrievalProvider:
             delivered = 9_000 + (index * 103)
             content = (
                 f"Tesla produced {produced} vehicles and delivered {delivered} vehicles in Q4 2099. "
-                f"Search proof source {index} for {leaf_id}."
+                f"Search proof source {index} for {leaf_id}. "
+                "The fetched page contains enough bounded source detail for researcher classification, "
+                "claim extraction, and certified snippet assignment without exposing unbounded page text. "
+                * 4
             )
             self._url_content[url] = {
                 "content": content,

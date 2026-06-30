@@ -43,6 +43,7 @@ from researcher_swarm.model_context import (  # noqa: E402
 )
 from researcher_swarm.openclaw_runtime import parse_openclaw_researcher_swarm_stdout  # noqa: E402
 from researcher_swarm.retrieval import (  # noqa: E402
+    RESEARCH_USABLE_SNIPPET_MIN_CHARS,
     build_evidence_chunk,
     build_retrieval_evidence_item,
     build_retrieval_packet,
@@ -167,7 +168,11 @@ class LeafResearchAssignmentContractTest(unittest.TestCase):
             )
             selected.extend([official, secondary])
         for item in selected:
-            text = f"Certified source excerpt for {item['transport_attempt_ref']}"
+            text = (
+                f"Certified source excerpt for {item['transport_attempt_ref']} with enough bounded "
+                "source detail for researcher classification. "
+                * 8
+            )
             chunk = build_evidence_chunk(
                 evidence_ref=item["evidence_ref"],
                 content_artifact_ref=f"artifact:browser-capture/{item['transport_attempt_ref']}",
@@ -234,6 +239,11 @@ class LeafResearchAssignmentContractTest(unittest.TestCase):
             self.assertTrue(assignment["assigned_evidence_refs"])
             certified_snippet = assignment["assigned_evidence_refs"][0]["certified_snippet"]
             self.assertEqual(certified_snippet["access_mode"], "bounded_certified_snippet")
+            self.assertEqual(certified_snippet["excerpt_policy"], "bounded_excerpt")
+            self.assertGreaterEqual(
+                certified_snippet["excerpt_char_count"],
+                RESEARCH_USABLE_SNIPPET_MIN_CHARS,
+            )
             self.assertTrue(certified_snippet["content_artifact_ref"].startswith("artifact:browser-capture/"))
             self.assertEqual(assignment["output_contract"]["forbidden_fields"], list(FORBIDDEN_OUTPUT_FIELDS))
             self.assertFalse(assignment["context_isolation"]["peer_context_allowed"])

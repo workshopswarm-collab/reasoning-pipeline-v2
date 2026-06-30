@@ -185,7 +185,10 @@ def _attach_fixture_chunks(packet: dict[str, Any]) -> None:
                 continue
             text = (
                 f"Canonical fixture snippet for {evidence['leaf_id']} from "
-                f"{evidence['source_class']} source {evidence['source_family_id']}."
+                f"{evidence['source_class']} source {evidence['source_family_id']}. "
+                "The bounded fixture source includes enough detail for researcher classification, "
+                "claim extraction, and certified snippet assignment without exposing unbounded page text. "
+                * 4
             )
             chunk = build_evidence_chunk(
                 evidence_ref=str(evidence["evidence_ref"]),

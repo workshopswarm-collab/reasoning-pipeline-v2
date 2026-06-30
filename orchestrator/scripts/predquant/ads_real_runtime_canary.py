@@ -797,6 +797,7 @@ def _source_collation_acceptance(
     real_candidate_count: int,
     fetched_attempt_count: int,
     admitted_ref_count: int,
+    meaningful_snippet_admitted_count: int,
     sufficiency: dict[str, Any],
     structural_unanswerability_certified: bool,
     search_candidate_discovery_blocked: bool,
@@ -817,6 +818,8 @@ def _source_collation_acceptance(
         unmet.append("fetch_attempts")
     if admitted_ref_count <= 0:
         unmet.append("admitted_evidence")
+    if admitted_ref_count > 0 and meaningful_snippet_admitted_count <= 0:
+        unmet.append("meaningful_snippet")
     if search_candidate_discovery_blocked:
         unmet.append("search_candidate_discovery")
     if not non_market_family_ids:
@@ -1055,16 +1058,17 @@ def _retrieval_runtime_evidence(manifests: list[dict[str, Any]]) -> dict[str, An
         retrieval_has_real_candidates = real_candidate_count > 0
         retrieval_has_fetch_attempts = fetched_attempt_count > 0
         retrieval_has_admitted_evidence = len(admitted_refs) > 0
+        retrieval_gap = summarize_retrieval_gap(payload, admitted_refs=admitted_refs)
         source_collation_acceptance = _source_collation_acceptance(
             payload,
             real_candidate_count=real_candidate_count,
             fetched_attempt_count=fetched_attempt_count,
             admitted_ref_count=len(admitted_refs),
+            meaningful_snippet_admitted_count=int(retrieval_gap["meaningful_snippet_admitted_count"]),
             sufficiency=sufficiency,
             structural_unanswerability_certified=structural_unanswerability_certified,
             search_candidate_discovery_blocked=search_candidate_discovery_blocked,
         )
-        retrieval_gap = summarize_retrieval_gap(payload, admitted_refs=admitted_refs)
         source_populated_or_structural_unanswerability = bool(
             (
                 retrieval_has_real_candidates
