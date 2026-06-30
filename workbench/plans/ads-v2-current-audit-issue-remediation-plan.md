@@ -1046,7 +1046,7 @@ Completion note, 2026-06-30:
 
 ## Phase 7 - SCAE Valid Forecast And Non-Executing Prediction Proof
 
-Status: pending
+Status: complete
 
 Goal: prove SCAE can produce a valid forecast with evidence delta refs while preserving non-executing canary safety.
 
@@ -1123,10 +1123,25 @@ Success criteria:
 
 Checklist:
 
-- [ ] SCAE valid forecast requires deltas.
-- [ ] Non-SCAE authority check passes.
-- [ ] Clone-only proof shows no live mutation.
-- [ ] Temporary artifacts deleted.
+- [x] SCAE valid forecast requires deltas.
+- [x] Non-SCAE authority check passes.
+- [x] Clone-only proof shows no live mutation.
+- [x] Temporary artifacts deleted.
+
+Completion note, 2026-06-30:
+
+- Added ADS bridge enforcement for true-production SCAE ledgers: otherwise-valid forecasts without accepted verified SCAE evidence-delta refs are downgraded to `invalid_for_forecast` before finalization and persistence.
+- Added final ledger authority metadata for Phase 7 reporting: `forecast_authority_policy=scae_only`, `scae_evidence_delta_ref_count`, `scae_evidence_delta_refs`, `scae_evidence_delta_ref_requirement_status`, and `non_scae_probability_inputs=[]`.
+- Added permanent operational canary coverage proving:
+  - a valid true-production SCAE forecast has nonzero evidence-delta refs and writes only to the cloned DB;
+  - the source/live DB protected tables remain unchanged during that clone proof;
+  - certified retrieval plus researcher output with no SCAE-eligible deltas produces an invalid forecast, blocked forecast-decision persistence, and zero market predictions.
+- Verification run:
+  - `/Users/agent2/.openclaw/orchestrator`: `python3 -m unittest discover -s scripts/tests -p 'test_*.py'` passed 297 tests.
+  - `/Users/agent2/.openclaw/SCAE`: `python3 -m unittest discover -s scripts/tests -p 'test_scae*.py'` passed 109 tests.
+  - `/Users/agent2/.openclaw/orchestrator`: `python3 -m unittest scripts.tests.test_ads_operational_canary` passed 28 tests.
+  - `/Users/agent2/.openclaw/orchestrator`: `python3 scripts/bin/check_ads_non_scae_authority.py` passed.
+- Current-repo note: the plan's `scripts.tests.test_ads_real_runtime_canary` target remains stale; real-runtime canary criteria coverage is in `scripts.tests.test_ads_operational_canary`.
 
 ## Phase 8 - Reporting, Clone Metadata, And Operator Readiness Semantics
 

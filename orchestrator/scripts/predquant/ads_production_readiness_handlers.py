@@ -8,6 +8,7 @@ allowed to produce scoreable forecasts.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import sqlite3
@@ -1092,6 +1093,40 @@ def _verified_evidence_delta_context(verification_payload: dict[str, Any] | None
     }
 
 
+def _verified_evidence_delta_refs(context: dict[str, Any] | None) -> list[str]:
+    if not isinstance(context, dict):
+        return []
+    refs: list[str] = []
+    for row in context.get("ledger_evidence_delta_slices") or []:
+        if not isinstance(row, dict) or row.get("accepted_for_ledger_input") is not True:
+            continue
+        for field_name in ("cluster_slice_id", "delta_input_ref", "candidate_slice_id", "slice_id"):
+            value = row.get(field_name)
+            if isinstance(value, str) and value.strip():
+                refs.append(value)
+                break
+    return sorted(set(refs))
+
+
+def _block_scae_ledger_without_verified_delta_refs(ledger: dict[str, Any]) -> dict[str, Any]:
+    blocked = copy.deepcopy(ledger)
+    reason = "verified_scae_evidence_delta_refs_missing"
+    research_context = copy.deepcopy(blocked.get("research_sufficiency_context") or {})
+    research_context["bundle_status"] = "invalid_missing_verified_evidence_deltas"
+    research_context["forecast_validity_status"] = "invalid_for_forecast"
+    research_context["verified_scae_evidence_delta_ref_count"] = 0
+    research_context["blocked_reason_codes"] = sorted(
+        set([*research_context.get("blocked_reason_codes", []), reason])
+    )
+    blocked["research_sufficiency_context"] = research_context
+    blocked["forecast_validity_status"] = "invalid_for_forecast"
+    blocked["calibration_debt_finalization_ready"] = False
+    blocked["scae_evidence_delta_ref_requirement_status"] = reason
+    blocked["scae_valid_forecast_requires_evidence_delta_refs"] = True
+    blocked["scae_evidence_delta_ref_count"] = 0
+    return blocked
+
+
 def _build_scae_ledger(
     *,
     lease: dict[str, Any],
@@ -1141,6 +1176,7 @@ def _build_scae_ledger(
         }
     )
     verified_evidence_context = _verified_evidence_delta_context(verification_payload)
+    verified_delta_refs = _verified_evidence_delta_refs(verified_evidence_context)
     pre_debt = build_pre_debt_ledger_output(
         prior_context,
         evidence_delta_slices=(
@@ -1207,6 +1243,12 @@ def _build_scae_ledger(
         qdt=qdt,
         sufficiency_reconciliations=sufficiency_rows,
     )
+    if (
+        not scoreable_pilot
+        and guarded.get("forecast_validity_status") != "invalid_for_forecast"
+        and not verified_delta_refs
+    ):
+        guarded = _block_scae_ledger_without_verified_delta_refs(guarded)
     finalized = finalize_scae_probability_fields(guarded)
     finalized.update(
         {
@@ -1220,6 +1262,18 @@ def _build_scae_ledger(
                 if scoreable_pilot
                 else "production_readiness_fail_closed"
             ),
+            "forecast_authority_policy": "scae_only",
+            "scae_valid_forecast_requires_evidence_delta_refs": not scoreable_pilot,
+            "scae_evidence_delta_ref_requirement_status": (
+                "not_applicable_structured_market_metadata_pilot"
+                if scoreable_pilot
+                else "satisfied"
+                if verified_delta_refs
+                else "verified_scae_evidence_delta_refs_missing"
+            ),
+            "scae_evidence_delta_ref_count": len(verified_delta_refs),
+            "scae_evidence_delta_refs": verified_delta_refs,
+            "non_scae_probability_inputs": [],
             "scoreable_forecast_output": bool(
                 scoreable_pilot and finalized.get("forecast_validity_status") != "invalid_for_forecast"
             ),

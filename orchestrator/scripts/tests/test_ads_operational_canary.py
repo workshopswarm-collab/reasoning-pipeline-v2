@@ -383,6 +383,7 @@ def _fake_researcher_runtime_bundle_all_evidence_accepted(
     retrieval_packet: dict[str, Any],
     true_production_mode: bool,
     max_concurrent: int,
+    evidence_delta_eligible_for_scae: Any = None,
 ) -> dict[str, Any]:
     model_context = resolve_researcher_leaf_nli_model_context()
     classifications = []
@@ -390,14 +391,15 @@ def _fake_researcher_runtime_bundle_all_evidence_accepted(
     for assignment in assignments:
         for assigned in assignment.get("assigned_evidence_refs", []):
             if isinstance(assigned, dict) and assigned.get("evidence_ref"):
-                classifications.append(
-                    _runtime_classification(
-                        qdt,
-                        retrieval_packet,
-                        assignment,
-                        evidence_ref=str(assigned["evidence_ref"]),
-                    )
+                classification = _runtime_classification(
+                    qdt,
+                    retrieval_packet,
+                    assignment,
+                    evidence_ref=str(assigned["evidence_ref"]),
                 )
+                if evidence_delta_eligible_for_scae is not None:
+                    classification["evidence_delta_eligible_for_scae"] = evidence_delta_eligible_for_scae
+                classifications.append(classification)
         coverage_proofs.append(_runtime_coverage(assignment, retrieval_packet))
     sidecar = build_researcher_sidecar_v2(
         qdt=qdt,
@@ -443,6 +445,13 @@ def _fake_researcher_runtime_bundle_all_evidence_accepted(
         subagent_results=results,
         true_production_mode=true_production_mode,
         max_concurrent=max_concurrent,
+    )
+
+
+def _fake_researcher_runtime_bundle_without_scae_deltas(**kwargs) -> dict[str, Any]:
+    return _fake_researcher_runtime_bundle_all_evidence_accepted(
+        **kwargs,
+        evidence_delta_eligible_for_scae=False,
     )
 
 
@@ -588,6 +597,7 @@ class AdsOperationalCanaryTest(unittest.TestCase):
     def config(
         self,
         *,
+        db_path=None,
         require_scoreable_prediction=False,
         max_cases=1,
         require_manifest_handoffs=False,
@@ -595,7 +605,7 @@ class AdsOperationalCanaryTest(unittest.TestCase):
         require_researcher_model_executed=False,
     ):
         return OperationalCanaryConfig(
-            db_path=self.db_path,
+            db_path=Path(db_path) if db_path is not None else self.db_path,
             runner_mode="fixture",
             forecast_timestamp="2100-01-01T00:00:00+00:00",
             max_cases=max_cases,
@@ -607,6 +617,28 @@ class AdsOperationalCanaryTest(unittest.TestCase):
             require_real_runtime_canary_criteria=require_real_runtime_canary_criteria,
             require_researcher_model_executed=require_researcher_model_executed,
         )
+
+    def protected_counts_for(self, db_path: Path) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        with sqlite3.connect(db_path) as conn:
+            for table in ("market_predictions", "forecast_decision_records", "scae_ledger_outputs"):
+                exists = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+                    (table,),
+                ).fetchone()
+                counts[table] = (
+                    int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+                    if exists
+                    else 0
+                )
+        return counts
+
+    def clone_db_path(self, file_name: str) -> Path:
+        self.conn.commit()
+        clone_path = Path(self.tempdir.name) / file_name
+        with sqlite3.connect(clone_path) as clone_conn:
+            self.conn.backup(clone_conn)
+        return clone_path
 
     def stage_handlers(self):
         def make_handler(stage):
@@ -1415,6 +1447,131 @@ class AdsOperationalCanaryTest(unittest.TestCase):
             max_resolution_sync_age_seconds=10_000_000_000,
         )
         self.assertTrue(operator_report["cases"][0]["retrieval_sufficiency"]["leaf_retrieval_statuses"])
+
+    def test_phase7_valid_scae_forecast_writes_clone_only_without_live_db_mutation(self):
+        live_counts_before = self.protected_counts_for(self.db_path)
+        clone_path = self.clone_db_path("phase7-scoreable-clone.sqlite3")
+        config = self.config(
+            db_path=clone_path,
+            require_scoreable_prediction=True,
+            require_manifest_handoffs=True,
+            require_real_runtime_canary_criteria=True,
+            require_researcher_model_executed=True,
+        )
+        handlers = build_true_production_handlers(
+            db_path=config.db_path,
+            runner_mode=config.runner_mode,
+            forecast_timestamp=config.forecast_timestamp,
+            max_cases=config.max_cases,
+            metadata=config.metadata,
+            decomposer_runtime_transport_response_path=self._decomposer_live_response_path(),
+            retrieval_browser_provider=_SearchProofRetrievalProvider(),
+            retrieval_provider_policy=RetrievalProviderPolicy(
+                max_direct_urls=0,
+                max_total_search_calls=10,
+                max_search_results_per_variant=5,
+                max_total_search_result_fetches=50,
+            ),
+            researcher_swarm_runtime_runner=_fake_researcher_runtime_bundle_all_evidence_accepted,
+        )
+
+        result = run_one_case_canary(config, handlers)
+
+        self.assertTrue(result["ok"], result["errors"])
+        self.assertEqual(self.protected_counts_for(self.db_path), live_counts_before)
+        self.assertEqual(result["protected_count_deltas"]["forecast_decision_records"], 1)
+        self.assertEqual(result["protected_count_deltas"]["market_predictions"], 1)
+        self.assertEqual(result["real_runtime_canary_report"]["scae_runtime_evidence"]["valid_forecast_count"], 1)
+        self.assertGreater(result["real_runtime_canary_report"]["scae_runtime_evidence"]["delta_ref_count"], 0)
+        with sqlite3.connect(clone_path) as conn:
+            conn.row_factory = sqlite3.Row
+            scae_row = conn.execute(
+                """
+                SELECT artifact_path
+                FROM case_artifact_manifest
+                WHERE stage = 'scae'
+                ORDER BY id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+            decision = conn.execute(
+                """
+                SELECT production_persistence_status, production_forecast_persisted,
+                       probability_source, writes_market_prediction
+                FROM forecast_decision_records
+                """
+            ).fetchone()
+        scae = json.loads(Path(scae_row["artifact_path"]).read_text(encoding="utf-8"))
+        self.assertEqual(scae["forecast_validity_status"], "valid_for_forecast")
+        self.assertEqual(scae["forecast_authority_policy"], "scae_only")
+        self.assertEqual(scae["scae_evidence_delta_ref_requirement_status"], "satisfied")
+        self.assertGreater(scae["scae_evidence_delta_ref_count"], 0)
+        self.assertEqual(scae["non_scae_probability_inputs"], [])
+        self.assertEqual(decision["production_persistence_status"], "production_forecast_persisted_from_scae")
+        self.assertEqual(decision["production_forecast_persisted"], 1)
+        self.assertEqual(decision["probability_source"], "SCAE-012.production_forecast_prob")
+        self.assertEqual(decision["writes_market_prediction"], 0)
+
+    def test_phase7_missing_verified_scae_delta_refs_invalidates_forecast_without_prediction(self):
+        config = self.config(
+            require_scoreable_prediction=False,
+            require_manifest_handoffs=True,
+        )
+        handlers = build_true_production_handlers(
+            db_path=config.db_path,
+            runner_mode=config.runner_mode,
+            forecast_timestamp=config.forecast_timestamp,
+            max_cases=config.max_cases,
+            metadata=config.metadata,
+            decomposer_runtime_transport_response_path=self._decomposer_live_response_path(),
+            retrieval_browser_provider=_SearchProofRetrievalProvider(),
+            retrieval_provider_policy=RetrievalProviderPolicy(
+                max_direct_urls=0,
+                max_total_search_calls=10,
+                max_search_results_per_variant=5,
+                max_total_search_result_fetches=50,
+            ),
+            researcher_swarm_runtime_runner=_fake_researcher_runtime_bundle_without_scae_deltas,
+        )
+
+        result = run_one_case_canary(config, handlers)
+
+        self.assertTrue(result["ok"], result["errors"])
+        self.assertEqual(result["protected_count_deltas"]["forecast_decision_records"], 1)
+        self.assertEqual(result["protected_count_deltas"]["market_predictions"], 0)
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            scae_row = conn.execute(
+                """
+                SELECT artifact_path
+                FROM case_artifact_manifest
+                WHERE stage = 'scae'
+                ORDER BY id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+            decision = conn.execute(
+                """
+                SELECT production_persistence_status, production_forecast_persisted,
+                       production_forecast_prob, non_scoreable_reason_code
+                FROM forecast_decision_records
+                """
+            ).fetchone()
+            prediction_count = conn.execute("SELECT COUNT(*) FROM market_predictions").fetchone()[0]
+        scae = json.loads(Path(scae_row["artifact_path"]).read_text(encoding="utf-8"))
+        self.assertEqual(scae["forecast_validity_status"], "invalid_for_forecast")
+        self.assertEqual(
+            scae["scae_evidence_delta_ref_requirement_status"],
+            "verified_scae_evidence_delta_refs_missing",
+        )
+        self.assertEqual(scae["scae_evidence_delta_ref_count"], 0)
+        self.assertEqual(scae["non_scae_probability_inputs"], [])
+        self.assertNotIn("production_forecast_prob", scae)
+        self.assertEqual(decision["production_persistence_status"], "blocked_invalid_scae_forecast")
+        self.assertEqual(decision["production_forecast_persisted"], 0)
+        self.assertIsNone(decision["production_forecast_prob"])
+        self.assertEqual(decision["non_scoreable_reason_code"], "forecast_validity_invalid_for_forecast")
+        self.assertEqual(prediction_count, 0)
 
     def test_phase6_runtime_criteria_reports_first_failing_gate(self):
         base = {
