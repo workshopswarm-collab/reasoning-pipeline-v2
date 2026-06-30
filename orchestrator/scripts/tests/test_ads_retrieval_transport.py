@@ -878,20 +878,17 @@ class AdsRetrievalTransportTest(unittest.TestCase):
         self.assertFalse(packet["leaf_evidence_dockets"][0]["admitted_evidence_refs"])
         self.assertIn("retrieved_source_text_missing", packet["omitted_candidates"][0]["omission_reason_codes"])
 
-    def test_native_candidate_output_is_url_proposal_only(self) -> None:
+    def test_native_candidate_output_is_fetched_and_url_proposal_only(self) -> None:
         def native_provider(_context: dict, _variant: dict) -> list[dict]:
             return [
                 {
                     "url": "https://native.example/source",
                     "source_label": "Native candidate",
                     "candidate_claim_text": "Candidate claim only.",
-                    "source_class": "official_or_primary",
-                    "claim_family_id": "claim-family:native-final",
-                    "temporal_safety_final_authority": "pass",
-                    "research_sufficiency": "allowed",
                 }
             ]
 
+        provider = FakeBrowserProvider()
         transport = collect_live_retrieval_candidates(
             qdt=self._resolution_mechanics_qdt(),
             evidence_packet=self.evidence_packet,
@@ -900,19 +897,22 @@ class AdsRetrievalTransportTest(unittest.TestCase):
             source_cutoff_timestamp=CUTOFF_AT,
             forecast_timestamp=FORECAST_AT,
             provider_policy=RetrievalProviderPolicy(max_direct_urls=0, broad_search_enabled=False, native_enabled=True),
-            browser_provider=None,
+            browser_provider=provider,
             native_candidate_provider=native_provider,
         )
         native_candidate = transport.native_research_candidates[0]["candidate_urls"][0]
 
         self.assertTrue(transport.transport_diagnostics["native_research_model_executed"])
-        self.assertEqual(transport.transport_diagnostics["native_research_status"], "executed")
+        self.assertEqual(transport.transport_diagnostics["native_research_status"], "executed_with_candidates")
         self.assertEqual(transport.transport_diagnostics["native_research_call_count"], 1)
+        self.assertEqual(transport.transport_diagnostics["native_candidate_url_count"], 1)
+        self.assertEqual(transport.transport_diagnostics["native_candidate_fetch_attempt_count"], 1)
+        self.assertEqual(transport.transport_diagnostics["native_research_failure_count"], 0)
         self.assertEqual(native_candidate["url"], "https://native.example/source")
-        self.assertNotIn("source_class", native_candidate)
-        self.assertNotIn("claim_family_id", native_candidate)
-        self.assertNotIn("temporal_safety_final_authority", native_candidate)
-        self.assertNotIn("research_sufficiency", native_candidate)
+        self.assertEqual(transport.fetched_candidates[0]["retrieval_transport"], "native_gpt_research")
+        self.assertEqual(transport.fetched_candidates[0]["navigation_mode"], "native_gpt_research")
+        self.assertEqual(transport.fetched_candidates[0]["native_research_attempt_ref"], None)
+        self.assertEqual(provider.events, [("fetch", "https://native.example/source")])
 
         packet = build_live_retrieval_packet_from_candidates(
             self._resolution_mechanics_qdt(),
@@ -932,6 +932,45 @@ class AdsRetrievalTransportTest(unittest.TestCase):
         self.assertEqual(runtime_summary["metadata_classifier_assist_status"], "not_executed")
         self.assertFalse(discovery["authority_boundary"]["research_sufficiency_authority"])
         self.assertTrue(discovery["fetch_required_before_admission"])
+
+    def test_native_candidate_forbidden_authority_output_is_rejected(self) -> None:
+        def native_provider(_context: dict, _variant: dict) -> list[dict]:
+            return [
+                {
+                    "url": "https://native.example/source",
+                    "source_label": "Native candidate",
+                    "source_class": "official_or_primary",
+                    "claim_family_id": "claim-family:native-final",
+                    "temporal_safety_final_authority": "pass",
+                    "research_sufficiency": "allowed",
+                }
+            ]
+
+        provider = FakeBrowserProvider()
+        transport = collect_live_retrieval_candidates(
+            qdt=self._resolution_mechanics_qdt(),
+            evidence_packet=self.evidence_packet,
+            case_contract=self.case_contract,
+            amrg_context=None,
+            source_cutoff_timestamp=CUTOFF_AT,
+            forecast_timestamp=FORECAST_AT,
+            provider_policy=RetrievalProviderPolicy(max_direct_urls=0, broad_search_enabled=False, native_enabled=True),
+            browser_provider=provider,
+            native_candidate_provider=native_provider,
+        )
+
+        diagnostics = transport.transport_diagnostics
+        self.assertEqual(transport.native_research_candidates, [])
+        self.assertEqual(transport.fetched_candidates, [])
+        self.assertEqual(provider.events, [])
+        self.assertEqual(diagnostics["native_research_status"], "executed_with_failures")
+        self.assertEqual(diagnostics["native_research_call_count"], 1)
+        self.assertEqual(diagnostics["native_research_failure_count"], 1)
+        failure = diagnostics["native_research_failure_diagnostics"][0]
+        self.assertEqual(failure["event"], "native_discovery_failed")
+        self.assertIn("native_research_forbidden_or_invalid_output", failure["reason_codes"])
+        self.assertEqual(failure["error_class"], "NativeResearchOutputValidationError")
+        self.assertIn("source_class", failure["detail"])
 
     def test_source_populated_attempts_fail_closed_when_secondary_class_is_not_deterministic(self) -> None:
         provider = FakeBrowserProvider(search_results=[{"url": "https://secondary.example/report"}])

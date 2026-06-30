@@ -16,6 +16,12 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
+from predquant.ads_native_research import (
+    native_candidate_list as _native_candidate_payload_list,
+    native_candidate_payload_errors,
+    native_runtime_call_summary,
+)
+
 SOURCE_AUTHORITY_FIELDS = {
     "source_class",
     "source_family_id",
@@ -115,6 +121,11 @@ NATIVE_ALLOWED_FIELDS = {
     "why_it_may_matter",
     "why_may_matter",
     "related_leaf_id",
+    "leaf_id",
+    "query_variant_id",
+    "native_research_attempt_ref",
+    "attempt_ref",
+    "resolved_model_id",
     "candidate_claim_text",
     "claim_text",
     "uncertainty_notes",
@@ -154,6 +165,7 @@ RETRIEVAL_DIAGNOSTIC_FORBIDDEN_KEY_FRAGMENTS = (
 LEGACY_DEFAULT_MAX_TOTAL_SEARCH_CALLS = 2
 BROWSER_SEARCH_RETRY_POLICY_REF = "ads-browser-search-retry/v1"
 BROWSER_SEARCH_RETRY_DIAGNOSTIC_SCHEMA_VERSION = "ads-browser-search-retry-diagnostic/v1"
+NATIVE_RESEARCH_TRANSPORT_DIAGNOSTIC_SCHEMA_VERSION = "ads-native-research-transport-diagnostic/v1"
 
 
 @dataclass(frozen=True)
@@ -176,6 +188,8 @@ class RetrievalProviderPolicy:
     browser_search_base_backoff_seconds: float = 2.0
     browser_search_max_backoff_seconds: float = 15.0
     browser_search_jitter_fraction: float = 0.25
+    max_native_research_calls: int = 4
+    max_native_candidate_fetches: int = 4
 
 
 @dataclass
@@ -253,14 +267,20 @@ def _native_research_status(
     policy: RetrievalProviderPolicy,
     native_candidate_provider: Callable[[dict[str, Any], dict[str, Any]], Any] | None,
     native_research_call_count: int,
+    native_research_failure_count: int = 0,
+    native_research_candidate_count: int = 0,
 ) -> str:
     if not policy.native_enabled:
         return "disabled"
     if native_candidate_provider is None:
         return "not_configured"
     if native_research_call_count <= 0:
-        return "not_executed"
-    return "executed"
+        return "configured_not_needed"
+    if native_research_failure_count > 0 and native_research_candidate_count <= 0:
+        return "executed_with_failures"
+    if native_research_candidate_count > 0:
+        return "executed_with_candidates"
+    return "executed_no_candidates"
 
 
 def collect_live_retrieval_candidates(
@@ -318,6 +338,12 @@ def collect_live_retrieval_candidates(
     search_result_fetch_skipped_count = 0
     search_result_fetch_cache_hit_count = 0
     native_research_call_count = 0
+    native_candidate_fetch_count = 0
+    native_candidate_fetch_skipped_count = 0
+    native_research_failure_diagnostics: list[dict[str, Any]] = []
+    native_research_skip_diagnostics: list[dict[str, Any]] = []
+    native_research_runtime_calls: list[dict[str, Any]] = []
+    native_research_trigger_diagnostics: list[dict[str, Any]] = []
     fetch_cache: dict[tuple[str, str], dict[str, Any]] = {}
     collection_started_at = time.monotonic()
     direct_fetch_started_at = collection_started_at
@@ -481,24 +507,137 @@ def collect_live_retrieval_candidates(
                         search_result_fetch_count += 1
                     result.fetched_candidates.append(candidate)
 
-    if policy.native_enabled and native_candidate_provider is not None:
+    if policy.native_enabled:
         for context in contexts:
             variants = context.get("query_variants") if isinstance(context.get("query_variants"), list) else []
             if not variants:
                 continue
+            trigger_reasons = _native_discovery_trigger_reasons(
+                context,
+                fetched_candidates=result.fetched_candidates,
+                search_transport_failed_leaf_ids=search_transport_failed_leaf_ids,
+                leaf_search_call_counts=leaf_search_call_counts,
+                policy=policy,
+            )
+            if not trigger_reasons:
+                native_research_skip_diagnostics.append(
+                    _native_research_diagnostic(
+                        context,
+                        variants[0],
+                        event="native_discovery_not_needed",
+                        reason_codes=["retrieval_candidates_already_present"],
+                    )
+                )
+                continue
+            if native_candidate_provider is None:
+                native_research_skip_diagnostics.append(
+                    _native_research_diagnostic(
+                        context,
+                        variants[0],
+                        event="native_discovery_skipped",
+                        reason_codes=["native_research_transport_not_configured", *trigger_reasons],
+                    )
+                )
+                continue
+            if native_research_call_count >= max(0, int(policy.max_native_research_calls or 0)):
+                native_research_skip_diagnostics.append(
+                    _native_research_diagnostic(
+                        context,
+                        variants[0],
+                        event="native_discovery_skipped",
+                        reason_codes=["skipped_native_case_cap", *trigger_reasons],
+                    )
+                )
+                continue
             native_research_call_count += 1
-            raw_native = native_candidate_provider(context, variants[0])
+            native_research_trigger_diagnostics.append(
+                _native_research_diagnostic(
+                    context,
+                    variants[0],
+                    event="native_discovery_triggered",
+                    reason_codes=trigger_reasons,
+                )
+            )
+            try:
+                raw_native = native_candidate_provider(context, variants[0])
+            except Exception as exc:  # noqa: BLE001 - transport boundary records safe class only
+                runtime_summary = native_runtime_call_summary(getattr(exc, "runtime_call", None))
+                if runtime_summary is not None:
+                    native_research_runtime_calls.append(runtime_summary)
+                native_research_failure_diagnostics.append(
+                    _native_research_diagnostic(
+                        context,
+                        variants[0],
+                        event="native_discovery_failed",
+                        reason_codes=["native_research_transport_failed", *trigger_reasons],
+                        detail=str(exc)[:500] or exc.__class__.__name__,
+                        error_class=exc.__class__.__name__,
+                        runtime_call=runtime_summary,
+                    )
+                )
+                continue
+            runtime_summary = _native_runtime_summary_from_provider_result(raw_native)
+            if runtime_summary is not None:
+                native_research_runtime_calls.append(runtime_summary)
+            validation_errors = native_candidate_payload_errors(raw_native)
+            if validation_errors:
+                native_research_failure_diagnostics.append(
+                    _native_research_diagnostic(
+                        context,
+                        variants[0],
+                        event="native_discovery_failed",
+                        reason_codes=["native_research_forbidden_or_invalid_output", *trigger_reasons],
+                        detail="; ".join(validation_errors[:5]),
+                        error_class="NativeResearchOutputValidationError",
+                        runtime_call=runtime_summary,
+                    )
+                )
+                continue
             native_candidates = _native_candidate_list(raw_native)
             if native_candidates:
+                attempt_ref = _native_attempt_ref(raw_native, runtime_summary)
+                sanitized_candidates = [
+                    _sanitize_native_candidate(item, context["leaf_id"])
+                    for item in native_candidates
+                ]
                 result.native_research_candidates.append(
                     {
                         "leaf_id": context["leaf_id"],
                         "query_variant_id": variants[0]["query_variant_id"],
-                        "candidate_urls": [_sanitize_native_candidate(item, context["leaf_id"]) for item in native_candidates],
-                        "resolved_model_id": "gpt-5.5-high",
+                        "candidate_urls": sanitized_candidates,
+                        "native_research_attempt_ref": attempt_ref,
+                        "resolved_model_id": _native_resolved_model_id(raw_native, runtime_summary),
                         "discovered_at": forecast_timestamp,
                     }
                 )
+                for native_rank, native_candidate in enumerate(sanitized_candidates, start=1):
+                    if native_candidate_fetch_count >= max(0, int(policy.max_native_candidate_fetches or 0)):
+                        native_candidate_fetch_skipped_count += 1
+                        continue
+                    url = native_candidate.get("url") or native_candidate.get("canonical_url")
+                    hint = {
+                        "url": url,
+                        "source_ref": attempt_ref,
+                        "source_class": None,
+                        "source_class_resolution_method": None,
+                        "deterministic_source_class_proof": False,
+                    }
+                    candidate = _fetch_candidate(
+                        context=context,
+                        hint=hint,
+                        rank=native_rank,
+                        source_cutoff_timestamp=source_cutoff_timestamp,
+                        browser_provider=browser_provider,
+                        navigation_mode="native_gpt_research",
+                        search_candidate_url_ref=None,
+                        deterministic_direct_url_source_classes=False,
+                        fetch_cache=fetch_cache,
+                        retrieval_transport="native_gpt_research",
+                        native_research_attempt_ref=attempt_ref,
+                    )
+                    if candidate.get("canonical_fetch_cache_status") != "hit":
+                        native_candidate_fetch_count += 1
+                    result.fetched_candidates.append(candidate)
 
     result.omitted_candidates = [
         candidate
@@ -547,6 +686,13 @@ def collect_live_retrieval_candidates(
         "omitted_candidate_count": len(result.omitted_candidates),
         "search_candidate_url_count": len(result.search_candidate_urls),
         "native_research_candidate_count": len(result.native_research_candidates),
+        "native_candidate_url_count": sum(
+            len(item.get("candidate_urls") or [])
+            for item in result.native_research_candidates
+            if isinstance(item, dict)
+        ),
+        "native_candidate_fetch_attempt_count": native_candidate_fetch_count,
+        "native_candidate_fetch_skipped_count": native_candidate_fetch_skipped_count,
         "direct_url_capture_executed": bool(result.direct_url_candidates),
         "direct_url_capture_status": "executed" if result.direct_url_candidates else "not_executed",
         "browser_search_executed": search_call_count > 0,
@@ -563,8 +709,23 @@ def collect_live_retrieval_candidates(
             policy=policy,
             native_candidate_provider=native_candidate_provider,
             native_research_call_count=native_research_call_count,
+            native_research_failure_count=len(native_research_failure_diagnostics),
+            native_research_candidate_count=len(result.native_research_candidates),
         ),
         "native_research_call_count": native_research_call_count,
+        "native_research_failure_count": len(native_research_failure_diagnostics),
+        "native_research_trigger_diagnostics": native_research_trigger_diagnostics,
+        "native_research_failure_diagnostics": native_research_failure_diagnostics,
+        "native_research_skip_diagnostics": native_research_skip_diagnostics,
+        "native_research_runtime_calls": native_research_runtime_calls,
+        "native_research_transport_diagnostics": _native_transport_diagnostics(
+            policy=policy,
+            native_candidate_provider=native_candidate_provider,
+            native_research_call_count=native_research_call_count,
+            native_research_failure_diagnostics=native_research_failure_diagnostics,
+            native_research_runtime_calls=native_research_runtime_calls,
+            checked_at=forecast_timestamp,
+        ),
         "bounded_retrieval_policy": {
             "max_direct_urls": policy.max_direct_urls,
             "max_total_direct_fetches": policy.max_total_direct_fetches,
@@ -583,6 +744,8 @@ def collect_live_retrieval_candidates(
             "browser_search_max_backoff_seconds": policy.browser_search_max_backoff_seconds,
             "max_total_search_elapsed_seconds": max_total_search_elapsed_seconds,
             "max_total_search_result_fetches": policy.max_total_search_result_fetches,
+            "max_native_research_calls": policy.max_native_research_calls,
+            "max_native_candidate_fetches": policy.max_native_candidate_fetches,
         },
         "direct_url_fetch_attempt_count": direct_fetch_count,
         "direct_url_fetch_skipped_count": direct_fetch_skipped_count,
@@ -639,6 +802,161 @@ def collect_live_retrieval_candidates(
     if packet_safe_browser_provider_diagnostics:
         result.transport_diagnostics["browser_provider_diagnostics"] = packet_safe_browser_provider_diagnostics
     return result
+
+
+def _native_discovery_trigger_reasons(
+    context: dict[str, Any],
+    *,
+    fetched_candidates: list[dict[str, Any]],
+    search_transport_failed_leaf_ids: set[str],
+    leaf_search_call_counts: dict[str, int],
+    policy: RetrievalProviderPolicy,
+) -> list[str]:
+    leaf_id = str(context.get("leaf_id") or "")
+    reasons: list[str] = []
+    if leaf_id in search_transport_failed_leaf_ids:
+        reasons.append("browser_search_failed")
+    if not _leaf_has_meaningful_fetched_candidate(fetched_candidates, leaf_id):
+        reasons.append("meaningful_snippet_count_zero")
+    if _context_requires_protected_primary(context) and not _leaf_has_protected_primary_candidate(fetched_candidates, leaf_id):
+        reasons.append("protected_primary_missing")
+    if (
+        leaf_search_call_counts.get(leaf_id, 0) >= _leaf_search_call_cap(context, policy)
+        and not _leaf_has_meaningful_fetched_candidate(fetched_candidates, leaf_id)
+    ):
+        reasons.append("leaf_search_budget_exhausted_without_source_diversity")
+    return sorted(set(reasons))
+
+
+def _leaf_has_meaningful_fetched_candidate(candidates: list[dict[str, Any]], leaf_id: str) -> bool:
+    for candidate in candidates:
+        if str(candidate.get("leaf_id") or "") != leaf_id:
+            continue
+        if candidate.get("extraction_status") != "accepted":
+            continue
+        content = " ".join(str(candidate.get("content") or "").split())
+        if len(content) >= 80:
+            return True
+    return False
+
+
+def _leaf_has_protected_primary_candidate(candidates: list[dict[str, Any]], leaf_id: str) -> bool:
+    for candidate in candidates:
+        if str(candidate.get("leaf_id") or "") != leaf_id:
+            continue
+        if candidate.get("extraction_status") != "accepted":
+            continue
+        if candidate.get("source_class") == "official_or_primary" or candidate.get("official_source_hints"):
+            return True
+    return False
+
+
+def _native_research_diagnostic(
+    context: dict[str, Any],
+    variant: dict[str, Any],
+    *,
+    event: str,
+    reason_codes: list[str],
+    detail: str | None = None,
+    error_class: str | None = None,
+    runtime_call: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    diagnostic = {
+        "schema_version": NATIVE_RESEARCH_TRANSPORT_DIAGNOSTIC_SCHEMA_VERSION,
+        "event": event,
+        "component": "native_research_candidate_discovery",
+        "leaf_id": context.get("leaf_id"),
+        "parent_branch_id": context.get("parent_branch_id"),
+        "query_context_ref": context.get("query_context_ref"),
+        "query_variant_id": variant.get("query_variant_id"),
+        "query_role": variant.get("query_role"),
+        "reason_codes": list(reason_codes),
+        "authority_boundary": {
+            "candidate_discovery_only": True,
+            "source_metadata_final_authority": False,
+            "claim_family_final_authority": False,
+            "temporal_safety_final_authority": False,
+            "research_sufficiency_authority": False,
+            "forecast_authority": False,
+        },
+    }
+    if detail:
+        diagnostic["detail"] = detail[:500]
+    if error_class:
+        diagnostic["error_class"] = str(error_class)[:160]
+    if runtime_call is not None:
+        diagnostic["runtime_call"] = runtime_call
+    return diagnostic
+
+
+def _native_runtime_summary_from_provider_result(raw_native: Any) -> dict[str, Any] | None:
+    if not isinstance(raw_native, dict):
+        return None
+    runtime = raw_native.get("model_runtime_call") or raw_native.get("native_research_runtime_call")
+    return native_runtime_call_summary(runtime if isinstance(runtime, dict) else None)
+
+
+def _native_attempt_ref(raw_native: Any, runtime_summary: dict[str, Any] | None) -> str | None:
+    if runtime_summary and runtime_summary.get("runtime_call_id"):
+        return str(runtime_summary["runtime_call_id"])
+    if isinstance(raw_native, dict):
+        for key in ("native_research_attempt_ref", "attempt_ref"):
+            if raw_native.get(key):
+                return str(raw_native[key])
+    return None
+
+
+def _native_resolved_model_id(raw_native: Any, runtime_summary: dict[str, Any] | None) -> str:
+    if runtime_summary and runtime_summary.get("resolved_model_id"):
+        return str(runtime_summary["resolved_model_id"])
+    if isinstance(raw_native, dict) and raw_native.get("resolved_model_id"):
+        return str(raw_native["resolved_model_id"])
+    return "gpt-5.5-high"
+
+
+def _native_transport_diagnostics(
+    *,
+    policy: RetrievalProviderPolicy,
+    native_candidate_provider: Callable[[dict[str, Any], dict[str, Any]], Any] | None,
+    native_research_call_count: int,
+    native_research_failure_diagnostics: list[dict[str, Any]],
+    native_research_runtime_calls: list[dict[str, Any]],
+    checked_at: str,
+) -> list[dict[str, Any]]:
+    if not policy.native_enabled:
+        return []
+    availability_status = "available" if native_candidate_provider is not None else "unavailable"
+    unavailable_reason = None if native_candidate_provider is not None else "native_research_transport_not_configured"
+    if native_research_failure_diagnostics and native_research_call_count > 0:
+        availability_status = "partial"
+    return [
+        {
+            "schema_version": NATIVE_RESEARCH_TRANSPORT_DIAGNOSTIC_SCHEMA_VERSION,
+            "artifact_type": "native_research_transport_diagnostic",
+            "availability_status": availability_status,
+            "unavailable_reason": unavailable_reason,
+            "checked_at": checked_at,
+            "model_lane_id": "native_research_candidate_discovery",
+            "resolved_model_id": "gpt-5.5-high",
+            "research_transport": "native_gpt_research",
+            "native_research_call_count": native_research_call_count,
+            "native_research_failure_count": len(native_research_failure_diagnostics),
+            "runtime_call_refs": [
+                str(item.get("runtime_call_id"))
+                for item in native_research_runtime_calls
+                if item.get("runtime_call_id")
+            ],
+            "candidate_discovery_role": "fallback_url_discovery_only",
+            "native_output_authority": {
+                "candidate_discovery": True,
+                "source_metadata_final_authority": False,
+                "claim_family_final_authority": False,
+                "temporal_safety_final_authority": False,
+                "research_sufficiency_authority": False,
+                "forecast_authority": False,
+            },
+        }
+    ]
 
 
 def _bounded_reason_codes(
@@ -776,13 +1094,15 @@ def _fetch_candidate(
     search_candidate_url_ref: str | None,
     deterministic_direct_url_source_classes: bool,
     fetch_cache: dict[tuple[str, str], dict[str, Any]] | None = None,
+    retrieval_transport: str = "browser",
+    native_research_attempt_ref: str | None = None,
 ) -> dict[str, Any]:
     url = str(hint.get("url") or "")
     canonical_url = _canonicalize_url(url)
     base = {
         "leaf_id": context["leaf_id"],
         "parent_branch_id": context.get("parent_branch_id"),
-        "retrieval_transport": "browser",
+        "retrieval_transport": retrieval_transport,
         "navigation_mode": navigation_mode,
         "requested_url": url,
         "final_url": canonical_url or url,
@@ -790,6 +1110,9 @@ def _fetch_candidate(
         "result_rank": rank,
         "direct_url_source_ref": hint.get("source_ref") if navigation_mode == "direct_url" else None,
         "search_candidate_url_ref": search_candidate_url_ref,
+        "native_research_attempt_ref": native_research_attempt_ref
+        if retrieval_transport == "native_gpt_research"
+        else None,
     }
     if not _valid_http_url(url):
         return {
@@ -872,6 +1195,10 @@ def _fetch_candidate(
             "browser_fetch_certifies_claim_family": False,
             "browser_fetch_certifies_temporal_safety": False,
             "browser_fetch_certifies_sufficiency": False,
+            "native_research_certifies_source_class": False,
+            "native_research_certifies_claim_family": False,
+            "native_research_certifies_temporal_safety": False,
+            "native_research_certifies_sufficiency": False,
         },
     }
     if extraction_status == "accepted":
@@ -1415,14 +1742,14 @@ def _strip_authority_fields(value: dict[str, Any]) -> dict[str, Any]:
 
 def _sanitize_native_candidate(raw: dict[str, Any], leaf_id: str) -> dict[str, Any]:
     clean = {key: raw.get(key) for key in NATIVE_ALLOWED_FIELDS if key in raw}
+    if not clean.get("url"):
+        clean["url"] = clean.get("candidate_url") or clean.get("canonical_url")
     clean["related_leaf_id"] = str(clean.get("related_leaf_id") or leaf_id)
     return clean
 
 
 def _native_candidate_list(raw_native: Any) -> list[dict[str, Any]]:
-    if isinstance(raw_native, dict):
-        raw_native = raw_native.get("native_research_candidates") or raw_native.get("candidate_urls") or []
-    return [item for item in raw_native if isinstance(item, dict)] if isinstance(raw_native, list) else []
+    return _native_candidate_payload_list(raw_native)
 
 
 def _add_hint(

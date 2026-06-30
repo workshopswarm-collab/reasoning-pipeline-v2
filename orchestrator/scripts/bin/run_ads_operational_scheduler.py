@@ -80,6 +80,11 @@ def build_handler_factory_kwargs(args: argparse.Namespace) -> dict:
             args.retrieval_browser_provider_factory,
             default_attr="build_provider",
         )()
+    if getattr(args, "native_candidate_provider_factory", None):
+        kwargs["native_candidate_provider"] = load_object_factory(
+            args.native_candidate_provider_factory,
+            default_attr="build_native_candidate_provider",
+        )()
     return kwargs
 
 
@@ -107,6 +112,13 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Dotted module/path plus optional :factory returning a browser/search provider object. "
             "The provider is passed to retrieval_browser_provider and remains URL/search transport only."
+        ),
+    )
+    parser.add_argument(
+        "--native-candidate-provider-factory",
+        help=(
+            "Dotted module/path plus optional :factory returning a native candidate provider. "
+            "The provider is passed to native_candidate_provider and may only propose candidate URLs."
         ),
     )
     parser.add_argument("--forecast-timestamp", help="Forecast timestamp passed to handler factory/case policy.")

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any, Callable
 
 from predquant.ads_pipeline_runner import NonRetryableStageError, RetryableStageError
@@ -10,6 +11,8 @@ from predquant.ads_production_readiness_handlers import (
     TRUE_PRODUCTION_HANDLER_SCOPE,
     build_stage_handlers as _build_stage_handlers,
 )
+from predquant.ads_retrieval_transport import RetrievalProviderPolicy
+from predquant.ads_native_research import build_provider as build_default_native_candidate_provider
 from researcher_swarm.browser_provider import build_provider as build_default_retrieval_browser_provider
 
 ADS_PRODUCTION_STAGE_FAILURE_POLICY_SCHEMA_VERSION = "ads-production-stage-failure-policy/v1"
@@ -250,6 +253,14 @@ def build_stage_handlers(**kwargs: Any) -> dict[str, Callable[..., Any]]:
     if kwargs.get("retrieval_browser_provider") is None:
         kwargs["retrieval_browser_provider"] = build_default_retrieval_browser_provider()
     _assert_retrieval_browser_provider_configured(kwargs.get("retrieval_browser_provider"))
+    policy = kwargs.get("retrieval_provider_policy")
+    if policy is None:
+        policy = RetrievalProviderPolicy(native_enabled=True)
+    elif isinstance(policy, RetrievalProviderPolicy) and not policy.native_enabled:
+        policy = replace(policy, native_enabled=True)
+    kwargs["retrieval_provider_policy"] = policy
+    if kwargs.get("native_candidate_provider") is None:
+        kwargs["native_candidate_provider"] = build_default_native_candidate_provider()
     handlers = _build_stage_handlers(
         **kwargs,
         metadata=metadata,

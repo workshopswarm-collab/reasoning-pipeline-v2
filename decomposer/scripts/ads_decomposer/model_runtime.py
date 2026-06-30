@@ -627,6 +627,7 @@ def openclaw_codex_agent_transport_from_env(
     cli_path: str | None = None,
     session_key_prefix: str | None = None,
     model: str | None = None,
+    prompt_builder: Callable[[dict[str, Any]], str] | None = None,
 ) -> Transport:
     """Return an OpenClaw Gateway agent transport using Codex OAuth auth.
 
@@ -650,6 +651,7 @@ def openclaw_codex_agent_transport_from_env(
         or "ads-decomposer"
     )
     resolved_model = model or os.environ.get("ADS_DECOMPOSER_OPENCLAW_MODEL")
+    build_prompt = prompt_builder or _openclaw_agent_prompt
 
     def transport(request_payload: dict[str, Any]) -> dict[str, Any]:
         timeout = int(request_payload.get("timeout_seconds") or DEFAULT_TIMEOUT_SECONDS)
@@ -663,7 +665,7 @@ def openclaw_codex_agent_transport_from_env(
             "--session-key",
             session_key,
             "--message",
-            _openclaw_agent_prompt(request_payload),
+            build_prompt(request_payload),
             "--json",
             "--timeout",
             str(timeout),

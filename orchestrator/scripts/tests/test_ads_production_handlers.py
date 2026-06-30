@@ -136,6 +136,8 @@ class AdsProductionHandlersTest(unittest.TestCase):
                         "        return []",
                         "def build_provider():",
                         "    return Provider()",
+                        "def build_native_candidate_provider():",
+                        "    return lambda context, variant: []",
                     ]
                 ),
                 encoding="utf-8",
@@ -144,6 +146,7 @@ class AdsProductionHandlersTest(unittest.TestCase):
                 decomposer_runtime_transport_response=None,
                 researcher_swarm_runtime_bundle_response=None,
                 retrieval_browser_provider_factory=str(provider_module),
+                native_candidate_provider_factory=str(provider_module),
             )
 
             kwargs = run_ads_operational_scheduler.build_handler_factory_kwargs(args)
@@ -152,6 +155,7 @@ class AdsProductionHandlersTest(unittest.TestCase):
         self.assertEqual(provider.provider_id, "test-provider")
         self.assertTrue(callable(provider.fetch_url))
         self.assertTrue(callable(provider.search_candidate_urls))
+        self.assertTrue(callable(kwargs["native_candidate_provider"]))
 
     def test_one_case_canary_can_pass_explicit_runtime_factories(self):
         with tempfile.TemporaryDirectory() as tempdir:
@@ -167,6 +171,8 @@ class AdsProductionHandlersTest(unittest.TestCase):
                         "        return []",
                         "def build_provider():",
                         "    return Provider()",
+                        "def build_native_candidate_provider():",
+                        "    return lambda context, variant: []",
                         "def run_researcher_swarm_runtime(**kwargs):",
                         "    return {'artifact_type': 'researcher_swarm_runtime_bundle', 'kwargs': sorted(kwargs)}",
                     ]
@@ -174,9 +180,11 @@ class AdsProductionHandlersTest(unittest.TestCase):
                 encoding="utf-8",
             )
             args = SimpleNamespace(
+                decomposer_runtime_mode="fixture",
                 decomposer_runtime_transport_response=None,
                 researcher_swarm_runtime_bundle_response=None,
                 retrieval_browser_provider_factory=str(provider_module),
+                native_candidate_provider_factory=str(provider_module),
                 researcher_swarm_runtime_runner=str(provider_module),
                 retrieval_provider_policy_json=run_ads_one_case_canary.parse_retrieval_provider_policy(
                     '{"max_direct_urls":0,"max_total_search_calls":10,"max_total_search_result_fetches":50}'
@@ -186,6 +194,7 @@ class AdsProductionHandlersTest(unittest.TestCase):
             kwargs = run_ads_one_case_canary.build_handler_factory_kwargs(args)
 
         provider = kwargs["retrieval_browser_provider"]
+        self.assertEqual(kwargs["decomposer_runtime_mode"], "fixture")
         self.assertEqual(provider.provider_id, "one-case-provider")
         self.assertTrue(callable(provider.fetch_url))
         self.assertTrue(callable(provider.search_candidate_urls))
@@ -195,6 +204,7 @@ class AdsProductionHandlersTest(unittest.TestCase):
             runner(example=True)["artifact_type"],
             "researcher_swarm_runtime_bundle",
         )
+        self.assertTrue(callable(kwargs["native_candidate_provider"]))
         policy = kwargs["retrieval_provider_policy"]
         self.assertIsInstance(policy, RetrievalProviderPolicy)
         self.assertEqual(policy.max_direct_urls, 0)
@@ -213,6 +223,7 @@ class AdsProductionHandlersTest(unittest.TestCase):
 
         captured = {}
         provider = Provider()
+        native_provider = lambda _context, _variant: []
 
         def fake_build_stage_handlers(**kwargs):
             captured.update(kwargs)
@@ -222,11 +233,17 @@ class AdsProductionHandlersTest(unittest.TestCase):
             production_handlers,
             "build_default_retrieval_browser_provider",
             return_value=provider,
+        ), patch.object(
+            production_handlers,
+            "build_default_native_candidate_provider",
+            return_value=native_provider,
         ), patch.object(production_handlers, "_build_stage_handlers", side_effect=fake_build_stage_handlers):
             handlers = build_stage_handlers(db_path=":memory:")
 
         self.assertEqual(handlers, {})
         self.assertIs(captured["retrieval_browser_provider"], provider)
+        self.assertIs(captured["native_candidate_provider"], native_provider)
+        self.assertTrue(captured["retrieval_provider_policy"].native_enabled)
         self.assertTrue(captured["live_retrieval_runtime"])
 
     def test_true_production_factory_preserves_explicit_retrieval_provider(self):

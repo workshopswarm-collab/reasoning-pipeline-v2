@@ -431,6 +431,9 @@ def _attach_live_retrieval_transport_metadata(
                 "metadata_classifier_unavailable_count": len(classifier_unavailable),
             }
         )
+    native_transport_diagnostics = transport_diagnostics.get("native_research_transport_diagnostics")
+    if isinstance(native_transport_diagnostics, list) and native_transport_diagnostics:
+        packet["native_research_transport_diagnostics"] = native_transport_diagnostics
     if transport_diagnostics.get("browser_provider_status") == "unavailable":
         reason = str(
             transport_diagnostics.get("browser_provider_unavailable_reason")
@@ -1742,7 +1745,10 @@ def build_stage_handlers(
                 direct_url_candidates=transport.direct_url_candidates,
                 checked_at=forecast_at,
             )
-            if not transport.native_research_candidates:
+            if (
+                not transport.native_research_candidates
+                and not packet.get("native_research_transport_diagnostics")
+            ):
                 packet = attach_native_research_transport_diagnostics(
                     packet,
                     availability_status="unavailable",

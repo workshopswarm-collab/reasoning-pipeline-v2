@@ -80,6 +80,25 @@ class _ConfiguredEmptyRetrievalProvider:
         }
 
 
+class _EmptyNativeCandidateProvider:
+    def __call__(self, _query_context: dict[str, Any], _query_variant: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "schema_version": "unit-test-native-provider-result/v1",
+            "native_research_candidates": [],
+            "model_runtime_call": {
+                "schema_version": "native-research-runtime-call-summary/v1",
+                "runtime_call_id": "model-runtime-call:native-unit-test",
+                "model_lane_id": "native_research_candidate_discovery",
+                "resolved_model_id": "gpt-5.5-high",
+                "execution_status": "succeeded",
+                "mode": "fixture",
+                "retry_count": 0,
+                "retry_diagnostics": [],
+                "runtime_reason_codes": ["unit_test_native_provider"],
+            },
+        }
+
+
 class _SearchProofRetrievalProvider:
     provider_id = "search-proof-test-provider"
     fetch_configured = True
@@ -922,6 +941,7 @@ class AdsOperationalCanaryTest(unittest.TestCase):
             metadata=config.metadata,
             decomposer_runtime_transport_response_path=self._decomposer_live_response_path(),
             retrieval_browser_provider=_ConfiguredEmptyRetrievalProvider(),
+            native_candidate_provider=_EmptyNativeCandidateProvider(),
         )
 
         result = run_one_case_canary(config, handlers)
@@ -1180,8 +1200,9 @@ class AdsOperationalCanaryTest(unittest.TestCase):
         )
         self.assertEqual(
             retrieval["native_research_transport_diagnostics"][0]["availability_status"],
-            "unavailable",
+            "available",
         )
+        self.assertEqual(retrieval["retrieval_runtime_summary"]["native_research_status"], "executed_no_candidates")
         self.assertIn(retrieval_row["artifact_id"], classification_input_manifest_ids)
         self.assertEqual(classification_payload["classification_status"], "blocked_until_certified_retrieval")
         self.assertEqual(classification_payload["reason_codes"], ["retrieval_sufficiency_not_certified"])
@@ -1289,7 +1310,7 @@ class AdsOperationalCanaryTest(unittest.TestCase):
         self.assertFalse(packet["direct_url_capture_executed"])
         self.assertEqual(packet["direct_url_capture_status"], "not_executed")
         self.assertFalse(packet["native_research_model_executed"])
-        self.assertEqual(packet["native_research_status"], "disabled")
+        self.assertEqual(packet["native_research_status"], "configured_not_needed")
         self.assertFalse(packet["metadata_classifier_assist_executed"])
         self.assertEqual(packet["metadata_classifier_assist_status"], "not_executed")
         self.assertTrue(packet["source_collation_acceptance_met"])
@@ -2311,6 +2332,7 @@ class AdsOperationalCanaryTest(unittest.TestCase):
             metadata=config.metadata,
             decomposer_runtime_transport_response_path=self._decomposer_live_response_path(),
             retrieval_browser_provider=_ConfiguredEmptyRetrievalProvider(),
+            native_candidate_provider=_EmptyNativeCandidateProvider(),
         )
 
         result = run_one_case_canary(config, handlers)
@@ -2333,6 +2355,7 @@ class AdsOperationalCanaryTest(unittest.TestCase):
             metadata=config.metadata,
             decomposer_runtime_transport_response_path=self._decomposer_live_response_path(),
             retrieval_browser_provider=_ConfiguredEmptyRetrievalProvider(),
+            native_candidate_provider=_EmptyNativeCandidateProvider(),
         )
         result = run_one_case_canary(config, handlers)
         self.assertTrue(result["ok"], result["errors"])

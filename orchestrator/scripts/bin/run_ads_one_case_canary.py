@@ -75,6 +75,8 @@ def load_object(spec: str, *, default_attr: str):
 
 def build_handler_factory_kwargs(args: argparse.Namespace) -> dict:
     kwargs = {}
+    if getattr(args, "decomposer_runtime_mode", None):
+        kwargs["decomposer_runtime_mode"] = args.decomposer_runtime_mode
     if args.decomposer_runtime_transport_response is not None:
         kwargs["decomposer_runtime_transport_response_path"] = args.decomposer_runtime_transport_response
     if args.researcher_swarm_runtime_bundle_response is not None:
@@ -83,6 +85,11 @@ def build_handler_factory_kwargs(args: argparse.Namespace) -> dict:
         kwargs["retrieval_browser_provider"] = load_object(
             args.retrieval_browser_provider_factory,
             default_attr="build_provider",
+        )()
+    if getattr(args, "native_candidate_provider_factory", None):
+        kwargs["native_candidate_provider"] = load_object(
+            args.native_candidate_provider_factory,
+            default_attr="build_native_candidate_provider",
         )()
     if getattr(args, "researcher_swarm_runtime_runner", None):
         kwargs["researcher_swarm_runtime_runner"] = load_object(
@@ -128,6 +135,11 @@ def parse_args() -> argparse.Namespace:
         help="Optional model-runtime transport response JSON passed to production handler factories.",
     )
     parser.add_argument(
+        "--decomposer-runtime-mode",
+        choices=["fixture", "live"],
+        help="Optional Decomposer runtime mode passed to production handler factories.",
+    )
+    parser.add_argument(
         "--researcher-swarm-runtime-bundle-response",
         type=Path,
         help="Optional researcher-swarm-runtime-bundle JSON passed to production handler factories.",
@@ -137,6 +149,13 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Dotted module/path plus optional :factory returning a browser/search provider object. "
             "The provider is passed to retrieval_browser_provider and remains URL/search transport only."
+        ),
+    )
+    parser.add_argument(
+        "--native-candidate-provider-factory",
+        help=(
+            "Dotted module/path plus optional :factory returning a native candidate provider. "
+            "The provider is passed to native_candidate_provider and may only propose candidate URLs."
         ),
     )
     parser.add_argument(

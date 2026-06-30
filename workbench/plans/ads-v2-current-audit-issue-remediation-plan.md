@@ -535,7 +535,7 @@ Completion note:
 
 ## Phase 3 - Native Research Candidate Discovery Wiring
 
-Status: pending
+Status: complete
 
 Goal: configure the native GPT candidate-discovery lane so retrieval has a model-backed discovery fallback when browser search fails or source diversity remains unmet.
 
@@ -648,12 +648,22 @@ Success criteria:
 
 Checklist:
 
-- [ ] Native adapter wired through Researcher Swarm OAuth lane.
-- [ ] Native discovery retry/backoff implemented and tested.
-- [ ] Forbidden output scanner covers native outputs.
-- [ ] Native candidates are fetched before admission.
-- [ ] Unit tests pass.
-- [ ] Clone proof has no live DB mutation.
+- [x] Native adapter wired through Researcher Swarm OAuth lane.
+- [x] Native discovery retry/backoff implemented and tested.
+- [x] Forbidden output scanner covers native outputs.
+- [x] Native candidates are fetched before admission.
+- [x] Unit tests pass.
+- [x] Clone proof has no live DB mutation.
+
+Completion note:
+
+- Added an Orchestrator native candidate-discovery provider for `native_research_candidate_discovery` that uses the shared OpenClaw OAuth model runtime, the `gpt-5.5-high` lane, native-specific prompt instructions, bounded output validation, forbidden-output scanning, and model-runtime retry diagnostics.
+- True-production handlers now enable native discovery by default and supply a lazy native provider while still allowing canary/test injection.
+- Retrieval now triggers native discovery only when fallback is warranted, such as failed browser search, missing meaningful fetched snippets, protected-primary gaps, or exhausted per-leaf search without source diversity.
+- Native candidates are rejected if they contain authority fields, materialized only as URL proposals, fetched through the existing browser fetch path with `retrieval_transport="native_gpt_research"`, and left to deterministic validators for admission and sufficiency.
+- Operator/canary diagnostics now expose native trigger, skip, failure, runtime-call, and transport availability summaries without embedding authority-bearing model output.
+- Verification passed: full orchestrator test discovery (`293 tests OK`), full decomposer test discovery (`104 tests OK`), full researcher-swarm test discovery (`247 tests OK`), and `git diff --check`.
+- Clone proof run `ads-pipeline-run:0a59ebc022784caee56b909dff8f404df01e78bf9a00723509b0adcdf6261408` used a cloned SQLite DB with fixture QDT and forced native discovery. It recorded `native_research_model_executed_count=1`, native status `executed_with_candidates`, 4 native candidate URLs, 20 fetched attempts, 4 admitted evidence refs, and no live DB mutation. Retrieval still failed closed on live acceptance, proving deterministic validators retained authority.
 
 ## Phase 4 - Evidence Extraction, Claim Families, And Freshness
 
