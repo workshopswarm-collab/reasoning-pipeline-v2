@@ -180,6 +180,20 @@ ALLOWED_BROWSER_EXTRACTION_STATUSES = {
 }
 ALLOWED_NATIVE_ATTEMPT_STATUSES = {"accepted", "partial", "failed"}
 ALLOWED_NATIVE_TRANSPORT_AVAILABILITY_STATUSES = {"available", "unavailable", "partial"}
+PLANNED_EXPANSION_STATUS = "planned_not_executed"
+TERMINAL_EXPANSION_STATUSES = {
+    "executed",
+    "expansion_exhausted_no_admissible_candidates",
+    "expansion_exhausted_transport_unavailable",
+}
+TRANSPORT_UNAVAILABLE_REASON_CODES = {
+    "browser_provider_not_configured",
+    "browser_provider_returned_non_object",
+    "native_research_transport_not_configured",
+    "native_research_transport_unavailable",
+    "no_browser_candidates_supplied",
+    "search_transport_unavailable",
+}
 ALLOWED_CLAIM_VALIDATION_STATUSES = {
     "accepted_for_normalization",
     "rejected_multi_claim",
@@ -3730,7 +3744,7 @@ def build_retrieval_expansion_attempt(
     *,
     attempt_index: int,
     unsatisfied_requirement_codes: list[str],
-    attempt_status: str = "planned_not_executed",
+    attempt_status: str = PLANNED_EXPANSION_STATUS,
 ) -> dict[str, Any]:
     requirements = query_context.get("sufficiency_requirements")
     if not isinstance(requirements, dict):
@@ -3944,6 +3958,152 @@ def _max_expansion_attempts(context: dict[str, Any]) -> int:
         return max(1, int(value))
     except (TypeError, ValueError):
         return 1
+
+
+def _leaf_selected_evidence_refs(result: dict[str, Any] | None) -> list[str]:
+    refs: list[str] = []
+    for item in _selected_from_result(result):
+        if _is_non_empty_string(item.get("evidence_ref")):
+            refs.append(str(item["evidence_ref"]))
+    return sorted(set(refs))
+
+
+def _leaf_transport_activity_refs(packet: dict[str, Any], leaf_id: str) -> list[str]:
+    refs: list[str] = []
+    for field, id_field in (
+        ("browser_retrieval_attempts", "attempt_id"),
+        ("search_candidate_urls", "search_candidate_url_id"),
+        ("native_research_candidate_discoveries", "discovery_id"),
+        ("omitted_candidates", "candidate_id"),
+    ):
+        for item in packet.get(field, []) if isinstance(packet.get(field), list) else []:
+            if (
+                isinstance(item, dict)
+                and str(item.get("leaf_id") or "") == leaf_id
+                and _is_non_empty_string(item.get(id_field))
+            ):
+                refs.append(str(item[id_field]))
+    for record in packet.get("supplemental_evidence_admission_results", []) if isinstance(packet.get("supplemental_evidence_admission_results"), list) else []:
+        if (
+            isinstance(record, dict)
+            and str(record.get("leaf_id") or "") == leaf_id
+            and _is_non_empty_string(record.get("supplemental_evidence_ref"))
+        ):
+            refs.append(str(record["supplemental_evidence_ref"]))
+    return sorted(set(refs))
+
+
+def _leaf_omission_reason_codes(packet: dict[str, Any], leaf_id: str) -> set[str]:
+    codes: set[str] = set()
+    for item in packet.get("omitted_candidates", []) if isinstance(packet.get("omitted_candidates"), list) else []:
+        if not isinstance(item, dict) or str(item.get("leaf_id") or "") != leaf_id:
+            continue
+        for code in item.get("omission_reason_codes", []):
+            if _is_non_empty_string(code):
+                codes.add(str(code))
+    return codes
+
+
+def _packet_reports_browser_unavailable(packet: dict[str, Any]) -> bool:
+    diagnostics = packet.get("browser_search_provider_diagnostics")
+    if not isinstance(diagnostics, list) or not diagnostics:
+        return False
+    return any(
+        isinstance(item, dict)
+        and item.get("availability_status") == "unavailable"
+        for item in diagnostics
+    )
+
+
+def _expansion_terminal_status_for_leaf(
+    packet: dict[str, Any],
+    *,
+    leaf_id: str,
+    admitted_evidence_refs: list[str],
+    transport_activity_refs: list[str],
+) -> str:
+    if admitted_evidence_refs:
+        return "executed"
+    reason_codes = _leaf_omission_reason_codes(packet, leaf_id)
+    if not transport_activity_refs:
+        return "expansion_exhausted_transport_unavailable"
+    if reason_codes and reason_codes <= TRANSPORT_UNAVAILABLE_REASON_CODES:
+        return "expansion_exhausted_transport_unavailable"
+    if reason_codes & TRANSPORT_UNAVAILABLE_REASON_CODES and _packet_reports_browser_unavailable(packet):
+        return "expansion_exhausted_transport_unavailable"
+    return "expansion_exhausted_no_admissible_candidates"
+
+
+def _terminalize_retrieval_expansion_attempts(
+    packet: dict[str, Any],
+    certificates: list[dict[str, Any]],
+) -> None:
+    attempts = packet.get("retrieval_expansion_attempts")
+    if not isinstance(attempts, list) or not attempts:
+        return
+    results = _results_by_leaf(packet)
+    attempted_leaf_ids = {
+        str(item.get("leaf_id"))
+        for item in attempts
+        if isinstance(item, dict) and _is_non_empty_string(item.get("leaf_id"))
+    }
+    certificate_leaf_ids = {
+        str(cert.get("leaf_id"))
+        for cert in certificates
+        if isinstance(cert, dict) and _is_non_empty_string(cert.get("leaf_id"))
+    }
+    terminal_leaf_ids = attempted_leaf_ids | certificate_leaf_ids
+    status_counts: dict[str, int] = {}
+    for leaf_id in sorted(terminal_leaf_ids):
+        admitted_refs = _leaf_selected_evidence_refs(results.get(leaf_id))
+        transport_refs = _leaf_transport_activity_refs(packet, leaf_id)
+        status = _expansion_terminal_status_for_leaf(
+            packet,
+            leaf_id=leaf_id,
+            admitted_evidence_refs=admitted_refs,
+            transport_activity_refs=transport_refs,
+        )
+        status_counts[status] = status_counts.get(status, 0) + sum(
+            1
+            for item in attempts
+            if isinstance(item, dict) and str(item.get("leaf_id") or "") == leaf_id
+        )
+        for attempt in attempts:
+            if not isinstance(attempt, dict) or str(attempt.get("leaf_id") or "") != leaf_id:
+                continue
+            if attempt.get("attempt_status") in {None, "", PLANNED_EXPANSION_STATUS}:
+                attempt["attempt_status"] = status
+            attempt["candidate_refs"] = transport_refs
+            attempt["admitted_evidence_refs"] = admitted_refs
+            attempt["execution_reason_codes"] = sorted(
+                set([status, *_leaf_omission_reason_codes(packet, leaf_id)])
+            )
+            attempt["transport_execution_status"] = status
+            attempt["expansion_exhausted"] = status.startswith("expansion_exhausted_")
+        for fallback in packet.get("retrieval_fallback_states", []) if isinstance(packet.get("retrieval_fallback_states"), list) else []:
+            if not isinstance(fallback, dict) or str(fallback.get("leaf_id") or "") != leaf_id:
+                continue
+            fallback["targeted_expansion_terminal_status"] = status
+            fallback["targeted_expansion_exhausted"] = status.startswith("expansion_exhausted_")
+            fallback["reason_codes"] = sorted(
+                set([*fallback.get("reason_codes", []), status])
+            )
+    summary = packet.setdefault("retrieval_fallback_summary", {})
+    if isinstance(summary, dict):
+        summary["targeted_expansion_executed_count"] = status_counts.get("executed", 0)
+        summary["targeted_expansion_transport_unavailable_count"] = status_counts.get(
+            "expansion_exhausted_transport_unavailable",
+            0,
+        )
+        summary["targeted_expansion_no_admissible_candidate_count"] = status_counts.get(
+            "expansion_exhausted_no_admissible_candidates",
+            0,
+        )
+        summary["planned_not_executed_final_count"] = sum(
+            1
+            for item in attempts
+            if isinstance(item, dict) and item.get("attempt_status") == PLANNED_EXPANSION_STATUS
+        )
 
 
 def _structural_unanswerability_proof_ref(
@@ -4349,6 +4509,7 @@ def finalize_retrieval_packet_for_dispatch(
             )
             for leaf_id, context in sorted(contexts.items())
         ]
+    _terminalize_retrieval_expansion_attempts(packet_copy, certificates)
     cert_refs = [cert["certificate_id"] for cert in certificates]
     blocked_codes = sorted(
         {
@@ -6429,6 +6590,16 @@ def validate_research_sufficiency_dispatch_gate(packet: dict[str, Any], errors: 
     if status in {"allowed", "blocked_insufficient_research"}:
         if sorted(summary.get("leaf_certificate_refs", [])) != sorted(cert_refs):
             errors.append("research_sufficiency_summary.leaf_certificate_refs must match certificate ids")
+        planned_attempts = [
+            str(item.get("attempt_id") or f"retrieval_expansion_attempts[{idx}]")
+            for idx, item in enumerate(packet.get("retrieval_expansion_attempts", []))
+            if isinstance(item, dict) and item.get("attempt_status") == PLANNED_EXPANSION_STATUS
+        ]
+        if planned_attempts:
+            errors.append(
+                "terminal retrieval packets cannot contain planned_not_executed expansion attempts: "
+                + ",".join(planned_attempts)
+            )
         _validate_retrieval_outcome_state(packet.get("retrieval_outcome_state"), summary, certificates, errors)
 
 
@@ -6658,6 +6829,16 @@ def validate_retrieval_packet(packet: dict[str, Any]) -> RetrievalValidationResu
         validate_negative_check_attempt(item, f"negative_check_attempts[{idx}]", errors)
     for idx, item in enumerate(packet.get("retrieval_breadth_coverage_slices", []) if isinstance(packet.get("retrieval_breadth_coverage_slices"), list) else []):
         validate_retrieval_breadth_coverage_slice(item, f"retrieval_breadth_coverage_slices[{idx}]", errors)
+    for idx, item in enumerate(packet.get("retrieval_expansion_attempts", []) if isinstance(packet.get("retrieval_expansion_attempts"), list) else []):
+        if not isinstance(item, dict):
+            errors.append(f"retrieval_expansion_attempts[{idx}] must be an object")
+            continue
+        if item.get("attempt_status") not in {PLANNED_EXPANSION_STATUS, *TERMINAL_EXPANSION_STATUSES}:
+            errors.append(f"retrieval_expansion_attempts[{idx}].attempt_status is invalid")
+        if not isinstance(item.get("candidate_refs", []), list):
+            errors.append(f"retrieval_expansion_attempts[{idx}].candidate_refs must be a list")
+        if not isinstance(item.get("admitted_evidence_refs", []), list):
+            errors.append(f"retrieval_expansion_attempts[{idx}].admitted_evidence_refs must be a list")
     for idx, item in enumerate(packet.get("leaf_research_sufficiency_certificates", []) if isinstance(packet.get("leaf_research_sufficiency_certificates"), list) else []):
         validate_research_sufficiency_certificate(
             item,

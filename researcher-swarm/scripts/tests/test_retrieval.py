@@ -1247,6 +1247,16 @@ class RetrievalPacketContractTest(unittest.TestCase):
             [attempt["attempt_index"] for attempt in blocked["retrieval_expansion_attempts"]],
             [1, 2],
         )
+        self.assertEqual(
+            {attempt["attempt_status"] for attempt in blocked["retrieval_expansion_attempts"]},
+            {"expansion_exhausted_transport_unavailable"},
+        )
+        self.assertTrue(
+            all(
+                attempt["attempt_status"] != "planned_not_executed"
+                for attempt in blocked["retrieval_expansion_attempts"]
+            )
+        )
         with self.assertRaisesRegex(LeafResearchAssignmentError, "blocked_insufficient_research"):
             build_leaf_research_assignments(qdt=qdt, retrieval_packet=blocked)
 
@@ -1302,6 +1312,102 @@ class RetrievalPacketContractTest(unittest.TestCase):
             "certified_high_certainty",
         )
         self.assertEqual(len(assignments), 1)
+
+    def test_unsatisfied_thin_evidence_marks_expansion_executed(self) -> None:
+        qdt = copy.deepcopy(self.qdt)
+        qdt["required_leaf_questions"] = [qdt["required_leaf_questions"][0]]
+        leaf = qdt["required_leaf_questions"][0]
+        leaf["research_sufficiency_requirements"].update(
+            {
+                "required_source_classes": ["official_or_primary", "independent_secondary"],
+                "min_independent_claim_families": 2,
+                "min_independent_source_families": 2,
+                "protected_primary_required": True,
+                "max_targeted_expansion_attempts": 2,
+            }
+        )
+        context = build_retrieval_query_contexts(qdt, evidence_packet=self.evidence_packet)[0]
+        secondary = self._evidence(
+            context,
+            attempt_ref="thin-secondary",
+            canonical_url="https://independent.example/thin",
+            source_class="independent_secondary",
+            source_family_id="source-family-thin-secondary",
+            claim_family_id="claim-family-thin-secondary",
+        )
+        packet = build_retrieval_packet(
+            qdt,
+            evidence_packet=self.evidence_packet,
+            selected_evidence=[secondary],
+        )
+
+        finalized = finalize_retrieval_packet_for_dispatch(packet)
+
+        self.assertEqual(
+            finalized["research_sufficiency_summary"]["classification_dispatch_status"],
+            "blocked_insufficient_research",
+        )
+        self.assertEqual(
+            {attempt["attempt_status"] for attempt in finalized["retrieval_expansion_attempts"]},
+            {"executed"},
+        )
+        self.assertTrue(
+            all(
+                secondary["evidence_ref"] in attempt["admitted_evidence_refs"]
+                for attempt in finalized["retrieval_expansion_attempts"]
+            )
+        )
+        self.assertEqual(
+            finalized["retrieval_fallback_summary"]["targeted_expansion_executed_count"],
+            2,
+        )
+
+    def test_transport_run_without_admissible_evidence_exhausts_expansion(self) -> None:
+        qdt = copy.deepcopy(self.qdt)
+        qdt["required_leaf_questions"] = [qdt["required_leaf_questions"][0]]
+        leaf = qdt["required_leaf_questions"][0]
+        leaf["research_sufficiency_requirements"]["max_targeted_expansion_attempts"] = 2
+        context = build_retrieval_query_contexts(qdt, evidence_packet=self.evidence_packet)[0]
+        variant = context["query_variants"][0]
+        omitted = build_retrieval_candidate_record(
+            leaf_id=context["leaf_id"],
+            query_context_ref=context["query_context_ref"],
+            query_variant_id=variant["query_variant_id"],
+            retrieval_transport="browser",
+            transport_attempt_ref="browser-attempt-empty-content",
+            candidate_status="rejected",
+            requested_url="https://independent.example/empty",
+            canonical_url="https://independent.example/empty",
+            omission_reason_codes=["retrieved_source_text_missing"],
+        )
+        packet = build_retrieval_packet(
+            qdt,
+            evidence_packet=self.evidence_packet,
+            omitted_candidates=[omitted],
+        )
+
+        finalized = finalize_retrieval_packet_for_dispatch(packet)
+
+        self.assertEqual(
+            {attempt["attempt_status"] for attempt in finalized["retrieval_expansion_attempts"]},
+            {"expansion_exhausted_no_admissible_candidates"},
+        )
+        self.assertTrue(
+            all(
+                omitted["candidate_id"] in attempt["candidate_refs"]
+                for attempt in finalized["retrieval_expansion_attempts"]
+            )
+        )
+        self.assertEqual(
+            finalized["retrieval_fallback_summary"]["targeted_expansion_no_admissible_candidate_count"],
+            2,
+        )
+        self.assertTrue(
+            all(
+                attempt["attempt_status"] != "planned_not_executed"
+                for attempt in finalized["retrieval_expansion_attempts"]
+            )
+        )
 
     def test_browser_only_cutover_uses_direct_urls_and_yields_assignments(self) -> None:
         contexts = build_retrieval_query_contexts(self.qdt, evidence_packet=self.evidence_packet)

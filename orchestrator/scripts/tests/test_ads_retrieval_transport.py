@@ -990,6 +990,16 @@ class AdsRetrievalTransportTest(unittest.TestCase):
             packet["research_sufficiency_summary"]["classification_dispatch_status"],
             "blocked_insufficient_research",
         )
+        self.assertEqual(
+            {attempt["attempt_status"] for attempt in packet["retrieval_expansion_attempts"]},
+            {"expansion_exhausted_transport_unavailable"},
+        )
+        self.assertFalse(
+            any(
+                attempt["attempt_status"] == "planned_not_executed"
+                for attempt in packet["retrieval_expansion_attempts"]
+            )
+        )
 
 
 if __name__ == "__main__":

@@ -926,6 +926,10 @@ class AdsOperationalCanaryTest(unittest.TestCase):
         self.assertIn("retrieval_runtime_evidence", criteria_report)
         self.assertEqual(criteria_report["retrieval_runtime_evidence"]["source_populated_count"], 0)
         self.assertEqual(criteria_report["retrieval_runtime_evidence"]["admitted_evidence_ref_count"], 0)
+        self.assertEqual(
+            criteria_report["retrieval_runtime_evidence"]["planned_not_executed_expansion_count"],
+            0,
+        )
         runtime_gate_statuses = {
             item["gate"]: item["status"]
             for item in criteria_report["criteria"]["runtime_gates"]
