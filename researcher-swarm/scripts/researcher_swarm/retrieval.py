@@ -254,6 +254,7 @@ PROTECTED_SOURCE_CLASSES = {
 }
 DETERMINISTIC_SOURCE_CLASS_METHODS = {
     "manual_fixture",
+    "bank_of_israel_official_domain_path",
     "official_url_hint",
     "market_rules_resolution_url",
     "source_registry",
@@ -283,6 +284,17 @@ FORBIDDEN_RETRIEVAL_KEY_FRAGMENTS = (
     "prediction_result",
     "scorecard",
 )
+STABLE_SOURCE_IDENTITY_FRESHNESS_ROLES = {"resolution_mechanics"}
+STABLE_SOURCE_IDENTITY_EVIDENCE_FIELDS = {
+    "contract_resolution_text",
+    "contract_rules",
+    "cutoff_window",
+    "official_decision_schedule",
+    "resolution_criteria",
+    "resolution_deadline",
+    "rules_text",
+    "schedule",
+}
 MAX_QUERY_VARIANTS = 7
 MAX_QUERY_TEXT_CHARS = 360
 MAX_REASON_CODE_LENGTH = 80
@@ -534,6 +546,38 @@ def _source_class_targets(requirements: dict[str, Any]) -> list[str]:
     return sorted(set(targets)) or ["unknown"]
 
 
+def _required_evidence_fields_from_leaf(leaf: dict[str, Any]) -> set[str]:
+    raw = leaf.get("required_evidence_fields")
+    return {str(item) for item in raw if _is_non_empty_string(item)} if isinstance(raw, list) else set()
+
+
+def _stable_source_identity_freshness_policy_applies(leaf: dict[str, Any]) -> bool:
+    role = str(leaf.get("leaf_temporal_role") or "")
+    purpose = str(leaf.get("purpose") or "")
+    fields = _required_evidence_fields_from_leaf(leaf)
+    if role in {"current_status", "pre_resolution_forecast_driver", "material_unknown", "terminal_verification"}:
+        return False
+    if purpose and purpose != "resolution_mechanics":
+        return False
+    if role not in STABLE_SOURCE_IDENTITY_FRESHNESS_ROLES and purpose != "resolution_mechanics":
+        return False
+    return bool(fields & STABLE_SOURCE_IDENTITY_EVIDENCE_FIELDS)
+
+
+def _freshness_policy_for_leaf(leaf: dict[str, Any]) -> dict[str, Any]:
+    if _stable_source_identity_freshness_policy_applies(leaf):
+        return {
+            "freshness_policy": "stable_source_identity",
+            "require_fresh_publication": False,
+            "require_source_identity": True,
+        }
+    return {
+        "freshness_policy": "publication_or_update",
+        "require_fresh_publication": True,
+        "require_source_identity": False,
+    }
+
+
 def _live_policy_thresholds_for_leaf(leaf: dict[str, Any], requirements: dict[str, Any]) -> dict[str, Any]:
     purpose = str(leaf.get("purpose") or "other")
     weight = _leaf_research_priority(leaf)
@@ -605,6 +649,7 @@ def build_retrieval_breadth_profile_placeholder(
 ) -> dict[str, Any]:
     requirements = copy.deepcopy(leaf.get("research_sufficiency_requirements", {}))
     source_targets = _source_class_targets(requirements)
+    freshness_policy = _freshness_policy_for_leaf(leaf)
     tier, variant_count, raw_range, admitted_range, max_expansion = _volume_tier_for_leaf(leaf, requirements)
     live_thresholds = _live_policy_thresholds_for_leaf(leaf, requirements) if live_policy_overlay else {}
     min_claim_families = int(requirements.get("min_independent_claim_families", 0))
@@ -639,6 +684,7 @@ def build_retrieval_breadth_profile_placeholder(
         "freshness_requirement": {
             "recency_window_seconds": int(requirements.get("recency_window_seconds", 0)),
             "min_fresh_sources": min_fresh_sources,
+            **freshness_policy,
         },
         "admitted_evidence_requirement": {
             "min_admitted_evidence_items": int(live_thresholds.get("min_admitted_evidence_items", 0)),
@@ -910,6 +956,7 @@ def build_leaf_retrieval_query_context(
         "leaf_question": leaf.get("question_text"),
         "macro_question": qdt.get("macro_question"),
         "purpose": leaf.get("purpose"),
+        "leaf_temporal_role": leaf.get("leaf_temporal_role"),
         "condition_scope": leaf.get("leaf_condition_scope"),
         "market_component_terms": market_terms,
         "market_reality_constraints_digest": qdt.get("market_reality_constraints_digest"),
@@ -3311,18 +3358,44 @@ def _source_freshness_timestamp(item: dict[str, Any]) -> datetime | None:
     return None
 
 
-def _fresh_source_count(selected: list[dict[str, Any]], profile: dict[str, Any], source_cutoff_timestamp: str | None) -> int:
+def _stable_source_identity_satisfies_freshness(item: dict[str, Any], context: dict[str, Any]) -> bool:
+    method = str(item.get("source_class_resolution_method") or "")
+    return bool(
+        item.get("temporal_gate_status") == "pass"
+        and _is_known_source_family_id(item.get("source_family_id"))
+        and _source_class_counts_as_protected_primary(item.get("source_class"), context)
+        and (
+            item.get("deterministic_source_class_proof") is True
+            or method in DETERMINISTIC_SOURCE_CLASS_METHODS
+            or item.get("retrieval_transport") == "manual_fixture"
+        )
+    )
+
+
+def _fresh_source_count(
+    selected: list[dict[str, Any]],
+    profile: dict[str, Any],
+    source_cutoff_timestamp: str | None,
+    query_context: dict[str, Any],
+) -> int:
     requirement = profile.get("freshness_requirement") if isinstance(profile.get("freshness_requirement"), dict) else {}
     window_seconds = int(requirement.get("recency_window_seconds", 0) or 0)
+    stable_identity_policy = str(requirement.get("freshness_policy") or "") == "stable_source_identity"
+
+    def counts_without_fresh_publication(item: dict[str, Any]) -> bool:
+        return stable_identity_policy and _stable_source_identity_satisfies_freshness(item, query_context)
+
     if window_seconds <= 0:
         return sum(
             1
             for item in selected
             if item.get("temporal_gate_status") == "pass"
-            and _source_freshness_timestamp(item) is not None
+            and (_source_freshness_timestamp(item) is not None or counts_without_fresh_publication(item))
         )
     cutoff = _parse_timestamp(source_cutoff_timestamp)
     if cutoff is None:
+        if stable_identity_policy:
+            return sum(1 for item in selected if counts_without_fresh_publication(item))
         return 0
     threshold = cutoff - timedelta(seconds=window_seconds)
     count = 0
@@ -3331,6 +3404,10 @@ def _fresh_source_count(selected: list[dict[str, Any]], profile: dict[str, Any],
             continue
         published = _source_freshness_timestamp(item)
         if published is not None and threshold <= published <= cutoff:
+            count += 1
+        elif published is None and counts_without_fresh_publication(item):
+            count += 1
+        elif stable_identity_policy and counts_without_fresh_publication(item):
             count += 1
     return count
 
@@ -3402,7 +3479,7 @@ def build_retrieval_breadth_coverage_slice(
             if _is_known_source_family_id(item.get("source_family_id"))
         }
     )
-    fresh_source_count = _fresh_source_count(selected, profile, source_cutoff_timestamp)
+    fresh_source_count = _fresh_source_count(selected, profile, source_cutoff_timestamp, query_context)
     required_source_classes = [
         item
         for item in profile.get("source_class_requirements", {}).get("required", [])
@@ -3517,6 +3594,9 @@ def build_retrieval_breadth_coverage_slice(
         "claim_family_count": len(claim_family_ids),
         "source_family_count": len(source_family_ids),
         "fresh_source_count": fresh_source_count,
+        "freshness_policy": str(profile.get("freshness_requirement", {}).get("freshness_policy") or "publication_or_update")
+        if isinstance(profile.get("freshness_requirement"), dict)
+        else "publication_or_update",
         "contradiction_attempt_refs": contradiction_refs,
         "negative_check_attempt_refs": negative_refs,
         "protected_primary_status": protected_status,

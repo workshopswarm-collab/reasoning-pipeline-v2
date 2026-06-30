@@ -198,6 +198,14 @@ class AdsRetrievalTransportTest(unittest.TestCase):
         ]
         return qdt
 
+    def _boi_source_of_truth_qdt(self) -> dict:
+        qdt = self._source_of_truth_qdt()
+        leaf = qdt["required_leaf_questions"][0]
+        leaf["question_text"] = "What did the Bank of Israel official source say about the decision?"
+        leaf["market_component_terms"] = ["Bank of Israel", "BOI"]
+        leaf["required_evidence_fields"] = ["official_status", "bank_of_israel_decision"]
+        return qdt
+
     def test_direct_url_collection_prioritizes_source_truth_before_broad_search(self) -> None:
         provider = FakeBrowserProvider(search_results=[{"url": "https://secondary.example/report"}])
 
@@ -308,6 +316,77 @@ class AdsRetrievalTransportTest(unittest.TestCase):
             packet["research_sufficiency_summary"]["classification_dispatch_status"],
             "blocked_insufficient_research",
         )
+
+    def test_boi_official_url_counts_as_official_only_for_boi_facts(self) -> None:
+        provider = FakeBrowserProvider()
+        boi_evidence_packet = {
+            **self.evidence_packet,
+            "official_source_hints": ["https://boi.org.il/en/markets/schedule"],
+            "market_reality_constraints": {},
+        }
+
+        boi_transport = collect_live_retrieval_candidates(
+            qdt=self._boi_source_of_truth_qdt(),
+            evidence_packet=boi_evidence_packet,
+            case_contract=self.case_contract,
+            amrg_context=None,
+            source_cutoff_timestamp=CUTOFF_AT,
+            forecast_timestamp=FORECAST_AT,
+            provider_policy=RetrievalProviderPolicy(max_direct_urls=1, broad_search_enabled=False),
+            browser_provider=provider,
+        )
+        boi_candidate = boi_transport.fetched_candidates[0]
+        self.assertEqual(boi_candidate["source_class"], "official_or_primary")
+        self.assertEqual(boi_candidate["source_class_resolution_method"], "bank_of_israel_official_domain_path")
+        self.assertEqual(boi_candidate["source_class_registry_match"], "boi.org.il")
+
+        non_boi_transport = collect_live_retrieval_candidates(
+            qdt=self._source_of_truth_qdt(),
+            evidence_packet=boi_evidence_packet,
+            case_contract=self.case_contract,
+            amrg_context=None,
+            source_cutoff_timestamp=CUTOFF_AT,
+            forecast_timestamp=FORECAST_AT,
+            provider_policy=RetrievalProviderPolicy(max_direct_urls=1, broad_search_enabled=False),
+            browser_provider=provider,
+        )
+        non_boi_candidate = non_boi_transport.fetched_candidates[0]
+        self.assertNotEqual(non_boi_candidate.get("source_class"), "official_or_primary")
+        self.assertIsNone(non_boi_candidate.get("source_class_resolution_method"))
+
+    def test_polymarket_url_does_not_satisfy_boi_underlying_fact_protected_primary(self) -> None:
+        provider = FakeBrowserProvider()
+        transport = collect_live_retrieval_candidates(
+            qdt=self._boi_source_of_truth_qdt(),
+            evidence_packet={
+                **self.evidence_packet,
+                "market_rules": {},
+                "official_source_hints": [],
+                "market_reality_constraints": {},
+            },
+            case_contract=self.case_contract,
+            amrg_context=None,
+            source_cutoff_timestamp=CUTOFF_AT,
+            forecast_timestamp=FORECAST_AT,
+            provider_policy=RetrievalProviderPolicy(max_direct_urls=1, broad_search_enabled=False),
+            browser_provider=provider,
+        )
+        candidate = transport.fetched_candidates[0]
+        self.assertEqual(candidate["direct_url_source_ref"], "case_contract.market_url")
+        self.assertEqual(candidate["source_class"], "market_rules_or_resolution_source")
+
+        packet = build_live_retrieval_packet_from_candidates(
+            self._boi_source_of_truth_qdt(),
+            evidence_packet=self.evidence_packet,
+            fetched_candidates=transport.fetched_candidates,
+            search_candidate_urls=transport.search_candidate_urls,
+            forecast_timestamp=FORECAST_AT,
+            source_cutoff_timestamp=CUTOFF_AT,
+            live_policy_overlay=True,
+        )
+        coverage = packet["retrieval_breadth_coverage_slices"][0]
+        self.assertEqual(coverage["protected_primary_status"], "blocked")
+        self.assertIn("protected_primary_blocked", coverage["unsatisfied_breadth_dimensions"])
 
     def test_embedded_resolution_urls_become_direct_candidates(self) -> None:
         provider = FakeBrowserProvider(search_results=[{"url": "https://secondary.example/report"}])

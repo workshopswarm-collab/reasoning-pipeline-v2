@@ -82,6 +82,24 @@ DETERMINISTIC_SOURCE_CLASS_URL_REGISTRY = (
         "source_class": "official_or_primary",
     },
 )
+BOI_OFFICIAL_DOMAIN_SUFFIXES = ("boi.org.il",)
+BOI_OFFICIAL_PATH_PREFIXES = (
+    "/en/",
+    "/he/",
+    "/markets",
+    "/monetary-policy",
+    "/communication-and-publications",
+    "/research",
+    "/statistics",
+)
+BOI_CONTEXT_TERMS = (
+    "bank of israel",
+    "boi",
+    "israeli central bank",
+    "israel interest",
+    "israel inflation",
+    "israel monetary",
+)
 
 NATIVE_ALLOWED_FIELDS = {
     "url",
@@ -712,15 +730,24 @@ def _fetch_candidate(
             candidate["admission_reason_code"] = "pre_dispatch_direct_url_source_time_inferred"
         else:
             candidate["admission_reason_code"] = "transport_candidate_requires_deterministic_validation"
+        boi_registry_match = _deterministic_boi_official_source_match(final_url, context)
         registry_match = _deterministic_source_class_registry_match(final_url)
-        if registry_match and registry_match["source_class"] == "official_or_primary":
+        boi_non_matching_context = _is_boi_official_url(final_url) and boi_registry_match is None
+        if boi_registry_match:
+            candidate["source_class"] = boi_registry_match["source_class"]
+            candidate["deterministic_source_class_proof"] = True
+            candidate["source_class_resolution_method"] = "bank_of_israel_official_domain_path"
+            candidate["source_class_registry_id"] = boi_registry_match["registry_id"]
+            candidate["source_class_registry_match"] = boi_registry_match["matched_domain"]
+            candidate["official_source_hints"] = [url]
+        elif registry_match and registry_match["source_class"] == "official_or_primary":
             candidate["source_class"] = registry_match["source_class"]
             candidate["deterministic_source_class_proof"] = True
             candidate["source_class_resolution_method"] = "deterministic_url_registry"
             candidate["source_class_registry_id"] = registry_match["registry_id"]
             candidate["source_class_registry_match"] = registry_match["matched_domain"]
             candidate["official_source_hints"] = [url]
-        elif deterministic_direct_url_source_classes and hint.get("source_class"):
+        elif deterministic_direct_url_source_classes and hint.get("source_class") and not boi_non_matching_context:
             candidate["source_class"] = hint["source_class"]
             candidate["deterministic_source_class_proof"] = True
             candidate["source_class_resolution_method"] = hint.get("source_class_resolution_method")
@@ -793,6 +820,44 @@ def _deterministic_source_class_registry_match(url: str) -> dict[str, str] | Non
                     "source_class": source_class,
                 }
     return None
+
+
+def _is_boi_official_url(url: str) -> bool:
+    parsed = urlsplit(url)
+    host = parsed.netloc.lower().split("@")[-1].split(":")[0]
+    if host.startswith("www."):
+        host = host[4:]
+    if not any(host == suffix or host.endswith(f".{suffix}") for suffix in BOI_OFFICIAL_DOMAIN_SUFFIXES):
+        return False
+    path = parsed.path.lower() or "/"
+    return any(path == prefix.rstrip("/") or path.startswith(prefix) for prefix in BOI_OFFICIAL_PATH_PREFIXES)
+
+
+def _context_requires_boi_fact(context: dict[str, Any]) -> bool:
+    fields = context.get("required_evidence_fields") if isinstance(context.get("required_evidence_fields"), list) else []
+    terms = context.get("market_component_terms") if isinstance(context.get("market_component_terms"), list) else []
+    haystack = " ".join(
+        str(value)
+        for value in [
+            context.get("leaf_question"),
+            context.get("macro_question"),
+            context.get("purpose"),
+            *fields,
+            *terms,
+        ]
+        if value
+    ).lower()
+    return any(term in haystack for term in BOI_CONTEXT_TERMS)
+
+
+def _deterministic_boi_official_source_match(url: str, context: dict[str, Any]) -> dict[str, str] | None:
+    if not _is_boi_official_url(url) or not _context_requires_boi_fact(context):
+        return None
+    return {
+        "registry_id": "ads-static-official-source-registry/bank-of-israel",
+        "matched_domain": "boi.org.il",
+        "source_class": "official_or_primary",
+    }
 
 
 def _provider_diagnostics(browser_provider: Any | None) -> dict[str, Any]:

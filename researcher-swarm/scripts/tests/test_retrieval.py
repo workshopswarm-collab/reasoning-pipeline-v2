@@ -1853,6 +1853,114 @@ class RetrievalPacketContractTest(unittest.TestCase):
             "blocked_insufficient_research",
         )
 
+    def test_stable_boi_schedule_identity_satisfies_freshness_without_published_time(self) -> None:
+        qdt = copy.deepcopy(self.qdt)
+        qdt["required_leaf_questions"] = [qdt["required_leaf_questions"][0]]
+        leaf = qdt["required_leaf_questions"][0]
+        leaf["purpose"] = "resolution_mechanics"
+        leaf["leaf_temporal_role"] = "resolution_mechanics"
+        leaf["question_text"] = "What is the Bank of Israel published decision schedule and rules?"
+        leaf["required_evidence_fields"] = ["official_decision_schedule", "rules_text"]
+        leaf["research_sufficiency_requirements"].update(
+            {
+                "required_source_classes": ["official_or_primary"],
+                "min_independent_claim_families": 1,
+                "min_independent_source_families": 1,
+                "min_temporally_fresh_sources": 1,
+                "recency_window_seconds": 3600,
+                "protected_primary_required": True,
+                "contradiction_search_required": False,
+                "required_negative_checks": [],
+            }
+        )
+        context = build_retrieval_query_contexts(qdt, evidence_packet=self.evidence_packet)[0]
+        candidate = self._live_candidate(context, 0, direct=True, official=True)
+        boi_url = "https://boi.org.il/en/markets/schedule"
+        candidate.update(
+            {
+                "requested_url": boi_url,
+                "final_url": boi_url,
+                "canonical_url": boi_url,
+                "source_observed_at": "2026-06-24T11:30:00+00:00",
+            }
+        )
+        candidate.pop("source_published_at", None)
+        candidate.pop("source_updated_at", None)
+
+        packet = build_live_retrieval_packet_from_candidates(
+            qdt,
+            evidence_packet=self.evidence_packet,
+            fetched_candidates=[candidate],
+            search_candidate_urls=[],
+            question_decomposition_artifact_id="artifact:qdt-1",
+            policy_context_ref="artifact:profile-1",
+            live_policy_overlay=False,
+        )
+        coverage = packet["retrieval_breadth_coverage_slices"][0]
+        provenance = packet["retrieval_evidence_provenance_slices"][0]
+
+        self.assertEqual(coverage["freshness_policy"], "stable_source_identity")
+        self.assertEqual(coverage["fresh_source_count"], 1)
+        self.assertNotIn("freshness", coverage["unsatisfied_breadth_dimensions"])
+        self.assertIsNone(provenance["source_metadata_resolution"]["published_at"])
+        self.assertEqual(
+            packet["research_sufficiency_summary"]["classification_dispatch_status"],
+            "allowed",
+        )
+
+    def test_current_boi_status_still_requires_publication_or_update_freshness(self) -> None:
+        qdt = copy.deepcopy(self.qdt)
+        qdt["required_leaf_questions"] = [qdt["required_leaf_questions"][0]]
+        leaf = qdt["required_leaf_questions"][0]
+        leaf["purpose"] = "direct_evidence"
+        leaf["leaf_temporal_role"] = "current_status"
+        leaf["question_text"] = "What is the current Bank of Israel guidance and inflation status?"
+        leaf["required_evidence_fields"] = ["current_guidance", "inflation_status"]
+        leaf["research_sufficiency_requirements"].update(
+            {
+                "required_source_classes": ["official_or_primary"],
+                "min_independent_claim_families": 1,
+                "min_independent_source_families": 1,
+                "min_temporally_fresh_sources": 1,
+                "recency_window_seconds": 3600,
+                "protected_primary_required": True,
+                "contradiction_search_required": False,
+                "required_negative_checks": [],
+            }
+        )
+        context = build_retrieval_query_contexts(qdt, evidence_packet=self.evidence_packet)[0]
+        candidate = self._live_candidate(context, 0, direct=True, official=True)
+        boi_url = "https://boi.org.il/en/communication-and-publications"
+        candidate.update(
+            {
+                "requested_url": boi_url,
+                "final_url": boi_url,
+                "canonical_url": boi_url,
+                "source_observed_at": "2026-06-24T11:30:00+00:00",
+            }
+        )
+        candidate.pop("source_published_at", None)
+        candidate.pop("source_updated_at", None)
+
+        packet = build_live_retrieval_packet_from_candidates(
+            qdt,
+            evidence_packet=self.evidence_packet,
+            fetched_candidates=[candidate],
+            search_candidate_urls=[],
+            question_decomposition_artifact_id="artifact:qdt-1",
+            policy_context_ref="artifact:profile-1",
+            live_policy_overlay=False,
+        )
+        coverage = packet["retrieval_breadth_coverage_slices"][0]
+
+        self.assertEqual(coverage["freshness_policy"], "publication_or_update")
+        self.assertEqual(coverage["fresh_source_count"], 0)
+        self.assertIn("freshness", coverage["unsatisfied_breadth_dimensions"])
+        self.assertEqual(
+            packet["research_sufficiency_summary"]["classification_dispatch_status"],
+            "blocked_insufficient_research",
+        )
+
     def test_live_candidate_without_validated_claim_family_does_not_count_toward_breadth(self) -> None:
         qdt = copy.deepcopy(self.qdt)
         qdt["required_leaf_questions"] = [qdt["required_leaf_questions"][0]]
