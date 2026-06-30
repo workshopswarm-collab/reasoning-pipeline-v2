@@ -442,7 +442,35 @@ Success criteria:
 
 ## Phase 5 - Final Representative End-to-End Clone Batch
 
+Status: blocked after the first final-batch attempt. Preserve the runtime robustness fix from this
+phase, but do not mark ADS v2 end-to-end remediation complete until a later rerun includes at least
+one true `scoreable_success`.
+
 Goal: prove the intended v2 path after all remaining fixes with the existing canary/report scripts, then leave the workspace clean.
+
+Phase 5 attempt result:
+
+- The first representative clone batch uncovered an outdated runtime-entrypoint validator in
+  `decomposer/scripts/bin/run_decomposition.py`: live model outputs with more than the compact
+  default leaf count were rejected before canonical QDT `leaf_budget_decision` validation could
+  apply.
+- That runtime mismatch is fixed by deferring leaf-count enforcement to the canonical QDT budget
+  contract. Permanent regression coverage lives in
+  `decomposer/scripts/tests/test_runtime_decomposition.py`.
+- After the fix, representative clone-only runs no longer had unexpected stage failures from the
+  compact leaf-budget mismatch.
+- No tested eligible case reached `scoreable_success`. The final blocker is live retrieval
+  sufficiency:
+  - several cases passed QDT end-to-end quality and then blocked because retrieval produced no
+    source-populated accepted evidence or did not satisfy freshness/protected-primary/source-family
+    acceptance;
+  - several Bank of Israel/Khamenei-style cases also showed truthful QDT coverage failures where
+    `research_coverage_check` did not pass;
+  - all non-scoreable cases wrote no scoreable prediction and drained active runs/leases cleanly.
+- Because the batch still has zero `scoreable_success` cases, this phase remains blocked rather
+  than complete. The next implementation effort should focus on true live retrieval sufficiency
+  for at least one representative, currently eligible market, using the existing retrieval,
+  report, and canary surfaces.
 
 Implementation:
 

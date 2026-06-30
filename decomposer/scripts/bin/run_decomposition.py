@@ -298,8 +298,6 @@ def _basic_response_validator(response: Any) -> tuple[bool, list[str]]:
         errors.append("branches must be a non-empty list")
     if not isinstance(response.get("required_leaf_questions"), list) or not response["required_leaf_questions"]:
         errors.append("required_leaf_questions must be a non-empty list")
-    if len(response.get("required_leaf_questions", [])) > COMPACT_DEFAULT_LEAF_BUDGET:
-        errors.append("required_leaf_questions exceeds compact default leaf budget")
     return not errors, errors
 
 

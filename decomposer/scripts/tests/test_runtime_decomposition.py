@@ -199,6 +199,73 @@ class RuntimeDecompositionEntrypointTest(unittest.TestCase):
         self.assertEqual(runtime["repair_count"], 1)
         self.assertEqual(qdt["model_execution_context"]["repair_count"], 1)
 
+    def test_runtime_accepts_large_response_for_canonical_leaf_budget_validation(self) -> None:
+        handoff = self._handoff()
+        response = build_question_specific_fixture_response(handoff)
+        base_leaf = response["required_leaf_questions"][0]
+        base_branch = response["branches"][0]
+        additional_questions = [
+            (
+                "Which unresolved engineering blockers could prevent Acme from shipping the Atlas update "
+                "before July 2026?"
+            ),
+            (
+                "What public launch communications from Acme currently support or weaken a before-July "
+                "Atlas update release?"
+            ),
+            (
+                "How do dependency, vendor, or platform milestones affect the remaining Atlas update "
+                "delivery window?"
+            ),
+            (
+                "Which beta, release-candidate, or customer rollout signals show progress toward an Atlas "
+                "update launch?"
+            ),
+            (
+                "What explicit counterevidence indicates Acme may delay the Atlas update beyond the market "
+                "deadline?"
+            ),
+            (
+                "How have Acme's comparable roadmap commitments performed when similar release windows were "
+                "announced?"
+            ),
+            (
+                "Which source-quality gaps remain after checking Acme-owned sources and credible external "
+                "coverage?"
+            ),
+        ]
+        for offset, question in enumerate(additional_questions, start=1):
+            next_index = len(response["required_leaf_questions"]) + 1
+            leaf = dict(base_leaf)
+            leaf["leaf_id"] = f"leaf-extra-pre-resolution-{offset}"
+            leaf["question_text"] = question
+            leaf["leaf_question"] = leaf["question_text"]
+            leaf["coverage_dimension"] = f"additional_driver_{next_index}"
+            leaf["research_factor"] = f"driver_signal_{next_index}"
+            leaf["market_component_terms"] = ["Acme", "Atlas update", f"driver {next_index}"]
+            leaf["classification_targets"] = [f"driver_{next_index}_signal_strength"]
+            leaf["evidence_requirements"] = [f"current evidence about driver {next_index}"]
+            leaf["sufficiency_criteria"] = [f"driver {next_index} evidence is current and source-backed"]
+            leaf["specificity_evidence"] = {
+                "market_terms_used": ["Acme", "Atlas update"],
+                "why_this_must_be_investigated": f"Driver {next_index} could change pre-resolution delivery odds.",
+            }
+            response["required_leaf_questions"].append(leaf)
+            base_branch.setdefault("leaf_ids", []).append(leaf["leaf_id"])
+
+        qdt, runtime = build_question_decomposition_from_handoff(
+            handoff,
+            runtime_mode="fixture",
+            fixture_response=response,
+        )
+
+        self.assertTrue(validate_question_decomposition(qdt).valid)
+        self.assertGreater(len(qdt["required_leaf_questions"]), 10)
+        budget = qdt["leaf_budget_decision"]
+        self.assertGreater(budget["effective_leaf_budget"], budget["compact_default_leaf_budget"])
+        self.assertTrue(budget["hierarchical_branch_ledger_required"])
+        self.assertEqual(runtime["execution_status"], "succeeded")
+
     def test_schema_repair_does_not_convert_semantic_invalid_output(self) -> None:
         handoff = self._handoff()
         bad_response = build_question_specific_fixture_response(handoff)
