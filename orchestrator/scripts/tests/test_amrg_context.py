@@ -690,6 +690,79 @@ class AMRGContextTest(unittest.TestCase):
         for hint in anchor_context["hints"]:
             self.assertIn("qdt_anchor_dependency_hint", hint["allowed_use"])
 
+    def test_operator_report_uses_qdt_hint_consumption_slices(self):
+        artifact = enrich_related_live_market_context(
+            self.build_artifact([self.market(2), self.market(3)]),
+            evidence_packet=self.evidence_packet(),
+        )
+        artifact["amrg_decomposer_context"] = build_amrg_decomposer_context(artifact)
+        hints = artifact["amrg_decomposer_context"]["hints"]
+        self.assertGreaterEqual(len(hints), 2)
+        consumed_ref = hints[0]["hint_ref"]
+        ignored_ref = hints[1]["hint_ref"]
+
+        report = build_amrg_operator_report(
+            artifact,
+            question_decomposition={
+                "required_leaf_questions": [
+                    {"leaf_id": "leaf-amrg-context", "amrg_usage_refs": [consumed_ref]}
+                ],
+                "branches": [
+                    {"branch_id": "branch-amrg-context", "amrg_usage_refs": [consumed_ref]}
+                ],
+                "related_market_context_usage": {
+                    "usage_status": "related_context_used",
+                    "related_context_artifact_ref": "artifact:related-live-market-context",
+                    "amrg_usage_refs": [consumed_ref, ignored_ref],
+                    "weak_context_only": False,
+                    "anchor_dependency_status": "none",
+                },
+                "amrg_operator_metadata": {
+                    "schema_version": "qdt-amrg-operator-metadata/v1",
+                    "hint_consumption_slices": [
+                        {
+                            "hint_ref": consumed_ref,
+                            "decomposer_consumed": True,
+                            "consumed_by_leaf_ids": ["leaf-amrg-context"],
+                            "consumed_by_branch_ids": ["branch-amrg-context"],
+                            "ignored_reason_codes": [],
+                            "effect_status": "context_only_no_authority",
+                            "consumption_authority": "context_ref_only_no_forecast_authority",
+                        },
+                        {
+                            "hint_ref": ignored_ref,
+                            "decomposer_consumed": False,
+                            "consumed_by_leaf_ids": [],
+                            "consumed_by_branch_ids": [],
+                            "ignored_reason_codes": ["declared_in_related_context_usage_only"],
+                            "effect_status": "not_consumed_context_only_no_authority",
+                            "consumption_authority": "context_ref_only_no_forecast_authority",
+                        },
+                    ],
+                },
+            },
+        )
+
+        consumption = {item["hint_ref"]: item for item in report["hint_consumption"]}
+        self.assertTrue(consumption[consumed_ref]["decomposer_consumed"])
+        self.assertEqual(consumption[consumed_ref]["consumed_by_leaf_ids"], ["leaf-amrg-context"])
+        self.assertEqual(consumption[consumed_ref]["consumed_by_branch_ids"], ["branch-amrg-context"])
+        self.assertEqual(consumption[consumed_ref]["effect_status"], "context_only_no_authority")
+        self.assertFalse(consumption[ignored_ref]["decomposer_consumed"])
+        self.assertEqual(
+            consumption[ignored_ref]["ignored_reason_codes"],
+            ["declared_in_related_context_usage_only"],
+        )
+        self.assertEqual(
+            consumption[ignored_ref]["effect_status"],
+            "not_consumed_context_only_no_authority",
+        )
+        self.assertIn("probability_authority", consumption[ignored_ref]["forbidden_effects"])
+        self.assertEqual(
+            consumption[ignored_ref]["consumption_authority"],
+            "context_ref_only_no_forecast_authority",
+        )
+
     def test_relationship_typing_and_timing_alignment_can_add_safe_context_status(self):
         packet = self.evidence_packet()
         artifact = self.build_artifact([self.market(2)])

@@ -469,6 +469,22 @@ class RuntimeDecompositionEntrypointTest(unittest.TestCase):
                                     ],
                                     "freshness_status": "current",
                                     "candidate_leaf_relevance": "diagnostic_only",
+                                },
+                                {
+                                    "hint_ref": "hint-2",
+                                    "hint_category": "weak_context_hint",
+                                    "source_market_ref": "polymarket:related-2",
+                                    "relation_type": "generic_theme",
+                                    "effect_status": "weak_context_only",
+                                    "allowed_use": ["decomposition_context_hint"],
+                                    "prohibited_use": [
+                                        "qdt_selection",
+                                        "qdt_repair",
+                                        "probability_authority",
+                                        "scae_delta",
+                                    ],
+                                    "freshness_status": "current",
+                                    "candidate_leaf_relevance": "diagnostic_only",
                                 }
                             ],
                             "operator_metadata": {
@@ -481,7 +497,7 @@ class RuntimeDecompositionEntrypointTest(unittest.TestCase):
                             },
                             "authority": "context_hints_only_no_forecast_or_selection_authority",
                         },
-                        "relationship_edges": [{"edge_id": "hint-1"}],
+                        "relationship_edges": [{"edge_id": "hint-1"}, {"edge_id": "hint-2"}],
                     },
                     sort_keys=True,
                 ),
@@ -507,6 +523,18 @@ class RuntimeDecompositionEntrypointTest(unittest.TestCase):
         self.assertTrue(
             all("leaf-current-decision-status" == item["leaf_id"] for item in metadata["leaf_hint_ref_slices"])
         )
+        consumption = {item["hint_ref"]: item for item in metadata["hint_consumption_slices"]}
+        self.assertTrue(consumption["hint-1"]["decomposer_consumed"])
+        self.assertEqual(consumption["hint-1"]["consumed_by_leaf_ids"], ["leaf-current-decision-status"])
+        self.assertEqual(consumption["hint-1"]["consumed_by_branch_ids"], [qdt["branches"][0]["branch_id"]])
+        self.assertEqual(consumption["hint-1"]["ignored_reason_codes"], [])
+        self.assertEqual(consumption["hint-1"]["effect_status"], "context_only_no_authority")
+        self.assertFalse(consumption["hint-2"]["decomposer_consumed"])
+        self.assertEqual(
+            consumption["hint-2"]["ignored_reason_codes"],
+            ["not_referenced_by_qdt_branch_or_leaf"],
+        )
+        self.assertIn("probability_authority", consumption["hint-2"]["forbidden_effects"])
 
 
 if __name__ == "__main__":

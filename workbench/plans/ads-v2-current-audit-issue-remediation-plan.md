@@ -796,7 +796,7 @@ Completion note:
 
 ## Phase 5 - AMRG Context Consumption And Optional Assist Clarity
 
-Status: pending
+Status: complete
 
 Goal: make AMRG's contribution observable and useful without giving it forecast or evidence authority.
 
@@ -883,7 +883,7 @@ Required permanent tests:
 - Consumed hints record branch/leaf IDs.
 - AMRG hints cannot select QDT leaves or write probability/evidence authority.
 - Optional assist reports `not_requested` without claiming execution.
-- Enabled AMRG assist retries retryable transport failures and reports exhausted retries distinctly.
+- If AMRG assist is policy-enabled later, enabled-assist retry tests must cover retryable transport failures and exhausted retries distinctly.
 
 Clone proof:
 
@@ -906,12 +906,20 @@ Success criteria:
 
 Checklist:
 
-- [ ] AMRG hint consumption mapping implemented.
-- [ ] QDT context includes only active-safe hints.
-- [ ] AMRG authority boundaries tested.
-- [ ] AMRG optional assist retry/reporting semantics tested.
-- [ ] Reports distinguish optional not requested vs executed.
-- [ ] Temporary artifacts deleted.
+- [x] AMRG hint consumption mapping implemented.
+- [x] QDT context includes only active-safe hints.
+- [x] AMRG authority boundaries tested.
+- [x] AMRG optional not-requested reporting semantics tested; enabled-assist retry remains deferred until policy enables assist.
+- [x] Reports distinguish optional not requested vs executed.
+- [x] Temporary artifacts deleted.
+
+Completion note:
+
+- Added QDT `amrg_operator_metadata.hint_consumption_slices`, a deterministic per-hint ledger showing provided hints, consumed branch/leaf IDs, non-consumption reasons, context-only effect status, allowed use, forbidden effects, and no-forecast authority.
+- Updated AMRG operator reports to consume the QDT ledger when present, including ignored-hint reasons and context-only authority, while preserving legacy branch/leaf AMRG refs.
+- Preserved optional AMRG model-assist policy: not-requested assist still reports `assist_not_requested_by_policy`, `model_executed=false`, and `model_execution_claim=not_claimed`.
+- Kept vector context as a truthful weak-context availability signal; no Ollama requirement was introduced in this phase.
+- Verification passed: `python3 -m unittest decomposer/scripts/tests/test_runtime_decomposition.py`, `python3 -m unittest decomposer/scripts/tests/test_persistence.py`, and `python3 -m unittest orchestrator/scripts/tests/test_amrg_context.py`.
 
 ## Phase 6 - Researcher Runtime And Verification Positive Path
 

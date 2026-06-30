@@ -643,31 +643,84 @@ def _amrg_operator_metadata(
     amrg_decomposer_context: dict[str, Any] | None,
 ) -> dict[str, Any]:
     hints = amrg_decomposer_context.get("hints", []) if isinstance(amrg_decomposer_context, dict) else []
-    hint_refs = {str(hint.get("hint_ref")) for hint in hints if isinstance(hint, dict) and hint.get("hint_ref")}
-    leaf_slices: list[dict[str, Any]] = []
-    branch_slices: list[dict[str, Any]] = []
+    hints_by_ref = {
+        str(hint.get("hint_ref")): hint
+        for hint in hints
+        if isinstance(hint, dict) and hint.get("hint_ref")
+    }
+    hint_refs = set(hints_by_ref)
+    branch_refs_by_hint: dict[str, set[str]] = {hint_ref: set() for hint_ref in hint_refs}
+    leaf_refs_by_hint: dict[str, set[str]] = {hint_ref: set() for hint_ref in hint_refs}
     for branch in selected.get("branches", []):
         if isinstance(branch, dict) and isinstance(branch.get("amrg_usage_refs"), list):
             refs = sorted({str(ref) for ref in branch["amrg_usage_refs"] if str(ref) in hint_refs})
-            if refs:
-                branch_slices.append(
-                    {
-                        "branch_id": str(branch.get("branch_id")),
-                        "hint_refs": refs,
-                        "consumption_status": "diagnostic_or_validated_context_ref_only",
-                    }
-                )
+            branch_id = str(branch.get("branch_id"))
+            for ref in refs:
+                branch_refs_by_hint.setdefault(ref, set()).add(branch_id)
     for leaf in selected.get("required_leaf_questions", []):
         if isinstance(leaf, dict) and isinstance(leaf.get("amrg_usage_refs"), list):
             refs = sorted({str(ref) for ref in leaf["amrg_usage_refs"] if str(ref) in hint_refs})
-            if refs:
-                leaf_slices.append(
-                    {
-                        "leaf_id": str(leaf.get("leaf_id")),
-                        "hint_refs": refs,
-                        "consumption_status": "diagnostic_or_validated_context_ref_only",
-                    }
-                )
+            leaf_id = str(leaf.get("leaf_id"))
+            for ref in refs:
+                leaf_refs_by_hint.setdefault(ref, set()).add(leaf_id)
+    usage = selected.get("related_market_context_usage")
+    usage_refs = {
+        str(ref)
+        for ref in usage.get("amrg_usage_refs", [])
+        if isinstance(usage, dict) and str(ref) in hint_refs
+    } if isinstance(usage, dict) else set()
+    branch_slices = [
+        {
+            "branch_id": branch_id,
+            "hint_refs": sorted(ref for ref, branch_ids in branch_refs_by_hint.items() if branch_id in branch_ids),
+            "consumption_status": "diagnostic_or_validated_context_ref_only",
+        }
+        for branch_id in sorted({branch_id for refs in branch_refs_by_hint.values() for branch_id in refs})
+    ]
+    leaf_slices = [
+        {
+            "leaf_id": leaf_id,
+            "hint_refs": sorted(ref for ref, leaf_ids in leaf_refs_by_hint.items() if leaf_id in leaf_ids),
+            "consumption_status": "diagnostic_or_validated_context_ref_only",
+        }
+        for leaf_id in sorted({leaf_id for refs in leaf_refs_by_hint.values() for leaf_id in refs})
+    ]
+    hint_consumption_slices: list[dict[str, Any]] = []
+    for hint_ref in sorted(hint_refs):
+        hint = hints_by_ref[hint_ref]
+        branch_ids = sorted(branch_refs_by_hint.get(hint_ref, set()))
+        leaf_ids = sorted(leaf_refs_by_hint.get(hint_ref, set()))
+        consumed = bool(branch_ids or leaf_ids)
+        ignored_reasons: list[str] = []
+        if not consumed:
+            ignored_reasons.append(
+                "declared_in_related_context_usage_only"
+                if hint_ref in usage_refs
+                else "not_referenced_by_qdt_branch_or_leaf"
+            )
+        hint_consumption_slices.append(
+            {
+                "hint_ref": hint_ref,
+                "hint_category": hint.get("hint_category"),
+                "source_market_ref": hint.get("source_market_ref"),
+                "decomposer_consumed": consumed,
+                "consumed_by_branch_ids": branch_ids,
+                "consumed_by_leaf_ids": leaf_ids,
+                "ignored_reason_codes": ignored_reasons,
+                "effect_status": (
+                    "context_only_no_authority"
+                    if consumed
+                    else "not_consumed_context_only_no_authority"
+                ),
+                "allowed_use": list(hint.get("allowed_use", []))
+                if isinstance(hint.get("allowed_use"), list)
+                else [],
+                "forbidden_effects": list(hint.get("prohibited_use", []))
+                if isinstance(hint.get("prohibited_use"), list)
+                else [],
+                "consumption_authority": "context_ref_only_no_forecast_authority",
+            }
+        )
     return {
         "schema_version": "qdt-amrg-operator-metadata/v1",
         "amrg_decomposer_context_ref": amrg_decomposer_context.get("context_ref")
@@ -676,6 +729,7 @@ def _amrg_operator_metadata(
         "hint_refs_considered": sorted(hint_refs),
         "branch_hint_ref_slices": branch_slices,
         "leaf_hint_ref_slices": leaf_slices,
+        "hint_consumption_slices": hint_consumption_slices,
         "weak_hint_promotion_status": "not_promoted_without_validated_anchor_contract",
         "anchor_contract_edge_refs": sorted(
             {

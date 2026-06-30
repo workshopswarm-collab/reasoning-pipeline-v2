@@ -4538,6 +4538,7 @@ def build_amrg_operator_report(
     )
     consumed_leaf_refs: dict[str, list[str]] = {}
     consumed_branch_refs: dict[str, list[str]] = {}
+    qdt_consumption_by_ref: dict[str, dict[str, Any]] = {}
     if isinstance(question_decomposition, dict):
         for idx, leaf in enumerate(question_decomposition.get("required_leaf_questions") or []):
             if not isinstance(leaf, dict) or not isinstance(leaf.get("amrg_usage_refs"), list):
@@ -4564,6 +4565,22 @@ def build_amrg_operator_report(
                 for branch_id, refs in (metadata.get("branch_hint_refs") or {}).items()
                 if isinstance(refs, list)
             })
+            for item in metadata.get("leaf_hint_ref_slices") or []:
+                if not isinstance(item, dict) or not isinstance(item.get("hint_refs"), list):
+                    continue
+                leaf_id = str(item.get("leaf_id") or "")
+                if leaf_id:
+                    consumed_leaf_refs[leaf_id] = [str(ref) for ref in item["hint_refs"]]
+            for item in metadata.get("branch_hint_ref_slices") or []:
+                if not isinstance(item, dict) or not isinstance(item.get("hint_refs"), list):
+                    continue
+                branch_id = str(item.get("branch_id") or "")
+                if branch_id:
+                    consumed_branch_refs[branch_id] = [str(ref) for ref in item["hint_refs"]]
+            for item in metadata.get("hint_consumption_slices") or []:
+                if not isinstance(item, dict) or not item.get("hint_ref"):
+                    continue
+                qdt_consumption_by_ref[str(item["hint_ref"])] = item
     consumed_by_ref: dict[str, dict[str, list[str]]] = {
         str(hint.get("hint_ref")): {"leaf_ids": [], "branch_ids": []}
         for hint in hints
@@ -4575,6 +4592,13 @@ def build_amrg_operator_report(
     for branch_id, refs in consumed_branch_refs.items():
         for ref in refs:
             consumed_by_ref.setdefault(ref, {"leaf_ids": [], "branch_ids": []})["branch_ids"].append(branch_id)
+    for ref, item in qdt_consumption_by_ref.items():
+        leaf_ids = item.get("consumed_by_leaf_ids") if isinstance(item.get("consumed_by_leaf_ids"), list) else []
+        branch_ids = item.get("consumed_by_branch_ids") if isinstance(item.get("consumed_by_branch_ids"), list) else []
+        consumed_by_ref[ref] = {
+            "leaf_ids": [str(leaf_id) for leaf_id in leaf_ids],
+            "branch_ids": [str(branch_id) for branch_id in branch_ids],
+        }
     vector_runtime = context.get("vector_runtime") if isinstance(context.get("vector_runtime"), dict) else {}
     source_policy = context.get("source_policy") if isinstance(context.get("source_policy"), dict) else {}
     vector_required = bool(source_policy.get("vector_source_required", False))
@@ -4643,7 +4667,15 @@ def build_amrg_operator_report(
             {
                 "hint_ref": hint.get("hint_ref"),
                 "hint_category": hint.get("hint_category"),
-                "effect_status": hint.get("effect_status"),
+                "effect_status": qdt_consumption_by_ref.get(str(hint.get("hint_ref")), {}).get(
+                    "effect_status",
+                    "context_only_no_authority"
+                    if (
+                        consumed_by_ref.get(str(hint.get("hint_ref")), {}).get("leaf_ids")
+                        or consumed_by_ref.get(str(hint.get("hint_ref")), {}).get("branch_ids")
+                    )
+                    else "not_consumed_context_only_no_authority",
+                ),
                 "source_market_ref": hint.get("source_market_ref"),
                 "decomposer_consumed": bool(
                     consumed_by_ref.get(str(hint.get("hint_ref")), {}).get("leaf_ids")
@@ -4651,6 +4683,21 @@ def build_amrg_operator_report(
                 ),
                 "consumed_by_leaf_ids": sorted(consumed_by_ref.get(str(hint.get("hint_ref")), {}).get("leaf_ids", [])),
                 "consumed_by_branch_ids": sorted(consumed_by_ref.get(str(hint.get("hint_ref")), {}).get("branch_ids", [])),
+                "ignored_reason_codes": qdt_consumption_by_ref.get(str(hint.get("hint_ref")), {}).get(
+                    "ignored_reason_codes",
+                    []
+                    if (
+                        consumed_by_ref.get(str(hint.get("hint_ref")), {}).get("leaf_ids")
+                        or consumed_by_ref.get(str(hint.get("hint_ref")), {}).get("branch_ids")
+                    )
+                    else ["not_referenced_by_qdt_branch_or_leaf"],
+                ),
+                "allowed_use": hint.get("allowed_use", []),
+                "forbidden_effects": hint.get("prohibited_use", []),
+                "consumption_authority": qdt_consumption_by_ref.get(str(hint.get("hint_ref")), {}).get(
+                    "consumption_authority",
+                    "context_ref_only_no_forecast_authority",
+                ),
             }
             for hint in hints
             if isinstance(hint, dict)
