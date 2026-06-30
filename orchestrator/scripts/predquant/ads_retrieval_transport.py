@@ -151,6 +151,10 @@ RETRIEVAL_DIAGNOSTIC_FORBIDDEN_KEY_FRAGMENTS = (
     "scorecard",
 )
 
+LEGACY_DEFAULT_MAX_TOTAL_SEARCH_CALLS = 2
+BROWSER_SEARCH_RETRY_POLICY_REF = "ads-browser-search-retry/v1"
+BROWSER_SEARCH_RETRY_DIAGNOSTIC_SCHEMA_VERSION = "ads-browser-search-retry-diagnostic/v1"
+
 
 @dataclass(frozen=True)
 class RetrievalProviderPolicy:
@@ -164,6 +168,14 @@ class RetrievalProviderPolicy:
     broad_search_enabled: bool = True
     native_enabled: bool = False
     deterministic_direct_url_source_classes: bool = True
+    leaf_aware_default_search_budget: bool = True
+    default_leaf_search_call_cap: int = 2
+    high_priority_leaf_search_call_cap: int = 2
+    protected_primary_leaf_search_call_cap: int = 3
+    max_browser_search_attempts_per_query: int = 3
+    browser_search_base_backoff_seconds: float = 2.0
+    browser_search_max_backoff_seconds: float = 15.0
+    browser_search_jitter_fraction: float = 0.25
 
 
 @dataclass
@@ -262,6 +274,7 @@ def collect_live_retrieval_candidates(
     provider_policy: RetrievalProviderPolicy | None = None,
     browser_provider: Any | None = None,
     native_candidate_provider: Callable[[dict[str, Any], dict[str, Any]], Any] | None = None,
+    sleep_fn: Callable[[float], None] | None = None,
 ) -> RetrievalTransportResult:
     """Collect live retrieval candidate inputs without granting evidence authority."""
 
@@ -294,9 +307,13 @@ def collect_live_retrieval_candidates(
     direct_fetch_skipped_count = 0
     direct_fetch_cache_hit_count = 0
     search_call_count = 0
+    search_primary_call_count = 0
+    search_retry_attempt_count = 0
     search_call_skipped_count = 0
     search_failure_diagnostics: list[dict[str, Any]] = []
     search_skipped_diagnostics: list[dict[str, Any]] = []
+    search_retry_diagnostics: list[dict[str, Any]] = []
+    search_transport_failed_leaf_ids: set[str] = set()
     search_result_fetch_count = 0
     search_result_fetch_skipped_count = 0
     search_result_fetch_cache_hit_count = 0
@@ -333,11 +350,16 @@ def collect_live_retrieval_candidates(
     max_total_search_elapsed_seconds = max(0.0, float(policy.max_total_search_elapsed_seconds or 0.0))
     search_started_at = time.monotonic()
     search_deadline = search_started_at + max_total_search_elapsed_seconds if max_total_search_elapsed_seconds else None
+    search_budget = _search_budget_for_case(contexts, policy)
+    leaf_search_call_counts: dict[str, int] = {}
+    sleep = sleep_fn or time.sleep
 
     if policy.broad_search_enabled:
         for context in contexts:
             variants = context.get("query_variants") if isinstance(context.get("query_variants"), list) else []
-            for variant in variants[: policy.max_search_variants_per_leaf]:
+            leaf_id = str(context.get("leaf_id") or "")
+            leaf_cap = _leaf_search_call_cap(context, policy)
+            for variant_index, variant in enumerate(variants[: policy.max_search_variants_per_leaf]):
                 if not browser_search_configured:
                     search_call_skipped_count += 1
                     search_skipped_diagnostics.append(
@@ -349,9 +371,22 @@ def collect_live_retrieval_candidates(
                         )
                     )
                     continue
+                if leaf_id in search_transport_failed_leaf_ids:
+                    search_call_skipped_count += 1
+                    search_skipped_diagnostics.append(
+                        _search_query_diagnostic(
+                            context,
+                            variant,
+                            reason_code="skipped_after_provider_failure",
+                            detail="provider_failure_retry_exhausted_for_leaf",
+                        )
+                    )
+                    continue
                 skip_reason = _search_skip_reason(
-                    search_call_count=search_call_count,
-                    max_total_search_calls=max(0, policy.max_total_search_calls),
+                    case_search_call_count=search_primary_call_count,
+                    max_total_search_calls=search_budget["absolute_case_search_cap"],
+                    leaf_search_call_count=leaf_search_call_counts.get(leaf_id, 0),
+                    leaf_search_call_cap=leaf_cap,
                     search_deadline=search_deadline,
                 )
                 if skip_reason:
@@ -360,41 +395,60 @@ def collect_live_retrieval_candidates(
                         _search_query_diagnostic(context, variant, reason_code=skip_reason)
                     )
                     continue
-                search_call_count += 1
-                call_started_at = time.monotonic()
-                search_exception_recorded = False
-                try:
-                    search_records = _search_candidate_urls(
-                        browser_provider,
-                        context,
-                        variant,
-                        searched_at=forecast_timestamp,
-                    )[: policy.max_search_results_per_variant]
-                except Exception as exc:
-                    search_records = []
-                    search_failure_diagnostics.append(
-                        _search_query_diagnostic(
-                            context,
-                            variant,
-                            reason_code="browser_provider_search_exception",
-                            detail=str(exc)[:500] or exc.__class__.__name__,
-                            error_class=exc.__class__.__name__,
+                search_primary_call_count += 1
+                leaf_search_call_counts[leaf_id] = leaf_search_call_counts.get(leaf_id, 0) + 1
+                search_records, attempt_failures, attempt_retry_events = _search_candidate_urls_with_retry(
+                    browser_provider=browser_provider,
+                    context=context,
+                    variants=variants,
+                    start_variant_index=variant_index,
+                    searched_at=forecast_timestamp,
+                    policy=policy,
+                    sleep_fn=sleep,
+                )
+                search_call_count += 1 + sum(
+                    1 for item in attempt_retry_events if item.get("event") == "local_retry"
+                )
+                search_retry_attempt_count += sum(
+                    1 for item in attempt_retry_events if item.get("event") == "local_retry"
+                )
+                search_failure_diagnostics.extend(attempt_failures)
+                search_retry_diagnostics.extend(attempt_retry_events)
+                if any(item.get("event") == "retry_exhausted" for item in attempt_retry_events):
+                    search_transport_failed_leaf_ids.add(leaf_id)
+                    if not (policy.native_enabled and native_candidate_provider is not None):
+                        search_retry_diagnostics.append(
+                            _search_retry_diagnostic(
+                                context,
+                                variant,
+                                event="retryable_stage_error_candidate",
+                                attempt=len(attempt_retry_events),
+                                max_attempts=_browser_search_max_attempts(policy),
+                                failure={
+                                    "retryable": True,
+                                    "failure_class": "browser_search_retry_exhausted",
+                                    "exception_type": None,
+                                },
+                                final_retry_outcome="retryable_retrieval_stage_error_candidate",
+                            )
                         )
-                    )
-                    search_exception_recorded = True
-                elapsed_seconds = max(0.0, time.monotonic() - call_started_at)
-                provider_error = _provider_last_search_error(browser_provider)
-                if provider_error and not search_records and not search_exception_recorded:
-                    search_failure_diagnostics.append(
-                        _search_query_diagnostic(
-                            context,
-                            variant,
-                            reason_code="browser_provider_search_failed",
-                            detail=provider_error,
-                            elapsed_seconds=elapsed_seconds,
-                            error_class="ProviderReportedSearchError",
+                    else:
+                        search_retry_diagnostics.append(
+                            _search_retry_diagnostic(
+                                context,
+                                variant,
+                                event="deferred_to_native_discovery",
+                                attempt=len(attempt_retry_events),
+                                max_attempts=_browser_search_max_attempts(policy),
+                                failure={
+                                    "retryable": True,
+                                    "failure_class": "browser_search_retry_exhausted",
+                                    "exception_type": None,
+                                },
+                                final_retry_outcome="deferred_to_native_discovery",
+                            )
                         )
-                    )
+                search_records = search_records[: policy.max_search_results_per_variant]
                 result.search_candidate_urls.extend(search_records)
                 for search_rank, record in enumerate(search_records, start=1):
                     url = record.get("url") or record.get("canonical_url")
@@ -517,19 +571,46 @@ def collect_live_retrieval_candidates(
             "max_search_variants_per_leaf": policy.max_search_variants_per_leaf,
             "max_search_results_per_variant": policy.max_search_results_per_variant,
             "max_total_search_calls": policy.max_total_search_calls,
+            "effective_case_search_call_cap": search_budget["absolute_case_search_cap"],
+            "leaf_aware_default_search_budget": search_budget["leaf_aware_default_search_budget"],
+            "default_leaf_search_call_cap": policy.default_leaf_search_call_cap,
+            "high_priority_leaf_search_call_cap": policy.high_priority_leaf_search_call_cap,
+            "protected_primary_leaf_search_call_cap": policy.protected_primary_leaf_search_call_cap,
+            "browser_search_retry_policy_ref": BROWSER_SEARCH_RETRY_POLICY_REF,
+            "max_browser_search_attempts_per_query": _browser_search_max_attempts(policy),
+            "provider_failure_retry_cap": _browser_search_max_attempts(policy) - 1,
+            "browser_search_base_backoff_seconds": policy.browser_search_base_backoff_seconds,
+            "browser_search_max_backoff_seconds": policy.browser_search_max_backoff_seconds,
             "max_total_search_elapsed_seconds": max_total_search_elapsed_seconds,
             "max_total_search_result_fetches": policy.max_total_search_result_fetches,
         },
         "direct_url_fetch_attempt_count": direct_fetch_count,
         "direct_url_fetch_skipped_count": direct_fetch_skipped_count,
         "search_call_count": search_call_count,
+        "search_primary_call_count": search_primary_call_count,
+        "search_retry_attempt_count": search_retry_attempt_count,
         "search_call_skipped_count": search_call_skipped_count,
         "direct_url_elapsed_seconds": round(direct_url_elapsed_seconds, 3),
         "search_elapsed_seconds": round(max(0.0, time.monotonic() - search_started_at), 3),
         "total_collection_elapsed_seconds": round(max(0.0, time.monotonic() - collection_started_at), 3),
         "search_failure_count": len(search_failure_diagnostics),
         "search_failure_diagnostics": search_failure_diagnostics,
+        "search_retry_diagnostics": search_retry_diagnostics,
+        "search_retry_exhausted_count": sum(
+            1 for item in search_retry_diagnostics if item.get("event") == "retry_exhausted"
+        ),
+        "search_transport_failed_leaf_ids": sorted(search_transport_failed_leaf_ids),
         "search_skipped_diagnostics": search_skipped_diagnostics,
+        "search_leaf_budgets": [
+            {
+                "leaf_id": str(context.get("leaf_id") or ""),
+                "leaf_search_call_cap": _leaf_search_call_cap(context, policy),
+                "primary_search_call_count": leaf_search_call_counts.get(str(context.get("leaf_id") or ""), 0),
+                "protected_primary_required": _context_requires_protected_primary(context),
+                "high_priority": _context_is_high_priority(context),
+            }
+            for context in contexts
+        ],
         "search_result_fetch_attempt_count": search_result_fetch_count,
         "search_result_fetch_skipped_count": search_result_fetch_skipped_count,
         "canonical_fetch_cache": {
@@ -578,6 +659,11 @@ def _bounded_reason_codes(
             for item in search_skipped_diagnostics
             if isinstance(item, dict) and item.get("reason_code")
         ]
+        skipped_reasons.extend(
+            str(item.get("legacy_reason_code"))
+            for item in search_skipped_diagnostics
+            if isinstance(item, dict) and item.get("legacy_reason_code")
+        )
         reasons.extend(skipped_reasons or ["search_call_limit_reached"])
     if search_failure_count:
         reasons.append("search_provider_failure_recorded")
@@ -973,18 +1059,149 @@ def _provider_last_search_error(browser_provider: Any | None) -> str | None:
     return text[:500] if text else None
 
 
+def _context_requires_protected_primary(context: dict[str, Any]) -> bool:
+    targets = context.get("breadth_targets") if isinstance(context.get("breadth_targets"), dict) else {}
+    return bool(targets.get("protected_primary_required") is True)
+
+
+def _context_is_high_priority(context: dict[str, Any]) -> bool:
+    purpose = str(context.get("purpose") or "")
+    role = str(context.get("leaf_temporal_role") or "")
+    targets = context.get("breadth_targets") if isinstance(context.get("breadth_targets"), dict) else {}
+    source_targets = targets.get("source_class_targets") if isinstance(targets.get("source_class_targets"), list) else []
+    return (
+        role == "pre_resolution_forecast_driver"
+        or purpose in {"source_of_truth", "resolution_mechanics", "direct_evidence", "catalyst"}
+        or "official_or_primary" in source_targets
+    )
+
+
+def _leaf_search_call_cap(context: dict[str, Any], policy: RetrievalProviderPolicy) -> int:
+    default_cap = max(1, int(policy.default_leaf_search_call_cap or 1))
+    if _context_requires_protected_primary(context):
+        return max(default_cap, int(policy.protected_primary_leaf_search_call_cap or default_cap))
+    if _context_is_high_priority(context):
+        return max(default_cap, int(policy.high_priority_leaf_search_call_cap or default_cap))
+    return default_cap
+
+
+def _search_budget_for_case(
+    contexts: list[dict[str, Any]],
+    policy: RetrievalProviderPolicy,
+) -> dict[str, Any]:
+    explicit_cap = max(0, int(policy.max_total_search_calls or 0))
+    use_dynamic_default = (
+        bool(policy.leaf_aware_default_search_budget)
+        and int(policy.max_total_search_calls or 0) == LEGACY_DEFAULT_MAX_TOTAL_SEARCH_CALLS
+    )
+    if use_dynamic_default:
+        cap = min(24, max(8, len(contexts) * 2))
+    else:
+        cap = explicit_cap
+    return {
+        "absolute_case_search_cap": cap,
+        "legacy_max_total_search_calls": explicit_cap,
+        "leaf_aware_default_search_budget": use_dynamic_default,
+    }
+
+
+def _browser_search_max_attempts(policy: RetrievalProviderPolicy) -> int:
+    configured = int(policy.max_browser_search_attempts_per_query or 1)
+    return max(1, configured)
+
+
+def _classify_browser_search_failure(exc: Exception | None = None, *, provider_error: str | None = None) -> dict[str, Any]:
+    text = str(provider_error if provider_error is not None else exc or "").lower()
+    exc_type = type(exc).__name__ if exc is not None else "ProviderReportedSearchError"
+    if isinstance(exc, TimeoutError) or "timeout" in text or "timed out" in text:
+        return {"retryable": True, "failure_class": "timeout", "exception_type": exc_type}
+    if isinstance(exc, (ConnectionError, ConnectionResetError, BrokenPipeError)):
+        return {"retryable": True, "failure_class": "connection_reset", "exception_type": exc_type}
+    if "rate limit" in text or "429" in text or "too many requests" in text:
+        return {"retryable": True, "failure_class": "rate_limit", "exception_type": exc_type}
+    if any(marker in text for marker in ("temporar", "try again", "502", "503", "504", "gateway")):
+        return {"retryable": True, "failure_class": "transient_provider_error", "exception_type": exc_type}
+    if provider_error:
+        return {"retryable": True, "failure_class": "provider_reported_search_error", "exception_type": exc_type}
+    return {"retryable": False, "failure_class": "non_retryable_search_failure", "exception_type": exc_type}
+
+
+def _browser_search_backoff(
+    *,
+    context: dict[str, Any],
+    variant: dict[str, Any],
+    attempt: int,
+    failure_class: str,
+    policy: RetrievalProviderPolicy,
+) -> tuple[float, str, list[float]]:
+    raw = min(
+        float(policy.browser_search_max_backoff_seconds or 0.0),
+        float(policy.browser_search_base_backoff_seconds or 0.0) * (2 ** max(0, attempt - 1)),
+    )
+    jitter_upper = max(0.0, raw * max(0.0, float(policy.browser_search_jitter_fraction or 0.0)))
+    seed_material = {
+        "policy_ref": BROWSER_SEARCH_RETRY_POLICY_REF,
+        "leaf_id": context.get("leaf_id"),
+        "query_variant_id": variant.get("query_variant_id"),
+        "attempt": attempt,
+        "failure_class": failure_class,
+    }
+    digest = hashlib.sha256(repr(seed_material).encode("utf-8")).hexdigest()
+    unit = int(digest[:12], 16) / float(0xFFFFFFFFFFFF)
+    backoff = raw + (unit * jitter_upper)
+    return round(backoff, 3), digest[:16], [0.0, round(jitter_upper, 3)]
+
+
+def _search_retry_diagnostic(
+    context: dict[str, Any],
+    variant: dict[str, Any],
+    *,
+    event: str,
+    attempt: int,
+    max_attempts: int,
+    failure: dict[str, Any] | None = None,
+    backoff_seconds: float | None = None,
+    jitter_seed: str | None = None,
+    jitter_range_seconds: list[float] | None = None,
+    final_retry_outcome: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "schema_version": BROWSER_SEARCH_RETRY_DIAGNOSTIC_SCHEMA_VERSION,
+        "event": event,
+        "component": "browser_search",
+        "leaf_id": context.get("leaf_id"),
+        "parent_branch_id": context.get("parent_branch_id"),
+        "query_variant_id": variant.get("query_variant_id"),
+        "query_role": variant.get("query_role"),
+        "attempt": attempt,
+        "max_attempts": max_attempts,
+        "failure_retryable": bool(failure.get("retryable")) if isinstance(failure, dict) else False,
+        "failure_class": failure.get("failure_class") if isinstance(failure, dict) else None,
+        "exception_type": failure.get("exception_type") if isinstance(failure, dict) else None,
+        "backoff_seconds": backoff_seconds,
+        "jitter_seed": jitter_seed,
+        "jitter_range_seconds": jitter_range_seconds or [0.0, 0.0],
+        "retry_policy_ref": BROWSER_SEARCH_RETRY_POLICY_REF,
+        "final_retry_outcome": final_retry_outcome,
+    }
+
+
 def _search_skip_reason(
     *,
-    search_call_count: int,
+    case_search_call_count: int,
     max_total_search_calls: int,
+    leaf_search_call_count: int,
+    leaf_search_call_cap: int,
     search_deadline: float | None,
 ) -> str | None:
     if max_total_search_calls <= 0:
         return "search_call_cap_zero"
-    if search_call_count >= max_total_search_calls:
-        return "search_call_limit_reached"
     if search_deadline is not None and time.monotonic() >= search_deadline:
-        return "search_elapsed_budget_exhausted"
+        return "skipped_elapsed_budget"
+    if case_search_call_count >= max_total_search_calls:
+        return "skipped_global_case_cap"
+    if leaf_search_call_count >= leaf_search_call_cap:
+        return "skipped_leaf_cap"
     return None
 
 
@@ -997,6 +1214,11 @@ def _search_query_diagnostic(
     elapsed_seconds: float | None = None,
     error_class: str | None = None,
 ) -> dict[str, Any]:
+    legacy_reason_aliases = {
+        "skipped_global_case_cap": "search_call_limit_reached",
+        "skipped_leaf_cap": "search_call_limit_reached",
+        "skipped_elapsed_budget": "search_elapsed_budget_exhausted",
+    }
     diagnostic = {
         "leaf_id": context.get("leaf_id"),
         "parent_branch_id": context.get("parent_branch_id"),
@@ -1004,6 +1226,8 @@ def _search_query_diagnostic(
         "query_role": variant.get("query_role"),
         "reason_code": reason_code,
     }
+    if reason_code in legacy_reason_aliases:
+        diagnostic["legacy_reason_code"] = legacy_reason_aliases[reason_code]
     if detail:
         diagnostic["detail"] = detail[:500]
     if error_class:
@@ -1011,6 +1235,111 @@ def _search_query_diagnostic(
     if elapsed_seconds is not None:
         diagnostic["elapsed_seconds"] = round(float(elapsed_seconds), 3)
     return diagnostic
+
+
+def _search_candidate_urls_with_retry(
+    *,
+    browser_provider: Any | None,
+    context: dict[str, Any],
+    variants: list[dict[str, Any]],
+    start_variant_index: int,
+    searched_at: str,
+    policy: RetrievalProviderPolicy,
+    sleep_fn: Callable[[float], None],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    max_attempts = _browser_search_max_attempts(policy)
+    failures: list[dict[str, Any]] = []
+    retry_events: list[dict[str, Any]] = []
+    if not variants:
+        return [], failures, retry_events
+    for attempt in range(1, max_attempts + 1):
+        selected_variant = variants[min(start_variant_index + attempt - 1, len(variants) - 1)]
+        call_started_at = time.monotonic()
+        try:
+            search_records = _search_candidate_urls(
+                browser_provider,
+                context,
+                selected_variant,
+                searched_at=searched_at,
+            )
+        except Exception as exc:
+            search_records = []
+            elapsed_seconds = max(0.0, time.monotonic() - call_started_at)
+            failure = _classify_browser_search_failure(exc)
+            failures.append(
+                _search_query_diagnostic(
+                    context,
+                    selected_variant,
+                    reason_code="browser_provider_search_exception",
+                    detail=str(exc)[:500] or exc.__class__.__name__,
+                    elapsed_seconds=elapsed_seconds,
+                    error_class=exc.__class__.__name__,
+                )
+            )
+        else:
+            elapsed_seconds = max(0.0, time.monotonic() - call_started_at)
+            provider_error = _provider_last_search_error(browser_provider)
+            if provider_error and not search_records:
+                failure = _classify_browser_search_failure(provider_error=provider_error)
+                failures.append(
+                    _search_query_diagnostic(
+                        context,
+                        selected_variant,
+                        reason_code="browser_provider_search_failed",
+                        detail=provider_error,
+                        elapsed_seconds=elapsed_seconds,
+                        error_class="ProviderReportedSearchError",
+                    )
+                )
+            else:
+                if attempt > 1:
+                    retry_events.append(
+                        _search_retry_diagnostic(
+                            context,
+                            selected_variant,
+                            event="retry_succeeded",
+                            attempt=attempt,
+                            max_attempts=max_attempts,
+                            final_retry_outcome="succeeded_after_retry",
+                        )
+                    )
+                return search_records, failures, retry_events
+        if not failure["retryable"] or attempt >= max_attempts:
+            retry_events.append(
+                _search_retry_diagnostic(
+                    context,
+                    selected_variant,
+                    event="retry_exhausted" if failure["retryable"] else "retry_not_attempted",
+                    attempt=attempt,
+                    max_attempts=max_attempts,
+                    failure=failure,
+                    final_retry_outcome="exhausted" if failure["retryable"] else "non_retryable_failure",
+                )
+            )
+            return [], failures, retry_events
+        backoff_seconds, jitter_seed, jitter_range_seconds = _browser_search_backoff(
+            context=context,
+            variant=selected_variant,
+            attempt=attempt,
+            failure_class=str(failure["failure_class"]),
+            policy=policy,
+        )
+        retry_events.append(
+            _search_retry_diagnostic(
+                context,
+                selected_variant,
+                event="local_retry",
+                attempt=attempt,
+                max_attempts=max_attempts,
+                failure=failure,
+                backoff_seconds=backoff_seconds,
+                jitter_seed=jitter_seed,
+                jitter_range_seconds=jitter_range_seconds,
+                final_retry_outcome="retry_scheduled",
+            )
+        )
+        sleep_fn(backoff_seconds)
+    return [], failures, retry_events
 
 
 def _search_candidate_urls(browser_provider: Any | None, context: dict[str, Any], variant: dict[str, Any], *, searched_at: str) -> list[dict[str, Any]]:

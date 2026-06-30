@@ -61,8 +61,13 @@ REQUIRED_UNRESOLVED_QDT_COVERAGE_DIMENSIONS = {
     "material_unknowns",
     "timing_deadline_constraints",
 }
-SEARCH_CAP_SKIP_REASON_CODES = {"search_call_limit_reached", "search_call_cap_zero"}
-SEARCH_ELAPSED_SKIP_REASON_CODES = {"search_elapsed_budget_exhausted"}
+SEARCH_CAP_SKIP_REASON_CODES = {
+    "search_call_limit_reached",
+    "search_call_cap_zero",
+    "skipped_global_case_cap",
+    "skipped_leaf_cap",
+}
+SEARCH_ELAPSED_SKIP_REASON_CODES = {"search_elapsed_budget_exhausted", "skipped_elapsed_budget"}
 FORBIDDEN_QDT_FIELD_NAMES = {
     "bayesian_weighting",
     "probability",

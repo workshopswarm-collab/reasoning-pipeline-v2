@@ -109,6 +109,40 @@ class TimeoutSearchBrowserProvider(FakeBrowserProvider):
         }
 
 
+class FlakySearchBrowserProvider(FakeBrowserProvider):
+    def __init__(self, *, failures_by_leaf: dict[str, int]):
+        super().__init__()
+        self.failures_by_leaf = dict(failures_by_leaf)
+        self.search_attempts: list[dict[str, str]] = []
+        self.call_counts: dict[str, int] = {}
+
+    def search_candidate_urls(self, query_context: dict, query_variant: dict, *, searched_at: str | None = None) -> list[dict]:
+        leaf_id = str(query_context["leaf_id"])
+        count = self.call_counts.get(leaf_id, 0) + 1
+        self.call_counts[leaf_id] = count
+        self.events.append(("search", leaf_id))
+        self.search_attempts.append(
+            {
+                "leaf_id": leaf_id,
+                "query_variant_id": str(query_variant["query_variant_id"]),
+            }
+        )
+        if count <= self.failures_by_leaf.get(leaf_id, 0):
+            raise TimeoutError(f"transient timeout for {leaf_id}")
+        return [
+            {
+                "leaf_id": leaf_id,
+                "query_variant_id": query_variant["query_variant_id"],
+                "query_role": query_variant.get("query_role") or "primary_leaf_retrieval",
+                "rank": 1,
+                "url": f"https://secondary.example/{leaf_id}/{count}",
+                "title": f"result for {leaf_id}",
+                "snippet": "bounded search result",
+                "searched_at": searched_at,
+            }
+        ]
+
+
 class NoTimestampBrowserProvider(FakeBrowserProvider):
     def fetch_url(self, url: str) -> dict:
         self.events.append(("fetch", url))
@@ -1085,13 +1119,90 @@ class AdsRetrievalTransportTest(unittest.TestCase):
         self.assertEqual(transport.transport_diagnostics["search_call_count"], 1)
         self.assertGreater(transport.transport_diagnostics["search_call_skipped_count"], 0)
         self.assertIn("search_call_limit_reached", transport.transport_diagnostics["bounded_retrieval_reason_codes"])
+        self.assertIn("skipped_global_case_cap", transport.transport_diagnostics["bounded_retrieval_reason_codes"])
         self.assertEqual(
             transport.transport_diagnostics["search_skipped_diagnostics"][0]["reason_code"],
+            "skipped_global_case_cap",
+        )
+        self.assertEqual(
+            transport.transport_diagnostics["search_skipped_diagnostics"][0]["legacy_reason_code"],
             "search_call_limit_reached",
+        )
+
+    def test_failed_second_search_does_not_starve_later_critical_leaves(self) -> None:
+        provider = FlakySearchBrowserProvider(failures_by_leaf={"leaf-direct-evidence": 1})
+        sleep_calls: list[float] = []
+
+        transport = collect_live_retrieval_candidates(
+            qdt=self.qdt,
+            evidence_packet={**self.evidence_packet, "official_source_hints": []},
+            case_contract=self.case_contract,
+            amrg_context=None,
+            source_cutoff_timestamp=CUTOFF_AT,
+            forecast_timestamp=FORECAST_AT,
+            provider_policy=RetrievalProviderPolicy(
+                max_direct_urls=0,
+                max_total_search_result_fetches=0,
+                max_search_results_per_variant=1,
+            ),
+            browser_provider=provider,
+            sleep_fn=sleep_calls.append,
+        )
+
+        searched_leaf_ids = [attempt["leaf_id"] for attempt in provider.search_attempts]
+        self.assertGreater(transport.transport_diagnostics["search_primary_call_count"], 2)
+        self.assertGreater(len(set(searched_leaf_ids)), 2)
+        self.assertIn("leaf-direct-evidence", searched_leaf_ids)
+        self.assertTrue(
+            any(leaf_id not in {"leaf-resolution-mechanics", "leaf-direct-evidence"} for leaf_id in searched_leaf_ids),
+            searched_leaf_ids,
+        )
+        self.assertEqual(transport.transport_diagnostics["search_failure_count"], 1)
+        self.assertEqual(transport.transport_diagnostics["search_retry_attempt_count"], 1)
+        self.assertEqual(len(sleep_calls), 1)
+        self.assertEqual(
+            transport.transport_diagnostics["bounded_retrieval_policy"]["effective_case_search_call_cap"],
+            max(8, len(self.qdt["required_leaf_questions"]) * 2),
+        )
+
+    def test_protected_primary_leaf_receives_reserved_retry_budget(self) -> None:
+        provider = FlakySearchBrowserProvider(failures_by_leaf={"leaf-source-of-truth": 2})
+        sleep_calls: list[float] = []
+
+        transport = collect_live_retrieval_candidates(
+            qdt=self._source_of_truth_qdt(),
+            evidence_packet={**self.evidence_packet, "official_source_hints": []},
+            case_contract=self.case_contract,
+            amrg_context=None,
+            source_cutoff_timestamp=CUTOFF_AT,
+            forecast_timestamp=FORECAST_AT,
+            provider_policy=RetrievalProviderPolicy(
+                max_direct_urls=0,
+                max_total_search_result_fetches=0,
+                max_search_results_per_variant=1,
+            ),
+            browser_provider=provider,
+            sleep_fn=sleep_calls.append,
+        )
+
+        diagnostics = transport.transport_diagnostics
+        self.assertEqual([attempt["leaf_id"] for attempt in provider.search_attempts], ["leaf-source-of-truth"] * 3)
+        self.assertEqual(len({attempt["query_variant_id"] for attempt in provider.search_attempts}), 3)
+        self.assertEqual(diagnostics["search_retry_attempt_count"], 2)
+        self.assertEqual(diagnostics["search_retry_exhausted_count"], 0)
+        self.assertEqual(len(sleep_calls), 2)
+        leaf_budget = diagnostics["search_leaf_budgets"][0]
+        self.assertTrue(leaf_budget["protected_primary_required"])
+        self.assertEqual(leaf_budget["leaf_search_call_cap"], 3)
+        self.assertEqual(leaf_budget["primary_search_call_count"], 1)
+        self.assertEqual(
+            [item["event"] for item in diagnostics["search_retry_diagnostics"]],
+            ["local_retry", "local_retry", "retry_succeeded"],
         )
 
     def test_search_timeout_materializes_fail_closed_packet(self) -> None:
         provider = TimeoutSearchBrowserProvider()
+        sleep_calls: list[float] = []
 
         transport = collect_live_retrieval_candidates(
             qdt=self._resolution_mechanics_qdt(),
@@ -1102,6 +1213,7 @@ class AdsRetrievalTransportTest(unittest.TestCase):
             forecast_timestamp=FORECAST_AT,
             provider_policy=RetrievalProviderPolicy(max_direct_urls=0, max_total_search_calls=1),
             browser_provider=provider,
+            sleep_fn=sleep_calls.append,
         )
         packet = build_live_retrieval_packet_from_candidates(
             self._resolution_mechanics_qdt(),
@@ -1113,7 +1225,10 @@ class AdsRetrievalTransportTest(unittest.TestCase):
             live_policy_overlay=True,
         )
 
-        self.assertEqual(transport.transport_diagnostics["search_failure_count"], 1)
+        self.assertEqual(transport.transport_diagnostics["search_failure_count"], 3)
+        self.assertEqual(transport.transport_diagnostics["search_retry_attempt_count"], 2)
+        self.assertEqual(transport.transport_diagnostics["search_retry_exhausted_count"], 1)
+        self.assertEqual(transport.transport_diagnostics["search_transport_failed_leaf_ids"], ["leaf-resolution-mechanics"])
         self.assertEqual(transport.transport_diagnostics["search_candidate_url_count"], 0)
         self.assertEqual(
             transport.transport_diagnostics["search_candidate_discovery_status"],
@@ -1124,6 +1239,11 @@ class AdsRetrievalTransportTest(unittest.TestCase):
         self.assertIn("search_provider_failure_recorded", transport.transport_diagnostics["bounded_retrieval_reason_codes"])
         self.assertEqual(transport.transport_diagnostics["search_failure_diagnostics"][0]["reason_code"], "browser_provider_search_exception")
         self.assertEqual(transport.transport_diagnostics["search_failure_diagnostics"][0]["error_class"], "TimeoutError")
+        self.assertEqual(
+            [item["event"] for item in transport.transport_diagnostics["search_retry_diagnostics"]],
+            ["local_retry", "local_retry", "retry_exhausted", "retryable_stage_error_candidate"],
+        )
+        self.assertEqual(len(sleep_calls), 2)
         self.assertEqual(
             packet["research_sufficiency_summary"]["classification_dispatch_status"],
             "blocked_insufficient_research",

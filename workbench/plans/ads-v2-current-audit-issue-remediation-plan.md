@@ -402,7 +402,7 @@ Completion note:
 
 ## Phase 2 - Search Failure Handling And Per-Leaf Retrieval Budgets
 
-Status: pending
+Status: complete
 
 Goal: prevent one search success and one provider failure from starving the remaining QDT leaves.
 
@@ -516,12 +516,22 @@ Success criteria:
 
 Checklist:
 
-- [ ] Leaf-aware budget implemented.
-- [ ] Provider failure retry/backoff/fallback recorded.
-- [ ] Exhausted retryable search failure classification tested.
-- [ ] Absolute cap still enforced.
-- [ ] BOI-like run shows no broad leaf starvation.
-- [ ] Temporary clone artifacts deleted.
+- [x] Leaf-aware budget implemented.
+- [x] Provider failure retry/backoff/fallback recorded.
+- [x] Exhausted retryable search failure classification tested.
+- [x] Absolute cap still enforced.
+- [x] BOI-like run shows no broad leaf starvation.
+- [x] Temporary clone artifacts deleted.
+
+Completion note:
+
+- Replaced the legacy default global two-search budget with a bounded leaf-aware case budget while preserving explicit low caps and the absolute cap contract.
+- Added per-leaf primary search counters, protected-primary/high-priority leaf caps, and diagnostics for effective case cap plus per-leaf budget usage.
+- Added browser-search retry diagnostics under `ads-browser-search-retry/v1`: retryable provider failures use deterministic jittered exponential backoff, alternate query variants, and do not consume unrelated leaves' primary search budget.
+- Exhausted retryable search failures now mark the leaf as search-transport failed and surface either `deferred_to_native_discovery` or `retryable_stage_error_candidate`.
+- Search skip diagnostics now distinguish `skipped_global_case_cap`, `skipped_leaf_cap`, `skipped_elapsed_budget`, and `skipped_after_provider_failure`, while preserving legacy aliases for existing reports.
+- Verification passed: `python3 -m unittest scripts.tests.test_ads_retrieval_transport scripts.tests.test_ads_operational_canary scripts.tests.test_ads_operator_review` from `orchestrator`; `python3 -m unittest scripts.tests.test_retrieval` and `python3 -m unittest discover -s scripts/tests -p 'test_*.py'` from `researcher-swarm`; `git diff --check`.
+- Clone proof run `ads-pipeline-run:fe7221a215eb0b8a44cf48c9f059dfdec9deb5dc0e9917306f21bb4c539cf4e6` attempted 3 searches, recorded 0 provider failures, 0 cap skips, and 7 elapsed-budget skips. It failed closed on QDT end-to-end quality and retrieval live acceptance, but Phase 2's broad two-search starvation was not reproduced.
 
 ## Phase 3 - Native Research Candidate Discovery Wiring
 
