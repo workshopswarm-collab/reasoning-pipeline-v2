@@ -10,6 +10,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from predquant.ads_pipeline_runner import NonRetryableStageError, RetryableStageError
+from predquant.ads_retrieval_transport import RetrievalProviderPolicy
 from predquant.ads_stage_logging import validate_failure_class
 from predquant.ads_production_handlers import (
     ADS_PRODUCTION_FAILURE_CLASSES,
@@ -29,6 +30,12 @@ SCHEDULER_SPEC = importlib.util.spec_from_file_location("run_ads_operational_sch
 assert SCHEDULER_SPEC is not None and SCHEDULER_SPEC.loader is not None
 run_ads_operational_scheduler = importlib.util.module_from_spec(SCHEDULER_SPEC)
 SCHEDULER_SPEC.loader.exec_module(run_ads_operational_scheduler)
+
+ONE_CASE_PATH = Path(__file__).resolve().parents[1] / "bin" / "run_ads_one_case_canary.py"
+ONE_CASE_SPEC = importlib.util.spec_from_file_location("run_ads_one_case_canary", ONE_CASE_PATH)
+assert ONE_CASE_SPEC is not None and ONE_CASE_SPEC.loader is not None
+run_ads_one_case_canary = importlib.util.module_from_spec(ONE_CASE_SPEC)
+ONE_CASE_SPEC.loader.exec_module(run_ads_one_case_canary)
 
 
 class AdsProductionHandlersTest(unittest.TestCase):
@@ -145,6 +152,54 @@ class AdsProductionHandlersTest(unittest.TestCase):
         self.assertEqual(provider.provider_id, "test-provider")
         self.assertTrue(callable(provider.fetch_url))
         self.assertTrue(callable(provider.search_candidate_urls))
+
+    def test_one_case_canary_can_pass_explicit_runtime_factories(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            provider_module = Path(tempdir) / "runtime_factories.py"
+            provider_module.write_text(
+                "\n".join(
+                    [
+                        "class Provider:",
+                        "    provider_id = 'one-case-provider'",
+                        "    def fetch_url(self, url):",
+                        "        return {'url': url, 'extraction_status': 'rejected'}",
+                        "    def search_candidate_urls(self, query_context, query_variant, *, searched_at=None):",
+                        "        return []",
+                        "def build_provider():",
+                        "    return Provider()",
+                        "def run_researcher_swarm_runtime(**kwargs):",
+                        "    return {'artifact_type': 'researcher_swarm_runtime_bundle', 'kwargs': sorted(kwargs)}",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            args = SimpleNamespace(
+                decomposer_runtime_transport_response=None,
+                researcher_swarm_runtime_bundle_response=None,
+                retrieval_browser_provider_factory=str(provider_module),
+                researcher_swarm_runtime_runner=str(provider_module),
+                retrieval_provider_policy_json=run_ads_one_case_canary.parse_retrieval_provider_policy(
+                    '{"max_direct_urls":0,"max_total_search_calls":10,"max_total_search_result_fetches":50}'
+                ),
+            )
+
+            kwargs = run_ads_one_case_canary.build_handler_factory_kwargs(args)
+
+        provider = kwargs["retrieval_browser_provider"]
+        self.assertEqual(provider.provider_id, "one-case-provider")
+        self.assertTrue(callable(provider.fetch_url))
+        self.assertTrue(callable(provider.search_candidate_urls))
+        runner = kwargs["researcher_swarm_runtime_runner"]
+        self.assertTrue(callable(runner))
+        self.assertEqual(
+            runner(example=True)["artifact_type"],
+            "researcher_swarm_runtime_bundle",
+        )
+        policy = kwargs["retrieval_provider_policy"]
+        self.assertIsInstance(policy, RetrievalProviderPolicy)
+        self.assertEqual(policy.max_direct_urls, 0)
+        self.assertEqual(policy.max_total_search_calls, 10)
+        self.assertEqual(policy.max_total_search_result_fetches, 50)
 
     def test_true_production_factory_loads_default_retrieval_provider(self):
         class Provider:

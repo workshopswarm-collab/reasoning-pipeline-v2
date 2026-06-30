@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import importlib
+import importlib.util
 import json
 import os
 import sqlite3
@@ -20,6 +22,7 @@ from predquant.ads_operational_canary import (  # noqa: E402
     validate_preflight,
 )
 from predquant.ads_pipeline_runner import RUNNER_MODES, PipelineRunnerContractError  # noqa: E402
+from predquant.ads_retrieval_transport import RetrievalProviderPolicy  # noqa: E402
 from predquant.sqlite_store import DEFAULT_DB_PATH  # noqa: E402
 
 
@@ -33,6 +36,62 @@ def parse_metadata(value: str | None) -> dict:
     if not isinstance(parsed, dict):
         raise argparse.ArgumentTypeError("--metadata-json must decode to a JSON object")
     return parsed
+
+
+def parse_retrieval_provider_policy(value: str | None) -> RetrievalProviderPolicy | None:
+    if value is None:
+        return None
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+    if not isinstance(parsed, dict):
+        raise argparse.ArgumentTypeError("--retrieval-provider-policy-json must decode to a JSON object")
+    try:
+        return RetrievalProviderPolicy(**parsed)
+    except TypeError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
+def load_object(spec: str, *, default_attr: str):
+    module_ref, _, attr = spec.partition(":")
+    if not module_ref:
+        raise argparse.ArgumentTypeError("object module is required")
+    attr = attr or default_attr
+    if module_ref.endswith(".py") or "/" in module_ref:
+        path = Path(module_ref).expanduser().resolve()
+        module_spec = importlib.util.spec_from_file_location(path.stem, path)
+        if module_spec is None or module_spec.loader is None:
+            raise argparse.ArgumentTypeError(f"cannot load object module: {path}")
+        module = importlib.util.module_from_spec(module_spec)
+        module_spec.loader.exec_module(module)
+    else:
+        module = importlib.import_module(module_ref)
+    loaded = getattr(module, attr, None)
+    if not callable(loaded):
+        raise argparse.ArgumentTypeError(f"object is not callable: {spec}")
+    return loaded
+
+
+def build_handler_factory_kwargs(args: argparse.Namespace) -> dict:
+    kwargs = {}
+    if args.decomposer_runtime_transport_response is not None:
+        kwargs["decomposer_runtime_transport_response_path"] = args.decomposer_runtime_transport_response
+    if args.researcher_swarm_runtime_bundle_response is not None:
+        kwargs["researcher_swarm_runtime_bundle_response_path"] = args.researcher_swarm_runtime_bundle_response
+    if getattr(args, "retrieval_browser_provider_factory", None):
+        kwargs["retrieval_browser_provider"] = load_object(
+            args.retrieval_browser_provider_factory,
+            default_attr="build_provider",
+        )()
+    if getattr(args, "researcher_swarm_runtime_runner", None):
+        kwargs["researcher_swarm_runtime_runner"] = load_object(
+            args.researcher_swarm_runtime_runner,
+            default_attr="run_researcher_swarm_runtime",
+        )
+    if getattr(args, "retrieval_provider_policy_json", None) is not None:
+        kwargs["retrieval_provider_policy"] = args.retrieval_provider_policy_json
+    return kwargs
 
 
 def parse_args() -> argparse.Namespace:
@@ -72,6 +131,25 @@ def parse_args() -> argparse.Namespace:
         "--researcher-swarm-runtime-bundle-response",
         type=Path,
         help="Optional researcher-swarm-runtime-bundle JSON passed to production handler factories.",
+    )
+    parser.add_argument(
+        "--retrieval-browser-provider-factory",
+        help=(
+            "Dotted module/path plus optional :factory returning a browser/search provider object. "
+            "The provider is passed to retrieval_browser_provider and remains URL/search transport only."
+        ),
+    )
+    parser.add_argument(
+        "--researcher-swarm-runtime-runner",
+        help=(
+            "Dotted module/path plus optional :callable for a researcher runtime runner. "
+            "The callable receives bounded certified evidence assignments and returns a runtime bundle."
+        ),
+    )
+    parser.add_argument(
+        "--retrieval-provider-policy-json",
+        type=parse_retrieval_provider_policy,
+        help="JSON object used to construct predquant.ads_retrieval_transport.RetrievalProviderPolicy.",
     )
     parser.add_argument(
         "--allow-non-scoreable",
@@ -118,11 +196,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    handler_factory_kwargs = {}
-    if args.decomposer_runtime_transport_response is not None:
-        handler_factory_kwargs["decomposer_runtime_transport_response_path"] = args.decomposer_runtime_transport_response
-    if args.researcher_swarm_runtime_bundle_response is not None:
-        handler_factory_kwargs["researcher_swarm_runtime_bundle_response_path"] = args.researcher_swarm_runtime_bundle_response
+    handler_factory_kwargs = build_handler_factory_kwargs(args)
     config = OperationalCanaryConfig(
         db_path=Path(args.db_path),
         runner_mode=args.runner_mode,

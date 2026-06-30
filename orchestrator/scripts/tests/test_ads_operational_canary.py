@@ -4,6 +4,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -96,6 +97,21 @@ class _SearchProofRetrievalProvider:
     def __init__(self) -> None:
         self._url_content: dict[str, dict[str, Any]] = {}
 
+    def _relative_source_times(self, searched_at: Any) -> dict[str, str]:
+        timestamp = str(searched_at or "2100-01-01T00:00:00+00:00")
+        try:
+            base = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        except ValueError:
+            base = datetime(2100, 1, 1, tzinfo=timezone.utc)
+        if base.tzinfo is None:
+            base = base.replace(tzinfo=timezone.utc)
+        base = base.astimezone(timezone.utc)
+        return {
+            "source_published_at": (base - timedelta(days=1)).isoformat(),
+            "source_updated_at": (base - timedelta(hours=1)).isoformat(),
+            "captured_at": (base - timedelta(minutes=5)).isoformat(),
+        }
+
     def search_candidate_urls(
         self,
         query_context: dict[str, Any],
@@ -109,6 +125,7 @@ class _SearchProofRetrievalProvider:
         if query_context.get("purpose") == "catalyst":
             domains = ["ir.tesla.com", "reuters.com", "gartner.com", "apnews.com", "bloomberg.com"]
         records: list[dict[str, Any]] = []
+        source_times = self._relative_source_times(searched_at)
         for index, domain in enumerate(domains[:required_count], start=1):
             path_leaf = leaf_id.replace("_", "-")
             url = f"https://{domain}/ads-search-proof/{path_leaf}/{index}"
@@ -123,9 +140,7 @@ class _SearchProofRetrievalProvider:
             )
             self._url_content[url] = {
                 "content": content,
-                "source_published_at": "2099-12-30T12:00:00+00:00",
-                "source_updated_at": "2099-12-30T13:00:00+00:00",
-                "captured_at": "2099-12-31T12:00:00+00:00",
+                **source_times,
             }
             records.append(
                 {
