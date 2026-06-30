@@ -1547,6 +1547,144 @@ class AdsOperationalCanaryTest(unittest.TestCase):
         self.assertFalse(evidence["live_acceptance_ok"])
         self.assertFalse(evidence["ok"])
 
+    def test_retrieval_gap_diagnostics_capture_baseline_failure_shape(self):
+        packet_path = Path(self.tempdir.name) / "retrieval-packet.json"
+        packet_path.write_text(
+            json.dumps(
+                {
+                    "adapter_mode": "source_populated_live_retrieval_runtime",
+                    "retrieval_runtime_summary": {
+                        "runtime_mode": "live_retrieval_runtime",
+                        "direct_url_attempt_count": 1,
+                        "web_search_attempt_count": 1,
+                        "search_candidate_url_count": 0,
+                        "browser_search_executed": True,
+                        "browser_search_status": "executed_with_failures",
+                        "direct_url_capture_executed": True,
+                        "direct_url_capture_status": "executed",
+                        "duplicate_canonical_url_omissions": 1,
+                    },
+                    "ads_retrieval_transport_diagnostics": {
+                        "direct_url_candidate_count": 2,
+                        "search_candidate_url_count": 0,
+                        "browser_search_executed": True,
+                        "browser_search_status": "executed_with_failures",
+                    },
+                    "ads_retrieval_direct_url_candidates": [
+                        {"url": "https://boi.org.il/en/markets/schedule"},
+                        {"url": "https://boi.org.il/en/markets/schedule?duplicate=1"},
+                    ],
+                    "search_candidate_urls": [],
+                    "browser_retrieval_attempts": [
+                        {
+                            "navigation_mode": "direct_url",
+                            "url": "https://boi.org.il/en/markets/schedule",
+                            "extraction_status": "accepted",
+                        },
+                        {
+                            "navigation_mode": "web_search",
+                            "url": "https://search.invalid/empty",
+                            "extraction_status": "rejected",
+                        },
+                    ],
+                    "omitted_candidates": [
+                        {
+                            "canonical_url": "https://boi.org.il/en/markets/schedule",
+                            "omission_reason_codes": ["duplicate_canonical_url"],
+                        }
+                    ],
+                    "retrieval_expansion_attempts": [
+                        {"leaf_id": "leaf-a", "attempt_status": "planned_not_executed"},
+                        {"leaf_id": "leaf-b", "attempt_status": "planned_not_executed"},
+                    ],
+                    "research_sufficiency_summary": {
+                        "classification_dispatch_status": "blocked_insufficient_research",
+                        "retrieval_outcome": "insufficient_evidence",
+                    },
+                    "retrieval_outcome_state": {
+                        "retrieval_outcome": "insufficient_evidence",
+                        "classification_dispatch_status": "blocked_insufficient_research",
+                        "terminal_blocked": True,
+                    },
+                    "leaf_retrieval_results": [
+                        {
+                            "leaf_id": "leaf-a",
+                            "admitted_evidence_refs": [
+                                "evidence:hash-only",
+                                "evidence:short",
+                                "evidence:meaningful",
+                            ],
+                            "selected_evidence_refs": [
+                                "evidence:hash-only",
+                                "evidence:short",
+                                "evidence:meaningful",
+                            ],
+                        }
+                    ],
+                    "leaf_evidence_dockets": [
+                        {
+                            "leaf_id": "leaf-a",
+                            "admitted_evidence_refs": [
+                                "evidence:hash-only",
+                                "evidence:short",
+                                "evidence:meaningful",
+                            ],
+                        }
+                    ],
+                    "evidence_chunks": [
+                        {
+                            "evidence_ref": "evidence:hash-only",
+                            "excerpt_policy": "hash_only",
+                            "excerpt_char_count": 12,
+                        },
+                        {
+                            "evidence_ref": "evidence:short",
+                            "excerpt_policy": "redacted_snippet",
+                            "excerpt_char_count": 96,
+                        },
+                        {
+                            "evidence_ref": "evidence:meaningful",
+                            "excerpt_policy": "redacted_snippet",
+                            "excerpt_char_count": 320,
+                        },
+                    ],
+                    "retrieval_breadth_coverage_slices": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        evidence = _retrieval_runtime_evidence(
+            [
+                {
+                    "artifact_id": "artifact:retrieval",
+                    "artifact_type": "retrieval-packet",
+                    "path": str(packet_path),
+                }
+            ]
+        )
+
+        packet = evidence["retrieval_packets"][0]
+        self.assertTrue(packet["browser_search_executed"])
+        self.assertEqual(packet["browser_search_status"], "executed_with_failures")
+        self.assertEqual(packet["search_candidates_materialized_count"], 0)
+        self.assertEqual(packet["planned_not_executed_expansion_count"], 2)
+        self.assertEqual(packet["hash_only_admitted_count"], 1)
+        self.assertEqual(packet["short_chunk_admitted_count"], 2)
+        self.assertEqual(packet["meaningful_snippet_admitted_count"], 1)
+        self.assertEqual(packet["canonical_fetch_duplicate_count"], 1)
+        self.assertEqual(packet["classification_dispatch_status"], "blocked_insufficient_research")
+        self.assertTrue(packet["blocked_when_acceptance_unmet"])
+        self.assertIn("independent_non_market_source_family", packet["acceptance_unmet_dimension_codes"])
+        self.assertEqual(evidence["search_candidates_materialized_count"], 0)
+        self.assertEqual(evidence["planned_not_executed_expansion_count"], 2)
+        self.assertEqual(evidence["hash_only_admitted_count"], 1)
+        self.assertEqual(evidence["short_chunk_admitted_count"], 2)
+        self.assertEqual(evidence["meaningful_snippet_admitted_count"], 1)
+        self.assertEqual(evidence["canonical_fetch_duplicate_count"], 1)
+        self.assertFalse(evidence["live_acceptance_ok"])
+        self.assertFalse(evidence["ok"])
+
     def test_structured_metadata_pilot_does_not_prove_external_source_discovery(self):
         packet_path = Path(self.tempdir.name) / "retrieval-packet.json"
         packet_path.write_text(

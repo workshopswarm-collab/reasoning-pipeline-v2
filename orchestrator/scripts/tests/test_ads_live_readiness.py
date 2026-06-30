@@ -120,6 +120,14 @@ class AdsLiveReadinessTest(unittest.TestCase):
                 "require_scoreable_prediction": False,
                 "first_failing_gate": None,
             },
+            "retrieval_runtime_evidence": {
+                "planned_not_executed_expansion_count": 0,
+                "meaningful_snippet_admitted_count": 0,
+                "hash_only_admitted_count": 0,
+                "short_chunk_admitted_count": 0,
+                "search_candidates_materialized_count": 0,
+                "canonical_fetch_duplicate_count": 0,
+            },
         }
 
     def _seed_calibration_debt_clearance_evidence(self, count: int = 100):
@@ -312,6 +320,17 @@ class AdsLiveReadinessTest(unittest.TestCase):
         self.assertEqual(
             report["strict_non_scoreable_canary_signal_report"]["status"],
             "passed",
+        )
+        self.assertEqual(
+            report["strict_non_scoreable_canary_signal_report"]["retrieval_gap_diagnostics"],
+            {
+                "planned_not_executed_expansion_count": 0,
+                "meaningful_snippet_admitted_count": 0,
+                "hash_only_admitted_count": 0,
+                "short_chunk_admitted_count": 0,
+                "search_candidates_materialized_count": 0,
+                "canonical_fetch_duplicate_count": 0,
+            },
         )
 
     def test_scoreable_gate_blocks_when_strict_canary_evidence_absent(self):

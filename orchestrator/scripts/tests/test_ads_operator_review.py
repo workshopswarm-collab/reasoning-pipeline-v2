@@ -46,6 +46,66 @@ class AdsOperatorReviewTest(unittest.TestCase):
         self.assertEqual(summary["leaf_evidence_docket_count"], 0)
         self.assertEqual(summary["admitted_evidence_ref_count"], 0)
 
+    def test_retrieval_summary_exposes_gap_diagnostics(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            artifact_path = Path(tempdir) / "retrieval.json"
+            artifact_path.write_text(
+                json.dumps(
+                    {
+                        "adapter_mode": "live_retrieval_runtime",
+                        "retrieval_runtime_summary": {
+                            "search_candidate_url_count": 0,
+                            "duplicate_canonical_url_omissions": 1,
+                        },
+                        "research_sufficiency_summary": {
+                            "classification_dispatch_status": "blocked_insufficient_research",
+                        },
+                        "search_candidate_urls": [],
+                        "retrieval_expansion_attempts": [
+                            {"attempt_status": "planned_not_executed"},
+                        ],
+                        "leaf_evidence_dockets": [
+                            {
+                                "leaf_id": "leaf-a",
+                                "admitted_evidence_refs": ["evidence:short"],
+                            }
+                        ],
+                        "leaf_retrieval_results": [
+                            {
+                                "leaf_id": "leaf-a",
+                                "admitted_evidence_refs": ["evidence:short"],
+                            }
+                        ],
+                        "evidence_chunks": [
+                            {
+                                "evidence_ref": "evidence:short",
+                                "excerpt_policy": "hash_only",
+                                "excerpt_char_count": 12,
+                            }
+                        ],
+                    },
+                    sort_keys=True,
+                ),
+                encoding="utf-8",
+            )
+
+            summary = _retrieval_summary(
+                [
+                    {
+                        "stage": "retrieval",
+                        "artifact_id": "retrieval-manifest:1",
+                        "artifact_path": str(artifact_path),
+                    }
+                ]
+            )
+
+        self.assertEqual(summary["planned_not_executed_expansion_count"], 1)
+        self.assertEqual(summary["search_candidates_materialized_count"], 0)
+        self.assertEqual(summary["hash_only_admitted_count"], 1)
+        self.assertEqual(summary["short_chunk_admitted_count"], 1)
+        self.assertEqual(summary["meaningful_snippet_admitted_count"], 0)
+        self.assertEqual(summary["canonical_fetch_duplicate_count"], 1)
+
     def test_true_production_non_scoreable_alerts_are_warnings(self):
         alerts = self._true_production_alerts_for_run(
             {

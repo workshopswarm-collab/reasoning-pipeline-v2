@@ -56,6 +56,14 @@ TRUE_RUNTIME_CUTOVER_STATUSES = {
     "blocked_missing_scae_ledger",
     "blocked_missing_strict_canary",
 }
+RETRIEVAL_GAP_DIAGNOSTIC_FIELDS = (
+    "planned_not_executed_expansion_count",
+    "meaningful_snippet_admitted_count",
+    "hash_only_admitted_count",
+    "short_chunk_admitted_count",
+    "search_candidates_materialized_count",
+    "canonical_fetch_duplicate_count",
+)
 
 
 def _load_health_module() -> Any:
@@ -90,6 +98,15 @@ def _handler_module(handler_factory: str | None) -> str | None:
 
 def _as_list(value: Any) -> list[Any]:
     return value if isinstance(value, list) else []
+
+
+def _int_value(value: Any) -> int:
+    if isinstance(value, bool):
+        return int(value)
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
@@ -219,8 +236,19 @@ def _strict_non_scoreable_canary_signal_report(report: dict[str, Any] | None) ->
             "pipeline_run_id": None,
             "expected_market_predictions": None,
             "require_scoreable_prediction": None,
+            "retrieval_gap_diagnostics": {},
         }
     criteria = report.get("criteria") if isinstance(report.get("criteria"), dict) else {}
+    retrieval = (
+        report.get("retrieval_runtime_evidence")
+        if isinstance(report.get("retrieval_runtime_evidence"), dict)
+        else {}
+    )
+    retrieval_gap_diagnostics = {
+        field: _int_value(retrieval.get(field))
+        for field in RETRIEVAL_GAP_DIAGNOSTIC_FIELDS
+        if field in retrieval
+    }
     expected_predictions = criteria.get("expected_market_predictions")
     require_scoreable_prediction = criteria.get("require_scoreable_prediction")
     first_failing_gate = report.get("first_failing_gate") or criteria.get("first_failing_gate")
@@ -242,6 +270,7 @@ def _strict_non_scoreable_canary_signal_report(report: dict[str, Any] | None) ->
         "pipeline_run_id": report.get("pipeline_run_id"),
         "expected_market_predictions": expected_predictions,
         "require_scoreable_prediction": require_scoreable_prediction,
+        "retrieval_gap_diagnostics": retrieval_gap_diagnostics,
     }
 
 

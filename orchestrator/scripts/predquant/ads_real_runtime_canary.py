@@ -41,6 +41,7 @@ MARKET_SOURCE_CLASSES = {
 }
 UNKNOWN_SOURCE_FAMILY_IDS = {"", "source-family-unknown"}
 GENERIC_QDT_LEAF_IDS = {"leaf-source-of-truth", "leaf-direct-evidence", "leaf-resolution-mechanics"}
+MEANINGFUL_SNIPPET_MIN_CHARS = 280
 QDT_UNRESOLVED_DISPATCHABLE_ROLES = {
     "pre_resolution_forecast_driver",
     "current_status",
@@ -586,6 +587,84 @@ def _int_value(value: Any) -> int:
         return 0
 
 
+def summarize_retrieval_gap(
+    packet: dict[str, Any],
+    *,
+    admitted_refs: set[str] | None = None,
+) -> dict[str, int]:
+    """Return compact counters for ADS live retrieval insufficiency diagnostics."""
+
+    runtime_summary = (
+        packet.get("retrieval_runtime_summary")
+        if isinstance(packet.get("retrieval_runtime_summary"), dict)
+        else {}
+    )
+    transport = (
+        packet.get("ads_retrieval_transport_diagnostics")
+        if isinstance(packet.get("ads_retrieval_transport_diagnostics"), dict)
+        else {}
+    )
+    if admitted_refs is None:
+        admitted_refs = set()
+        for row in _list_of_dicts(packet.get("leaf_retrieval_results")):
+            admitted_refs.update(_evidence_refs_from(row.get("admitted_evidence_refs")))
+        for row in _list_of_dicts(packet.get("leaf_evidence_dockets")):
+            admitted_refs.update(_evidence_refs_from(row.get("admitted_evidence_refs")))
+
+    admitted_chunks = [
+        chunk
+        for chunk in _list_of_dicts(packet.get("evidence_chunks"))
+        if str(chunk.get("evidence_ref") or "") in admitted_refs
+    ]
+    meaningful_snippet_admitted_count = sum(
+        1
+        for chunk in admitted_chunks
+        if str(chunk.get("excerpt_policy") or "") != "hash_only"
+        and _int_value(chunk.get("excerpt_char_count")) >= MEANINGFUL_SNIPPET_MIN_CHARS
+    )
+    hash_only_admitted_count = sum(
+        1 for chunk in admitted_chunks if str(chunk.get("excerpt_policy") or "") == "hash_only"
+    )
+    short_chunk_admitted_count = sum(
+        1
+        for chunk in admitted_chunks
+        if _int_value(chunk.get("excerpt_char_count")) < MEANINGFUL_SNIPPET_MIN_CHARS
+    )
+    canonical_fetch_duplicate_count = max(
+        _int_value(runtime_summary.get("duplicate_canonical_url_omissions")),
+        sum(
+            1
+            for item in _list_of_dicts(packet.get("omitted_candidates"))
+            if "duplicate_canonical_url"
+            in [
+                str(code)
+                for code in (
+                    item.get("omission_reason_codes")
+                    if isinstance(item.get("omission_reason_codes"), list)
+                    else []
+                )
+                if code
+            ]
+        ),
+    )
+    return {
+        "planned_not_executed_expansion_count": sum(
+            1
+            for item in _list_of_dicts(packet.get("retrieval_expansion_attempts"))
+            if item.get("attempt_status") == "planned_not_executed"
+        ),
+        "meaningful_snippet_admitted_count": meaningful_snippet_admitted_count,
+        "hash_only_admitted_count": hash_only_admitted_count,
+        "short_chunk_admitted_count": short_chunk_admitted_count,
+        "search_candidates_materialized_count": max(
+            len(_list_of_dicts(packet.get("search_candidate_urls"))),
+            _int_value(runtime_summary.get("search_candidate_url_count")),
+            _int_value(transport.get("search_candidate_url_count")),
+        ),
+        "canonical_fetch_duplicate_count": canonical_fetch_duplicate_count,
+    }
+
+
 def _known_source_family_id(value: Any) -> str | None:
     if not isinstance(value, str):
         return None
@@ -967,6 +1046,7 @@ def _retrieval_runtime_evidence(manifests: list[dict[str, Any]]) -> dict[str, An
             sufficiency=sufficiency,
             structural_unanswerability_certified=structural_unanswerability_certified,
         )
+        retrieval_gap = summarize_retrieval_gap(payload, admitted_refs=admitted_refs)
         source_populated_or_structural_unanswerability = bool(
             (
                 retrieval_has_real_candidates
@@ -1005,6 +1085,7 @@ def _retrieval_runtime_evidence(manifests: list[dict[str, Any]]) -> dict[str, An
                 "docket_admitted_evidence_ref_count": len(docket_admitted_refs),
                 "selected_evidence_ref_count": len(selected_refs),
                 "reported_evidence_ref_count": len(reported_refs),
+                **retrieval_gap,
                 "structural_unanswerability_certified": structural_unanswerability_certified,
                 "classification_dispatch_allowed": dispatch_allowed,
                 "retrieval_has_real_candidates": retrieval_has_real_candidates,
@@ -1030,6 +1111,20 @@ def _retrieval_runtime_evidence(manifests: list[dict[str, Any]]) -> dict[str, An
         "fetched_attempt_count": sum(int(item["fetched_attempt_count"]) for item in retrieval_packets),
         "admitted_evidence_ref_count": sum(
             int(item["admitted_evidence_ref_count"]) for item in retrieval_packets
+        ),
+        "planned_not_executed_expansion_count": sum(
+            int(item["planned_not_executed_expansion_count"]) for item in retrieval_packets
+        ),
+        "meaningful_snippet_admitted_count": sum(
+            int(item["meaningful_snippet_admitted_count"]) for item in retrieval_packets
+        ),
+        "hash_only_admitted_count": sum(int(item["hash_only_admitted_count"]) for item in retrieval_packets),
+        "short_chunk_admitted_count": sum(int(item["short_chunk_admitted_count"]) for item in retrieval_packets),
+        "search_candidates_materialized_count": sum(
+            int(item["search_candidates_materialized_count"]) for item in retrieval_packets
+        ),
+        "canonical_fetch_duplicate_count": sum(
+            int(item["canonical_fetch_duplicate_count"]) for item in retrieval_packets
         ),
         "external_source_discovery_proven_count": sum(
             1 for item in retrieval_packets if item["external_source_discovery_proven"]
