@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
+from __future__ import annotations
+
 import json
 import sqlite3
 import sys
 import tempfile
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -96,6 +99,61 @@ class _EmptyNativeCandidateProvider:
                 "retry_diagnostics": [],
                 "runtime_reason_codes": ["unit_test_native_provider"],
             },
+        }
+
+
+class _FakeChildProcess:
+    pid = 5151
+
+    def __init__(self) -> None:
+        self.terminated = False
+        self.returncode: int | None = None
+
+    def poll(self) -> int | None:
+        return self.returncode
+
+    def terminate(self) -> None:
+        self.terminated = True
+        self.returncode = -15
+
+    def wait(self, timeout: float | None = None) -> int | None:
+        return self.returncode
+
+
+class _HangingRetrievalProvider:
+    provider_id = "hanging-canary-retrieval-provider"
+    fetch_configured = True
+    search_configured = True
+
+    def __init__(self) -> None:
+        self.child = _FakeChildProcess()
+        self.terminated_children = False
+
+    def fetch_url(self, url: str, *, timeout_seconds: float | None = None) -> dict[str, Any]:
+        time.sleep(30)
+        return {"url": url, "extraction_status": "rejected", "reason_codes": ["unexpected_fetch_returned"]}
+
+    def search_candidate_urls(
+        self,
+        query_context: dict[str, Any],
+        query_variant: dict[str, Any],
+        *,
+        searched_at: Any = None,
+    ) -> list[dict[str, Any]]:
+        return []
+
+    def active_child_processes(self) -> list[_FakeChildProcess]:
+        return [self.child]
+
+    def terminate_children(self, *, reason_code: str | None = None) -> None:
+        self.terminated_children = True
+        self.child.terminate()
+
+    def provider_diagnostics(self) -> dict[str, Any]:
+        return {
+            "provider_id": self.provider_id,
+            "fetch_configured": self.fetch_configured,
+            "search_configured": self.search_configured,
         }
 
 
@@ -1068,6 +1126,71 @@ class AdsOperationalCanaryTest(unittest.TestCase):
         report = build_handoff_report(self.db_path)
         self.assertTrue(report["ok"], report["unresolved_output_manifest_refs"])
         self.assertGreaterEqual(report["manifest_counts_by_validation_status"].get("valid", 0), len(ADS_PIPELINE_STAGE_ORDER))
+
+    def test_true_production_retrieval_timeout_writes_artifact_and_drains_active_work(self):
+        config = self.config(require_scoreable_prediction=False, require_manifest_handoffs=True)
+        provider = _HangingRetrievalProvider()
+        handlers = build_true_production_handlers(
+            db_path=config.db_path,
+            runner_mode=config.runner_mode,
+            forecast_timestamp=config.forecast_timestamp,
+            max_cases=config.max_cases,
+            metadata=config.metadata,
+            decomposer_runtime_transport_response_path=self._decomposer_live_response_path(),
+            retrieval_browser_provider=provider,
+            retrieval_provider_policy=RetrievalProviderPolicy(
+                max_direct_urls=1,
+                broad_search_enabled=False,
+                retrieval_stage_timeout_seconds=0.05,
+                max_provider_call_timeout_seconds=30.0,
+                child_process_termination_grace_seconds=0.0,
+            ),
+            native_candidate_provider=_EmptyNativeCandidateProvider(),
+        )
+
+        result = run_one_case_canary(config, handlers)
+
+        self.assertTrue(result["ok"], result["errors"])
+        self.assertEqual(result["result"]["completed_stage_count"], len(ADS_PIPELINE_STAGE_ORDER))
+        self.assertEqual(result["active_after"], {"active_runs": 0, "active_leases": 0})
+        self.assertEqual(result["protected_count_deltas"]["market_predictions"], 0)
+        self.assertTrue(provider.terminated_children)
+        self.assertTrue(provider.child.terminated)
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            retrieval_row = conn.execute(
+                """
+                SELECT artifact_path
+                FROM case_artifact_manifest
+                WHERE artifact_type = 'retrieval-packet'
+                ORDER BY id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+        self.assertIsNotNone(retrieval_row)
+        retrieval = json.loads(Path(retrieval_row["artifact_path"]).read_text(encoding="utf-8"))
+        runtime_summary = retrieval["retrieval_runtime_summary"]
+        timeout_block = retrieval["retrieval_timeout_readiness_block"]
+        diagnostics = retrieval["ads_retrieval_transport_diagnostics"]
+
+        self.assertEqual(retrieval["adapter_mode"], "source_populated_live_retrieval_runtime")
+        self.assertTrue(runtime_summary["retrieval_stage_timeout"])
+        self.assertEqual(runtime_summary["retrieval_stage_timeout_reason_code"], "retrieval_stage_hard_timeout")
+        self.assertEqual(timeout_block["readiness_status"], "blocked")
+        self.assertFalse(timeout_block["scoreable_write_allowed"])
+        self.assertEqual(diagnostics["browser_provider_status"], "timeout")
+        self.assertTrue(diagnostics["retrieval_stage_timeout"])
+        self.assertEqual(diagnostics["bounded_retrieval_reason_codes"], ["retrieval_stage_hard_timeout"])
+        self.assertEqual(
+            retrieval["research_sufficiency_summary"]["classification_dispatch_status"],
+            "blocked_insufficient_research",
+        )
+        self.assertTrue(
+            any(
+                event["event"] == "provider_cancel_called"
+                for event in timeout_block["child_process_registry"]["events"]
+            )
+        )
 
     def test_true_production_factory_clone_canary_blocks_at_leaf_research_barrier(self):
         config = self.config(

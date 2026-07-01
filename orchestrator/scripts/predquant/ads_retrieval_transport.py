@@ -9,7 +9,10 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import inspect
 import re
+import signal
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -247,6 +250,9 @@ class RetrievalProviderPolicy:
     max_native_candidate_fetches: int = 4
     max_parallel_leaf_tasks: int = 1
     max_parallel_provider_lanes: int = 1
+    retrieval_stage_timeout_seconds: float = 300.0
+    max_provider_call_timeout_seconds: float = 120.0
+    child_process_termination_grace_seconds: float = 2.0
 
 
 @dataclass
@@ -258,6 +264,561 @@ class RetrievalTransportResult:
     supplemental_candidates: list[dict[str, Any]] = field(default_factory=list)
     direct_url_candidates: list[dict[str, Any]] = field(default_factory=list)
     transport_diagnostics: dict[str, Any] = field(default_factory=dict)
+
+
+RETRIEVAL_STAGE_TIMEOUT_REASON_CODE = "retrieval_stage_hard_timeout"
+RETRIEVAL_PROVIDER_CALL_TIMEOUT_REASON_CODE = "retrieval_provider_call_timeout"
+
+
+class RetrievalStageTimeout(Exception):
+    """Terminal timeout for one live retrieval collection attempt."""
+
+    def __init__(self, diagnostics: dict[str, Any]):
+        self.timeout_diagnostics = diagnostics
+        super().__init__(str(diagnostics.get("safe_reason") or diagnostics.get("reason_code") or "retrieval timed out"))
+
+    def attach_child_process_registry(self, summary: dict[str, Any]) -> None:
+        self.timeout_diagnostics["child_process_registry"] = summary
+
+
+class RetrievalChildProcessRegistry:
+    """Best-effort cancellation registry for provider-owned subprocess work."""
+
+    def __init__(self, *, grace_seconds: float) -> None:
+        self.grace_seconds = max(0.0, float(grace_seconds or 0.0))
+        self._providers: list[tuple[str, Any]] = []
+        self._processes: list[tuple[str, Any]] = []
+        self.events: list[dict[str, Any]] = []
+
+    def track_provider(self, provider: Any | None, *, provider_id: str, operation: str) -> None:
+        if provider is None:
+            return
+        if not any(existing is provider for _, existing in self._providers):
+            self._providers.append((provider_id, provider))
+        self._discover_provider_processes(provider, provider_id=provider_id, operation=operation)
+
+    def terminate_all(self, *, reason_code: str) -> dict[str, Any]:
+        self.events.append(
+            {
+                "event": "termination_started",
+                "reason_code": reason_code,
+                "tracked_provider_count": len(self._providers),
+                "tracked_child_process_count": len(self._processes),
+            }
+        )
+        for provider_id, provider in list(self._providers):
+            self._discover_provider_processes(provider, provider_id=provider_id, operation="termination")
+            self._cancel_provider(provider, provider_id=provider_id, reason_code=reason_code)
+        for provider_id, process in list(self._processes):
+            self._terminate_process(process, provider_id=provider_id, reason_code=reason_code)
+        return self.summary()
+
+    def summary(self) -> dict[str, Any]:
+        return {
+            "schema_version": "ads-retrieval-child-process-registry/v1",
+            "tracked_provider_count": len(self._providers),
+            "tracked_child_process_count": len(self._processes),
+            "termination_event_count": len(self.events),
+            "events": copy.deepcopy(self.events),
+        }
+
+    def _add_process(self, process: Any, *, provider_id: str, operation: str) -> None:
+        if process is None:
+            return
+        if any(existing is process for _, existing in self._processes):
+            return
+        self._processes.append((provider_id, process))
+        self.events.append(
+            {
+                "event": "child_process_tracked",
+                "provider_id": provider_id,
+                "operation": operation,
+                "pid": getattr(process, "pid", None),
+            }
+        )
+
+    def _discover_provider_processes(self, provider: Any, *, provider_id: str, operation: str) -> None:
+        for attr_name in ("active_child_processes", "child_processes", "processes"):
+            value = _safe_getattr(provider, attr_name)
+            if callable(value):
+                try:
+                    value = value()
+                except Exception as exc:  # noqa: BLE001 - provider boundary records safe class only
+                    self.events.append(
+                        {
+                            "event": "child_process_discovery_failed",
+                            "provider_id": provider_id,
+                            "operation": operation,
+                            "attribute": attr_name,
+                            "error_class": exc.__class__.__name__,
+                            "safe_reason": str(exc)[:500] or exc.__class__.__name__,
+                        }
+                    )
+                    continue
+            if isinstance(value, (list, tuple, set)):
+                for process in value:
+                    self._add_process(process, provider_id=provider_id, operation=operation)
+        for attr_name in ("active_child_process", "child_process", "process", "popen"):
+            self._add_process(_safe_getattr(provider, attr_name), provider_id=provider_id, operation=operation)
+
+    def _cancel_provider(self, provider: Any, *, provider_id: str, reason_code: str) -> None:
+        for method_name in ("terminate_child_processes", "terminate_children", "cancel", "close", "shutdown"):
+            method = _safe_getattr(provider, method_name)
+            if not callable(method):
+                continue
+            try:
+                _call_provider_cancel_method(method, reason_code=reason_code)
+            except Exception as exc:  # noqa: BLE001 - provider boundary records safe class only
+                self.events.append(
+                    {
+                        "event": "provider_cancel_failed",
+                        "provider_id": provider_id,
+                        "method": method_name,
+                        "error_class": exc.__class__.__name__,
+                        "safe_reason": str(exc)[:500] or exc.__class__.__name__,
+                    }
+                )
+            else:
+                self.events.append(
+                    {
+                        "event": "provider_cancel_called",
+                        "provider_id": provider_id,
+                        "method": method_name,
+                        "status": "succeeded",
+                    }
+                )
+
+    def _terminate_process(self, process: Any, *, provider_id: str, reason_code: str) -> None:
+        pid = getattr(process, "pid", None)
+        status = "unknown"
+        try:
+            poll = getattr(process, "poll", None)
+            if callable(poll) and poll() is not None:
+                status = "already_exited"
+            else:
+                terminate = getattr(process, "terminate", None)
+                if callable(terminate):
+                    terminate()
+                    status = "terminate_sent"
+                wait = getattr(process, "wait", None)
+                if callable(wait):
+                    try:
+                        wait(timeout=self.grace_seconds)
+                    except TypeError:
+                        wait()
+                    except Exception:
+                        kill = getattr(process, "kill", None)
+                        if callable(kill):
+                            kill()
+                            status = "kill_sent_after_grace"
+                poll_after = getattr(process, "poll", None)
+                if callable(poll_after):
+                    exit_code = poll_after()
+                    if exit_code is not None:
+                        status = "exited"
+        except Exception as exc:  # noqa: BLE001 - provider boundary records safe class only
+            self.events.append(
+                {
+                    "event": "child_process_termination_failed",
+                    "provider_id": provider_id,
+                    "pid": pid,
+                    "reason_code": reason_code,
+                    "error_class": exc.__class__.__name__,
+                    "safe_reason": str(exc)[:500] or exc.__class__.__name__,
+                }
+            )
+            return
+        self.events.append(
+            {
+                "event": "child_process_termination_attempted",
+                "provider_id": provider_id,
+                "pid": pid,
+                "reason_code": reason_code,
+                "status": status,
+            }
+        )
+
+
+def _safe_getattr(value: Any, attr_name: str) -> Any:
+    try:
+        return getattr(value, attr_name)
+    except Exception:  # noqa: BLE001 - provider objects may expose unsafe dynamic attrs
+        return None
+
+
+def _callable_accepts_kwarg(callable_obj: Callable[..., Any], kwarg_name: str) -> bool:
+    try:
+        signature = inspect.signature(callable_obj)
+    except (TypeError, ValueError):
+        return False
+    for parameter in signature.parameters.values():
+        if parameter.kind is inspect.Parameter.VAR_KEYWORD:
+            return True
+        if parameter.name == kwarg_name:
+            return True
+    return False
+
+
+def _call_with_optional_timeout(
+    callable_obj: Callable[..., Any],
+    *args: Any,
+    timeout_seconds: float | None,
+    **kwargs: Any,
+) -> Any:
+    if timeout_seconds is not None and _callable_accepts_kwarg(callable_obj, "timeout_seconds"):
+        kwargs["timeout_seconds"] = max(0.0, float(timeout_seconds))
+    return callable_obj(*args, **kwargs)
+
+
+def _call_provider_cancel_method(method: Callable[..., Any], *, reason_code: str) -> Any:
+    if _callable_accepts_kwarg(method, "reason_code"):
+        return method(reason_code=reason_code)
+    return method()
+
+
+def _retrieval_stage_timeout_seconds(policy: RetrievalProviderPolicy) -> float:
+    return max(0.0, float(policy.retrieval_stage_timeout_seconds or 0.0))
+
+
+def _max_provider_call_timeout_seconds(policy: RetrievalProviderPolicy) -> float:
+    return max(0.0, float(policy.max_provider_call_timeout_seconds or 0.0))
+
+
+def _child_process_termination_grace_seconds(policy: RetrievalProviderPolicy) -> float:
+    return max(0.0, float(policy.child_process_termination_grace_seconds or 0.0))
+
+
+def _remaining_retrieval_seconds(
+    deadline: float | None,
+    *,
+    monotonic_fn: Callable[[], float],
+) -> float | None:
+    if deadline is None:
+        return None
+    return max(0.0, deadline - monotonic_fn())
+
+
+def _effective_provider_timeout_seconds(
+    *,
+    policy: RetrievalProviderPolicy,
+    deadline: float | None,
+    monotonic_fn: Callable[[], float],
+) -> tuple[float | None, str | None]:
+    remaining = _remaining_retrieval_seconds(deadline, monotonic_fn=monotonic_fn)
+    provider_cap = _max_provider_call_timeout_seconds(policy)
+    if remaining is not None and remaining <= 0.0:
+        return 0.0, RETRIEVAL_STAGE_TIMEOUT_REASON_CODE
+    if provider_cap <= 0.0:
+        return remaining, RETRIEVAL_STAGE_TIMEOUT_REASON_CODE if remaining is not None else None
+    if remaining is None:
+        return provider_cap, RETRIEVAL_PROVIDER_CALL_TIMEOUT_REASON_CODE
+    if provider_cap < remaining:
+        return provider_cap, RETRIEVAL_PROVIDER_CALL_TIMEOUT_REASON_CODE
+    return remaining, RETRIEVAL_STAGE_TIMEOUT_REASON_CODE
+
+
+def _retrieval_timeout_exception(
+    *,
+    policy: RetrievalProviderPolicy,
+    reason_code: str,
+    operation: str,
+    provider_id: str,
+    collection_started_at: float,
+    monotonic_fn: Callable[[], float],
+    deadline: float | None,
+    provider_timeout_seconds: float | None = None,
+) -> RetrievalStageTimeout:
+    elapsed_seconds = max(0.0, monotonic_fn() - collection_started_at)
+    remaining_seconds = _remaining_retrieval_seconds(deadline, monotonic_fn=monotonic_fn)
+    diagnostics = {
+        "schema_version": "ads-retrieval-stage-timeout/v1",
+        "reason_code": reason_code,
+        "safe_class": "RetrievalStageTimeout",
+        "safe_reason": f"{operation} exceeded the bounded live retrieval deadline",
+        "operation": operation,
+        "provider_id": provider_id,
+        "elapsed_seconds": round(elapsed_seconds, 3),
+        "remaining_seconds": round(remaining_seconds, 3) if remaining_seconds is not None else None,
+        "provider_timeout_seconds": round(provider_timeout_seconds, 3)
+        if provider_timeout_seconds is not None
+        else None,
+        "retrieval_stage_timeout_seconds": _retrieval_stage_timeout_seconds(policy),
+        "max_provider_call_timeout_seconds": _max_provider_call_timeout_seconds(policy),
+        "child_process_termination_grace_seconds": _child_process_termination_grace_seconds(policy),
+    }
+    return RetrievalStageTimeout(diagnostics)
+
+
+def _raise_retrieval_timeout(
+    *,
+    policy: RetrievalProviderPolicy,
+    reason_code: str,
+    operation: str,
+    provider_id: str,
+    collection_started_at: float,
+    monotonic_fn: Callable[[], float],
+    deadline: float | None,
+    child_registry: RetrievalChildProcessRegistry,
+    provider_timeout_seconds: float | None = None,
+) -> None:
+    exc = _retrieval_timeout_exception(
+        policy=policy,
+        reason_code=reason_code,
+        operation=operation,
+        provider_id=provider_id,
+        collection_started_at=collection_started_at,
+        monotonic_fn=monotonic_fn,
+        deadline=deadline,
+        provider_timeout_seconds=provider_timeout_seconds,
+    )
+    child_summary = child_registry.terminate_all(reason_code=reason_code)
+    exc.attach_child_process_registry(child_summary)
+    raise exc
+
+
+def _check_retrieval_deadline(
+    *,
+    policy: RetrievalProviderPolicy,
+    deadline: float | None,
+    monotonic_fn: Callable[[], float],
+    operation: str,
+    provider_id: str,
+    collection_started_at: float,
+    child_registry: RetrievalChildProcessRegistry,
+) -> None:
+    remaining = _remaining_retrieval_seconds(deadline, monotonic_fn=monotonic_fn)
+    if remaining is not None and remaining <= 0.0:
+        _raise_retrieval_timeout(
+            policy=policy,
+            reason_code=RETRIEVAL_STAGE_TIMEOUT_REASON_CODE,
+            operation=operation,
+            provider_id=provider_id,
+            collection_started_at=collection_started_at,
+            monotonic_fn=monotonic_fn,
+            deadline=deadline,
+            child_registry=child_registry,
+            provider_timeout_seconds=0.0,
+        )
+
+
+def _call_with_retrieval_deadline(
+    callback: Callable[[float | None], Any],
+    *,
+    policy: RetrievalProviderPolicy,
+    deadline: float | None,
+    monotonic_fn: Callable[[], float],
+    operation: str,
+    provider: Any | None,
+    provider_id: str,
+    collection_started_at: float,
+    child_registry: RetrievalChildProcessRegistry,
+) -> Any:
+    _check_retrieval_deadline(
+        policy=policy,
+        deadline=deadline,
+        monotonic_fn=monotonic_fn,
+        operation=operation,
+        provider_id=provider_id,
+        collection_started_at=collection_started_at,
+        child_registry=child_registry,
+    )
+    provider_timeout_seconds, timeout_reason_code = _effective_provider_timeout_seconds(
+        policy=policy,
+        deadline=deadline,
+        monotonic_fn=monotonic_fn,
+    )
+    if provider_timeout_seconds is not None and provider_timeout_seconds <= 0.0:
+        _raise_retrieval_timeout(
+            policy=policy,
+            reason_code=timeout_reason_code or RETRIEVAL_STAGE_TIMEOUT_REASON_CODE,
+            operation=operation,
+            provider_id=provider_id,
+            collection_started_at=collection_started_at,
+            monotonic_fn=monotonic_fn,
+            deadline=deadline,
+            child_registry=child_registry,
+            provider_timeout_seconds=provider_timeout_seconds,
+        )
+    child_registry.track_provider(provider, provider_id=provider_id, operation=operation)
+    old_handler = None
+    old_timer: tuple[float, float] | None = None
+    alarm_enabled = False
+
+    def _alarm_handler(_signum: int, _frame: Any) -> None:
+        raise _retrieval_timeout_exception(
+            policy=policy,
+            reason_code=timeout_reason_code or RETRIEVAL_STAGE_TIMEOUT_REASON_CODE,
+            operation=operation,
+            provider_id=provider_id,
+            collection_started_at=collection_started_at,
+            monotonic_fn=monotonic_fn,
+            deadline=deadline,
+            provider_timeout_seconds=provider_timeout_seconds,
+        )
+
+    result: Any = None
+    try:
+        if (
+            provider_timeout_seconds is not None
+            and provider_timeout_seconds > 0.0
+            and threading.current_thread() is threading.main_thread()
+        ):
+            old_timer = signal.getitimer(signal.ITIMER_REAL)
+            if old_timer[0] <= 0.0:
+                old_handler = signal.getsignal(signal.SIGALRM)
+                signal.signal(signal.SIGALRM, _alarm_handler)
+                signal.setitimer(signal.ITIMER_REAL, provider_timeout_seconds)
+                alarm_enabled = True
+        result = callback(provider_timeout_seconds)
+    except RetrievalStageTimeout as exc:
+        child_summary = child_registry.terminate_all(
+            reason_code=str(exc.timeout_diagnostics.get("reason_code") or RETRIEVAL_STAGE_TIMEOUT_REASON_CODE)
+        )
+        exc.attach_child_process_registry(child_summary)
+        raise
+    finally:
+        if alarm_enabled:
+            signal.setitimer(signal.ITIMER_REAL, 0.0)
+            signal.signal(signal.SIGALRM, old_handler)
+            if old_timer and old_timer[0] > 0.0:
+                signal.setitimer(signal.ITIMER_REAL, old_timer[0], old_timer[1])
+    _check_retrieval_deadline(
+        policy=policy,
+        deadline=deadline,
+        monotonic_fn=monotonic_fn,
+        operation=operation,
+        provider_id=provider_id,
+        collection_started_at=collection_started_at,
+        child_registry=child_registry,
+    )
+    return result
+
+
+def build_retrieval_timeout_transport_diagnostics(
+    exc: RetrievalStageTimeout,
+    *,
+    provider_policy: RetrievalProviderPolicy | None = None,
+    browser_provider: Any | None = None,
+    native_candidate_provider: Callable[[dict[str, Any], dict[str, Any]], Any] | None = None,
+    checked_at: str | None = None,
+) -> dict[str, Any]:
+    policy = provider_policy or RetrievalProviderPolicy()
+    browser_provider_diagnostics = _provider_diagnostics(browser_provider)
+    browser_fetch_configured = _provider_capability_configured(
+        browser_provider,
+        "fetch_url",
+        browser_provider_diagnostics,
+        "fetch_configured",
+    )
+    browser_search_configured = _provider_capability_configured(
+        browser_provider,
+        "search_candidate_urls",
+        browser_provider_diagnostics,
+        "search_configured",
+    )
+    timeout_diagnostics = copy.deepcopy(exc.timeout_diagnostics)
+    child_registry_summary = timeout_diagnostics.get("child_process_registry")
+    return {
+        "schema_version": "ads-retrieval-transport-diagnostics/v1",
+        "browser_provider_status": "timeout",
+        "browser_provider_unavailable_reason": None,
+        "browser_fetch_configured": browser_fetch_configured,
+        "browser_search_configured": browser_search_configured,
+        "direct_url_candidate_count": 0,
+        "fetched_candidate_count": 0,
+        "omitted_candidate_count": 0,
+        "search_candidate_url_count": 0,
+        "native_research_candidate_count": 0,
+        "native_candidate_url_count": 0,
+        "native_candidate_fetch_attempt_count": 0,
+        "native_candidate_fetch_skipped_count": 0,
+        "direct_url_capture_executed": False,
+        "direct_url_capture_status": "timeout",
+        "browser_search_executed": False,
+        "browser_search_status": "timeout",
+        "search_candidate_discovery_status": "timeout",
+        "search_failure_blocks_sufficiency": True,
+        "native_research_model_executed": False,
+        "native_research_status": "timeout" if native_candidate_provider is not None else "unavailable",
+        "native_research_call_count": 0,
+        "native_research_failure_count": 0,
+        "native_research_trigger_diagnostics": [],
+        "native_research_failure_diagnostics": [],
+        "native_research_skip_diagnostics": [],
+        "native_research_call_diagnostics": [],
+        "native_research_runtime_calls": [],
+        "native_research_transport_diagnostics": _native_transport_diagnostics(
+            policy=policy,
+            native_candidate_provider=native_candidate_provider,
+            native_research_call_count=0,
+            native_research_failure_diagnostics=[],
+            native_research_runtime_calls=[],
+            checked_at=checked_at,
+        ),
+        "retrieval_stage_timeout": True,
+        "retrieval_stage_timeout_reason_code": str(
+            timeout_diagnostics.get("reason_code") or RETRIEVAL_STAGE_TIMEOUT_REASON_CODE
+        ),
+        "retrieval_stage_timeout_operation": timeout_diagnostics.get("operation"),
+        "retrieval_stage_timeout_provider_id": timeout_diagnostics.get("provider_id"),
+        "retrieval_stage_timeout_seconds": timeout_diagnostics.get("retrieval_stage_timeout_seconds"),
+        "retrieval_stage_timeout_diagnostics": timeout_diagnostics,
+        "child_process_registry": child_registry_summary
+        or {
+            "schema_version": "ads-retrieval-child-process-registry/v1",
+            "tracked_provider_count": 0,
+            "tracked_child_process_count": 0,
+            "termination_event_count": 0,
+            "events": [],
+        },
+        "bounded_retrieval_policy": {
+            "max_direct_urls": policy.max_direct_urls,
+            "max_total_direct_fetches": policy.max_total_direct_fetches,
+            "max_search_variants_per_leaf": policy.max_search_variants_per_leaf,
+            "max_search_results_per_variant": policy.max_search_results_per_variant,
+            "max_total_search_calls": policy.max_total_search_calls,
+            "max_total_search_elapsed_seconds": max(0.0, float(policy.max_total_search_elapsed_seconds or 0.0)),
+            "max_total_search_result_fetches": policy.max_total_search_result_fetches,
+            "max_native_research_calls": policy.max_native_research_calls,
+            "max_native_candidate_fetches": policy.max_native_candidate_fetches,
+            "max_parallel_leaf_tasks": max(1, int(policy.max_parallel_leaf_tasks or 1)),
+            "max_parallel_provider_lanes": max(1, int(policy.max_parallel_provider_lanes or 1)),
+            "retrieval_stage_timeout_seconds": _retrieval_stage_timeout_seconds(policy),
+            "max_provider_call_timeout_seconds": _max_provider_call_timeout_seconds(policy),
+            "child_process_termination_grace_seconds": _child_process_termination_grace_seconds(policy),
+        },
+        "direct_url_fetch_attempt_count": 0,
+        "direct_url_fetch_skipped_count": 0,
+        "direct_url_fetch_leaf_scope_skipped_count": 0,
+        "search_call_count": 0,
+        "search_primary_call_count": 0,
+        "search_retry_attempt_count": 0,
+        "search_call_skipped_count": 0,
+        "direct_url_elapsed_seconds": 0.0,
+        "search_elapsed_seconds": 0.0,
+        "total_collection_elapsed_seconds": timeout_diagnostics.get("elapsed_seconds", 0.0),
+        "search_failure_count": 0,
+        "search_failure_diagnostics": [],
+        "search_retry_diagnostics": [],
+        "search_retry_exhausted_count": 0,
+        "search_transport_failed_leaf_ids": [],
+        "search_skipped_diagnostics": [],
+        "search_leaf_budgets": [],
+        "search_result_fetch_attempt_count": 0,
+        "search_result_fetch_skipped_count": 0,
+        "canonical_fetch_cache": {
+            "schema_version": "canonical-fetch-cache-summary/v1",
+            "cache_key": "canonical_url_plus_cutoff",
+            "unique_fetch_count": 0,
+            "direct_url_cache_hit_count": 0,
+            "search_result_cache_hit_count": 0,
+            "cache_hit_count": 0,
+            "cached_fetch_refs": [],
+        },
+        "bounded_retrieval_reason_codes": [str(timeout_diagnostics.get("reason_code") or RETRIEVAL_STAGE_TIMEOUT_REASON_CODE)],
+        "browser_fetch_authority": "url_fetch_extraction_only",
+        "deterministic_admission_authority": "build_live_retrieval_packet_from_candidates",
+    }
 
 
 def _hash_suffix(value: Any, length: int = 24) -> str:
@@ -475,12 +1036,20 @@ def collect_live_retrieval_candidates(
     browser_provider: Any | None = None,
     native_candidate_provider: Callable[[dict[str, Any], dict[str, Any]], Any] | None = None,
     sleep_fn: Callable[[float], None] | None = None,
+    monotonic_fn: Callable[[], float] | None = None,
 ) -> RetrievalTransportResult:
     """Collect live retrieval candidate inputs without granting evidence authority."""
 
     from researcher_swarm.retrieval import build_retrieval_query_contexts
 
     policy = provider_policy or RetrievalProviderPolicy()
+    monotonic = monotonic_fn or time.monotonic
+    collection_started_at = monotonic()
+    retrieval_timeout_seconds = _retrieval_stage_timeout_seconds(policy)
+    deadline = collection_started_at + retrieval_timeout_seconds if retrieval_timeout_seconds else None
+    child_registry = RetrievalChildProcessRegistry(
+        grace_seconds=_child_process_termination_grace_seconds(policy)
+    )
     browser_provider_diagnostics = _provider_diagnostics(browser_provider)
     browser_fetch_configured = _provider_capability_configured(
         browser_provider,
@@ -554,11 +1123,28 @@ def collect_live_retrieval_candidates(
     native_research_trigger_diagnostics: list[dict[str, Any]] = []
     native_research_call_diagnostics: list[dict[str, Any]] = []
     fetch_cache: dict[tuple[str, str], dict[str, Any]] = {}
-    collection_started_at = time.monotonic()
+    _check_retrieval_deadline(
+        policy=policy,
+        deadline=deadline,
+        monotonic_fn=monotonic,
+        operation="collect_live_retrieval_candidates",
+        provider_id="retrieval_transport",
+        collection_started_at=collection_started_at,
+        child_registry=child_registry,
+    )
     direct_fetch_started_at = collection_started_at
 
     for context in scheduled_contexts:
         for rank, hint in enumerate(direct_urls, start=1):
+            _check_retrieval_deadline(
+                policy=policy,
+                deadline=deadline,
+                monotonic_fn=monotonic,
+                operation="direct_url_fetch",
+                provider_id=_search_provider_id(browser_provider),
+                collection_started_at=collection_started_at,
+                child_registry=child_registry,
+            )
             if not _direct_hint_targets_context(hint, context):
                 direct_fetch_leaf_scope_skipped_count += 1
                 continue
@@ -577,6 +1163,11 @@ def collect_live_retrieval_candidates(
                 search_candidate_url_ref=None,
                 deterministic_direct_url_source_classes=policy.deterministic_direct_url_source_classes,
                 fetch_cache=fetch_cache,
+                policy=policy,
+                deadline=deadline,
+                child_registry=child_registry,
+                monotonic_fn=monotonic,
+                collection_started_at=collection_started_at,
             )
             if candidate.get("canonical_fetch_cache_status") == "hit":
                 direct_fetch_cache_hit_count += 1
@@ -584,9 +1175,9 @@ def collect_live_retrieval_candidates(
                 direct_fetch_count += 1
             result.fetched_candidates.append(candidate)
 
-    direct_url_elapsed_seconds = max(0.0, time.monotonic() - direct_fetch_started_at)
+    direct_url_elapsed_seconds = max(0.0, monotonic() - direct_fetch_started_at)
     max_total_search_elapsed_seconds = max(0.0, float(policy.max_total_search_elapsed_seconds or 0.0))
-    search_started_at = time.monotonic()
+    search_started_at = monotonic()
     search_budget = _search_budget_for_case(scheduled_contexts, policy)
     leaf_search_call_counts: dict[str, int] = {}
     leaf_search_elapsed_seconds: dict[str, float] = {}
@@ -597,13 +1188,22 @@ def collect_live_retrieval_candidates(
             variants = context.get("query_variants") if isinstance(context.get("query_variants"), list) else []
             leaf_id = str(context.get("leaf_id") or "")
             leaf_cap = _leaf_search_call_cap(context, policy)
-            leaf_search_started_at = time.monotonic()
+            leaf_search_started_at = monotonic()
             leaf_search_deadline = (
                 leaf_search_started_at + max_total_search_elapsed_seconds
                 if max_total_search_elapsed_seconds
                 else None
             )
             for variant_index, variant in enumerate(variants[: policy.max_search_variants_per_leaf]):
+                _check_retrieval_deadline(
+                    policy=policy,
+                    deadline=deadline,
+                    monotonic_fn=monotonic,
+                    operation="browser_search",
+                    provider_id=_search_provider_id(browser_provider),
+                    collection_started_at=collection_started_at,
+                    child_registry=child_registry,
+                )
                 if not browser_search_configured:
                     search_call_skipped_count += 1
                     search_skipped_diagnostics.append(
@@ -635,7 +1235,7 @@ def collect_live_retrieval_candidates(
                 )
                 if skip_reason:
                     search_call_skipped_count += 1
-                    elapsed_seconds = max(0.0, time.monotonic() - leaf_search_started_at)
+                    elapsed_seconds = max(0.0, monotonic() - leaf_search_started_at)
                     search_skipped_diagnostics.append(
                         _search_query_diagnostic(
                             context,
@@ -656,7 +1256,7 @@ def collect_live_retrieval_candidates(
                 search_primary_call_count += 1
                 leaf_search_call_counts[leaf_id] = leaf_search_call_counts.get(leaf_id, 0) + 1
                 search_provider_id = _search_provider_id(browser_provider)
-                provider_started = time.monotonic()
+                provider_started = monotonic()
                 search_records, attempt_failures, attempt_retry_events = _search_candidate_urls_with_retry(
                     browser_provider=browser_provider,
                     context=context,
@@ -665,8 +1265,12 @@ def collect_live_retrieval_candidates(
                     searched_at=forecast_timestamp,
                     policy=policy,
                     sleep_fn=sleep,
+                    deadline=deadline,
+                    child_registry=child_registry,
+                    monotonic_fn=monotonic,
+                    collection_started_at=collection_started_at,
                 )
-                provider_elapsed = max(0.0, time.monotonic() - provider_started)
+                provider_elapsed = max(0.0, monotonic() - provider_started)
                 search_safe_error = None
                 search_provider_status = "succeeded"
                 if attempt_failures:
@@ -775,20 +1379,34 @@ def collect_live_retrieval_candidates(
                         search_candidate_url_ref=record.get("search_candidate_url_id") or record.get("candidate_url_ref"),
                         deterministic_direct_url_source_classes=False,
                         fetch_cache=fetch_cache,
+                        policy=policy,
+                        deadline=deadline,
+                        child_registry=child_registry,
+                        monotonic_fn=monotonic,
+                        collection_started_at=collection_started_at,
                     )
                     if candidate.get("canonical_fetch_cache_status") == "hit":
                         search_result_fetch_cache_hit_count += 1
                     elif candidate.get("canonical_fetch_cache_status") == "miss":
                         search_result_fetch_count += 1
                     result.fetched_candidates.append(candidate)
-            leaf_search_elapsed_seconds[leaf_id] = max(0.0, time.monotonic() - leaf_search_started_at)
+            leaf_search_elapsed_seconds[leaf_id] = max(0.0, monotonic() - leaf_search_started_at)
 
-    native_started_at = time.monotonic()
+    native_started_at = monotonic()
     if policy.native_enabled:
         for context in scheduled_contexts:
             variants = context.get("query_variants") if isinstance(context.get("query_variants"), list) else []
             if not variants:
                 continue
+            _check_retrieval_deadline(
+                policy=policy,
+                deadline=deadline,
+                monotonic_fn=monotonic,
+                operation="native_research_candidate_discovery",
+                provider_id="native_research_candidate_discovery",
+                collection_started_at=collection_started_at,
+                child_registry=child_registry,
+            )
             trigger_reasons = _native_discovery_trigger_reasons(
                 context,
                 fetched_candidates=result.fetched_candidates,
@@ -835,9 +1453,26 @@ def collect_live_retrieval_candidates(
                     reason_codes=trigger_reasons,
                 )
             )
-            native_provider_started = time.monotonic()
+            native_provider_started = monotonic()
             try:
-                raw_native = native_candidate_provider(context, variants[0])
+                raw_native = _call_with_retrieval_deadline(
+                    lambda timeout_seconds: _call_with_optional_timeout(
+                        native_candidate_provider,
+                        context,
+                        variants[0],
+                        timeout_seconds=timeout_seconds,
+                    ),
+                    policy=policy,
+                    deadline=deadline,
+                    monotonic_fn=monotonic,
+                    operation="native_research_candidate_discovery",
+                    provider=native_candidate_provider,
+                    provider_id="native_research_candidate_discovery",
+                    collection_started_at=collection_started_at,
+                    child_registry=child_registry,
+                )
+            except RetrievalStageTimeout:
+                raise
             except Exception as exc:  # noqa: BLE001 - transport boundary records safe class only
                 runtime_summary = native_runtime_call_summary(getattr(exc, "runtime_call", None))
                 if runtime_summary is not None:
@@ -856,7 +1491,7 @@ def collect_live_retrieval_candidates(
                     variant=variants[0],
                     runtime_call=runtime_summary,
                     safe_error=safe_error,
-                    elapsed_seconds=max(0.0, time.monotonic() - native_provider_started),
+                    elapsed_seconds=max(0.0, monotonic() - native_provider_started),
                 )
                 source_provider_runtime_refs.append(native_runtime_ref)
                 native_research_call_diagnostics.append(
@@ -908,7 +1543,7 @@ def collect_live_retrieval_candidates(
                     variant=variants[0],
                     runtime_call=runtime_summary,
                     safe_error=safe_error,
-                    elapsed_seconds=max(0.0, time.monotonic() - native_provider_started),
+                    elapsed_seconds=max(0.0, monotonic() - native_provider_started),
                 )
                 source_provider_runtime_refs.append(native_runtime_ref)
                 native_research_call_diagnostics.append(
@@ -950,7 +1585,7 @@ def collect_live_retrieval_candidates(
                 context=context,
                 variant=variants[0],
                 runtime_call=runtime_summary,
-                elapsed_seconds=max(0.0, time.monotonic() - native_provider_started),
+                elapsed_seconds=max(0.0, monotonic() - native_provider_started),
             )
             source_provider_runtime_refs.append(native_runtime_ref)
             native_research_call_diagnostics.append(
@@ -1023,11 +1658,16 @@ def collect_live_retrieval_candidates(
                         fetch_cache=fetch_cache,
                         retrieval_transport="native_gpt_research",
                         native_research_attempt_ref=attempt_ref,
+                        policy=policy,
+                        deadline=deadline,
+                        child_registry=child_registry,
+                        monotonic_fn=monotonic,
+                        collection_started_at=collection_started_at,
                     )
                     if candidate.get("canonical_fetch_cache_status") != "hit":
                         native_candidate_fetch_count += 1
                     result.fetched_candidates.append(candidate)
-    native_elapsed_seconds = max(0.0, time.monotonic() - native_started_at)
+    native_elapsed_seconds = max(0.0, monotonic() - native_started_at)
 
     result.omitted_candidates = [
         candidate
@@ -1061,8 +1701,8 @@ def collect_live_retrieval_candidates(
             )
         )
     )
-    search_elapsed_seconds = max(0.0, time.monotonic() - search_started_at)
-    total_collection_elapsed_seconds = max(0.0, time.monotonic() - collection_started_at)
+    search_elapsed_seconds = max(0.0, monotonic() - search_started_at)
+    total_collection_elapsed_seconds = max(0.0, monotonic() - collection_started_at)
     official_direct_adapter_candidate_count = sum(
         1
         for item in result.direct_url_candidates
@@ -1183,6 +1823,9 @@ def collect_live_retrieval_candidates(
             "max_native_candidate_fetches": policy.max_native_candidate_fetches,
             "max_parallel_leaf_tasks": max(1, int(policy.max_parallel_leaf_tasks or 1)),
             "max_parallel_provider_lanes": max(1, int(policy.max_parallel_provider_lanes or 1)),
+            "retrieval_stage_timeout_seconds": _retrieval_stage_timeout_seconds(policy),
+            "max_provider_call_timeout_seconds": _max_provider_call_timeout_seconds(policy),
+            "child_process_termination_grace_seconds": _child_process_termination_grace_seconds(policy),
             "search_elapsed_budget_scope": "per_leaf_browser_search_lane",
         },
         "direct_url_fetch_attempt_count": direct_fetch_count,
@@ -1241,6 +1884,8 @@ def collect_live_retrieval_candidates(
         ),
         "browser_fetch_authority": "url_fetch_extraction_only",
         "deterministic_admission_authority": "build_live_retrieval_packet_from_candidates",
+        "retrieval_stage_timeout": False,
+        "child_process_registry": child_registry.summary(),
     }
     if packet_safe_browser_provider_diagnostics:
         result.transport_diagnostics["browser_provider_diagnostics"] = packet_safe_browser_provider_diagnostics
@@ -1746,7 +2391,18 @@ def _fetch_candidate(
     fetch_cache: dict[tuple[str, str], dict[str, Any]] | None = None,
     retrieval_transport: str = "browser",
     native_research_attempt_ref: str | None = None,
+    policy: RetrievalProviderPolicy | None = None,
+    deadline: float | None = None,
+    child_registry: RetrievalChildProcessRegistry | None = None,
+    monotonic_fn: Callable[[], float] | None = None,
+    collection_started_at: float | None = None,
 ) -> dict[str, Any]:
+    active_policy = policy or RetrievalProviderPolicy()
+    active_monotonic = monotonic_fn or time.monotonic
+    active_child_registry = child_registry or RetrievalChildProcessRegistry(
+        grace_seconds=_child_process_termination_grace_seconds(active_policy)
+    )
+    active_collection_started_at = collection_started_at if collection_started_at is not None else active_monotonic()
     url = str(hint.get("url") or "")
     canonical_url = _canonicalize_url(url)
     base = {
@@ -1795,7 +2451,21 @@ def _fetch_candidate(
         fetched = copy.deepcopy(fetch_cache[cache_key])
         cache_status = "hit"
     else:
-        fetched = _provider_fetch(browser_provider, url)
+        fetched = _call_with_retrieval_deadline(
+            lambda timeout_seconds: _provider_fetch(
+                browser_provider,
+                url,
+                timeout_seconds=timeout_seconds,
+            ),
+            policy=active_policy,
+            deadline=deadline,
+            monotonic_fn=active_monotonic,
+            operation=f"{navigation_mode}_fetch",
+            provider=browser_provider,
+            provider_id=_search_provider_id(browser_provider),
+            collection_started_at=active_collection_started_at,
+            child_registry=active_child_registry,
+        )
         if fetch_cache is not None and cache_key is not None:
             fetch_cache[cache_key] = copy.deepcopy(fetched)
             cache_status = "miss"
@@ -1925,14 +2595,19 @@ def _direct_hint_allows_inferred_source_time(
     return source_ref.startswith(("case_contract.", "evidence_packet."))
 
 
-def _provider_fetch(browser_provider: Any | None, url: str) -> dict[str, Any]:
+def _provider_fetch(
+    browser_provider: Any | None,
+    url: str,
+    *,
+    timeout_seconds: float | None = None,
+) -> dict[str, Any]:
     if browser_provider is None or not hasattr(browser_provider, "fetch_url"):
         return {
             "url": url,
             "extraction_status": "rejected",
             "reason_codes": ["browser_provider_not_configured"],
         }
-    fetched = browser_provider.fetch_url(url)
+    fetched = _call_with_optional_timeout(browser_provider.fetch_url, url, timeout_seconds=timeout_seconds)
     if not isinstance(fetched, dict):
         return {
             "url": url,
@@ -2488,7 +3163,16 @@ def _search_candidate_urls_with_retry(
     searched_at: str,
     policy: RetrievalProviderPolicy,
     sleep_fn: Callable[[float], None],
+    deadline: float | None = None,
+    child_registry: RetrievalChildProcessRegistry | None = None,
+    monotonic_fn: Callable[[], float] | None = None,
+    collection_started_at: float | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    monotonic = monotonic_fn or time.monotonic
+    active_child_registry = child_registry or RetrievalChildProcessRegistry(
+        grace_seconds=_child_process_termination_grace_seconds(policy)
+    )
+    active_collection_started_at = collection_started_at if collection_started_at is not None else monotonic()
     max_attempts = _browser_search_max_attempts(policy)
     failures: list[dict[str, Any]] = []
     retry_events: list[dict[str, Any]] = []
@@ -2496,17 +3180,30 @@ def _search_candidate_urls_with_retry(
         return [], failures, retry_events
     for attempt in range(1, max_attempts + 1):
         selected_variant = variants[min(start_variant_index + attempt - 1, len(variants) - 1)]
-        call_started_at = time.monotonic()
+        call_started_at = monotonic()
         try:
-            search_records = _search_candidate_urls(
-                browser_provider,
-                context,
-                selected_variant,
-                searched_at=searched_at,
+            search_records = _call_with_retrieval_deadline(
+                lambda timeout_seconds: _search_candidate_urls(
+                    browser_provider,
+                    context,
+                    selected_variant,
+                    searched_at=searched_at,
+                    timeout_seconds=timeout_seconds,
+                ),
+                policy=policy,
+                deadline=deadline,
+                monotonic_fn=monotonic,
+                operation="browser_search",
+                provider=browser_provider,
+                provider_id=_search_provider_id(browser_provider),
+                collection_started_at=active_collection_started_at,
+                child_registry=active_child_registry,
             )
+        except RetrievalStageTimeout:
+            raise
         except Exception as exc:
             search_records = []
-            elapsed_seconds = max(0.0, time.monotonic() - call_started_at)
+            elapsed_seconds = max(0.0, monotonic() - call_started_at)
             failure = _classify_browser_search_failure(exc)
             failures.append(
                 _search_query_diagnostic(
@@ -2519,7 +3216,7 @@ def _search_candidate_urls_with_retry(
                 )
             )
         else:
-            elapsed_seconds = max(0.0, time.monotonic() - call_started_at)
+            elapsed_seconds = max(0.0, monotonic() - call_started_at)
             provider_error = _provider_last_search_error(browser_provider)
             if provider_error and not search_records:
                 failure = _classify_browser_search_failure(provider_error=provider_error)
@@ -2580,14 +3277,41 @@ def _search_candidate_urls_with_retry(
                 final_retry_outcome="retry_scheduled",
             )
         )
-        sleep_fn(backoff_seconds)
+        _call_with_retrieval_deadline(
+            lambda timeout_seconds: sleep_fn(
+                min(backoff_seconds, timeout_seconds)
+                if timeout_seconds is not None
+                else backoff_seconds
+            ),
+            policy=policy,
+            deadline=deadline,
+            monotonic_fn=monotonic,
+            operation="browser_search_retry_backoff",
+            provider=browser_provider,
+            provider_id=_search_provider_id(browser_provider),
+            collection_started_at=active_collection_started_at,
+            child_registry=active_child_registry,
+        )
     return [], failures, retry_events
 
 
-def _search_candidate_urls(browser_provider: Any | None, context: dict[str, Any], variant: dict[str, Any], *, searched_at: str) -> list[dict[str, Any]]:
+def _search_candidate_urls(
+    browser_provider: Any | None,
+    context: dict[str, Any],
+    variant: dict[str, Any],
+    *,
+    searched_at: str,
+    timeout_seconds: float | None = None,
+) -> list[dict[str, Any]]:
     if browser_provider is None or not hasattr(browser_provider, "search_candidate_urls"):
         return []
-    records = browser_provider.search_candidate_urls(context, variant, searched_at=searched_at)
+    records = _call_with_optional_timeout(
+        browser_provider.search_candidate_urls,
+        context,
+        variant,
+        searched_at=searched_at,
+        timeout_seconds=timeout_seconds,
+    )
     if not isinstance(records, list):
         return []
     return [
@@ -2919,6 +3643,8 @@ def _content_sha256(content: str) -> str:
 
 __all__ = [
     "RetrievalProviderPolicy",
+    "RetrievalStageTimeout",
     "RetrievalTransportResult",
+    "build_retrieval_timeout_transport_diagnostics",
     "collect_live_retrieval_candidates",
 ]

@@ -36,6 +36,8 @@ from predquant.ads_manifest_canary_handlers import _active_market_index
 from predquant.ads_pipeline_runner import ADS_PIPELINE_STAGE_ORDER, StageHandlerResult, utc_now_iso
 from predquant.ads_retrieval_transport import (
     RetrievalProviderPolicy,
+    RetrievalStageTimeout,
+    build_retrieval_timeout_transport_diagnostics,
     collect_live_retrieval_candidates,
 )
 from predquant.amrg import materialize_related_live_market_context
@@ -430,6 +432,21 @@ def _attach_live_retrieval_transport_metadata(
                 ),
                 "metadata_classifier_slice_count": len(classifier_slices),
                 "metadata_classifier_unavailable_count": len(classifier_unavailable),
+                "retrieval_stage_timeout": bool(
+                    transport_diagnostics.get("retrieval_stage_timeout")
+                ),
+                "retrieval_stage_timeout_reason_code": transport_diagnostics.get(
+                    "retrieval_stage_timeout_reason_code"
+                ),
+                "retrieval_stage_timeout_operation": transport_diagnostics.get(
+                    "retrieval_stage_timeout_operation"
+                ),
+                "retrieval_stage_timeout_seconds": transport_diagnostics.get(
+                    "retrieval_stage_timeout_seconds"
+                ),
+                "retrieval_child_process_registry": transport_diagnostics.get(
+                    "child_process_registry"
+                ),
             }
         )
     native_transport_diagnostics = transport_diagnostics.get("native_research_transport_diagnostics")
@@ -1832,53 +1849,125 @@ def build_stage_handlers(
             evidence_payload = load_manifest_payload(evidence_manifest)
             related_payload = load_manifest_payload(related_manifest)
             forecast_at = _forecast_timestamp(forecast_timestamp, lease)
-            transport = collect_live_retrieval_candidates(
-                qdt=qdt_payload,
-                evidence_packet=evidence_payload,
-                case_contract=case_contract,
-                amrg_context=related_payload,
-                source_cutoff_timestamp=source_cutoff,
-                forecast_timestamp=forecast_at,
-                provider_policy=retrieval_provider_policy,
-                browser_provider=retrieval_browser_provider,
-                native_candidate_provider=native_candidate_provider,
-            )
-            packet = build_live_retrieval_packet_from_candidates(
-                qdt_payload,
-                evidence_packet=evidence_payload,
-                amrg_context=related_payload,
-                fetched_candidates=transport.fetched_candidates,
-                search_candidate_urls=transport.search_candidate_urls,
-                native_research_candidates=transport.native_research_candidates,
-                supplemental_candidates=transport.supplemental_candidates,
-                question_decomposition_artifact_id=qdt_manifest["artifact_id"],
-                policy_context_ref=profile_manifest["artifact_id"],
-                forecast_timestamp=forecast_at,
-                source_cutoff_timestamp=source_cutoff,
-                pre_dispatch_input_whitelist_refs=[
-                    qdt_manifest["artifact_id"],
-                    evidence_manifest["artifact_id"],
-                    profile_manifest["artifact_id"],
-                    related_manifest["artifact_id"],
-                ],
-                live_retrieval_allowlist=["browser", "native_gpt_research", "structured_feed"],
-                live_policy_overlay=live_policy_overlay,
-                runtime_mode="live_retrieval_runtime",
-            )
-            packet = _attach_live_retrieval_transport_metadata(
-                packet,
-                transport_diagnostics=transport.transport_diagnostics,
-                direct_url_candidates=transport.direct_url_candidates,
-                checked_at=forecast_at,
-            )
-            if (
-                not transport.native_research_candidates
-                and not packet.get("native_research_transport_diagnostics")
-            ):
+            retrieval_timed_out = False
+            try:
+                transport = collect_live_retrieval_candidates(
+                    qdt=qdt_payload,
+                    evidence_packet=evidence_payload,
+                    case_contract=case_contract,
+                    amrg_context=related_payload,
+                    source_cutoff_timestamp=source_cutoff,
+                    forecast_timestamp=forecast_at,
+                    provider_policy=retrieval_provider_policy,
+                    browser_provider=retrieval_browser_provider,
+                    native_candidate_provider=native_candidate_provider,
+                )
+            except RetrievalStageTimeout as exc:
+                retrieval_timed_out = True
+                transport_diagnostics = build_retrieval_timeout_transport_diagnostics(
+                    exc,
+                    provider_policy=retrieval_provider_policy,
+                    browser_provider=retrieval_browser_provider,
+                    native_candidate_provider=native_candidate_provider,
+                    checked_at=forecast_at,
+                )
+                packet = build_live_retrieval_packet_from_candidates(
+                    qdt_payload,
+                    evidence_packet=evidence_payload,
+                    amrg_context=related_payload,
+                    fetched_candidates=[],
+                    search_candidate_urls=[],
+                    native_research_candidates=[],
+                    supplemental_candidates=[],
+                    question_decomposition_artifact_id=qdt_manifest["artifact_id"],
+                    policy_context_ref=profile_manifest["artifact_id"],
+                    forecast_timestamp=forecast_at,
+                    source_cutoff_timestamp=source_cutoff,
+                    pre_dispatch_input_whitelist_refs=[
+                        qdt_manifest["artifact_id"],
+                        evidence_manifest["artifact_id"],
+                        profile_manifest["artifact_id"],
+                        related_manifest["artifact_id"],
+                    ],
+                    live_retrieval_allowlist=["browser", "native_gpt_research", "structured_feed"],
+                    live_policy_overlay=live_policy_overlay,
+                    runtime_mode="live_retrieval_runtime",
+                )
+                packet = _attach_live_retrieval_transport_metadata(
+                    packet,
+                    transport_diagnostics=transport_diagnostics,
+                    direct_url_candidates=[],
+                    checked_at=forecast_at,
+                )
+                timeout_diagnostics = transport_diagnostics.get("retrieval_stage_timeout_diagnostics") or {}
+                packet["retrieval_timeout_readiness_block"] = {
+                    "schema_version": "ads-retrieval-timeout-readiness-block/v1",
+                    "readiness_status": "blocked",
+                    "reason_code": str(
+                        transport_diagnostics.get("retrieval_stage_timeout_reason_code")
+                        or "retrieval_stage_hard_timeout"
+                    ),
+                    "safe_class": "RetrievalStageTimeout",
+                    "safe_reason": str(
+                        timeout_diagnostics.get("safe_reason")
+                        or "live retrieval exceeded the bounded deadline"
+                    )[:500],
+                    "checked_at": forecast_at,
+                    "retrieval_stage_timeout_seconds": transport_diagnostics.get(
+                        "retrieval_stage_timeout_seconds"
+                    ),
+                    "timeout_operation": transport_diagnostics.get(
+                        "retrieval_stage_timeout_operation"
+                    ),
+                    "timeout_provider_id": transport_diagnostics.get(
+                        "retrieval_stage_timeout_provider_id"
+                    ),
+                    "child_process_registry": transport_diagnostics.get("child_process_registry"),
+                    "scoreable_write_allowed": False,
+                }
+            else:
+                packet = build_live_retrieval_packet_from_candidates(
+                    qdt_payload,
+                    evidence_packet=evidence_payload,
+                    amrg_context=related_payload,
+                    fetched_candidates=transport.fetched_candidates,
+                    search_candidate_urls=transport.search_candidate_urls,
+                    native_research_candidates=transport.native_research_candidates,
+                    supplemental_candidates=transport.supplemental_candidates,
+                    question_decomposition_artifact_id=qdt_manifest["artifact_id"],
+                    policy_context_ref=profile_manifest["artifact_id"],
+                    forecast_timestamp=forecast_at,
+                    source_cutoff_timestamp=source_cutoff,
+                    pre_dispatch_input_whitelist_refs=[
+                        qdt_manifest["artifact_id"],
+                        evidence_manifest["artifact_id"],
+                        profile_manifest["artifact_id"],
+                        related_manifest["artifact_id"],
+                    ],
+                    live_retrieval_allowlist=["browser", "native_gpt_research", "structured_feed"],
+                    live_policy_overlay=live_policy_overlay,
+                    runtime_mode="live_retrieval_runtime",
+                )
+                packet = _attach_live_retrieval_transport_metadata(
+                    packet,
+                    transport_diagnostics=transport.transport_diagnostics,
+                    direct_url_candidates=transport.direct_url_candidates,
+                    checked_at=forecast_at,
+                )
+                if (
+                    not transport.native_research_candidates
+                    and not packet.get("native_research_transport_diagnostics")
+                ):
+                    packet = attach_native_research_transport_diagnostics(
+                        packet,
+                        availability_status="unavailable",
+                        unavailable_reason="native_research_transport_not_configured",
+                    )
+            if retrieval_timed_out and not packet.get("native_research_transport_diagnostics"):
                 packet = attach_native_research_transport_diagnostics(
                     packet,
                     availability_status="unavailable",
-                    unavailable_reason="native_research_transport_not_configured",
+                    unavailable_reason="retrieval_stage_timeout",
                 )
         elif scoreable_pilot:
             selected_evidence, evidence_chunks = _structured_market_metadata_evidence(

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import sys
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -26,6 +27,7 @@ from predquant.ads_retrieval_transport import (  # noqa: E402
     DIRECT_URL_SOURCE_PROVIDER_KIND,
     POLYMARKET_CONTRACT_ADAPTER_ID,
     RetrievalProviderPolicy,
+    RetrievalStageTimeout,
     SOURCE_PROVIDER_RUNTIME_REF_SCHEMA_VERSION,
     collect_live_retrieval_candidates,
     normalize_source_provider_result,
@@ -113,6 +115,82 @@ class TimeoutSearchBrowserProvider(FakeBrowserProvider):
             "last_search_error": self.last_search_error,
             "web_fetch_must_not_be_used_as_search": True,
         }
+
+
+class FakeChildProcess:
+    pid = 4242
+
+    def __init__(self) -> None:
+        self.terminated = False
+        self.killed = False
+        self.returncode: int | None = None
+
+    def poll(self) -> int | None:
+        return self.returncode
+
+    def terminate(self) -> None:
+        self.terminated = True
+        self.returncode = -15
+
+    def kill(self) -> None:
+        self.killed = True
+        self.returncode = -9
+
+    def wait(self, timeout: float | None = None) -> int | None:
+        return self.returncode
+
+
+class HangingFetchBrowserProvider(FakeBrowserProvider):
+    provider_id = "hanging-fetch-provider"
+    fetch_configured = True
+    search_configured = False
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.child = FakeChildProcess()
+        self.terminated_children = False
+
+    def fetch_url(self, url: str, *, timeout_seconds: float | None = None) -> dict:
+        self.events.append(("fetch", url))
+        time.sleep(30)
+        return super().fetch_url(url)
+
+    def active_child_processes(self) -> list[FakeChildProcess]:
+        return [self.child]
+
+    def terminate_children(self, *, reason_code: str | None = None) -> None:
+        self.terminated_children = True
+        self.child.terminate()
+
+    def provider_diagnostics(self) -> dict:
+        return {
+            "provider_id": self.provider_id,
+            "fetch_configured": self.fetch_configured,
+            "search_configured": self.search_configured,
+        }
+
+
+class HangingNativeCandidateProvider:
+    def __init__(self) -> None:
+        self.child = FakeChildProcess()
+        self.terminated_children = False
+
+    def __call__(
+        self,
+        _query_context: dict,
+        _query_variant: dict,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> dict:
+        time.sleep(30)
+        return {"native_research_candidates": []}
+
+    def active_child_processes(self) -> list[FakeChildProcess]:
+        return [self.child]
+
+    def terminate_children(self, *, reason_code: str | None = None) -> None:
+        self.terminated_children = True
+        self.child.terminate()
 
 
 class FlakySearchBrowserProvider(FakeBrowserProvider):
@@ -1743,6 +1821,72 @@ class AdsRetrievalTransportTest(unittest.TestCase):
             "blocked_insufficient_research",
         )
         self.assertFalse(packet["leaf_evidence_dockets"][0]["admitted_evidence_refs"])
+
+    def test_hanging_browser_fetch_raises_stage_timeout_and_terminates_children(self) -> None:
+        provider = HangingFetchBrowserProvider()
+
+        with self.assertRaises(RetrievalStageTimeout) as caught:
+            collect_live_retrieval_candidates(
+                qdt=self._resolution_mechanics_qdt(),
+                evidence_packet=self.evidence_packet,
+                case_contract=self.case_contract,
+                amrg_context=None,
+                source_cutoff_timestamp=CUTOFF_AT,
+                forecast_timestamp=FORECAST_AT,
+                provider_policy=RetrievalProviderPolicy(
+                    max_direct_urls=1,
+                    broad_search_enabled=False,
+                    retrieval_stage_timeout_seconds=0.05,
+                    max_provider_call_timeout_seconds=30.0,
+                    child_process_termination_grace_seconds=0.0,
+                ),
+                browser_provider=provider,
+            )
+
+        diagnostics = caught.exception.timeout_diagnostics
+        child_registry = diagnostics["child_process_registry"]
+        self.assertEqual(diagnostics["reason_code"], "retrieval_stage_hard_timeout")
+        self.assertEqual(diagnostics["operation"], "direct_url_fetch")
+        self.assertTrue(provider.terminated_children)
+        self.assertTrue(provider.child.terminated)
+        self.assertGreaterEqual(child_registry["tracked_child_process_count"], 1)
+        self.assertTrue(
+            any(event["event"] == "provider_cancel_called" for event in child_registry["events"])
+        )
+
+    def test_hanging_native_provider_raises_stage_timeout_and_terminates_children(self) -> None:
+        native_provider = HangingNativeCandidateProvider()
+
+        with self.assertRaises(RetrievalStageTimeout) as caught:
+            collect_live_retrieval_candidates(
+                qdt=self._resolution_mechanics_qdt(),
+                evidence_packet={**self.evidence_packet, "official_source_hints": []},
+                case_contract=self.case_contract,
+                amrg_context=None,
+                source_cutoff_timestamp=CUTOFF_AT,
+                forecast_timestamp=FORECAST_AT,
+                provider_policy=RetrievalProviderPolicy(
+                    max_direct_urls=0,
+                    broad_search_enabled=False,
+                    native_enabled=True,
+                    retrieval_stage_timeout_seconds=0.05,
+                    max_provider_call_timeout_seconds=30.0,
+                    child_process_termination_grace_seconds=0.0,
+                ),
+                browser_provider=FakeBrowserProvider(),
+                native_candidate_provider=native_provider,
+            )
+
+        diagnostics = caught.exception.timeout_diagnostics
+        child_registry = diagnostics["child_process_registry"]
+        self.assertEqual(diagnostics["reason_code"], "retrieval_stage_hard_timeout")
+        self.assertEqual(diagnostics["operation"], "native_research_candidate_discovery")
+        self.assertTrue(native_provider.terminated_children)
+        self.assertTrue(native_provider.child.terminated)
+        self.assertGreaterEqual(child_registry["tracked_child_process_count"], 1)
+        self.assertTrue(
+            any(event["event"] == "provider_cancel_called" for event in child_registry["events"])
+        )
 
     def test_no_admissible_evidence_records_bounded_failure_not_certification(self) -> None:
         provider = FakeBrowserProvider(
