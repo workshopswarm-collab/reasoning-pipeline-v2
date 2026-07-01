@@ -477,6 +477,20 @@ def _leaf_looks_like_terminal_verification(leaf: dict[str, Any]) -> bool:
     return any(re.search(pattern, text) for pattern in TERMINAL_RESULT_VERIFICATION_PATTERNS)
 
 
+def _leaf_looks_like_material_unknown_contract(leaf: dict[str, Any]) -> bool:
+    leaf_id = str(leaf.get("leaf_id") or "").lower().replace("_", "-")
+    if "material-unknown" in leaf_id:
+        return True
+    if leaf.get("coverage_dimension") == "material_unknowns":
+        return True
+    text = _leaf_semantic_text(leaf)
+    return "material" in text and (
+        "unknown" in text
+        or "unanswered" in text
+        or "unavailable" in text
+    )
+
+
 def _result_verification_leaf_ids(leaves: list[dict[str, Any]]) -> list[str]:
     return [
         str(leaf.get("leaf_id"))
@@ -2117,6 +2131,24 @@ def _validate_unresolved_forecast_semantics(
         errors.append("missing_pre_resolution_dispatchable_leaves")
         return
 
+    terminal_leaf_ids = sorted(
+        str(leaf.get("leaf_id"))
+        for leaf in leaves_by_id.values()
+        if leaf.get("leaf_id") and leaf.get("leaf_temporal_role") == "terminal_verification"
+    )
+    if terminal_leaf_ids:
+        errors.append("terminal_verification_leaf_for_unresolved_market: " + ", ".join(terminal_leaf_ids))
+
+    material_unknown_role_drift_ids = sorted(
+        str(leaf.get("leaf_id"))
+        for leaf in leaves_by_id.values()
+        if leaf.get("leaf_id")
+        and _leaf_looks_like_material_unknown_contract(leaf)
+        and leaf.get("leaf_temporal_role") != "material_unknown"
+    )
+    if material_unknown_role_drift_ids:
+        errors.append("material_unknown_leaf_role_drift: " + ", ".join(material_unknown_role_drift_ids))
+
     result_verification_ids = _result_verification_leaf_ids(dispatchable_leaves)
     misclassified_ids = sorted(
         str(leaf.get("leaf_id"))
@@ -2222,6 +2254,10 @@ def _validate_research_coverage_graph(
     if market_temporal_state == "unresolved":
         terminal_dispatch = sorted(terminal & dispatchable)
         if terminal_dispatch:
+            errors.append(
+                "dispatchable_terminal_verification_leaf_for_unresolved_market: "
+                + ", ".join(terminal_dispatch)
+            )
             errors.append(
                 "research_coverage_graph.dispatchable_pre_resolution_leaf_ids contains terminal verification leaves: "
                 + ", ".join(terminal_dispatch)
@@ -2612,8 +2648,11 @@ def compute_qdt_quality_checks(
                 "overlapping_leaf_questions_not_deduplicated",
                 "missing_pre_resolution_dispatchable_leaves",
                 "missing_pre_resolution_forecast_dimensions",
+                "terminal_verification_leaf_for_unresolved_market",
                 "terminal_verification_leaf_misclassified_as_pre_resolution",
                 "terminal_verification_dominates_unresolved_forecast_qdt",
+                "dispatchable_terminal_verification_leaf_for_unresolved_market",
+                "material_unknown_leaf_role_drift",
                 "analyst_consensus",
                 "classification_targets",
                 "evidence_requirements",
@@ -2632,8 +2671,11 @@ def compute_qdt_quality_checks(
                 "negative_market_mapping_not_decomposed",
                 "ambiguous_terms_not_decomposed",
                 "market_family_context_not_analyzed",
+                "terminal_verification_leaf_for_unresolved_market",
                 "terminal_verification_leaf_misclassified_as_pre_resolution",
                 "terminal_verification_dominates_unresolved_forecast_qdt",
+                "dispatchable_terminal_verification_leaf_for_unresolved_market",
+                "material_unknown_leaf_role_drift",
                 "analyst_consensus",
                 "specificity_evidence",
                 "leaf_question",

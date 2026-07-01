@@ -221,8 +221,28 @@ class RuntimeDecompositionEntrypointTest(unittest.TestCase):
         self.assertEqual(payload["prompt_schema_version"], "decomposer-qdt-prompt-input/v1")
         self.assertEqual(payload["market_temporal_state"], "unresolved")
         self.assertEqual(payload["source_cutoff_timestamp"], self._handoff()["source_cutoff_timestamp"])
+        self.assertEqual(payload["qdt_role_contract"]["market_temporal_state"], "unresolved")
+        self.assertFalse(payload["qdt_role_contract"]["terminal_verification_allowed"])
+        self.assertFalse(
+            payload["qdt_role_contract"]["terminal_verification_dispatchable_before_resolution"]
+        )
+        self.assertTrue(
+            payload["qdt_role_contract"]["forbid_dispatchable_terminal_leaves_when_unresolved"]
+        )
+        self.assertEqual(payload["qdt_role_contract"]["material_unknowns_role"], "material_unknown")
+        self.assertEqual(
+            payload["qdt_role_contract"]["material_unknowns_coverage_dimension"],
+            "material_unknowns",
+        )
+        self.assertEqual(
+            payload["qdt_role_contract"]["pre_resolution_leaf_question_focus"],
+            "observable_current_drivers_not_final_outcomes",
+        )
         self.assertIn("pre-resolution forecast research", instruction_text)
         self.assertIn("terminal_verification", instruction_text)
+        self.assertIn("unresolved_market_temporal_role_contract", instruction_text)
+        self.assertIn("observable current drivers", instruction_text)
+        self.assertIn("structural uncertainty leaves", instruction_text)
         self.assertIn("weak_context_only=true", instruction_text)
         self.assertIn("consume_relevant_hints_by_ref", payload_text)
         self.assertIn("ignored_reason_codes", payload_text)
@@ -255,6 +275,7 @@ class RuntimeDecompositionEntrypointTest(unittest.TestCase):
         self.assertEqual(crib["required_leaf_fields"], sorted(REQUIRED_LEAF_FIELDS))
         self.assertIn("answerability_status", crib["required_leaf_structural_validation_fields"])
         self.assertIn("qdt_schema_crib_contract", block_ids)
+        self.assertIn("unresolved_market_temporal_role_contract", block_ids)
         self.assertEqual(payload["instructions"]["schema_crib_ref"], "qdt_schema_crib")
 
     def test_live_transport_builds_question_specific_qdt_without_fixture_mode(self) -> None:

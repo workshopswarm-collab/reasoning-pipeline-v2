@@ -127,6 +127,25 @@ def _market_temporal_state_from_handoff(
     return "unresolved"
 
 
+def _qdt_temporal_role_contract(market_temporal_state: str) -> dict[str, Any]:
+    unresolved = market_temporal_state == "unresolved"
+    return {
+        "market_temporal_state": market_temporal_state,
+        "terminal_verification_allowed": not unresolved,
+        "terminal_verification_dispatchable_before_resolution": False if unresolved else None,
+        "forbid_dispatchable_terminal_leaves_when_unresolved": unresolved,
+        "terminal_verification_scope": (
+            "resolved_or_final_result_settlement_checks_only"
+            if unresolved
+            else "resolved_or_settlement_audit_result_checks"
+        ),
+        "material_unknowns_role": "material_unknown",
+        "material_unknowns_coverage_dimension": "material_unknowns",
+        "material_unknowns_dispatch_semantics": "structural_uncertainty_not_terminal_verification",
+        "pre_resolution_leaf_question_focus": "observable_current_drivers_not_final_outcomes",
+    }
+
+
 def _slug(value: str, *, fallback: str) -> str:
     tokens = re.findall(r"[a-z0-9]+", value.lower())
     slug = "-".join(tokens[:4])
@@ -533,6 +552,11 @@ def _ensure_model_candidate_contract_shape(repaired: dict[str, Any]) -> dict[str
             leaf["leaf_temporal_role"] = "pre_resolution_forecast_driver"
             _ensure_analyst_consensus_evidence_fields(leaf)
             leaf.pop("research_sufficiency_requirements", None)
+        elif (
+            leaf.get("coverage_dimension") == "material_unknowns"
+            and leaf.get("leaf_temporal_role") not in ALLOWED_LEAF_TEMPORAL_ROLES
+        ):
+            leaf["leaf_temporal_role"] = "material_unknown"
         else:
             leaf["leaf_temporal_role"] = _normalize_temporal_role(leaf.get("leaf_temporal_role"))
         purpose = str(leaf["purpose"])
@@ -914,6 +938,7 @@ def build_decomposition_prompt_payload(
         evidence_payload=evidence_payload,
     )
     qdt_schema_crib = build_qdt_schema_crib()
+    temporal_role_contract = _qdt_temporal_role_contract(market_temporal_state)
     pre_resolution_instruction = (
         "If market_temporal_state is unresolved, prioritize pre-resolution forecast research. "
         "Ask what current evidence, drivers, blockers, source quality, timing constraints, "
@@ -922,10 +947,19 @@ def build_decomposition_prompt_payload(
         "checks in terminal_verification leaves and mark them non-dispatchable before resolution unless "
         "already observable before the source cutoff."
     )
+    unresolved_role_contract_instruction = (
+        "For unresolved markets, terminal_verification is reserved for resolved/final-result "
+        "settlement checks and must not be dispatchable before resolution. Material unknowns are "
+        "structural uncertainty leaves with coverage_dimension=material_unknowns and "
+        "leaf_temporal_role=material_unknown. Pre-resolution forecast-driver leaves must ask about "
+        "observable current drivers, blockers, source quality, timing, and evidence gaps rather than "
+        "whether the final outcome happened."
+    )
     return {
         "prompt_schema_version": "decomposer-qdt-prompt-input/v1",
         "prompt_template_id": handoff["model_execution_context"]["prompt_template_id"],
         "qdt_schema_crib": qdt_schema_crib,
+        "qdt_role_contract": temporal_role_contract,
         "macro_question": handoff["macro_question"],
         "market_temporal_state": market_temporal_state,
         "source_cutoff_timestamp": source_cutoff_timestamp,
@@ -989,6 +1023,10 @@ def build_decomposition_prompt_payload(
                 "text": pre_resolution_instruction,
             },
             {
+                "block_id": "unresolved_market_temporal_role_contract",
+                "text": unresolved_role_contract_instruction,
+            },
+            {
                 "block_id": "required_qdt_partitions",
                 "text": (
                     "Separate contract guard leaves, material research-factor leaves, material unknowns, "
@@ -1030,7 +1068,9 @@ def build_decomposition_prompt_payload(
             "leaf_budget": COMPACT_DEFAULT_LEAF_BUDGET,
             "make_leaves_question_specific": True,
             "market_temporal_state": market_temporal_state,
+            "qdt_role_contract": temporal_role_contract,
             "pre_resolution_forecast_research": pre_resolution_instruction,
+            "unresolved_market_temporal_role_contract": unresolved_role_contract_instruction,
             "terminal_verification_gating": (
                 "Terminal verification leaves are for settlement/result checks and must not be dispatched "
                 "as pre-resolution research for unresolved markets unless the result is already observable "

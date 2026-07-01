@@ -951,7 +951,114 @@ class QDTContractTest(unittest.TestCase):
         result = validate_question_decomposition(broken)
 
         self.assertFalse(result.valid)
+        self.assertIn("terminal_verification_leaf_for_unresolved_market", "; ".join(result.errors))
+        self.assertIn("dispatchable_terminal_verification_leaf_for_unresolved_market", "; ".join(result.errors))
         self.assertIn("dispatchable_pre_resolution_leaf_ids contains terminal verification", "; ".join(result.errors))
+
+    def test_unresolved_qdt_rejects_non_dispatchable_terminal_verification_leaf(self):
+        selected = select_qdt_candidate([build_fixture_qdt_candidate(self.handoff)])
+        broken = copy.deepcopy(selected)
+        leaf = broken["required_leaf_questions"][0]
+        leaf["leaf_temporal_role"] = "terminal_verification"
+        leaf_id = leaf["leaf_id"]
+        graph = broken["research_coverage_graph"]
+        graph["terminal_verification_leaf_ids"] = [leaf_id]
+        graph["dispatchable_pre_resolution_leaf_ids"] = [
+            item for item in graph["dispatchable_pre_resolution_leaf_ids"] if item != leaf_id
+        ]
+
+        result = validate_question_decomposition(broken)
+
+        joined = "; ".join(result.errors)
+        self.assertFalse(result.valid)
+        self.assertIn("terminal_verification_leaf_for_unresolved_market", joined)
+        self.assertNotIn("dispatchable_terminal_verification_leaf_for_unresolved_market", joined)
+
+    def test_unresolved_qdt_rejects_material_unknown_leaf_role_drift(self):
+        selected = select_qdt_candidate([build_fixture_qdt_candidate(self.handoff)])
+        broken = copy.deepcopy(selected)
+        leaf = next(
+            item for item in broken["required_leaf_questions"]
+            if item["coverage_dimension"] == "material_unknowns"
+        )
+        leaf["leaf_temporal_role"] = "pre_resolution_forecast_driver"
+
+        result = validate_question_decomposition(broken)
+
+        self.assertFalse(result.valid)
+        self.assertIn("material_unknown_leaf_role_drift", "; ".join(result.errors))
+
+    def test_unresolved_qdt_accepts_valid_material_unknown_leaf_contract(self):
+        selected = select_qdt_candidate([build_fixture_qdt_candidate(self.handoff)])
+        leaf = next(
+            item for item in selected["required_leaf_questions"]
+            if item["coverage_dimension"] == "material_unknowns"
+        )
+
+        result = validate_question_decomposition(selected)
+
+        self.assertTrue(result.valid, result.errors)
+        self.assertEqual(leaf["leaf_temporal_role"], "material_unknown")
+        self.assertIn(
+            leaf["leaf_id"],
+            selected["research_coverage_graph"]["required_leaf_ids_by_dimension"]["material_unknowns"],
+        )
+
+    def test_boi_material_unknown_terminal_role_drift_reports_precise_phase1_codes(self):
+        selected = select_qdt_candidate([build_fixture_qdt_candidate(self._bank_of_israel_handoff())])
+        broken = copy.deepcopy(selected)
+        old_leaf_id = "leaf-material-unknowns"
+        new_leaf_id = "leaf-boi-july-material-unknowns"
+        leaf = next(item for item in broken["required_leaf_questions"] if item["leaf_id"] == old_leaf_id)
+        leaf.update(
+            {
+                "leaf_id": new_leaf_id,
+                "leaf_temporal_role": "terminal_verification",
+                "question_text": (
+                    "What material questions remain unanswered about the Bank of Israel July "
+                    "rate-decrease decision before the source cutoff?"
+                ),
+                "leaf_question": (
+                    "What material questions remain unanswered about the Bank of Israel July "
+                    "rate-decrease decision before the source cutoff?"
+                ),
+            }
+        )
+        for branch in broken["branches"]:
+            branch["leaf_ids"] = [
+                new_leaf_id if item == old_leaf_id else item for item in branch["leaf_ids"]
+            ]
+        graph = broken["research_coverage_graph"]
+        for field in (
+            "contract_guard_leaf_ids",
+            "material_question_leaf_ids",
+            "terminal_verification_leaf_ids",
+            "dispatchable_pre_resolution_leaf_ids",
+        ):
+            values = list(graph.get(field) or [])
+            graph[field] = [new_leaf_id if item == old_leaf_id else item for item in values]
+        graph["terminal_verification_leaf_ids"] = sorted(
+            set(graph["terminal_verification_leaf_ids"]) | {new_leaf_id}
+        )
+        graph["dispatchable_pre_resolution_leaf_ids"] = sorted(
+            set(graph["dispatchable_pre_resolution_leaf_ids"]) | {new_leaf_id}
+        )
+        by_dimension = graph["required_leaf_ids_by_dimension"]
+        by_dimension["material_unknowns"] = [
+            new_leaf_id if item == old_leaf_id else item for item in by_dimension["material_unknowns"]
+        ]
+        for factor in graph["research_factors"]:
+            if factor.get("leaf_id") == old_leaf_id:
+                factor["leaf_id"] = new_leaf_id
+                factor["leaf_temporal_role"] = "terminal_verification"
+
+        result = validate_question_decomposition(broken)
+        joined = "; ".join(result.errors)
+
+        self.assertFalse(result.valid)
+        self.assertIn("terminal_verification_leaf_for_unresolved_market", joined)
+        self.assertIn("material_unknown_leaf_role_drift", joined)
+        self.assertIn("dispatchable_terminal_verification_leaf_for_unresolved_market", joined)
 
     def test_generic_mad_lib_leaf_is_rejected(self):
         selected = select_qdt_candidate([build_fixture_qdt_candidate(self.handoff)])
@@ -1239,13 +1346,23 @@ class QDTContractTest(unittest.TestCase):
             item["candidate_id"]: item
             for item in selected["candidate_selection_audit"]["scored_candidates"]
         }
+        rejected = {
+            item["candidate_id"]: item
+            for item in selected["candidate_selection_audit"]["rejected_candidates"]
+        }
 
-        self.assertTrue(validate_question_decomposition(terminal_heavy, require_selected=False).valid)
+        terminal_validation = validate_question_decomposition(terminal_heavy, require_selected=False)
+        self.assertFalse(terminal_validation.valid)
+        self.assertIn(
+            "terminal_verification_leaf_for_unresolved_market",
+            "; ".join(terminal_validation.errors),
+        )
         self.assertEqual(selected["candidate_selection_audit"]["selected_candidate_id"], "qdt-victor-pre-resolution")
-        self.assertGreater(score_qdt_candidate(pre_resolution), score_qdt_candidate(terminal_heavy))
-        self.assertGreater(
-            scored["qdt-victor-terminal-heavy"]["penalty_components"]["terminal_verification_overhead"],
-            0,
+        self.assertNotIn("qdt-victor-terminal-heavy", scored)
+        self.assertIn("qdt-victor-terminal-heavy", rejected)
+        self.assertIn(
+            "terminal_verification_leaf_for_unresolved_market",
+            "; ".join(rejected["qdt-victor-terminal-heavy"]["validation_errors"]),
         )
 
     def test_candidate_selection_penalizes_unsupported_amrg_refs(self):

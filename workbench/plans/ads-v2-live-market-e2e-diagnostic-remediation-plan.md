@@ -122,7 +122,7 @@ Success for cleanup means:
 
 ## Phase 0 - Preserve The Failure Shape And Diagnostic Taxonomy
 
-Status: pending
+Status: completed 2026-07-01
 
 Goal: turn the live-market audit into durable test fixtures and report categories before changing
 behavior.
@@ -268,12 +268,27 @@ Success criteria:
 
 Checklist:
 
-- [ ] Prompt payload updated.
-- [ ] Validator issue codes updated.
-- [ ] BOI unresolved-market regression added.
-- [ ] Prompt and validator tests pass.
-- [ ] No temp artifacts remain.
-- [ ] `git diff --check` passes.
+- [x] Prompt payload updated.
+- [x] Validator issue codes updated.
+- [x] BOI unresolved-market regression added.
+- [x] Prompt and validator tests pass.
+- [x] No temp artifacts remain.
+- [x] `git diff --check` passes.
+
+Completion notes:
+
+- Added an explicit `qdt_role_contract` to the live Decomposer prompt payload and instruction
+  blocks. For unresolved markets it makes terminal verification non-dispatchable, binds material
+  unknowns to `coverage_dimension=material_unknowns` / `leaf_temporal_role=material_unknown`, and
+  tells pre-resolution leaves to focus on observable current drivers rather than final outcomes.
+- Added precise unresolved-market validator issue codes for
+  `terminal_verification_leaf_for_unresolved_market`,
+  `material_unknown_leaf_role_drift`, and
+  `dispatchable_terminal_verification_leaf_for_unresolved_market` while keeping the existing broad
+  graph error for report continuity.
+- Added prompt payload assertions, validator regressions for terminal leakage/material-unknown drift
+  and valid material unknowns, plus a BOI `leaf-boi-july-material-unknowns` regression that preserves
+  the audited failure shape as a precise invalid candidate.
 
 ## Phase 2 - Narrow QDT Material-Unknown Repair
 
