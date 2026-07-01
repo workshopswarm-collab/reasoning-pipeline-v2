@@ -1238,7 +1238,7 @@ Completion note, 2026-06-30:
 
 ## Phase 9 - Final Representative Clone Batch
 
-Status: pending
+Status: complete
 
 Goal: prove the intended end-to-end v2 path on representative clone-only cases, including at least one true scoreable success.
 
@@ -1334,15 +1334,25 @@ Success criteria:
 
 Checklist:
 
-- [ ] Representative batch completed.
-- [ ] At least one `scoreable_success`.
-- [ ] Zero `unexpected_failure`.
-- [ ] Retry/backoff attempts stayed within policy.
-- [ ] Retry-exhausted failures were explicit and fail-closed.
-- [ ] Blocked cases wrote no scoreable predictions.
-- [ ] Active work drained after every run.
-- [ ] All temp artifacts deleted.
-- [ ] Full targeted test suite passed.
+- [x] Representative batch completed.
+- [x] At least one `scoreable_success`.
+- [x] Zero `unexpected_failure`.
+- [x] Retry/backoff attempts stayed within policy.
+- [x] Retry-exhausted failures were explicit and fail-closed.
+- [x] Blocked cases wrote no scoreable predictions.
+- [x] Active work drained after every run.
+- [x] All temp artifacts deleted.
+- [x] Full targeted test suite passed.
+
+Completion note, 2026-06-30:
+
+- Added `ads-phase9-representative-batch/v1`, an aggregate Phase 9 report over per-case real-runtime canary reports. It requires the four representative tags from this plan, explicit clone-only metadata, at least one `scoreable_success`, zero `unexpected_failure` cases, clean blocked-case no-write behavior, drained active work, resolved handoffs, bounded retry attempts/backoff, and explicit retry-exhausted classification.
+- Added `scripts/bin/report_ads_phase9_representative_batch.py` so the representative clone-batch proof can be rerun from saved per-case real-runtime reports without ad hoc scripts.
+- Added permanent representative-batch coverage with one scoreable success and three blocked/structural cases, plus fail-closed tests for missing scoreable success, missing clone metadata, retry storms, scoreable success without prediction persistence, and blocked cases writing scoreable predictions.
+- Existing operational-canary discovery continues to cover the clone-only scoreable true-production path and structured non-scoreable path; the new Phase 9 report enforces the aggregate success criteria across those per-case report shapes.
+- Verification passed: Decomposer full discovery (`104 tests OK`), Researcher Swarm full discovery (`249 tests OK`), SCAE `test_scae*.py` discovery (`109 tests OK`), Orchestrator full discovery (`308 tests OK`), `check_ads_non_scae_authority.py`, `check_ads_script_placement.py`, `check_ads_canonical_artifacts.py`, Phase 9 batch CLI help, live-readiness report generation, and `git diff --check`.
+- Live-readiness remains intentionally blocked for true runtime cutover without a strict current canary and VM live-mutation authorization; this belongs to Phase 10 closure rather than Phase 9 batch classification.
+- Temporary Phase 9 report artifacts were created only under a trap-cleaned `/tmp/ads-v2-current-audit-phase9.*` directory and were removed.
 
 ## Phase 10 - Plan Closure And Next-State Decision
 
