@@ -922,6 +922,8 @@ class AdsRetrievalTransportTest(unittest.TestCase):
                 {
                     "url": "https://native.example/source",
                     "source_label": "Native candidate",
+                    "source_type_hint": "official_site_or_independent_reporting",
+                    "reason": "May contain source material for this leaf.",
                     "candidate_claim_text": "Candidate claim only.",
                 }
             ]
@@ -947,9 +949,19 @@ class AdsRetrievalTransportTest(unittest.TestCase):
         self.assertEqual(transport.transport_diagnostics["native_candidate_fetch_attempt_count"], 1)
         self.assertEqual(transport.transport_diagnostics["native_research_failure_count"], 0)
         self.assertEqual(native_candidate["url"], "https://native.example/source")
+        self.assertEqual(native_candidate["source_type_hint"], "official_site_or_independent_reporting")
+        self.assertEqual(native_candidate["reason"], "May contain source material for this leaf.")
         self.assertEqual(transport.fetched_candidates[0]["retrieval_transport"], "native_gpt_research")
         self.assertEqual(transport.fetched_candidates[0]["navigation_mode"], "native_gpt_research")
         self.assertEqual(transport.fetched_candidates[0]["native_research_attempt_ref"], None)
+        self.assertNotEqual(transport.fetched_candidates[0].get("source_class"), "official_or_primary")
+        call_diagnostic = transport.transport_diagnostics["native_research_call_diagnostics"][0]
+        self.assertEqual(call_diagnostic["event"], "native_discovery_call_completed")
+        self.assertEqual(call_diagnostic["output_parse_status"], "validated_with_candidates")
+        self.assertEqual(call_diagnostic["candidate_url_count"], 1)
+        self.assertEqual(call_diagnostic["validation_rejection_reasons"], [])
+        self.assertEqual(call_diagnostic["model_execution_status"], "provider_result_without_runtime_summary")
+        self.assertTrue(call_diagnostic["model_executed"])
         self.assertEqual(provider.events, [("fetch", "https://native.example/source")])
 
         packet = build_live_retrieval_packet_from_candidates(
@@ -1009,6 +1021,11 @@ class AdsRetrievalTransportTest(unittest.TestCase):
         self.assertIn("native_research_forbidden_or_invalid_output", failure["reason_codes"])
         self.assertEqual(failure["error_class"], "NativeResearchOutputValidationError")
         self.assertIn("source_class", failure["detail"])
+        call_diagnostic = diagnostics["native_research_call_diagnostics"][0]
+        self.assertEqual(call_diagnostic["output_parse_status"], "validation_failed")
+        self.assertEqual(call_diagnostic["candidate_url_count"], 0)
+        self.assertTrue(any("source_class" in reason for reason in call_diagnostic["validation_rejection_reasons"]))
+        self.assertFalse(call_diagnostic["authority_boundary"]["source_metadata_final_authority"])
 
     def test_source_populated_attempts_fail_closed_when_secondary_class_is_not_deterministic(self) -> None:
         provider = FakeBrowserProvider(search_results=[{"url": "https://secondary.example/report"}])

@@ -73,6 +73,28 @@ class AdsNativeResearchTest(unittest.TestCase):
             ["local_retry", "retry_succeeded"],
         )
 
+    def test_native_provider_repairs_single_candidate_object(self) -> None:
+        provider = NativeResearchCandidateProvider(
+            mode="fixture",
+            fixture_response={
+                "url": "https://native.example/repaired",
+                "source_label": "Native source",
+                "source_type_hint": "official_site_or_independent_reporting",
+                "reason": "May contain source material for this leaf.",
+                "candidate_claim_text": "Candidate claim only.",
+            },
+        )
+
+        result = provider(self.context, self.variant)
+
+        self.assertEqual(result["native_research_candidates"][0]["url"], "https://native.example/repaired")
+        runtime = result["model_runtime_call"]
+        self.assertEqual(runtime["execution_status"], "succeeded")
+        self.assertEqual(runtime["repair_count"], 1)
+        self.assertIn("schema_repair_attempted", runtime["runtime_reason_codes"])
+        self.assertTrue(runtime["schema_repair_diagnostics"][0]["repair_attempted"])
+        self.assertEqual(runtime["schema_repair_diagnostics"][0]["remaining_errors"], [])
+
     def test_native_provider_rejects_forbidden_authority_fields(self) -> None:
         provider = NativeResearchCandidateProvider(
             mode="fixture",

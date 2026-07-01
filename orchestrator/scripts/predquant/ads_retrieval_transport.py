@@ -117,7 +117,10 @@ NATIVE_ALLOWED_FIELDS = {
     "url",
     "canonical_url",
     "source_label",
+    "source_type_hint",
     "title",
+    "reason",
+    "relevance_reason",
     "why_it_may_matter",
     "why_may_matter",
     "related_leaf_id",
@@ -344,6 +347,7 @@ def collect_live_retrieval_candidates(
     native_research_skip_diagnostics: list[dict[str, Any]] = []
     native_research_runtime_calls: list[dict[str, Any]] = []
     native_research_trigger_diagnostics: list[dict[str, Any]] = []
+    native_research_call_diagnostics: list[dict[str, Any]] = []
     fetch_cache: dict[tuple[str, str], dict[str, Any]] = {}
     collection_started_at = time.monotonic()
     direct_fetch_started_at = collection_started_at
@@ -578,6 +582,20 @@ def collect_live_retrieval_candidates(
                 runtime_summary = native_runtime_call_summary(getattr(exc, "runtime_call", None))
                 if runtime_summary is not None:
                     native_research_runtime_calls.append(runtime_summary)
+                native_research_call_diagnostics.append(
+                    _native_research_diagnostic(
+                        context,
+                        variants[0],
+                        event="native_discovery_call_completed",
+                        reason_codes=["native_research_transport_failed", *trigger_reasons],
+                        detail=str(exc)[:500] or exc.__class__.__name__,
+                        error_class=exc.__class__.__name__,
+                        runtime_call=runtime_summary,
+                        output_parse_status="transport_failed",
+                        candidate_url_count=0,
+                        validation_rejection_reasons=[],
+                    )
+                )
                 native_research_failure_diagnostics.append(
                     _native_research_diagnostic(
                         context,
@@ -595,6 +613,20 @@ def collect_live_retrieval_candidates(
                 native_research_runtime_calls.append(runtime_summary)
             validation_errors = native_candidate_payload_errors(raw_native)
             if validation_errors:
+                native_research_call_diagnostics.append(
+                    _native_research_diagnostic(
+                        context,
+                        variants[0],
+                        event="native_discovery_call_completed",
+                        reason_codes=["native_research_forbidden_or_invalid_output", *trigger_reasons],
+                        detail="; ".join(validation_errors[:5]),
+                        error_class="NativeResearchOutputValidationError",
+                        runtime_call=runtime_summary,
+                        output_parse_status="validation_failed",
+                        candidate_url_count=0,
+                        validation_rejection_reasons=validation_errors,
+                    )
+                )
                 native_research_failure_diagnostics.append(
                     _native_research_diagnostic(
                         context,
@@ -608,6 +640,18 @@ def collect_live_retrieval_candidates(
                 )
                 continue
             native_candidates = _native_candidate_list(raw_native)
+            native_research_call_diagnostics.append(
+                _native_research_diagnostic(
+                    context,
+                    variants[0],
+                    event="native_discovery_call_completed",
+                    reason_codes=["native_research_output_validated", *trigger_reasons],
+                    runtime_call=runtime_summary,
+                    output_parse_status="validated_with_candidates" if native_candidates else "validated_empty",
+                    candidate_url_count=len(native_candidates),
+                    validation_rejection_reasons=[],
+                )
+            )
             if native_candidates:
                 attempt_ref = _native_attempt_ref(raw_native, runtime_summary)
                 sanitized_candidates = [
@@ -731,6 +775,7 @@ def collect_live_retrieval_candidates(
         "native_research_trigger_diagnostics": native_research_trigger_diagnostics,
         "native_research_failure_diagnostics": native_research_failure_diagnostics,
         "native_research_skip_diagnostics": native_research_skip_diagnostics,
+        "native_research_call_diagnostics": native_research_call_diagnostics,
         "native_research_runtime_calls": native_research_runtime_calls,
         "native_research_transport_diagnostics": _native_transport_diagnostics(
             policy=policy,
@@ -874,7 +919,11 @@ def _native_research_diagnostic(
     detail: str | None = None,
     error_class: str | None = None,
     runtime_call: dict[str, Any] | None = None,
+    output_parse_status: str | None = None,
+    candidate_url_count: int | None = None,
+    validation_rejection_reasons: list[str] | None = None,
 ) -> dict[str, Any]:
+    runtime_call = runtime_call if isinstance(runtime_call, dict) else None
     diagnostic = {
         "schema_version": NATIVE_RESEARCH_TRANSPORT_DIAGNOSTIC_SCHEMA_VERSION,
         "event": event,
@@ -894,12 +943,33 @@ def _native_research_diagnostic(
             "forecast_authority": False,
         },
     }
+    if runtime_call is not None:
+        diagnostic["runtime_call"] = runtime_call
+        diagnostic["model_execution_status"] = runtime_call.get("execution_status")
+        diagnostic["model_executed"] = bool(runtime_call.get("model_executed"))
+        diagnostic["runtime_call_id"] = runtime_call.get("runtime_call_id")
+        diagnostic["repair_count"] = int(runtime_call.get("repair_count") or 0)
+        diagnostic["repair_attempted"] = int(runtime_call.get("repair_count") or 0) > 0
+        diagnostic["schema_repair_diagnostics"] = copy.deepcopy(
+            runtime_call.get("schema_repair_diagnostics") or []
+        )
+    else:
+        diagnostic["model_execution_status"] = "provider_result_without_runtime_summary"
+        diagnostic["model_executed"] = event == "native_discovery_call_completed"
+        diagnostic["repair_count"] = 0
+        diagnostic["repair_attempted"] = False
+    if output_parse_status:
+        diagnostic["output_parse_status"] = str(output_parse_status)[:80]
+    if candidate_url_count is not None:
+        diagnostic["candidate_url_count"] = max(0, int(candidate_url_count))
+    if validation_rejection_reasons is not None:
+        diagnostic["validation_rejection_reasons"] = [
+            str(reason)[:240] for reason in validation_rejection_reasons[:10]
+        ]
     if detail:
         diagnostic["detail"] = detail[:500]
     if error_class:
         diagnostic["error_class"] = str(error_class)[:160]
-    if runtime_call is not None:
-        diagnostic["runtime_call"] = runtime_call
     return diagnostic
 
 

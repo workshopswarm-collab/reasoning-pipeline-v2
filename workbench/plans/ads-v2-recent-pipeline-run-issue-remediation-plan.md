@@ -673,7 +673,7 @@ Completion note:
 
 ## Phase 6 - Native Research Candidate Discovery Usefulness
 
-Status: planned
+Status: complete
 
 Goal: make native research produce useful candidate URLs or precise failure diagnostics without gaining evidence authority.
 
@@ -741,12 +741,22 @@ Success criteria:
 
 Checklist:
 
-- [ ] Native per-call diagnostics implemented.
-- [ ] Native repair path covered.
-- [ ] Authority-bound candidate validation covered.
-- [ ] Positive native-candidate fixture covered.
-- [ ] Clone proof validates useful candidate or precise failure.
-- [ ] Temp artifacts and one-off scripts removed.
+- [x] Native per-call diagnostics implemented.
+- [x] Native repair path covered.
+- [x] Authority-bound candidate validation covered.
+- [x] Positive native-candidate fixture covered.
+- [x] Clone proof validates useful candidate or precise failure.
+- [x] Temp artifacts and one-off scripts removed.
+
+Completion note:
+
+- Added authority-clean native output repair for mechanical shape errors: a single candidate object or single-object candidate container is repaired once into the required candidate list, while forbidden authority fields remain non-repairable and fail closed.
+- Extended native runtime summaries with model execution, repair count, and schema repair diagnostics.
+- Added native per-call transport diagnostics for completed, invalid, and transport-failed calls. Each call now records leaf/query refs, trigger reason codes, model execution status, output parse status, candidate URL count, validation rejection reasons, repair status, and the candidate-only authority boundary.
+- Allowed safe native hint fields (`source_type_hint`, `reason`, `relevance_reason`) to flow into candidate discoveries while preserving deterministic fetch/admission as the only path to evidence, source metadata, and sufficiency.
+- Verification passed: `orchestrator` `scripts.tests.test_ads_native_research`, `scripts.tests.test_ads_retrieval_transport`, `scripts.tests.test_ads_operational_canary`; `researcher-swarm` `scripts.tests.test_retrieval` and full discovery (`249 tests OK`); `py_compile` for changed runtime modules; and `git diff --check`.
+- Clone proof `ads-pipeline-run:987e882d39444bebf990940a42a4adb6250796da0ce7099508af7ef830c50fcc` used a cloned SQLite DB, fixture decomposition, native discovery enabled, and direct/search disabled to force native candidate discovery for BOI case `polymarket:1795635`. It recorded `native_research_status=executed_with_candidates`, `native_research_call_count=8`, `native_candidate_url_count=8`, `native_candidate_fetch_attempt_count=8`, `native_research_failure_count=0`, per-call `output_parse_status=validated_with_candidates`, and source metadata resolutions with `native_research_final_authority=false`. It still failed closed as `structured_non_scoreable_insufficiency` because deterministic admission did not certify source class/claim breadth; it wrote no `market_predictions` or `scae_ledger_outputs` rows.
+- Temporary clone-run directories and the temporary provider module under `/tmp` were removed.
 
 ## Phase 7 - AMRG Ranking, Filtering, And QDT Consumption Proof
 

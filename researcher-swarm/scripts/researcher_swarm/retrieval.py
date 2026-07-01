@@ -1193,6 +1193,8 @@ def _compact_native_candidate(raw: dict[str, Any], query_context: dict[str, Any]
         "url": url,
         "canonical_url": canonicalize_source_url(url),
         "source_label": _bounded_excerpt(raw.get("source_label") or raw.get("title") or "unknown", max_chars=160),
+        "source_type_hint": _bounded_excerpt(raw.get("source_type_hint") or "", max_chars=120),
+        "reason": _bounded_excerpt(raw.get("reason") or raw.get("relevance_reason") or "", max_chars=360),
         "why_it_may_matter": _bounded_excerpt(raw.get("why_it_may_matter") or raw.get("why_may_matter"), max_chars=360),
         "related_leaf_id": related_leaf_id,
         "candidate_claim_text": _bounded_excerpt(raw.get("candidate_claim_text") or raw.get("claim_text"), max_chars=480),

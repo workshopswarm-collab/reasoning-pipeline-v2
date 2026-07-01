@@ -39,7 +39,10 @@ NATIVE_ALLOWED_FIELDS = {
     "canonical_url",
     "candidate_url",
     "source_label",
+    "source_type_hint",
     "title",
+    "reason",
+    "relevance_reason",
     "why_it_may_matter",
     "why_may_matter",
     "related_leaf_id",
@@ -79,6 +82,16 @@ NATIVE_RESEARCH_PROMPT_TEMPLATE = {
 }
 
 
+NATIVE_CANDIDATE_CONTAINER_KEYS = ("native_research_candidates", "candidate_urls")
+NATIVE_CANDIDATE_URL_KEYS = ("url", "candidate_url", "canonical_url")
+
+
+def _has_native_candidate_shape(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    return any(str(value.get(key) or "").strip() for key in NATIVE_CANDIDATE_URL_KEYS)
+
+
 def native_candidate_list(raw_native: Any) -> list[dict[str, Any]]:
     if isinstance(raw_native, dict):
         raw_native = raw_native.get("native_research_candidates") or raw_native.get("candidate_urls") or []
@@ -108,11 +121,12 @@ def native_candidate_payload_errors(raw_native: Any) -> list[str]:
     candidates = native_candidate_list(raw_native)
     if not isinstance(raw_native, (dict, list)):
         errors.append("native_research output must be an object or list")
-    if isinstance(raw_native, dict) and not isinstance(
-        raw_native.get("native_research_candidates") or raw_native.get("candidate_urls") or [],
-        list,
-    ):
-        errors.append("native_research candidate container must be a list")
+    if isinstance(raw_native, dict):
+        container_key = next((key for key in NATIVE_CANDIDATE_CONTAINER_KEYS if key in raw_native), None)
+        if container_key is None:
+            errors.append("native_research_candidates is required")
+        elif not isinstance(raw_native.get(container_key), list):
+            errors.append(f"{container_key} must be a list")
     for index, candidate in enumerate(candidates):
         unknown_keys = sorted(set(candidate) - NATIVE_ALLOWED_FIELDS)
         if unknown_keys:
@@ -127,6 +141,23 @@ def validate_native_candidate_payload(raw_native: Any) -> tuple[bool, list[str]]
     return not errors, errors
 
 
+def repair_native_candidate_payload(raw_native: Any, validation_errors: list[str]) -> Any:
+    """Repair only authority-clean mechanical native candidate shapes."""
+
+    if _forbidden_native_output_errors(raw_native):
+        return copy.deepcopy(raw_native)
+    if isinstance(raw_native, dict):
+        for key in NATIVE_CANDIDATE_CONTAINER_KEYS:
+            value = raw_native.get(key)
+            if isinstance(value, dict) and _has_native_candidate_shape(value):
+                repaired = copy.deepcopy(raw_native)
+                repaired[key] = [copy.deepcopy(value)]
+                return repaired
+        if not any(key in raw_native for key in NATIVE_CANDIDATE_CONTAINER_KEYS) and _has_native_candidate_shape(raw_native):
+            return {"native_research_candidates": [copy.deepcopy(raw_native)]}
+    return copy.deepcopy(raw_native)
+
+
 def native_runtime_call_summary(runtime_call: dict[str, Any] | None) -> dict[str, Any] | None:
     if not isinstance(runtime_call, dict):
         return None
@@ -138,8 +169,12 @@ def native_runtime_call_summary(runtime_call: dict[str, Any] | None) -> dict[str
         "provider_route": runtime_call.get("provider_route"),
         "execution_status": runtime_call.get("execution_status"),
         "mode": runtime_call.get("mode"),
+        "model_call_performed": bool(runtime_call.get("model_call_performed")),
+        "model_executed": bool(runtime_call.get("model_executed")),
         "retry_count": int(runtime_call.get("retry_count") or 0),
+        "repair_count": int(runtime_call.get("repair_count") or 0),
         "retry_diagnostics": copy.deepcopy(runtime_call.get("retry_diagnostics") or []),
+        "schema_repair_diagnostics": copy.deepcopy(runtime_call.get("schema_repair_diagnostics") or []),
         "forbidden_output_scan": copy.deepcopy(runtime_call.get("forbidden_output_scan") or {}),
         "runtime_reason_codes": list(runtime_call.get("runtime_reason_codes") or []),
         "provider_status": copy.deepcopy(runtime_call.get("provider_status") or {}),
@@ -154,7 +189,9 @@ def _native_research_prompt(request_payload: dict[str, Any]) -> str:
                 {
                     "url": "https://example.com/source",
                     "source_label": "short source label",
+                    "source_type_hint": "official_site_or_independent_reporting",
                     "why_it_may_matter": "bounded relevance note",
+                    "reason": "why this URL may contain source material for the leaf",
                     "related_leaf_id": request_payload.get("request_payload", {})
                     .get("query_context", {})
                     .get("leaf_id"),
@@ -252,7 +289,7 @@ class NativeResearchCandidateProvider:
             fixture_response=self.fixture_response,
             transport=self._transport(lane),
             output_validator=validate_native_candidate_payload,
-            repairer=None,
+            repairer=repair_native_candidate_payload,
             sleep_fn=self.sleep_fn,
         )
         candidates: list[dict[str, Any]] = []
@@ -287,6 +324,7 @@ __all__ = [
     "build_provider",
     "native_candidate_list",
     "native_candidate_payload_errors",
+    "repair_native_candidate_payload",
     "native_runtime_call_summary",
     "validate_native_candidate_payload",
 ]
