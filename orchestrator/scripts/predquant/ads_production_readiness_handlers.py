@@ -2024,43 +2024,97 @@ def build_stage_handlers(
             if payload is not None:
                 runtime_validation = validate_researcher_swarm_runtime_bundle(payload)
                 if not runtime_validation.valid:
-                    raise ValueError(
-                        "researcher swarm runtime bundle invalid: "
-                        + "; ".join(runtime_validation.errors)
+                    validation_errors = [str(error) for error in runtime_validation.errors]
+                    sidecar_validations = payload.get("sidecar_validations") if isinstance(payload, dict) else None
+                    leaf_runtime_status = payload.get("leaf_runtime_status") if isinstance(payload, dict) else None
+                    runtime_sidecars = payload.get("sidecars") if isinstance(payload, dict) else None
+                    classification_status = "blocked_invalid_researcher_runtime_bundle"
+                    reason_codes = [
+                        "researcher_runtime_bundle_invalid",
+                        *[error[:160] for error in validation_errors[:5]],
+                    ]
+                    file_name = "researcher-classification-readiness-block.json"
+                    runtime_manifest_metadata = {
+                        "runtime_bundle_count": 0,
+                        "invalid_runtime_bundle_count": 1,
+                        "runtime_bundle_id": payload.get("runtime_bundle_id") if isinstance(payload, dict) else None,
+                        "runtime_sidecar_validation_count": len(sidecar_validations)
+                        if isinstance(sidecar_validations, list)
+                        else 0,
+                        "runtime_sidecar_count": len(runtime_sidecars) if isinstance(runtime_sidecars, list) else 0,
+                        "runtime_leaf_count": len(leaf_runtime_status)
+                        if isinstance(leaf_runtime_status, list)
+                        else 0,
+                        "runtime_model_executed_count": sum(
+                            1
+                            for row in (leaf_runtime_status if isinstance(leaf_runtime_status, list) else [])
+                            if isinstance(row, dict) and row.get("model_executed") is True
+                        ),
+                        "runtime_proceed_to_verification_scae": False,
+                    }
+                    payload = {
+                        "artifact_type": "researcher_classification_readiness_block",
+                        "schema_version": STAGE_SCHEMA_VERSIONS["researcher_classification"],
+                        "case_id": lease["case_id"],
+                        "case_key": lease["case_key"],
+                        "dispatch_id": lease["dispatch_id"],
+                        "run_id": context.pipeline_run_id,
+                        "forecast_timestamp": _forecast_timestamp(forecast_timestamp, lease),
+                        "qdt_ref": qdt_manifest["artifact_id"],
+                        "retrieval_packet_ref": retrieval_manifest["artifact_id"],
+                        "classification_dispatch_status": summary.get("classification_dispatch_status"),
+                        "classification_status": classification_status,
+                        "reason_codes": reason_codes,
+                        "runtime_bundle_validation": runtime_validation.to_dict(),
+                        "invalid_runtime_bundle_not_persisted": True,
+                        "assignments": assignments,
+                        "spawn_plan": spawn_plan,
+                        "researcher_probability_authority": False,
+                        "writes_scae_delta": False,
+                        "selected_evidence_count": sum(
+                            len(result.get("selected_evidence", []))
+                            for result in packet.get("leaf_retrieval_results", [])
+                            if isinstance(result, dict)
+                        ),
+                        "leaf_certificate_refs": list(summary.get("leaf_certificate_refs") or []),
+                    }
+                    manifest_artifact_type = STAGE_ARTIFACT_TYPES["researcher_classification"]
+                    manifest_schema_version = STAGE_SCHEMA_VERSIONS["researcher_classification"]
+                else:
+                    classification_status = (
+                        "researcher_swarm_runtime_bundle_accepted"
+                        if payload.get("proceed_to_verification_scae") is True
+                        else "blocked_leaf_research_barrier"
                     )
-                classification_status = (
-                    "researcher_swarm_runtime_bundle_accepted"
-                    if payload.get("proceed_to_verification_scae") is True
-                    else "blocked_leaf_research_barrier"
-                )
-                reason_codes = list(payload.get("validation_errors") or [])
-                if not reason_codes and classification_status == "blocked_leaf_research_barrier":
-                    barrier = payload.get("leaf_research_barrier") if isinstance(payload.get("leaf_research_barrier"), dict) else {}
-                    reason_codes = list(barrier.get("blocker_reason_codes") or ["leaf_research_barrier_not_terminal"])
-                file_name = "researcher-swarm-runtime-bundle.json"
-                manifest_artifact_type = "researcher-swarm-runtime-bundle"
-                manifest_schema_version = "researcher-swarm-runtime-bundle/v1"
-                sidecar_validations = payload.get("sidecar_validations")
-                leaf_runtime_status = payload.get("leaf_runtime_status")
-                runtime_manifest_metadata = {
-                    "runtime_bundle_count": 1,
-                    "runtime_bundle_id": payload.get("runtime_bundle_id"),
-                    "runtime_sidecar_validation_count": len(sidecar_validations)
-                    if isinstance(sidecar_validations, list)
-                    else 0,
-                    "runtime_sidecar_count": len(payload.get("sidecars"))
-                    if isinstance(payload.get("sidecars"), list)
-                    else 0,
-                    "runtime_leaf_count": len(leaf_runtime_status)
-                    if isinstance(leaf_runtime_status, list)
-                    else 0,
-                    "runtime_model_executed_count": sum(
-                        1
-                        for row in (leaf_runtime_status if isinstance(leaf_runtime_status, list) else [])
-                        if isinstance(row, dict) and row.get("model_executed") is True
-                    ),
-                    "runtime_proceed_to_verification_scae": payload.get("proceed_to_verification_scae") is True,
-                }
+                    reason_codes = list(payload.get("validation_errors") or [])
+                    if not reason_codes and classification_status == "blocked_leaf_research_barrier":
+                        barrier = payload.get("leaf_research_barrier") if isinstance(payload.get("leaf_research_barrier"), dict) else {}
+                        reason_codes = list(barrier.get("blocker_reason_codes") or ["leaf_research_barrier_not_terminal"])
+                    file_name = "researcher-swarm-runtime-bundle.json"
+                    manifest_artifact_type = "researcher-swarm-runtime-bundle"
+                    manifest_schema_version = "researcher-swarm-runtime-bundle/v1"
+                    sidecar_validations = payload.get("sidecar_validations")
+                    leaf_runtime_status = payload.get("leaf_runtime_status")
+                    runtime_manifest_metadata = {
+                        "runtime_bundle_count": 1,
+                        "invalid_runtime_bundle_count": 0,
+                        "runtime_bundle_id": payload.get("runtime_bundle_id"),
+                        "runtime_sidecar_validation_count": len(sidecar_validations)
+                        if isinstance(sidecar_validations, list)
+                        else 0,
+                        "runtime_sidecar_count": len(payload.get("sidecars"))
+                        if isinstance(payload.get("sidecars"), list)
+                        else 0,
+                        "runtime_leaf_count": len(leaf_runtime_status)
+                        if isinstance(leaf_runtime_status, list)
+                        else 0,
+                        "runtime_model_executed_count": sum(
+                            1
+                            for row in (leaf_runtime_status if isinstance(leaf_runtime_status, list) else [])
+                            if isinstance(row, dict) and row.get("model_executed") is True
+                        ),
+                        "runtime_proceed_to_verification_scae": payload.get("proceed_to_verification_scae") is True,
+                    }
             else:
                 barrier = build_leaf_research_barrier(assignments, true_production_mode=True)
                 classification_status = "blocked_leaf_research_barrier"

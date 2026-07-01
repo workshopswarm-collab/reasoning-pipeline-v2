@@ -2686,7 +2686,7 @@ class AdsOperationalCanaryTest(unittest.TestCase):
         self.assertEqual(scae_count, 0)
         self.assertEqual(prediction_count, 0)
 
-    def test_phase6_researcher_authority_leakage_is_terminal_without_retry_or_scae_output(self):
+    def test_phase6_researcher_authority_leakage_creates_readiness_block_without_scoreable_output(self):
         config = self.config(
             require_scoreable_prediction=False,
             require_manifest_handoffs=True,
@@ -2708,8 +2708,7 @@ class AdsOperationalCanaryTest(unittest.TestCase):
 
         result = run_one_case_canary(config, handlers)
 
-        self.assertFalse(result["ok"])
-        self.assertIn("terminal_status was 'auto003_stage_failed'", result["errors"])
+        self.assertTrue(result["ok"], result["errors"])
         with sqlite3.connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
             status = conn.execute(
@@ -2721,38 +2720,60 @@ class AdsOperationalCanaryTest(unittest.TestCase):
                 LIMIT 1
                 """
             ).fetchone()
-            stage_events = conn.execute(
+            failure_events = conn.execute(
                 """
                 SELECT event_type, failure_class, safe_exception_class, safe_metadata
                 FROM v2_stage_execution_events
                 WHERE stage = 'researcher_classification'
+                  AND event_type IN ('stage_failed', 'retry_scheduled')
                 ORDER BY id DESC
                 """
             ).fetchall()
+            readiness_row = conn.execute(
+                """
+                SELECT artifact_type, artifact_path, metadata
+                FROM case_artifact_manifest
+                WHERE stage = 'researcher_classification'
+                ORDER BY id DESC
+                LIMIT 1
+                """
+            ).fetchone()
             runtime_bundle_count = conn.execute(
                 "SELECT COUNT(*) FROM case_artifact_manifest WHERE artifact_type = 'researcher-swarm-runtime-bundle'"
             ).fetchone()[0]
-            verification_count = conn.execute(
-                "SELECT COUNT(*) FROM case_artifact_manifest WHERE stage = 'classification_verification'"
-            ).fetchone()[0]
-            scae_count = conn.execute(
-                "SELECT COUNT(*) FROM case_artifact_manifest WHERE stage = 'scae'"
-            ).fetchone()[0]
+            scae_row = conn.execute(
+                """
+                SELECT artifact_path
+                FROM case_artifact_manifest
+                WHERE stage = 'scae'
+                ORDER BY id DESC
+                LIMIT 1
+                """
+            ).fetchone()
             prediction_count = conn.execute("SELECT COUNT(*) FROM market_predictions").fetchone()[0]
 
         self.assertIsNotNone(status)
+        self.assertIsNotNone(readiness_row)
+        self.assertIsNotNone(scae_row)
         status_metadata = json.loads(status["metadata"])
-        self.assertEqual(status["status"], "failed")
-        self.assertEqual(json.loads(status["reason_codes"]), ["ads_production_policy_violation_quarantine"])
-        self.assertEqual(status_metadata["safe_reason_code"], "ads_production_policy_violation_quarantine")
-        self.assertTrue(stage_events)
-        self.assertEqual(stage_events[0]["event_type"], "stage_failed")
-        self.assertEqual(stage_events[0]["failure_class"], "policy_violation_quarantine")
-        self.assertEqual(stage_events[0]["safe_exception_class"], "NonRetryableStageError")
-        self.assertNotIn("retry_scheduled", {row["event_type"] for row in stage_events})
+        readiness = json.loads(Path(readiness_row["artifact_path"]).read_text(encoding="utf-8"))
+        readiness_metadata = json.loads(readiness_row["metadata"])
+        scae = json.loads(Path(scae_row["artifact_path"]).read_text(encoding="utf-8"))
+        self.assertEqual(status["status"], "complete")
+        self.assertEqual(status_metadata["classification_status"], "blocked_invalid_researcher_runtime_bundle")
+        self.assertEqual(readiness_row["artifact_type"], "researcher-classification-readiness-block")
+        self.assertEqual(readiness["artifact_type"], "researcher_classification_readiness_block")
+        self.assertEqual(readiness["classification_status"], "blocked_invalid_researcher_runtime_bundle")
+        self.assertIn("researcher_runtime_bundle_invalid", readiness["reason_codes"])
+        self.assertFalse(readiness["runtime_bundle_validation"]["valid"])
+        self.assertTrue(readiness["invalid_runtime_bundle_not_persisted"])
+        self.assertNotIn("sidecars", readiness)
+        self.assertEqual(readiness_metadata["runtime_bundle_count"], 0)
+        self.assertEqual(readiness_metadata["invalid_runtime_bundle_count"], 1)
+        self.assertGreater(readiness_metadata["runtime_model_executed_count"], 0)
+        self.assertEqual(failure_events, [])
         self.assertEqual(runtime_bundle_count, 0)
-        self.assertEqual(verification_count, 0)
-        self.assertEqual(scae_count, 0)
+        self.assertFalse(scae["scoreable_forecast_output"])
         self.assertEqual(prediction_count, 0)
 
     def test_real_runtime_criteria_requires_researcher_model_execution_when_requested(self):

@@ -650,7 +650,7 @@ Completion note, 2026-07-01:
 
 ## Phase 6 - Researcher Dispatch Positive Path
 
-Status: pending
+Status: complete
 
 Goal: unblock researcher classification only after retrieval sufficiency certifies, and prove that
 researcher output is real, bounded, and verification-ready.
@@ -709,12 +709,24 @@ Success criteria:
 
 Checklist:
 
-- [ ] Uncertified retrieval block remains tested.
-- [ ] Certified dispatch positive path is tested.
-- [ ] Researcher provenance is required.
-- [ ] Forbidden authority scan is tested.
-- [ ] Temp artifacts and scripts are deleted.
-- [ ] `git diff --check` passes.
+- [x] Uncertified retrieval block remains tested.
+- [x] Certified dispatch positive path is tested.
+- [x] Researcher provenance is required.
+- [x] Forbidden authority scan is tested.
+- [x] Temp artifacts and scripts are deleted.
+- [x] `git diff --check` passes.
+
+Completion notes:
+
+- Researcher dispatch still fails closed until retrieval sufficiency allows classification, and certified
+  retrieval still builds bounded evidence assignments.
+- Valid runtime bundles continue to persist as researcher runtime manifests and feed nonzero
+  classification slices through verification.
+- Invalid researcher runtime bundles now persist sanitized researcher-classification readiness blocks
+  instead of raw invalid sidecars or terminal stage failures.
+- Verification: focused Phase 6 canary, positive runtime-bundle canaries, researcher assignment runtime
+  tests, classification matrix tests, full Researcher suite (`253` tests), and full Orchestrator suite
+  (`334` tests).
 
 ## Phase 7 - AMRG Consumption And Reporting Accuracy
 
