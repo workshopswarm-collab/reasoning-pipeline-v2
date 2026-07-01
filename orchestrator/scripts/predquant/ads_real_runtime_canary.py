@@ -959,6 +959,22 @@ def _model_runtime_evidence(manifests: list[dict[str, Any]]) -> dict[str, Any]:
                 else {},
                 "retry_diagnostics": _list_of_dicts(payload.get("retry_diagnostics")),
                 "schema_repair_diagnostics": _list_of_dicts(payload.get("schema_repair_diagnostics")),
+                "validation_feedback_retry_count": _int_value(
+                    payload.get("validation_feedback_retry_count")
+                ),
+                "validation_feedback_retry_diagnostics": _list_of_dicts(
+                    payload.get("validation_feedback_retry_diagnostics")
+                ),
+                "rejected_candidate_summaries": _list_of_dicts(
+                    payload.get("rejected_candidate_summaries")
+                ),
+                "previous_runtime_call_refs": [
+                    str(ref)
+                    for ref in payload.get("previous_runtime_call_refs", [])
+                    if isinstance(ref, str) and ref
+                ]
+                if isinstance(payload.get("previous_runtime_call_refs"), list)
+                else [],
                 "runtime_reason_codes": [
                     str(code)
                     for code in payload.get("runtime_reason_codes", [])

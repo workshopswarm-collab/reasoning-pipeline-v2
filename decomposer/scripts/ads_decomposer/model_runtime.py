@@ -41,6 +41,14 @@ MODEL_TRANSPORT_RETRY_POLICY = {
 }
 DEFAULT_MAX_TRANSPORT_RETRIES = MODEL_TRANSPORT_RETRY_POLICY["max_attempts"] - 1
 DEFAULT_MAX_SCHEMA_REPAIRS = 1
+MODEL_RUNTIME_VALIDATION_FEEDBACK_RETRY_DIAGNOSTIC_SCHEMA_VERSION = (
+    "model-runtime-validation-feedback-retry-diagnostic/v1"
+)
+QDT_VALIDATION_FEEDBACK_RETRY_ALLOWED_GROUPS = (
+    "mechanical_schema",
+    "material_unknown_role",
+    "terminal_temporal_role",
+)
 MODEL_RUNTIME_TRANSPORT_REQUEST_SCHEMA_VERSION = "model-runtime-transport-request/v1"
 MODEL_RUNTIME_TRANSPORT_RESPONSE_SCHEMA_VERSION = "model-runtime-transport-response/v1"
 OPENCLAW_CODEX_OAUTH_PROVIDER_ROUTE_PREFIX = "openclaw_codex_oauth"
@@ -361,6 +369,53 @@ def classify_qdt_validation_errors(errors: list[str]) -> dict[str, list[str]]:
 
 def _validation_error_group_counts(groups: dict[str, list[str]]) -> dict[str, int]:
     return {group: len(groups.get(group, [])) for group in VALIDATION_ERROR_GROUPS}
+
+
+def qdt_validation_feedback_retry_decision(
+    errors: list[str],
+    *,
+    forbidden_scan: dict[str, Any] | None,
+    model_executed: bool,
+    validation_retry_count: int,
+    max_validation_retries: int = 1,
+) -> dict[str, Any]:
+    groups = classify_qdt_validation_errors(errors)
+    active_groups = [group for group in VALIDATION_ERROR_GROUPS if groups.get(group)]
+    eligible_groups = [
+        group for group in active_groups if group in QDT_VALIDATION_FEEDBACK_RETRY_ALLOWED_GROUPS
+    ]
+    blocked_groups = [
+        group for group in active_groups if group not in QDT_VALIDATION_FEEDBACK_RETRY_ALLOWED_GROUPS
+    ]
+    scan_status = forbidden_scan.get("status") if isinstance(forbidden_scan, dict) else None
+    retry_allowed = False
+    retry_status = "validation_errors_not_repairable"
+    if not model_executed:
+        retry_status = "model_not_executed"
+    elif scan_status != "passed":
+        retry_status = "forbidden_output_scan_not_passed"
+    elif validation_retry_count >= max_validation_retries:
+        retry_status = "validation_feedback_retry_budget_exhausted"
+    elif not active_groups:
+        retry_status = "no_validation_errors"
+    elif blocked_groups:
+        retry_status = "validation_errors_not_repairable"
+    else:
+        retry_allowed = bool(eligible_groups)
+        retry_status = "validation_feedback_retry_available" if retry_allowed else "no_retryable_groups"
+    return {
+        "schema_version": "qdt-validation-feedback-retry-eligibility/v1",
+        "retry_allowed": retry_allowed,
+        "retry_status": retry_status,
+        "validation_retry_count": int(validation_retry_count),
+        "max_validation_retries": int(max_validation_retries),
+        "forbidden_output_scan_status": scan_status,
+        "active_error_groups": active_groups,
+        "eligible_error_groups": eligible_groups,
+        "blocked_error_groups": blocked_groups,
+        "error_groups": groups,
+        "error_counts": _validation_error_group_counts(groups),
+    }
 
 
 def _schema_repair_decision(
@@ -911,6 +966,10 @@ def _base_runtime_call(
         },
         "retry_diagnostics": [],
         "schema_repair_diagnostics": [],
+        "validation_feedback_retry_count": 0,
+        "validation_feedback_retry_diagnostics": [],
+        "rejected_candidate_summaries": [],
+        "previous_runtime_call_refs": [],
         "runtime_reason_codes": [],
     }
 
@@ -1226,6 +1285,14 @@ def model_execution_context_from_runtime_call(
             "schema_repair_diagnostics": copy.deepcopy(
                 runtime_call.get("schema_repair_diagnostics", [])
             ),
+            "validation_feedback_retry_count": runtime_call.get("validation_feedback_retry_count", 0),
+            "validation_feedback_retry_diagnostics": copy.deepcopy(
+                runtime_call.get("validation_feedback_retry_diagnostics", [])
+            ),
+            "rejected_candidate_summaries": copy.deepcopy(
+                runtime_call.get("rejected_candidate_summaries", [])
+            ),
+            "previous_runtime_call_refs": list(runtime_call.get("previous_runtime_call_refs", [])),
             "fixture_mode": runtime_call.get("fixture_mode"),
             "model_call_performed": runtime_call.get("model_call_performed"),
             "model_executed": runtime_call.get("model_executed"),
@@ -1247,6 +1314,14 @@ def model_execution_context_from_runtime_call(
         "transport_retry_policy": copy.deepcopy(runtime_call.get("transport_retry_policy")),
         "retry_diagnostics": copy.deepcopy(runtime_call.get("retry_diagnostics", [])),
         "schema_repair_diagnostics": copy.deepcopy(runtime_call.get("schema_repair_diagnostics", [])),
+        "validation_feedback_retry_count": runtime_call.get("validation_feedback_retry_count", 0),
+        "validation_feedback_retry_diagnostics": copy.deepcopy(
+            runtime_call.get("validation_feedback_retry_diagnostics", [])
+        ),
+        "rejected_candidate_summaries": copy.deepcopy(
+            runtime_call.get("rejected_candidate_summaries", [])
+        ),
+        "previous_runtime_call_refs": list(runtime_call.get("previous_runtime_call_refs", [])),
         "runtime_reason_codes": list(runtime_call.get("runtime_reason_codes", [])),
         "fallback_reason_codes": list(context.get("fallback_reason_codes", ["no_fallback_required"])),
     }
@@ -1259,8 +1334,10 @@ __all__ = [
     "MODEL_RUNTIME_RETRY_DIAGNOSTIC_SCHEMA_VERSION",
     "MODEL_RUNTIME_SCHEMA_REPAIR_DIAGNOSTIC_SCHEMA_VERSION",
     "MODEL_RUNTIME_TIMEOUTS",
+    "MODEL_RUNTIME_VALIDATION_FEEDBACK_RETRY_DIAGNOSTIC_SCHEMA_VERSION",
     "MODEL_TRANSPORT_RETRY_POLICY",
     "MODEL_TRANSPORT_RETRY_POLICY_REF",
+    "QDT_VALIDATION_FEEDBACK_RETRY_ALLOWED_GROUPS",
     "ModelRuntimeError",
     "ModelRuntimeResult",
     "classify_qdt_validation_errors",
@@ -1269,6 +1346,7 @@ __all__ = [
     "model_execution_context_from_runtime_call",
     "openclaw_codex_agent_transport_from_env",
     "prefixed_sha256",
+    "qdt_validation_feedback_retry_decision",
     "resolve_model_runtime_lane",
     "scan_forbidden_model_outputs",
 ]

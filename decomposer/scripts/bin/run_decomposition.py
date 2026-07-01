@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
 import re
@@ -23,12 +24,14 @@ from predquant.amrg import (  # noqa: E402
 )
 from ads_decomposer.handoff import validate_decomposer_handoff  # noqa: E402
 from ads_decomposer.model_runtime import (  # noqa: E402
+    MODEL_RUNTIME_VALIDATION_FEEDBACK_RETRY_DIAGNOSTIC_SCHEMA_VERSION,
     MODEL_RUNTIME_TRANSPORT_RESPONSE_SCHEMA_VERSION,
     ModelRuntimeError,
     execute_model_runtime_call,
     model_execution_context_from_runtime_call,
     openclaw_codex_agent_transport_from_env,
     prefixed_sha256,
+    qdt_validation_feedback_retry_decision,
 )
 from ads_decomposer.qdt import (  # noqa: E402
     ALLOWED_ANSWERABILITY_STATUSES,
@@ -63,6 +66,10 @@ def _load(path: Path | None) -> dict[str, Any]:
 
 
 Transport = Callable[[dict[str, Any]], Any]
+QDT_VALIDATION_FEEDBACK_RETRY_LIMIT = 1
+QDT_VALIDATION_FEEDBACK_ERROR_LIMIT = 8
+QDT_VALIDATION_FEEDBACK_ERROR_EXCERPT_CHARS = 320
+CANDIDATE_ID_RE = re.compile(r'"candidate_id"\s*:\s*"([^"]+)"')
 
 
 def _load_manifest_payload(manifest_ref: dict[str, Any]) -> dict[str, Any]:
@@ -1057,6 +1064,162 @@ def _response_validator_for_handoff(
     return validator
 
 
+def _bounded_validation_error_excerpt(error: Any) -> str:
+    text = re.sub(r"\s+", " ", str(error)).strip()
+    if len(text) <= QDT_VALIDATION_FEEDBACK_ERROR_EXCERPT_CHARS:
+        return text
+    return text[: QDT_VALIDATION_FEEDBACK_ERROR_EXCERPT_CHARS - 3] + "..."
+
+
+def _runtime_remaining_validation_errors(runtime_call: dict[str, Any]) -> list[str]:
+    diagnostics = runtime_call.get("schema_repair_diagnostics", [])
+    if isinstance(diagnostics, list):
+        for diagnostic in reversed(diagnostics):
+            if not isinstance(diagnostic, dict):
+                continue
+            remaining = diagnostic.get("remaining_errors")
+            if isinstance(remaining, list) and remaining:
+                return [str(error) for error in remaining]
+            pre_repair = diagnostic.get("pre_repair_errors")
+            if isinstance(pre_repair, list) and pre_repair:
+                return [str(error) for error in pre_repair]
+    return []
+
+
+def _runtime_schema_repair_codes(runtime_call: dict[str, Any]) -> list[str]:
+    codes: list[str] = []
+    diagnostics = runtime_call.get("schema_repair_diagnostics", [])
+    if isinstance(diagnostics, list):
+        for diagnostic in diagnostics:
+            if isinstance(diagnostic, dict) and isinstance(diagnostic.get("repair_decision"), str):
+                codes.append(diagnostic["repair_decision"])
+    return sorted(set(codes))
+
+
+def _candidate_ids_from_validation_errors(errors: list[str]) -> list[str]:
+    ids: list[str] = []
+    for error in errors:
+        ids.extend(match.group(1) for match in CANDIDATE_ID_RE.finditer(str(error)))
+    compact = sorted({candidate_id for candidate_id in ids if candidate_id})
+    return compact or ["qdt-candidate-model-runtime"]
+
+
+def _build_rejected_candidate_summary(
+    *,
+    runtime_call: dict[str, Any],
+    validation_errors: list[str],
+    retry_check: dict[str, Any],
+) -> dict[str, Any]:
+    excerpts = [
+        _bounded_validation_error_excerpt(error)
+        for error in validation_errors[:QDT_VALIDATION_FEEDBACK_ERROR_LIMIT]
+    ]
+    return {
+        "schema_version": "qdt-rejected-candidate-summary/v1",
+        "source_runtime_call_id": runtime_call.get("runtime_call_id"),
+        "source_runtime_status": runtime_call.get("execution_status"),
+        "source_response_sha256": runtime_call.get("response_sha256"),
+        "candidate_ids": _candidate_ids_from_validation_errors(validation_errors),
+        "validation_error_excerpts": excerpts,
+        "validation_error_excerpt_count": len(excerpts),
+        "validation_error_total_count": len(validation_errors),
+        "validation_error_groups": list(retry_check.get("active_error_groups", [])),
+        "validation_error_counts": copy.deepcopy(retry_check.get("error_counts", {})),
+        "schema_repair_codes": _runtime_schema_repair_codes(runtime_call),
+        "retry_prompt_feedback_sha256": None,
+    }
+
+
+def _build_validation_feedback_payload(
+    *,
+    source_runtime_call: dict[str, Any],
+    rejected_summary: dict[str, Any],
+    retry_check: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "schema_version": "qdt-validation-feedback-retry-prompt/v1",
+        "retry_attempt": 1,
+        "max_validation_retries": QDT_VALIDATION_FEEDBACK_RETRY_LIMIT,
+        "source_runtime_call_id": source_runtime_call.get("runtime_call_id"),
+        "candidate_ids": list(rejected_summary.get("candidate_ids", [])),
+        "validation_error_groups": list(retry_check.get("active_error_groups", [])),
+        "eligible_error_groups": list(retry_check.get("eligible_error_groups", [])),
+        "validation_error_counts": copy.deepcopy(retry_check.get("error_counts", {})),
+        "validation_error_excerpts": list(rejected_summary.get("validation_error_excerpts", [])),
+        "schema_repair_codes": list(rejected_summary.get("schema_repair_codes", [])),
+        "retry_status": retry_check.get("retry_status"),
+        "instructions": [
+            "Regenerate one complete QDT candidate that fixes only the listed schema and role-contract errors.",
+            "Preserve decomposer-only authority: no probability, fair-value, SCAE, forecast, or decision outputs.",
+            (
+                "For unresolved markets, keep final-result checks in non-dispatchable terminal_verification "
+                "leaves and keep material unknowns as material_unknown structural leaves."
+            ),
+        ],
+    }
+
+
+def _request_payload_with_validation_feedback(
+    request_payload: dict[str, Any],
+    feedback_payload: dict[str, Any],
+) -> dict[str, Any]:
+    retry_payload = copy.deepcopy(request_payload)
+    retry_payload["validation_feedback_retry"] = copy.deepcopy(feedback_payload)
+    retry_payload.setdefault("instructions", {})
+    if isinstance(retry_payload["instructions"], dict):
+        retry_payload["instructions"]["validation_feedback_retry"] = copy.deepcopy(feedback_payload)
+    retry_payload.setdefault("instruction_blocks", [])
+    if isinstance(retry_payload["instruction_blocks"], list):
+        retry_payload["instruction_blocks"].append(
+            {
+                "block_id": "validation_feedback_retry",
+                "text": (
+                    "This is the single validation-feedback retry. Use validation_feedback_retry to repair "
+                    "the listed schema or role-contract errors only; do not add forecast authority."
+                ),
+            }
+        )
+    return retry_payload
+
+
+def _attach_validation_feedback_retry_metadata(
+    runtime_call: dict[str, Any],
+    *,
+    source_runtime_call: dict[str, Any],
+    rejected_summary: dict[str, Any],
+    retry_check: dict[str, Any],
+    feedback_payload: dict[str, Any],
+    event: str,
+) -> None:
+    source_runtime_call_id = source_runtime_call.get("runtime_call_id")
+    summary = copy.deepcopy(rejected_summary)
+    diagnostic = {
+        "schema_version": MODEL_RUNTIME_VALIDATION_FEEDBACK_RETRY_DIAGNOSTIC_SCHEMA_VERSION,
+        "event": event,
+        "retry_attempt": 1,
+        "max_validation_retries": QDT_VALIDATION_FEEDBACK_RETRY_LIMIT,
+        "retry_status": retry_check.get("retry_status"),
+        "eligible_error_groups": list(retry_check.get("eligible_error_groups", [])),
+        "blocked_error_groups": list(retry_check.get("blocked_error_groups", [])),
+        "candidate_ids": list(summary.get("candidate_ids", [])),
+        "source_runtime_call_id": source_runtime_call_id,
+        "retry_runtime_call_id": runtime_call.get("runtime_call_id"),
+        "rejected_candidate_summary_sha256": prefixed_sha256(summary),
+        "retry_prompt_feedback_sha256": feedback_payload.get("retry_prompt_feedback_sha256"),
+    }
+    runtime_call["validation_feedback_retry_count"] = 1
+    runtime_call.setdefault("previous_runtime_call_refs", [])
+    if source_runtime_call_id and source_runtime_call_id not in runtime_call["previous_runtime_call_refs"]:
+        runtime_call["previous_runtime_call_refs"].append(source_runtime_call_id)
+    runtime_call["rejected_candidate_summaries"] = [summary]
+    runtime_call.setdefault("validation_feedback_retry_diagnostics", [])
+    runtime_call["validation_feedback_retry_diagnostics"].append(diagnostic)
+    runtime_call.setdefault("runtime_reason_codes", [])
+    for code in ("validation_feedback_retry_attempted", event, str(retry_check.get("retry_status"))):
+        if code and code not in runtime_call["runtime_reason_codes"]:
+            runtime_call["runtime_reason_codes"].append(code)
+
+
 def build_decomposition_prompt_payload(
     handoff: dict[str, Any],
     *,
@@ -1325,28 +1488,88 @@ def build_question_decomposition_from_handoff(
     evidence_packet = payloads.get("evidence_packet") or None
     related_market_context = payloads.get("related_market_context") or None
     amrg_decomposer_context = request_payload.get("amrg_decomposer_context")
-    runtime_result = execute_model_runtime_call(
-        model_lane_id=base_context["model_lane_id"],
-        provider=base_context.get("provider", "openai"),
-        resolved_model_id=base_context["resolved_model_id"],
-        provider_route=base_context.get("provider_route")
-        or f"{base_context.get('provider', 'openai')}/{base_context['resolved_model_id']}",
-        prompt_template_id=base_context["prompt_template_id"],
-        prompt_template_sha256=base_context["prompt_template_sha256"],
-        input_manifest_refs=list(base_context.get("input_manifest_ids", [])),
-        output_schema_version=QUESTION_DECOMPOSITION_SCHEMA_VERSION,
-        request_payload=request_payload,
-        mode=runtime_mode,
-        fixture_response=response if runtime_mode == "fixture" else None,
-        transport=transport,
-        output_validator=_response_validator_for_handoff(
-            handoff,
-            runtime_mode=runtime_mode,
-            evidence_packet=evidence_packet,
-        ),
-        repairer=_response_repairer,
-        max_schema_repairs=max_schema_repairs,
+    output_validator = _response_validator_for_handoff(
+        handoff,
+        runtime_mode=runtime_mode,
+        evidence_packet=evidence_packet,
     )
+
+    def execute_qdt_runtime_call(candidate_request_payload: dict[str, Any]):
+        return execute_model_runtime_call(
+            model_lane_id=base_context["model_lane_id"],
+            provider=base_context.get("provider", "openai"),
+            resolved_model_id=base_context["resolved_model_id"],
+            provider_route=base_context.get("provider_route")
+            or f"{base_context.get('provider', 'openai')}/{base_context['resolved_model_id']}",
+            prompt_template_id=base_context["prompt_template_id"],
+            prompt_template_sha256=base_context["prompt_template_sha256"],
+            input_manifest_refs=list(base_context.get("input_manifest_ids", [])),
+            output_schema_version=QUESTION_DECOMPOSITION_SCHEMA_VERSION,
+            request_payload=candidate_request_payload,
+            mode=runtime_mode,
+            fixture_response=response if runtime_mode == "fixture" else None,
+            transport=transport,
+            output_validator=output_validator,
+            repairer=_response_repairer,
+            max_schema_repairs=max_schema_repairs,
+        )
+
+    try:
+        runtime_result = execute_qdt_runtime_call(request_payload)
+    except ModelRuntimeError as first_error:
+        first_runtime_call = first_error.runtime_call
+        if not isinstance(first_runtime_call, dict):
+            raise
+        validation_errors = _runtime_remaining_validation_errors(first_runtime_call)
+        retry_check = qdt_validation_feedback_retry_decision(
+            validation_errors,
+            forbidden_scan=first_runtime_call.get("forbidden_output_scan"),
+            model_executed=bool(first_runtime_call.get("model_executed")),
+            validation_retry_count=int(first_runtime_call.get("validation_feedback_retry_count", 0)),
+            max_validation_retries=QDT_VALIDATION_FEEDBACK_RETRY_LIMIT,
+        )
+        if runtime_mode != "live" or not retry_check["retry_allowed"]:
+            raise
+        rejected_summary = _build_rejected_candidate_summary(
+            runtime_call=first_runtime_call,
+            validation_errors=validation_errors,
+            retry_check=retry_check,
+        )
+        feedback_payload = _build_validation_feedback_payload(
+            source_runtime_call=first_runtime_call,
+            rejected_summary=rejected_summary,
+            retry_check=retry_check,
+        )
+        feedback_hash = prefixed_sha256(feedback_payload)
+        feedback_payload["retry_prompt_feedback_sha256"] = feedback_hash
+        rejected_summary["retry_prompt_feedback_sha256"] = feedback_hash
+        retry_request_payload = _request_payload_with_validation_feedback(
+            request_payload,
+            feedback_payload,
+        )
+        try:
+            runtime_result = execute_qdt_runtime_call(retry_request_payload)
+        except ModelRuntimeError as retry_error:
+            retry_runtime_call = retry_error.runtime_call
+            if isinstance(retry_runtime_call, dict):
+                _attach_validation_feedback_retry_metadata(
+                    retry_runtime_call,
+                    source_runtime_call=first_runtime_call,
+                    rejected_summary=rejected_summary,
+                    retry_check=retry_check,
+                    feedback_payload=feedback_payload,
+                    event="validation_feedback_retry_failed",
+                )
+                retry_error.runtime_call = retry_runtime_call
+            raise
+        _attach_validation_feedback_retry_metadata(
+            runtime_result.runtime_call,
+            source_runtime_call=first_runtime_call,
+            rejected_summary=rejected_summary,
+            retry_check=retry_check,
+            feedback_payload=feedback_payload,
+            event="validation_feedback_retry_succeeded",
+        )
     runtime_context = model_execution_context_from_runtime_call(
         base_context,
         runtime_result.runtime_call,

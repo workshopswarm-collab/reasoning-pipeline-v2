@@ -356,6 +356,64 @@ class RuntimeDecompositionEntrypointTest(unittest.TestCase):
         self.assertGreater(diagnostic["remaining_error_counts"]["material_unknown_role"], 0)
         self.assertIn("leaf-boi-july-material-unknowns", "; ".join(diagnostic["remaining_errors"]))
 
+    def test_live_validation_feedback_retry_recovers_material_unknown_role_drift(self) -> None:
+        handoff = self._boi_rate_handoff()
+        bad_response = self._boi_material_unknown_role_drift_response(
+            handoff,
+            final_result_question=True,
+        )
+        good_response = build_question_specific_fixture_response(handoff)
+        requests: list[dict] = []
+
+        def transport(payload: dict) -> dict:
+            requests.append(payload)
+            response = bad_response if len(requests) == 1 else good_response
+            return {
+                "schema_version": MODEL_RUNTIME_TRANSPORT_RESPONSE_SCHEMA_VERSION,
+                "response_payload": response,
+                "provider_status": {"transport": "unit-test-validation-feedback-retry"},
+            }
+
+        qdt, runtime = build_question_decomposition_from_handoff(
+            handoff,
+            runtime_mode="live",
+            transport=transport,
+        )
+
+        self.assertEqual(len(requests), 2)
+        self.assertTrue(validate_question_decomposition(qdt).valid)
+        self.assertEqual(runtime["execution_status"], "succeeded")
+        self.assertEqual(runtime["validation_feedback_retry_count"], 1)
+        self.assertEqual(qdt["model_execution_context"]["validation_feedback_retry_count"], 1)
+        self.assertEqual(qdt["model_execution_context"]["runtime"]["validation_feedback_retry_count"], 1)
+        self.assertIn("validation_feedback_retry_succeeded", runtime["runtime_reason_codes"])
+        self.assertNotIn("validation_feedback_retry", requests[0]["request_payload"])
+        feedback = requests[1]["request_payload"]["validation_feedback_retry"]
+        self.assertEqual(feedback["retry_attempt"], 1)
+        self.assertEqual(feedback["retry_status"], "validation_feedback_retry_available")
+        self.assertTrue(feedback["retry_prompt_feedback_sha256"].startswith("sha256:"))
+        self.assertIn(
+            "validation_feedback_retry",
+            requests[1]["request_payload"]["instructions"],
+        )
+        summaries = runtime["rejected_candidate_summaries"]
+        self.assertEqual(len(summaries), 1)
+        summary = summaries[0]
+        self.assertTrue(summary["retry_prompt_feedback_sha256"].startswith("sha256:"))
+        self.assertEqual(summary["retry_prompt_feedback_sha256"], feedback["retry_prompt_feedback_sha256"])
+        self.assertTrue(summary["candidate_ids"])
+        self.assertIn("material_unknown_role", summary["validation_error_groups"])
+        self.assertLessEqual(summary["validation_error_excerpt_count"], 8)
+        self.assertTrue(
+            all(len(excerpt) <= 320 for excerpt in summary["validation_error_excerpts"]),
+            summary["validation_error_excerpts"],
+        )
+        self.assertNotIn("required_leaf_questions", json.dumps(summary, sort_keys=True))
+        diagnostic = runtime["validation_feedback_retry_diagnostics"][0]
+        self.assertEqual(diagnostic["event"], "validation_feedback_retry_succeeded")
+        self.assertEqual(diagnostic["source_runtime_call_id"], runtime["previous_runtime_call_refs"][0])
+        self.assertEqual(diagnostic["retry_runtime_call_id"], runtime["runtime_call_id"])
+
     def test_material_unknown_repair_does_not_run_on_forbidden_probability_authority(self) -> None:
         handoff = self._boi_rate_handoff()
         unsafe_response = self._boi_material_unknown_role_drift_response(handoff)
@@ -372,6 +430,34 @@ class RuntimeDecompositionEntrypointTest(unittest.TestCase):
         self.assertEqual(runtime["execution_status"], "failed_forbidden_output")
         self.assertEqual(runtime["repair_count"], 0)
         self.assertEqual(runtime["schema_repair_diagnostics"], [])
+
+    def test_live_forbidden_probability_output_does_not_validation_retry(self) -> None:
+        handoff = self._boi_rate_handoff()
+        unsafe_response = self._boi_material_unknown_role_drift_response(handoff)
+        unsafe_response["required_leaf_questions"][0]["probability_estimate"] = 0.62
+        requests: list[dict] = []
+
+        def transport(payload: dict) -> dict:
+            requests.append(payload)
+            return {
+                "schema_version": MODEL_RUNTIME_TRANSPORT_RESPONSE_SCHEMA_VERSION,
+                "response_payload": unsafe_response,
+                "provider_status": {"transport": "unit-test-forbidden-no-retry"},
+            }
+
+        with self.assertRaises(ModelRuntimeError) as raised:
+            build_question_decomposition_from_handoff(
+                handoff,
+                runtime_mode="live",
+                transport=transport,
+            )
+
+        runtime = raised.exception.runtime_call
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(runtime["execution_status"], "failed_forbidden_output")
+        self.assertEqual(runtime["validation_feedback_retry_count"], 0)
+        self.assertEqual(runtime["validation_feedback_retry_diagnostics"], [])
+        self.assertEqual(runtime["rejected_candidate_summaries"], [])
 
     def test_resolved_market_terminal_verification_remains_governed_by_existing_rules(self) -> None:
         handoff = self._boi_rate_handoff()

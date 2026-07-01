@@ -27,6 +27,7 @@ from ads_decomposer.model_runtime import (  # noqa: E402
     model_execution_context_from_runtime_call,
     _openclaw_agent_prompt,
     _parse_openclaw_agent_stdout,
+    qdt_validation_feedback_retry_decision,
     resolve_model_runtime_lane,
     scan_forbidden_model_outputs,
 )
@@ -289,6 +290,49 @@ class ModelRuntimeContractTest(unittest.TestCase):
         )
         self.assertEqual(groups["semantic_quality"], ["required_coverage_dimension_missing: source_quality"])
         self.assertEqual(groups["forbidden_authority"], ["model output authority forbidden"])
+
+    def test_validation_feedback_retry_eligibility_is_bounded_to_repairable_groups(self) -> None:
+        allowed = qdt_validation_feedback_retry_decision(
+            [
+                "required_leaf_questions[0].purpose is invalid",
+                "material_unknown_leaf_role_drift: leaf-boi-july-material-unknowns",
+                "dispatchable_terminal_verification_leaf_for_unresolved_market: leaf-final",
+            ],
+            forbidden_scan={"status": "passed"},
+            model_executed=True,
+            validation_retry_count=0,
+        )
+        semantic = qdt_validation_feedback_retry_decision(
+            ["required_coverage_dimension_missing: source_quality"],
+            forbidden_scan={"status": "passed"},
+            model_executed=True,
+            validation_retry_count=0,
+        )
+        forbidden = qdt_validation_feedback_retry_decision(
+            ["required_leaf_questions[0].purpose is invalid"],
+            forbidden_scan={"status": "failed"},
+            model_executed=True,
+            validation_retry_count=0,
+        )
+        exhausted = qdt_validation_feedback_retry_decision(
+            ["required_leaf_questions[0].purpose is invalid"],
+            forbidden_scan={"status": "passed"},
+            model_executed=True,
+            validation_retry_count=1,
+        )
+
+        self.assertTrue(allowed["retry_allowed"])
+        self.assertEqual(allowed["retry_status"], "validation_feedback_retry_available")
+        self.assertEqual(
+            allowed["eligible_error_groups"],
+            ["mechanical_schema", "material_unknown_role", "terminal_temporal_role"],
+        )
+        self.assertFalse(semantic["retry_allowed"])
+        self.assertEqual(semantic["blocked_error_groups"], ["semantic_quality"])
+        self.assertFalse(forbidden["retry_allowed"])
+        self.assertEqual(forbidden["retry_status"], "forbidden_output_scan_not_passed")
+        self.assertFalse(exhausted["retry_allowed"])
+        self.assertEqual(exhausted["retry_status"], "validation_feedback_retry_budget_exhausted")
 
     def test_material_unknown_role_drift_can_trigger_bounded_repair(self) -> None:
         def validator(value: Any) -> tuple[bool, list[str]]:

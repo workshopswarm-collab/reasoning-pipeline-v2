@@ -273,8 +273,54 @@ class QDTPersistenceTest(unittest.TestCase):
             },
         }
         qdt["model_execution_context"]["schema_repair_diagnostics"] = [copy.deepcopy(diagnostic)]
+        rejected_summary = {
+            "schema_version": "qdt-rejected-candidate-summary/v1",
+            "source_runtime_call_id": "model-runtime-call-first",
+            "source_runtime_status": "failed_schema_validation",
+            "source_response_sha256": "sha256:" + "2" * 64,
+            "candidate_ids": ["qdt-candidate-model-runtime"],
+            "validation_error_excerpts": ["material_unknown_leaf_role_drift: leaf-boi-july-material-unknowns"],
+            "validation_error_excerpt_count": 1,
+            "validation_error_total_count": 1,
+            "validation_error_groups": ["material_unknown_role"],
+            "validation_error_counts": {
+                "forbidden_authority": 0,
+                "mechanical_schema": 0,
+                "material_unknown_role": 1,
+                "semantic_quality": 0,
+                "terminal_temporal_role": 0,
+            },
+            "schema_repair_codes": ["material_unknown_role_repair_available"],
+            "retry_prompt_feedback_sha256": "sha256:" + "3" * 64,
+        }
+        retry_diagnostic = {
+            "schema_version": "model-runtime-validation-feedback-retry-diagnostic/v1",
+            "event": "validation_feedback_retry_succeeded",
+            "retry_attempt": 1,
+            "max_validation_retries": 1,
+            "retry_status": "validation_feedback_retry_available",
+            "eligible_error_groups": ["material_unknown_role"],
+            "blocked_error_groups": [],
+            "candidate_ids": ["qdt-candidate-model-runtime"],
+            "source_runtime_call_id": "model-runtime-call-first",
+            "retry_runtime_call_id": "model-runtime-call-second",
+            "rejected_candidate_summary_sha256": "sha256:" + "4" * 64,
+            "retry_prompt_feedback_sha256": "sha256:" + "3" * 64,
+        }
+        qdt["model_execution_context"]["validation_feedback_retry_count"] = 1
+        qdt["model_execution_context"]["validation_feedback_retry_diagnostics"] = [
+            copy.deepcopy(retry_diagnostic)
+        ]
+        qdt["model_execution_context"]["rejected_candidate_summaries"] = [
+            copy.deepcopy(rejected_summary)
+        ]
+        qdt["model_execution_context"]["previous_runtime_call_refs"] = ["model-runtime-call-first"]
         qdt["model_execution_context"]["runtime"] = {
             "schema_repair_diagnostics": [copy.deepcopy(diagnostic)],
+            "validation_feedback_retry_count": 1,
+            "validation_feedback_retry_diagnostics": [copy.deepcopy(retry_diagnostic)],
+            "rejected_candidate_summaries": [copy.deepcopy(rejected_summary)],
+            "previous_runtime_call_refs": ["model-runtime-call-first"],
         }
 
         with tempfile.TemporaryDirectory() as temp:

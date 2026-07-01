@@ -205,7 +205,7 @@ Completion notes:
 
 ## Phase 1 - QDT Unresolved-Market Temporal Contract Hardening
 
-Status: pending
+Status: complete
 
 Goal: make the live Decomposer less likely to generate invalid terminal-verification roles for
 unresolved markets.
@@ -386,7 +386,7 @@ Completion notes:
 
 ## Phase 3 - QDT Validation-Feedback Retry And Runtime Observability
 
-Status: pending
+Status: complete
 
 Goal: make live QDT resilient to one repairable schema/role failure and make rejected output easier
 to debug without external session spelunking.
@@ -453,12 +453,27 @@ Success criteria:
 
 Checklist:
 
-- [ ] Retry eligibility policy implemented.
-- [ ] Validation-feedback prompt path implemented.
-- [ ] Rejected-candidate summary persisted.
-- [ ] Retry and no-retry tests pass.
-- [ ] No temp artifacts remain.
-- [ ] `git diff --check` passes.
+- [x] Retry eligibility policy implemented.
+- [x] Validation-feedback prompt path implemented.
+- [x] Rejected-candidate summary persisted.
+- [x] Retry and no-retry tests pass.
+- [x] No temp artifacts remain.
+- [x] `git diff --check` passes.
+
+Completion notes:
+
+- Added QDT validation-feedback retry eligibility around the existing validation taxonomy:
+  retry is allowed only when the model executed, forbidden-output scan passed, validation retry
+  budget remains, and active validation groups are limited to mechanical schema, material-unknown
+  role, or terminal-temporal role errors.
+- Added a live-only Decomposer retry path that sends one bounded validation-feedback prompt after
+  the first repairable validation failure, then records the previous runtime call ref and final
+  retry outcome on the accepted or failed runtime artifact.
+- Persisted sanitized rejected-candidate summaries with candidate ids, bounded validation-error
+  excerpts, schema repair codes, error-group counts, source response hash, and retry prompt
+  feedback hash. Runtime summaries now carry these fields into operator/canary evidence.
+- Added focused retry/no-retry coverage plus persistence and operator-summary regressions. Full
+  Decomposer and Orchestrator test suites pass.
 
 ## Phase 4 - Retrieval Hard Timeout And Child-Process Cancellation
 

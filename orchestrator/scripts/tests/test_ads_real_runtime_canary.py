@@ -31,6 +31,10 @@ def _runtime_payload(
     reason_codes: list[str],
     repair_count: int = 0,
     schema_repair_diagnostics=None,
+    validation_feedback_retry_count: int = 0,
+    validation_feedback_retry_diagnostics=None,
+    rejected_candidate_summaries=None,
+    previous_runtime_call_refs=None,
 ) -> dict:
     return {
         "schema_version": "model-runtime-call-summary/v1",
@@ -44,6 +48,10 @@ def _runtime_payload(
         "repair_count": repair_count,
         "retry_count": 0,
         "schema_repair_diagnostics": list(schema_repair_diagnostics or []),
+        "validation_feedback_retry_count": validation_feedback_retry_count,
+        "validation_feedback_retry_diagnostics": list(validation_feedback_retry_diagnostics or []),
+        "rejected_candidate_summaries": list(rejected_candidate_summaries or []),
+        "previous_runtime_call_refs": list(previous_runtime_call_refs or []),
         "runtime_reason_codes": reason_codes,
     }
 
@@ -178,6 +186,64 @@ class AdsRealRuntimeCanaryTest(unittest.TestCase):
             qdt_evidence["runtime_results"][0]["schema_repair_diagnostics"][0]["repair_decision"],
             "mechanical_schema_repair_available",
         )
+
+    def test_qdt_runtime_evidence_surfaces_validation_feedback_retry_summary(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            rejected_summary = {
+                "schema_version": "qdt-rejected-candidate-summary/v1",
+                "source_runtime_call_id": "runtime-call:qdt-first",
+                "candidate_ids": ["qdt-candidate-model-runtime"],
+                "validation_error_excerpts": [
+                    "material_unknown_leaf_role_drift: leaf-boi-july-material-unknowns"
+                ],
+                "validation_error_groups": ["material_unknown_role"],
+                "schema_repair_codes": ["material_unknown_role_repair_available"],
+                "retry_prompt_feedback_sha256": "sha256:" + "4" * 64,
+            }
+            retry_diagnostic = {
+                "schema_version": "model-runtime-validation-feedback-retry-diagnostic/v1",
+                "event": "validation_feedback_retry_succeeded",
+                "retry_attempt": 1,
+                "retry_status": "validation_feedback_retry_available",
+                "source_runtime_call_id": "runtime-call:qdt-first",
+                "retry_runtime_call_id": "runtime-call:qdt-live",
+                "retry_prompt_feedback_sha256": "sha256:" + "4" * 64,
+            }
+            runtime_path = _write_json(
+                root,
+                "boi-qdt-runtime-retried.json",
+                _runtime_payload(
+                    execution_status="succeeded",
+                    reason_codes=["validation_feedback_retry_succeeded"],
+                    validation_feedback_retry_count=1,
+                    validation_feedback_retry_diagnostics=[retry_diagnostic],
+                    rejected_candidate_summaries=[rejected_summary],
+                    previous_runtime_call_refs=["runtime-call:qdt-first"],
+                ),
+            )
+
+            qdt_evidence = _model_runtime_evidence(
+                [
+                    {
+                        "artifact_id": "artifact:boi-runtime",
+                        "artifact_type": "model-runtime-call",
+                        "path": str(runtime_path),
+                    }
+                ]
+            )
+
+        runtime = qdt_evidence["runtime_results"][0]
+        self.assertEqual(runtime["validation_feedback_retry_count"], 1)
+        self.assertEqual(
+            runtime["validation_feedback_retry_diagnostics"][0]["event"],
+            "validation_feedback_retry_succeeded",
+        )
+        self.assertEqual(
+            runtime["rejected_candidate_summaries"][0]["candidate_ids"],
+            ["qdt-candidate-model-runtime"],
+        )
+        self.assertEqual(runtime["previous_runtime_call_refs"], ["runtime-call:qdt-first"])
 
     def test_boi_source_populated_retrieval_without_certified_evidence_is_taxonomized(self):
         with tempfile.TemporaryDirectory() as tempdir:
