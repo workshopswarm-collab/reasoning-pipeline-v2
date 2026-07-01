@@ -272,6 +272,7 @@ class ModelRuntimeContractTest(unittest.TestCase):
             [
                 "required_leaf_questions[0].purpose is invalid",
                 "terminal_verification_leaf_misclassified_as_pre_resolution: leaf-final",
+                "material_unknown_leaf_role_drift: leaf-boi-july-material-unknowns",
                 "required_coverage_dimension_missing: source_quality",
                 "model output authority forbidden",
             ]
@@ -282,8 +283,33 @@ class ModelRuntimeContractTest(unittest.TestCase):
             groups["terminal_temporal_role"],
             ["terminal_verification_leaf_misclassified_as_pre_resolution: leaf-final"],
         )
+        self.assertEqual(
+            groups["material_unknown_role"],
+            ["material_unknown_leaf_role_drift: leaf-boi-july-material-unknowns"],
+        )
         self.assertEqual(groups["semantic_quality"], ["required_coverage_dimension_missing: source_quality"])
         self.assertEqual(groups["forbidden_authority"], ["model output authority forbidden"])
+
+    def test_material_unknown_role_drift_can_trigger_bounded_repair(self) -> None:
+        def validator(value: Any) -> tuple[bool, list[str]]:
+            if isinstance(value, dict) and value.get("material_unknown_fixed") is True:
+                return True, []
+            return False, ["material_unknown_leaf_role_drift: leaf-boi-july-material-unknowns"]
+
+        def repairer(value: Any, _errors: list[str]) -> dict[str, Any]:
+            self.assertIsInstance(value, dict)
+            repaired = dict(value)
+            repaired["material_unknown_fixed"] = True
+            return repaired
+
+        result = self._call(fixture_response={"ok": False}, output_validator=validator, repairer=repairer)
+
+        diagnostic = result.runtime_call["schema_repair_diagnostics"][0]
+        self.assertEqual(result.runtime_call["repair_count"], 1)
+        self.assertEqual(diagnostic["repair_decision"], "material_unknown_role_repair_available")
+        self.assertEqual(diagnostic["pre_repair_error_counts"]["material_unknown_role"], 1)
+        self.assertEqual(diagnostic["remaining_error_counts"]["material_unknown_role"], 0)
+        self.assertIn("response.material_unknown_fixed", diagnostic["repaired_fields"])
 
     def test_mixed_mechanical_and_semantic_errors_repair_then_fail_closed(self) -> None:
         def validator(value: Any) -> tuple[bool, list[str]]:

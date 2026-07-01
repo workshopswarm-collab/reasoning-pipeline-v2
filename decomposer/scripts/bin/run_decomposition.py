@@ -428,6 +428,143 @@ def _leaf_looks_like_official_survey(leaf: dict[str, Any]) -> bool:
     )
 
 
+def _leaf_repair_text(leaf: dict[str, Any]) -> str:
+    return _normalized_token(
+        [
+            leaf.get("leaf_id"),
+            leaf.get("question_text"),
+            leaf.get("leaf_question"),
+            leaf.get("research_factor"),
+            leaf.get("coverage_dimension"),
+            leaf.get("purpose"),
+            leaf.get("required_evidence_fields"),
+            leaf.get("market_component_terms"),
+        ]
+    ).replace("_", " ")
+
+
+def _leaf_looks_like_final_result_repair_blocker(leaf: dict[str, Any]) -> bool:
+    text = _leaf_repair_text(leaf)
+    return bool(
+        re.search(r"\bfinal\b.{0,80}\b(result|outcome|resolution|settlement)\b", text)
+        or re.search(r"\bofficial\b.{0,80}\b(result|outcome)\b", text)
+        or re.search(r"\bresolved\b.{0,80}\b(outcome|result|market)\b", text)
+        or re.search(r"\bsettled\b.{0,80}\b(outcome|result|market)\b", text)
+        or re.search(r"\bresult\b.{0,40}\b(say|says|said|state|states)\b", text)
+    )
+
+
+def _leaf_looks_like_material_unknown_repair_candidate(leaf: dict[str, Any]) -> bool:
+    if _leaf_looks_like_final_result_repair_blocker(leaf):
+        return False
+    leaf_id = str(leaf.get("leaf_id") or "").lower().replace("_", "-")
+    if "material-unknown" in leaf_id:
+        return True
+    if leaf.get("coverage_dimension") == "material_unknowns":
+        return True
+    text = _leaf_repair_text(leaf)
+    return "material" in text and (
+        "unknown" in text
+        or "unanswered" in text
+        or "unavailable" in text
+        or "missing" in text
+    )
+
+
+def _repair_material_unknown_leaf_contract(leaf: dict[str, Any]) -> bool:
+    if not _leaf_looks_like_material_unknown_repair_candidate(leaf):
+        return False
+    needs_repair = (
+        leaf.get("purpose") != "structural"
+        or leaf.get("coverage_dimension") != "material_unknowns"
+        or leaf.get("leaf_temporal_role") != "material_unknown"
+    )
+    if not needs_repair:
+        return False
+    leaf["purpose"] = "structural"
+    leaf["coverage_dimension"] = "material_unknowns"
+    leaf["leaf_temporal_role"] = "material_unknown"
+    leaf["research_factor"] = "unanswered_material_questions"
+    leaf["required_evidence_fields"] = [
+        "unanswered_question_status",
+        "answerability_status",
+    ]
+    leaf["classification_targets"] = [
+        "answerability_status",
+        "unanswered_question_status",
+    ]
+    leaf["sufficiency_criteria"] = {
+        "classification_dispatch_requires_sufficiency_certificate": True,
+        "unanswerability_allowed": True,
+    }
+    leaf["missingness_interpretation"] = (
+        "unanswered_material_question_or_structural_unanswerability_candidate"
+    )
+    raw_forbidden = leaf.get("forbidden_outputs")
+    forbidden = set()
+    if isinstance(raw_forbidden, list):
+        forbidden = {
+            str(item)
+            for item in raw_forbidden
+            if isinstance(item, str) and item.strip()
+        }
+    leaf["forbidden_outputs"] = sorted(forbidden | FORBIDDEN_LEAF_OUTPUTS)
+    structural = leaf.get("structural_validation")
+    if not isinstance(structural, dict):
+        structural = {}
+    structural["depth"] = 2
+    structural.setdefault("answerability_status", "answerable")
+    leaf["structural_validation"] = structural
+    leaf.pop("research_sufficiency_requirements", None)
+    return True
+
+
+def _repair_material_unknown_graph_refs(repaired: dict[str, Any], repaired_leaf_ids: set[str]) -> None:
+    if not repaired_leaf_ids:
+        return
+    graph = repaired.get("research_coverage_graph")
+    if not isinstance(graph, dict):
+        return
+
+    def _without_repaired_ids(value: Any) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        return [str(item) for item in value if str(item) not in repaired_leaf_ids]
+
+    def _with_repaired_ids(value: Any) -> list[str]:
+        return sorted(set(_without_repaired_ids(value)) | repaired_leaf_ids)
+
+    graph["terminal_verification_leaf_ids"] = _without_repaired_ids(
+        graph.get("terminal_verification_leaf_ids")
+    )
+    graph["contract_guard_leaf_ids"] = _without_repaired_ids(
+        graph.get("contract_guard_leaf_ids")
+    )
+    graph["material_question_leaf_ids"] = _with_repaired_ids(
+        graph.get("material_question_leaf_ids")
+    )
+    graph["dispatchable_pre_resolution_leaf_ids"] = _with_repaired_ids(
+        graph.get("dispatchable_pre_resolution_leaf_ids")
+    )
+
+    by_dimension = graph.get("required_leaf_ids_by_dimension")
+    if isinstance(by_dimension, dict):
+        for dimension, leaf_ids in list(by_dimension.items()):
+            by_dimension[dimension] = _without_repaired_ids(leaf_ids)
+        by_dimension["material_unknowns"] = _with_repaired_ids(
+            by_dimension.get("material_unknowns")
+        )
+
+    research_factors = graph.get("research_factors")
+    if isinstance(research_factors, list):
+        for factor in research_factors:
+            if not isinstance(factor, dict) or str(factor.get("leaf_id")) not in repaired_leaf_ids:
+                continue
+            factor["coverage_dimension"] = "material_unknowns"
+            factor["research_factor"] = "unanswered_material_questions"
+            factor["leaf_temporal_role"] = "material_unknown"
+
+
 def _ensure_analyst_consensus_evidence_fields(leaf: dict[str, Any]) -> None:
     fields = leaf.get("required_evidence_fields")
     if not isinstance(fields, list):
@@ -525,6 +662,7 @@ def _ensure_model_candidate_contract_shape(repaired: dict[str, Any]) -> dict[str
     default_branch_id = next(iter(branch_by_id))
     membership: dict[str, list[str]] = {branch_id: [] for branch_id in branch_by_id}
     leaf_purposes_by_branch: dict[str, set[str]] = {branch_id: set() for branch_id in branch_by_id}
+    material_unknown_repaired_leaf_ids: set[str] = set()
 
     for idx, leaf in enumerate(leaves):
         if not isinstance(leaf, dict):
@@ -552,9 +690,12 @@ def _ensure_model_candidate_contract_shape(repaired: dict[str, Any]) -> dict[str
             leaf["leaf_temporal_role"] = "pre_resolution_forecast_driver"
             _ensure_analyst_consensus_evidence_fields(leaf)
             leaf.pop("research_sufficiency_requirements", None)
+        elif _repair_material_unknown_leaf_contract(leaf):
+            material_unknown_repaired_leaf_ids.add(leaf_id)
         elif (
             leaf.get("coverage_dimension") == "material_unknowns"
             and leaf.get("leaf_temporal_role") not in ALLOWED_LEAF_TEMPORAL_ROLES
+            and not _leaf_looks_like_final_result_repair_blocker(leaf)
         ):
             leaf["leaf_temporal_role"] = "material_unknown"
         else:
@@ -588,6 +729,8 @@ def _ensure_model_candidate_contract_shape(repaired: dict[str, Any]) -> dict[str
         structural["depth"] = 2
         structural.setdefault("answerability_status", "answerable")
         leaf["structural_validation"] = structural
+
+    _repair_material_unknown_graph_refs(repaired, material_unknown_repaired_leaf_ids)
 
     has_anchor_contracts = bool(repaired.get("amrg_anchor_dependency_contracts"))
     if not has_anchor_contracts:

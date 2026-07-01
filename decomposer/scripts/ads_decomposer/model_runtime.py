@@ -97,8 +97,13 @@ NON_REPAIRABLE_VALIDATION_ERROR_MARKERS = (
 )
 TERMINAL_TEMPORAL_ROLE_VALIDATION_ERROR_MARKERS = (
     "terminal_verification_dominates_unresolved_forecast_qdt",
+    "terminal_verification_leaf_for_unresolved_market",
     "terminal_verification_leaf_misclassified_as_pre_resolution",
+    "dispatchable_terminal_verification_leaf_for_unresolved_market",
     "dispatchable_pre_resolution_leaf_ids contains terminal verification leaves",
+)
+MATERIAL_UNKNOWN_ROLE_VALIDATION_ERROR_MARKERS = (
+    "material_unknown_leaf_role_drift",
 )
 FORBIDDEN_AUTHORITY_VALIDATION_ERROR_MARKERS = (
     "forbidden",
@@ -138,6 +143,7 @@ MECHANICAL_SCHEMA_VALIDATION_ERROR_MARKERS = (
 VALIDATION_ERROR_GROUPS = (
     "forbidden_authority",
     "mechanical_schema",
+    "material_unknown_role",
     "semantic_quality",
     "terminal_temporal_role",
 )
@@ -339,6 +345,9 @@ def classify_qdt_validation_errors(errors: list[str]) -> dict[str, list[str]]:
         if _contains_marker(normalized, TERMINAL_TEMPORAL_ROLE_VALIDATION_ERROR_MARKERS):
             groups["terminal_temporal_role"].append(text)
             matched = True
+        if _contains_marker(normalized, MATERIAL_UNKNOWN_ROLE_VALIDATION_ERROR_MARKERS):
+            groups["material_unknown_role"].append(text)
+            matched = True
         if _contains_marker(normalized, SEMANTIC_QUALITY_VALIDATION_ERROR_MARKERS):
             groups["semantic_quality"].append(text)
             matched = True
@@ -368,6 +377,8 @@ def _schema_repair_decision(
         return False, "repair_budget_exhausted"
     if groups.get("mechanical_schema"):
         return True, "mechanical_schema_repair_available"
+    if groups.get("material_unknown_role"):
+        return True, "material_unknown_role_repair_available"
     return False, "no_mechanical_schema_errors"
 
 
@@ -1095,6 +1106,7 @@ def execute_model_runtime_call(
                     repair_diagnostic["remaining_error_groups"] = {
                         "forbidden_authority": repair_diagnostic["remaining_errors"],
                         "mechanical_schema": [],
+                        "material_unknown_role": [],
                         "semantic_quality": [],
                         "terminal_temporal_role": [],
                     }

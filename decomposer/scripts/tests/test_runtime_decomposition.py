@@ -89,6 +89,83 @@ class RuntimeDecompositionEntrypointTest(unittest.TestCase):
             "validation_summary": {"status": "valid"},
         }
 
+    def _boi_rate_handoff(self) -> dict:
+        handoff = self._handoff()
+        handoff["case_id"] = "case-boi-rate-material-unknown"
+        handoff["case_key"] = "polymarket:boi-july-material-unknown"
+        handoff["macro_question"] = "Will the Bank of Israel cut interest rates at its July 2026 meeting?"
+        return handoff
+
+    def _boi_material_unknown_role_drift_response(
+        self,
+        handoff: dict,
+        *,
+        final_result_question: bool = False,
+    ) -> dict:
+        model_response = build_question_specific_fixture_response(handoff)
+        leaf = next(
+            item for item in model_response["required_leaf_questions"]
+            if item["coverage_dimension"] == "material_unknowns"
+        )
+        old_leaf_id = leaf["leaf_id"]
+        new_leaf_id = "leaf-boi-july-material-unknowns"
+        if final_result_question:
+            question = (
+                "What did the final official result say about whether the Bank of Israel "
+                "cut interest rates at its July 2026 meeting?"
+            )
+        else:
+            question = (
+                "What material questions remain unanswered about the Bank of Israel July "
+                "rate-decrease decision before the source cutoff?"
+            )
+        leaf.update(
+            {
+                "leaf_id": new_leaf_id,
+                "question_text": question,
+                "leaf_question": question,
+                "purpose": "direct_evidence",
+                "coverage_dimension": "current_direct_evidence",
+                "research_factor": (
+                    "final_result_status"
+                    if final_result_question
+                    else "unanswered_material_question_status"
+                ),
+                "leaf_temporal_role": "terminal_verification",
+                "required_evidence_fields": (
+                    ["official_result_status"]
+                    if final_result_question
+                    else ["unanswered_question_status"]
+                ),
+            }
+        )
+        for branch in model_response["branches"]:
+            branch["leaf_ids"] = [
+                new_leaf_id if item == old_leaf_id else item for item in branch["leaf_ids"]
+            ]
+        model_response["research_coverage_graph"] = {
+            "terminal_verification_leaf_ids": [new_leaf_id],
+            "contract_guard_leaf_ids": [new_leaf_id],
+            "material_question_leaf_ids": [],
+            "dispatchable_pre_resolution_leaf_ids": [new_leaf_id],
+            "required_leaf_ids_by_dimension": {
+                "current_direct_evidence": [new_leaf_id],
+            },
+            "research_factors": [
+                {
+                    "leaf_id": new_leaf_id,
+                    "coverage_dimension": "current_direct_evidence",
+                    "research_factor": (
+                        "final_result_status"
+                        if final_result_question
+                        else "unanswered_material_question_status"
+                    ),
+                    "leaf_temporal_role": "terminal_verification",
+                }
+            ],
+        }
+        return model_response
+
     def test_cli_writes_question_specific_qdt_and_runtime_call(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             temp = Path(tempdir)
@@ -212,6 +289,113 @@ class RuntimeDecompositionEntrypointTest(unittest.TestCase):
             repaired_leaf["research_sufficiency_requirements"]["required_source_classes"],
             ["independent_secondary", "expert_or_specialist"],
         )
+
+    def test_boi_material_unknown_role_drift_repairs_to_structural_contract(self) -> None:
+        handoff = self._boi_rate_handoff()
+        repairable = self._boi_material_unknown_role_drift_response(handoff)
+
+        qdt, runtime = build_question_decomposition_from_handoff(
+            handoff,
+            runtime_mode="fixture",
+            fixture_response=repairable,
+        )
+
+        repaired_leaf = next(
+            item for item in qdt["required_leaf_questions"]
+            if item["leaf_id"] == "leaf-boi-july-material-unknowns"
+        )
+        graph = qdt["research_coverage_graph"]
+        diagnostic = runtime["schema_repair_diagnostics"][0]
+        self.assertTrue(validate_question_decomposition(qdt).valid)
+        self.assertEqual(runtime["execution_status"], "succeeded")
+        self.assertEqual(runtime["repair_count"], 1)
+        self.assertEqual(diagnostic["repair_decision"], "material_unknown_role_repair_available")
+        self.assertGreater(diagnostic["pre_repair_error_counts"]["material_unknown_role"], 0)
+        self.assertEqual(diagnostic["remaining_error_counts"]["material_unknown_role"], 0)
+        self.assertEqual(diagnostic["remaining_error_counts"]["terminal_temporal_role"], 0)
+        self.assertEqual(repaired_leaf["purpose"], "structural")
+        self.assertEqual(repaired_leaf["coverage_dimension"], "material_unknowns")
+        self.assertEqual(repaired_leaf["leaf_temporal_role"], "material_unknown")
+        self.assertEqual(
+            repaired_leaf["classification_targets"],
+            ["answerability_status", "unanswered_question_status"],
+        )
+        self.assertIn("probability", repaired_leaf["forbidden_outputs"])
+        self.assertIn("final_forecast", repaired_leaf["forbidden_outputs"])
+        self.assertIn(repaired_leaf["leaf_id"], graph["dispatchable_pre_resolution_leaf_ids"])
+        self.assertIn(
+            repaired_leaf["leaf_id"],
+            graph["required_leaf_ids_by_dimension"]["material_unknowns"],
+        )
+        self.assertNotIn(repaired_leaf["leaf_id"], graph["terminal_verification_leaf_ids"])
+        self.assertTrue(
+            any(path.endswith(".leaf_temporal_role") for path in diagnostic["repaired_fields"]),
+            diagnostic["repaired_fields"],
+        )
+
+    def test_material_unknown_repair_does_not_convert_final_result_terminal_leak(self) -> None:
+        handoff = self._boi_rate_handoff()
+        bad_response = self._boi_material_unknown_role_drift_response(
+            handoff,
+            final_result_question=True,
+        )
+
+        with self.assertRaises(ModelRuntimeError) as raised:
+            build_question_decomposition_from_handoff(
+                handoff,
+                runtime_mode="fixture",
+                fixture_response=bad_response,
+            )
+
+        runtime = raised.exception.runtime_call
+        diagnostic = runtime["schema_repair_diagnostics"][0]
+        self.assertEqual(runtime["execution_status"], "failed_schema_validation")
+        self.assertEqual(runtime["repair_count"], 1)
+        self.assertEqual(diagnostic["repair_decision"], "material_unknown_role_repair_available")
+        self.assertGreater(diagnostic["remaining_error_counts"]["terminal_temporal_role"], 0)
+        self.assertGreater(diagnostic["remaining_error_counts"]["material_unknown_role"], 0)
+        self.assertIn("leaf-boi-july-material-unknowns", "; ".join(diagnostic["remaining_errors"]))
+
+    def test_material_unknown_repair_does_not_run_on_forbidden_probability_authority(self) -> None:
+        handoff = self._boi_rate_handoff()
+        unsafe_response = self._boi_material_unknown_role_drift_response(handoff)
+        unsafe_response["required_leaf_questions"][0]["probability_estimate"] = 0.62
+
+        with self.assertRaises(ModelRuntimeError) as raised:
+            build_question_decomposition_from_handoff(
+                handoff,
+                runtime_mode="fixture",
+                fixture_response=unsafe_response,
+            )
+
+        runtime = raised.exception.runtime_call
+        self.assertEqual(runtime["execution_status"], "failed_forbidden_output")
+        self.assertEqual(runtime["repair_count"], 0)
+        self.assertEqual(runtime["schema_repair_diagnostics"], [])
+
+    def test_resolved_market_terminal_verification_remains_governed_by_existing_rules(self) -> None:
+        handoff = self._boi_rate_handoff()
+        handoff["market_temporal_state"] = "resolved"
+        response = build_question_specific_fixture_response(handoff)
+        leaf = response["required_leaf_questions"][0]
+        question = (
+            "What final official result resolves whether the Bank of Israel cut interest rates "
+            "at its July 2026 meeting?"
+        )
+        leaf["question_text"] = question
+        leaf["leaf_question"] = question
+        leaf["leaf_temporal_role"] = "terminal_verification"
+
+        qdt, runtime = build_question_decomposition_from_handoff(
+            handoff,
+            runtime_mode="fixture",
+            fixture_response=response,
+        )
+
+        self.assertTrue(validate_question_decomposition(qdt).valid)
+        self.assertEqual(runtime["execution_status"], "succeeded")
+        self.assertEqual(runtime["repair_count"], 0)
+        self.assertIn(leaf["leaf_id"], qdt["research_coverage_graph"]["terminal_verification_leaf_ids"])
 
     def test_prompt_payload_contains_phase3_temporal_contract(self) -> None:
         payload = build_decomposition_prompt_payload(self._handoff(), payloads={})

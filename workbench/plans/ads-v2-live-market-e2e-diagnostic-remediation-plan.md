@@ -292,7 +292,7 @@ Completion notes:
 
 ## Phase 2 - Narrow QDT Material-Unknown Repair
 
-Status: pending
+Status: completed 2026-07-01
 
 Goal: allow safe repair of obvious material-unknown role drift while keeping true terminal
 verification misuse non-repairable.
@@ -364,12 +364,25 @@ Success criteria:
 
 Checklist:
 
-- [ ] Material-unknown detector implemented.
-- [ ] Narrow repair implemented.
-- [ ] Positive and negative QDT repair tests pass.
-- [ ] Runtime repair diagnostics updated.
-- [ ] No temp artifacts remain.
-- [ ] `git diff --check` passes.
+- [x] Material-unknown detector implemented.
+- [x] Narrow repair implemented.
+- [x] Positive and negative QDT repair tests pass.
+- [x] Runtime repair diagnostics updated.
+- [x] No temp artifacts remain.
+- [x] `git diff --check` passes.
+
+Completion notes:
+
+- Added `material_unknown_role` runtime validation grouping and
+  `material_unknown_role_repair_available` repair decisions so schema-repair diagnostics explain
+  material-unknown role drift separately from generic semantic quality or terminal leakage.
+- Added a narrow Decomposer response repair helper that recognizes material-unknown leaves by
+  stable id/text/dimension signals, refuses final-result/official-result language, repairs only
+  drifting contracts to `purpose=structural`, `coverage_dimension=material_unknowns`, and
+  `leaf_temporal_role=material_unknown`, and removes stale terminal graph refs when present.
+- Added runtime regressions proving the BOI `leaf-boi-july-material-unknowns` failure validates
+  after repair, final-result terminal leaks still fail closed, resolved-market terminal verification
+  remains governed by existing rules, and forbidden probability authority prevents repair entirely.
 
 ## Phase 3 - QDT Validation-Feedback Retry And Runtime Observability
 
