@@ -19,6 +19,13 @@ from predquant.ads_stage_logging import STAGE_STATUS_TABLE, ensure_stage_logging
 from predquant.ads_stage_logging import STAGE_EXECUTION_EVENT_TABLE
 
 
+ACCEPTED_VALIDATION_STATUSES = {"valid", "valid_with_warnings"}
+LINEAGE_ONLY_STAGES = {"case_selection", "training_trace", "replay_record"}
+INTELLIGENCE_HANDOFF_STAGES = frozenset(
+    stage for stage in ADS_PIPELINE_STAGE_ORDER if stage not in LINEAGE_ONLY_STAGES
+)
+
+
 def _decode_json(value: Any, fallback: Any) -> Any:
     if value in (None, ""):
         return fallback
@@ -115,6 +122,94 @@ def _manifest_summary(conn: sqlite3.Connection, artifact_id: str, *, stage: str 
         return {"artifact_id": artifact_id, "resolved": False, "error": str(exc)}
 
 
+def _normalized_token(value: Any) -> str:
+    return str(value or "").replace("-", "_")
+
+
+def _is_valid_manifest(manifest: dict[str, Any]) -> bool:
+    return str(manifest.get("validation_status") or "") in ACCEPTED_VALIDATION_STATUSES
+
+
+def _is_readiness_block_artifact(manifest: dict[str, Any]) -> bool:
+    normalized_type = _normalized_token(manifest.get("artifact_type"))
+    normalized_schema = _normalized_token(
+        manifest.get("artifact_schema_version") or manifest.get("schema_version")
+    )
+    return normalized_type.endswith("_readiness_block") or normalized_schema.endswith("_readiness_block/v1")
+
+
+def _downstream_consumers_by_input(stages: list[dict[str, Any]]) -> dict[str, list[dict[str, str]]]:
+    consumers: dict[str, list[dict[str, str]]] = {}
+    for stage in stages:
+        stage_name = str(stage.get("stage") or "")
+        for manifest in stage.get("output_manifests", []):
+            artifact_id = str(manifest.get("artifact_id") or "")
+            for input_ref in manifest.get("input_manifest_ids") or []:
+                consumers.setdefault(str(input_ref), []).append(
+                    {
+                        "stage": stage_name,
+                        "artifact_id": artifact_id,
+                    }
+                )
+    return consumers
+
+
+def _annotate_manifest_handoff(
+    manifest: dict[str, Any],
+    *,
+    consumers_by_input: dict[str, list[dict[str, str]]],
+) -> dict[str, Any]:
+    if manifest.get("non_manifest_ref"):
+        manifest["artifact_exists"] = False
+        manifest["artifact_valid"] = False
+        manifest["readiness_block"] = False
+        manifest["accepted_for_downstream"] = False
+        manifest["downstream_consumers"] = []
+        manifest["handoff_status"] = "non_manifest_reference"
+        return manifest
+
+    artifact_id = str(manifest.get("artifact_id") or "")
+    consumers = consumers_by_input.get(artifact_id, [])
+    artifact_exists = bool(manifest.get("resolved"))
+    artifact_valid = artifact_exists and _is_valid_manifest(manifest)
+    readiness_block = artifact_exists and _is_readiness_block_artifact(manifest)
+    accepted_for_downstream = bool(artifact_valid and consumers and not readiness_block)
+
+    if not artifact_exists:
+        handoff_status = "missing_or_unresolved"
+    elif readiness_block:
+        handoff_status = (
+            "valid_readiness_block_not_downstream_accepted"
+            if artifact_valid
+            else "readiness_block_not_valid"
+        )
+    elif not artifact_valid:
+        handoff_status = "artifact_exists_not_valid"
+    elif accepted_for_downstream:
+        handoff_status = "valid_and_accepted"
+    else:
+        handoff_status = "valid_not_accepted"
+
+    manifest["artifact_exists"] = artifact_exists
+    manifest["artifact_valid"] = artifact_valid
+    manifest["readiness_block"] = readiness_block
+    manifest["accepted_for_downstream"] = accepted_for_downstream
+    manifest["downstream_consumers"] = consumers
+    manifest["handoff_status"] = handoff_status
+    return manifest
+
+
+def _annotate_handoff_semantics(stages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    consumers_by_input = _downstream_consumers_by_input(stages)
+    for stage in stages:
+        stage["handoff_status_counts"] = {}
+        for manifest in stage.get("output_manifests", []):
+            _annotate_manifest_handoff(manifest, consumers_by_input=consumers_by_input)
+            status = str(manifest.get("handoff_status") or "unknown")
+            stage["handoff_status_counts"][status] = stage["handoff_status_counts"].get(status, 0) + 1
+    return stages
+
+
 def _stage_rows(conn: sqlite3.Connection, pipeline_run_id: str) -> list[dict[str, Any]]:
     if not _table_exists(conn, STAGE_STATUS_TABLE):
         return []
@@ -144,6 +239,10 @@ def _stage_rows(conn: sqlite3.Connection, pipeline_run_id: str) -> list[dict[str
     return result
 
 
+def _stage_completion_count(stages: list[dict[str, Any]]) -> int:
+    return sum(1 for stage in stages if str(stage.get("status") or "") == "complete")
+
+
 def _manifest_counts_for_stages(stages: list[dict[str, Any]]) -> dict[str, int]:
     counts: dict[str, int] = {}
     for stage in stages:
@@ -154,6 +253,57 @@ def _manifest_counts_for_stages(stages: list[dict[str, Any]]) -> dict[str, int]:
             status = status or "unknown"
             counts[status] = counts.get(status, 0) + 1
     return counts
+
+
+def _handoff_status_counts_for_stages(stages: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for stage in stages:
+        for manifest in stage["output_manifests"]:
+            status = str(manifest.get("handoff_status") or "unknown")
+            counts[status] = counts.get(status, 0) + 1
+    return counts
+
+
+def _accepted_intelligence_stage_count(stages: list[dict[str, Any]]) -> int:
+    count = 0
+    for stage in stages:
+        if stage.get("stage") not in INTELLIGENCE_HANDOFF_STAGES:
+            continue
+        if any(
+            manifest.get("accepted_for_downstream") and not manifest.get("readiness_block")
+            for manifest in stage.get("output_manifests", [])
+        ):
+            count += 1
+    return count
+
+
+def _handoff_health_summary(
+    *,
+    stages: list[dict[str, Any]],
+    unresolved: list[dict[str, Any]],
+) -> dict[str, Any]:
+    readiness_block_count = sum(
+        1
+        for stage in stages
+        for manifest in stage.get("output_manifests", [])
+        if manifest.get("readiness_block")
+    )
+    accepted_manifest_count = sum(
+        1
+        for stage in stages
+        for manifest in stage.get("output_manifests", [])
+        if manifest.get("accepted_for_downstream")
+    )
+    return {
+        "schema_version": "ads-handoff-health/v1",
+        "stage_completion_count": _stage_completion_count(stages),
+        "readiness_block_count": readiness_block_count,
+        "accepted_intelligence_stage_count": _accepted_intelligence_stage_count(stages),
+        "accepted_manifest_count": accepted_manifest_count,
+        "unresolved_output_manifest_ref_count": len(unresolved),
+        "handoff_counts_by_status": _handoff_status_counts_for_stages(stages),
+        "manifest_counts_by_validation_status": _manifest_counts_for_stages(stages),
+    }
 
 
 def build_handoff_report(
@@ -181,13 +331,14 @@ def build_handoff_report(
                 "ok": False,
                 "error": f"pipeline run not found: {selected_run_id}",
             }
-        stages = _stage_rows(conn, selected_run_id)
+        stages = _annotate_handoff_semantics(_stage_rows(conn, selected_run_id))
         unresolved = [
             manifest
             for stage in stages
             for manifest in stage["output_manifests"]
             if not manifest.get("resolved")
         ]
+        handoff_health = _handoff_health_summary(stages=stages, unresolved=unresolved)
         return {
             "schema_version": "ads-handoff-operator-report/v1",
             "ok": not unresolved,
@@ -195,7 +346,12 @@ def build_handoff_report(
             "loop_iterations": _loop_rows(conn, selected_run_id),
             "stages": stages,
             "unresolved_output_manifest_refs": unresolved,
-            "manifest_counts_by_validation_status": _manifest_counts_for_stages(stages),
+            "stage_completion_count": handoff_health["stage_completion_count"],
+            "readiness_block_count": handoff_health["readiness_block_count"],
+            "accepted_intelligence_stage_count": handoff_health["accepted_intelligence_stage_count"],
+            "handoff_counts_by_status": handoff_health["handoff_counts_by_status"],
+            "manifest_counts_by_validation_status": handoff_health["manifest_counts_by_validation_status"],
+            "handoff_health": handoff_health,
         }
     finally:
         conn.close()

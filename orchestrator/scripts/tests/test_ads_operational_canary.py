@@ -1483,6 +1483,13 @@ class AdsOperationalCanaryTest(unittest.TestCase):
         scae = criteria_report["scae_runtime_evidence"]
         self.assertGreater(scae["valid_forecast_count"], 0)
         self.assertGreater(scae["delta_ref_count"], 0)
+        health_summary = criteria_report["pipeline_health_summary"]
+        self.assertEqual(health_summary["stage_completion_count"], len(ADS_PIPELINE_STAGE_ORDER))
+        self.assertGreater(health_summary["accepted_intelligence_stage_count"], 0)
+        self.assertGreater(health_summary["certified_retrieval_leaf_count"], 0)
+        self.assertGreater(health_summary["classification_slice_count"], 0)
+        self.assertGreater(health_summary["scae_delta_ref_count"], 0)
+        self.assertIsNone(health_summary["first_postflight_reason"])
         self.assertEqual(result["protected_count_deltas"]["market_predictions"], 1)
         operator_report = build_ads_operator_review_report(
             self.db_path,
@@ -1491,6 +1498,12 @@ class AdsOperationalCanaryTest(unittest.TestCase):
             max_resolution_sync_age_seconds=10_000_000_000,
         )
         self.assertTrue(operator_report["cases"][0]["retrieval_sufficiency"]["leaf_retrieval_statuses"])
+        operator_health = operator_report["pipeline_health_summary"]
+        self.assertEqual(operator_health["stage_completion_count"], len(ADS_PIPELINE_STAGE_ORDER))
+        self.assertGreater(operator_health["certified_retrieval_leaf_count"], 0)
+        self.assertGreater(operator_health["classification_slice_count"], 0)
+        self.assertGreater(operator_health["scae_delta_ref_count"], 0)
+        self.assertEqual(operator_health["protected_write_deltas"]["market_predictions_delta"], 1)
 
     def test_phase9_valid_scae_forecast_writes_clone_only_without_live_db_mutation(self):
         live_counts_before = self.protected_counts_for(self.db_path)

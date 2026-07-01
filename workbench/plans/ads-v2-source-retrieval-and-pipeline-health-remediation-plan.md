@@ -884,7 +884,7 @@ Completion note, 2026-07-01:
 
 ## Phase 9 - Operator Reporting, Handoffs, And Health Semantics
 
-Status: pending
+Status: completed 2026-07-01
 
 Goal: make operator-facing reports explain pipeline health accurately across stage completion,
 readiness blocks, model execution, and protected writes.
@@ -955,12 +955,20 @@ Success criteria:
 
 Checklist:
 
-- [ ] New report fields are implemented.
-- [ ] Handoff acceptance semantics are tested.
-- [ ] CLI smoke tests pass.
-- [ ] No report overclaims authority or execution.
-- [ ] Temp artifacts and scripts are deleted.
-- [ ] `git diff --check` passes.
+- [x] New report fields are implemented.
+- [x] Handoff acceptance semantics are tested.
+- [x] CLI smoke tests pass.
+- [x] No report overclaims authority or execution.
+- [x] Temp artifacts and scripts are deleted.
+- [x] `git diff --check` passes.
+
+Completion note, 2026-07-01:
+
+- Added `ads-handoff-health/v1` semantics to the handoff report. Each output ref now reports artifact existence, validity, readiness-block status, downstream consumers, downstream acceptance, and a `handoff_status` such as `valid_and_accepted`, `valid_not_accepted`, `valid_readiness_block_not_downstream_accepted`, or `missing_or_unresolved`.
+- Added top-level Phase 9 health counters to handoff, real-runtime canary, and operator-review reports: stage completions, readiness blocks, accepted intelligence stages, live model calls and failures, certified retrieval leaves, classification slices, SCAE delta refs, and protected write deltas.
+- Added explicit `postflight_reason_order` reporting so operator-facing output shows failed runtime gates before secondary issue codes.
+- Focused tests cover valid readiness blocks not being counted as accepted downstream input, missing artifact refs failing manifest checks, Phase 9 summary counters, and the positive retrieval-to-SCAE path surfacing certified leaves, classification slices, SCAE deltas, and protected writes.
+- Verification passed: `test_ads_handoff_report`, `test_ads_real_runtime_canary`, `test_ads_operator_review`, focused `test_true_production_search_runtime_canary_proves_retrieval_to_scae_inputs`, full Orchestrator unittest discovery (`339` tests), `py_compile`, CLI help smokes for real-runtime canary/operator review/handoff/live-readiness, cloned-DB report emission smoke, temp cleanup, and `git diff --check`.
 
 ## Phase 10 - Representative Clone Batch And Closure
 

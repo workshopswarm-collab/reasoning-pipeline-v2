@@ -17,6 +17,7 @@ from predquant.ads_pipeline_runner import (
     read_pipeline_control_state,
 )
 from predquant.ads_real_runtime_canary import (
+    build_operator_pipeline_health_summary,
     phase9_leaf_retrieval_statuses,
     qdt_runtime_counters,
     summarize_retrieval_gap,
@@ -691,6 +692,23 @@ def _researcher_summary(manifests: list[dict[str, Any]]) -> dict[str, Any]:
     sidecars = []
     bundles = []
     classifications = []
+
+    def classification_slice_count(payload: dict[str, Any]) -> int:
+        candidates = []
+        for value in (
+            payload.get("classification_slices"),
+            payload.get("required_question_classifications"),
+            payload.get("classification_slice_refs"),
+        ):
+            if isinstance(value, list):
+                candidates.append(len(value))
+        matrix = payload.get("classification_matrix")
+        if isinstance(matrix, dict):
+            slices = matrix.get("classification_slices")
+            if isinstance(slices, list):
+                candidates.append(len(slices))
+        return max(candidates, default=0)
+
     for manifest in manifests:
         payload = _load_manifest_payload(manifest)
         artifact_type = str(manifest.get("artifact_type") or "")
@@ -727,6 +745,7 @@ def _researcher_summary(manifests: list[dict[str, Any]]) -> dict[str, Any]:
                     "classification_dispatch_status": payload.get("classification_dispatch_status"),
                     "reason_codes": list(payload.get("reason_codes") or []),
                     "researcher_probability_authority": payload.get("researcher_probability_authority"),
+                    "classification_slice_count": classification_slice_count(payload),
                 }
             )
     bundle_model_executed = sum(
@@ -763,6 +782,9 @@ def _researcher_summary(manifests: list[dict[str, Any]]) -> dict[str, Any]:
         "sidecars": sidecars,
         "runtime_bundles": bundles,
         "classification_artifacts": classifications,
+        "classification_slice_count": sum(
+            int(item["classification_slice_count"]) for item in classifications
+        ),
     }
 
 
@@ -1560,6 +1582,23 @@ def build_ads_operator_review_report(
         if counts["warning"]
         else "review_passed"
     )
+    operator_prediction_deltas = {
+        "delta_source": "pipeline_run_records",
+        "forecast_decision_records_delta": len(decisions),
+        "market_predictions_delta": len(predictions),
+        "expected_forecast_decision_records": None,
+        "expected_market_predictions": None,
+    }
+    pipeline_health_summary = build_operator_pipeline_health_summary(
+        handoff_report=handoff,
+        prediction_deltas=operator_prediction_deltas,
+        issues=[
+            str(alert.get("code"))
+            for alert in alerts
+            if alert.get("severity") in {"blocker", "warning"} and alert.get("code")
+        ],
+        cases=cases,
+    )
     return {
         "schema_version": ADS_OPERATOR_REVIEW_SCHEMA_VERSION,
         "ok": counts["blocker"] == 0,
@@ -1577,6 +1616,8 @@ def build_ads_operator_review_report(
         "pipeline_control": control,
         "alert_counts_by_severity": counts,
         "alerts": alerts,
+        "postflight_reason_order": pipeline_health_summary["postflight_reason_order"],
+        "pipeline_health_summary": pipeline_health_summary,
         "active_work": {
             "active_runs": len(active_runs),
             "active_leases": len(active_leases),

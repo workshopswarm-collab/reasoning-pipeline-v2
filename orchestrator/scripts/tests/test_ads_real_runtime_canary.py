@@ -11,6 +11,7 @@ from predquant.ads_real_runtime_canary import (
     SOURCE_RETRIEVAL_PHASE0_AUDIT_EXPECTATIONS,
     _model_runtime_evidence,
     _retrieval_runtime_evidence,
+    build_operator_pipeline_health_summary,
     build_source_retrieval_pipeline_health_taxonomy,
     build_current_audit_gap_summary,
     classify_qdt_runtime_state,
@@ -371,6 +372,80 @@ class AdsRealRuntimeCanaryTest(unittest.TestCase):
             "ads-pipeline-run:014933b9940a5449d49b216c316ca4b0a8bddd1ed41f33dac76b5071062a0afa",
         )
         self.assertIn("retrieval_live_acceptance_requirements", taxonomy["failed_runtime_gates"])
+
+    def test_operator_pipeline_health_summary_reports_phase9_counters_and_reason_order(self):
+        summary = build_operator_pipeline_health_summary(
+            handoff_report={
+                "handoff_health": {
+                    "stage_completion_count": 13,
+                    "readiness_block_count": 1,
+                    "accepted_intelligence_stage_count": 7,
+                    "handoff_counts_by_status": {
+                        "valid_and_accepted": 7,
+                        "valid_readiness_block_not_downstream_accepted": 1,
+                    },
+                }
+            },
+            qdt_evidence={
+                "qdt_live_model_call_executed_count": 1,
+                "qdt_live_output_rejected_count": 1,
+            },
+            retrieval_evidence={
+                "retrieval_packets": [
+                    {
+                        "leaf_retrieval_statuses": [
+                            {
+                                "leaf_id": "leaf-current-direct-evidence",
+                                "certificate_status": "certified_high_certainty",
+                                "classification_dispatch_allowed": True,
+                            },
+                            {
+                                "leaf_id": "leaf-source-quality",
+                                "certificate_status": "blocked_insufficient_research",
+                                "classification_dispatch_allowed": False,
+                            },
+                        ]
+                    }
+                ]
+            },
+            researcher_evidence={
+                "model_executed_count": 1,
+                "classification_slice_count": 2,
+                "sidecars": [{"model_executed": True, "ok": True}],
+                "runtime_bundles": [],
+            },
+            verification_evidence={
+                "verifications": [{"reconciliation_slice_count": 3}],
+            },
+            scae_evidence={"delta_ref_count": 4},
+            prediction_deltas={
+                "delta_source": "protected_count_deltas",
+                "forecast_decision_records_delta": 1,
+                "market_predictions_delta": 0,
+                "expected_forecast_decision_records": 1,
+                "expected_market_predictions": 0,
+            },
+            runtime_criteria=[
+                {
+                    "gate": "retrieval_live_acceptance_requirements",
+                    "required": True,
+                    "ok": False,
+                    "status": "failed",
+                }
+            ],
+            issues=["retrieval_live_acceptance_requirements_not_met"],
+        )
+
+        self.assertEqual(summary["stage_completion_count"], 13)
+        self.assertEqual(summary["readiness_block_count"], 1)
+        self.assertEqual(summary["accepted_intelligence_stage_count"], 7)
+        self.assertEqual(summary["live_model_call_count"], 2)
+        self.assertEqual(summary["live_model_call_failed_count"], 1)
+        self.assertEqual(summary["certified_retrieval_leaf_count"], 1)
+        self.assertEqual(summary["classification_slice_count"], 3)
+        self.assertEqual(summary["scae_delta_ref_count"], 4)
+        self.assertEqual(summary["protected_write_deltas"]["market_predictions_delta"], 0)
+        self.assertEqual(summary["first_postflight_reason"], "retrieval_live_acceptance_requirements")
 
 
 if __name__ == "__main__":

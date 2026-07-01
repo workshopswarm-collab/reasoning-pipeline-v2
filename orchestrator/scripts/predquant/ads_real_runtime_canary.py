@@ -25,6 +25,7 @@ from predquant.sqlite_store import brier_score_report, ensure_schema
 
 REAL_RUNTIME_CANARY_REPORT_SCHEMA_VERSION = "ads-real-runtime-canary-report/v1"
 REAL_RUNTIME_CANARY_CRITERIA_SCHEMA_VERSION = "ads-real-runtime-canary-criteria/v1"
+OPERATOR_PIPELINE_HEALTH_SUMMARY_SCHEMA_VERSION = "ads-operator-pipeline-health-summary/v1"
 REQUIRED_RUNTIME_MODEL_ID = "gpt-5.5-high"
 REQUIRED_RESEARCHER_RUNTIME_MODEL_IDS = {
     REQUIRED_RUNTIME_MODEL_ID,
@@ -600,7 +601,7 @@ def build_recent_run_failure_taxonomy(
 
 def _is_readiness_block_artifact(manifest: dict[str, Any]) -> bool:
     artifact_type = str(manifest.get("artifact_type") or "")
-    schema_version = str(manifest.get("schema_version") or "")
+    schema_version = str(manifest.get("artifact_schema_version") or manifest.get("schema_version") or "")
     normalized_type = artifact_type.replace("-", "_")
     normalized_schema = schema_version.replace("-", "_")
     return normalized_type.endswith("_readiness_block") or normalized_schema.endswith("_readiness_block/v1")
@@ -671,6 +672,201 @@ def build_source_retrieval_pipeline_health_taxonomy(
         "market_predictions_delta": market_predictions_delta,
         "no_scoreable_write_when_blocked": bool(phase9_case.get("no_scoreable_write_when_blocked")),
         "phase0_audit_expectations": dict(SOURCE_RETRIEVAL_PHASE0_AUDIT_EXPECTATIONS),
+    }
+
+
+def _certified_retrieval_leaf_count(retrieval_evidence: dict[str, Any]) -> int:
+    certified_statuses = {
+        "certified_high_certainty",
+        "structurally_unanswerable",
+        "structurally_unanswerable_certified",
+    }
+    count = 0
+    for packet in _list_of_dicts(retrieval_evidence.get("retrieval_packets")):
+        for leaf in _list_of_dicts(packet.get("leaf_retrieval_statuses")):
+            if (
+                str(leaf.get("certificate_status") or "") in certified_statuses
+                and leaf.get("classification_dispatch_allowed") is True
+            ):
+                count += 1
+    return count
+
+
+def _certified_retrieval_leaf_count_from_cases(cases: list[dict[str, Any]]) -> int:
+    certified_statuses = {
+        "certified_high_certainty",
+        "structurally_unanswerable",
+        "structurally_unanswerable_certified",
+    }
+    count = 0
+    for case in cases:
+        retrieval = case.get("retrieval_sufficiency") if isinstance(case, dict) else {}
+        if not isinstance(retrieval, dict):
+            continue
+        for leaf in _list_of_dicts(retrieval.get("leaf_retrieval_statuses")):
+            if (
+                str(leaf.get("certificate_status") or "") in certified_statuses
+                and leaf.get("classification_dispatch_allowed") is True
+            ):
+                count += 1
+    return count
+
+
+def _failed_researcher_model_call_count(researcher_evidence: dict[str, Any]) -> int:
+    failed = 0
+    for sidecar in _list_of_dicts(researcher_evidence.get("sidecars")):
+        if sidecar.get("model_executed") is True and not sidecar.get("ok"):
+            failed += 1
+    for bundle in _list_of_dicts(researcher_evidence.get("runtime_bundles")):
+        if _int_value(bundle.get("leaf_runtime_count")) > 0 and not bundle.get("ok"):
+            failed += 1
+    return failed
+
+
+def _postflight_reason_order(
+    *,
+    issues: list[str] | tuple[str, ...] | None = None,
+    runtime_criteria: list[dict[str, Any]] | tuple[dict[str, Any], ...] | None = None,
+) -> list[dict[str, Any]]:
+    ordered: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def add(kind: str, reason: str, detail: dict[str, Any] | None = None) -> None:
+        if not reason or reason in seen:
+            return
+        seen.add(reason)
+        ordered.append(
+            {
+                "rank": len(ordered) + 1,
+                "kind": kind,
+                "reason": reason,
+                "detail": detail or {},
+            }
+        )
+
+    for item in _list_of_dicts(runtime_criteria):
+        if item.get("required") and not item.get("ok"):
+            add(
+                "runtime_gate",
+                str(item.get("gate") or ""),
+                {
+                    "status": item.get("status"),
+                    "required": item.get("required"),
+                },
+            )
+    for issue in issues or []:
+        add("issue", str(issue))
+    return ordered
+
+
+def build_operator_pipeline_health_summary(
+    *,
+    handoff_report: dict[str, Any] | None = None,
+    qdt_evidence: dict[str, Any] | None = None,
+    retrieval_evidence: dict[str, Any] | None = None,
+    researcher_evidence: dict[str, Any] | None = None,
+    verification_evidence: dict[str, Any] | None = None,
+    scae_evidence: dict[str, Any] | None = None,
+    prediction_deltas: dict[str, Any] | None = None,
+    runtime_criteria: list[dict[str, Any]] | tuple[dict[str, Any], ...] | None = None,
+    issues: list[str] | tuple[str, ...] | None = None,
+    cases: list[dict[str, Any]] | tuple[dict[str, Any], ...] | None = None,
+) -> dict[str, Any]:
+    handoff = handoff_report if isinstance(handoff_report, dict) else {}
+    handoff_health = (
+        handoff.get("handoff_health")
+        if isinstance(handoff.get("handoff_health"), dict)
+        else {}
+    )
+    qdt = qdt_evidence if isinstance(qdt_evidence, dict) else {}
+    retrieval = retrieval_evidence if isinstance(retrieval_evidence, dict) else {}
+    researcher = researcher_evidence if isinstance(researcher_evidence, dict) else {}
+    verification = verification_evidence if isinstance(verification_evidence, dict) else {}
+    scae = scae_evidence if isinstance(scae_evidence, dict) else {}
+    deltas = prediction_deltas if isinstance(prediction_deltas, dict) else {}
+    case_rows = _list_of_dicts(cases)
+
+    if qdt:
+        qdt_live_model_call_count = _int_value(qdt.get("qdt_live_model_call_executed_count"))
+        qdt_live_failed_count = _int_value(qdt.get("qdt_live_output_rejected_count"))
+    else:
+        qdt_live_model_call_count = sum(
+            _int_value((case.get("qdt_model_provenance") or {}).get("qdt_live_model_call_executed_count"))
+            for case in case_rows
+        )
+        qdt_live_failed_count = sum(
+            _int_value((case.get("qdt_model_provenance") or {}).get("qdt_live_output_rejected_count"))
+            for case in case_rows
+        )
+
+    if researcher:
+        researcher_model_call_count = _int_value(researcher.get("model_executed_count"))
+        researcher_failed_count = _failed_researcher_model_call_count(researcher)
+        researcher_classification_slice_count = _int_value(researcher.get("classification_slice_count"))
+    else:
+        researcher_model_call_count = sum(
+            _int_value((case.get("researcher_model_provenance") or {}).get("model_executed_count"))
+            for case in case_rows
+        )
+        researcher_failed_count = 0
+        researcher_classification_slice_count = sum(
+            _int_value((case.get("researcher_model_provenance") or {}).get("classification_slice_count"))
+            for case in case_rows
+        )
+
+    if retrieval:
+        certified_retrieval_leaf_count = _certified_retrieval_leaf_count(retrieval)
+    else:
+        certified_retrieval_leaf_count = _certified_retrieval_leaf_count_from_cases(case_rows)
+
+    verification_slice_count = sum(
+        _int_value(item.get("reconciliation_slice_count"))
+        for item in _list_of_dicts(verification.get("verifications"))
+    )
+    if not verification_slice_count:
+        verification_slice_count = sum(
+            _int_value((case.get("verification_readiness") or {}).get("reconciliation_slice_count"))
+            for case in case_rows
+        )
+
+    scae_delta_ref_count = _int_value(scae.get("delta_ref_count"))
+    if not scae_delta_ref_count:
+        scae_delta_ref_count = sum(
+            _int_value((case.get("scae_readiness") or {}).get("evidence_delta_ref_count"))
+            for case in case_rows
+        )
+
+    protected_write_deltas = {
+        "delta_source": deltas.get("delta_source"),
+        "forecast_decision_records_delta": _int_value(deltas.get("forecast_decision_records_delta")),
+        "market_predictions_delta": _int_value(deltas.get("market_predictions_delta")),
+        "expected_forecast_decision_records": deltas.get("expected_forecast_decision_records"),
+        "expected_market_predictions": deltas.get("expected_market_predictions"),
+    }
+    postflight_reasons = _postflight_reason_order(issues=issues, runtime_criteria=runtime_criteria)
+    return {
+        "schema_version": OPERATOR_PIPELINE_HEALTH_SUMMARY_SCHEMA_VERSION,
+        "stage_completion_count": _int_value(
+            handoff_health.get("stage_completion_count", handoff.get("stage_completion_count"))
+        ),
+        "readiness_block_count": _int_value(
+            handoff_health.get("readiness_block_count", handoff.get("readiness_block_count"))
+        ),
+        "accepted_intelligence_stage_count": _int_value(
+            handoff_health.get(
+                "accepted_intelligence_stage_count",
+                handoff.get("accepted_intelligence_stage_count"),
+            )
+        ),
+        "live_model_call_count": qdt_live_model_call_count + researcher_model_call_count,
+        "live_model_call_failed_count": qdt_live_failed_count + researcher_failed_count,
+        "certified_retrieval_leaf_count": certified_retrieval_leaf_count,
+        "classification_slice_count": max(researcher_classification_slice_count, verification_slice_count),
+        "scae_delta_ref_count": scae_delta_ref_count,
+        "protected_write_deltas": protected_write_deltas,
+        "handoff_health": handoff_health,
+        "postflight_reason_order": postflight_reasons,
+        "first_postflight_reason": postflight_reasons[0]["reason"] if postflight_reasons else None,
     }
 
 
@@ -832,6 +1028,23 @@ def _researcher_runtime_evidence(manifests: list[dict[str, Any]]) -> dict[str, A
     sidecars = []
     bundles = []
     classifications = []
+
+    def classification_slice_count(payload: dict[str, Any]) -> int:
+        candidates = []
+        for value in (
+            payload.get("classification_slices"),
+            payload.get("required_question_classifications"),
+            payload.get("classification_slice_refs"),
+        ):
+            if isinstance(value, list):
+                candidates.append(len(value))
+        matrix = payload.get("classification_matrix")
+        if isinstance(matrix, dict):
+            slices = matrix.get("classification_slices")
+            if isinstance(slices, list):
+                candidates.append(len(slices))
+        return max(candidates, default=0)
+
     for manifest in manifests:
         artifact_type = str(manifest.get("artifact_type") or "")
         payload = _load_manifest_payload(manifest) or {}
@@ -873,6 +1086,7 @@ def _researcher_runtime_evidence(manifests: list[dict[str, Any]]) -> dict[str, A
                     "artifact_type": artifact_type,
                     "classification_status": payload.get("classification_status"),
                     "reason_codes": list(payload.get("reason_codes") or []),
+                    "classification_slice_count": classification_slice_count(payload),
                 }
             )
     model_executed_count = sum(1 for item in sidecars if item["ok"]) + sum(1 for item in bundles if item["ok"])
@@ -892,6 +1106,9 @@ def _researcher_runtime_evidence(manifests: list[dict[str, Any]]) -> dict[str, A
         "sidecars": sidecars,
         "runtime_bundles": bundles,
         "classification_artifacts": classifications,
+        "classification_slice_count": sum(
+            int(item["classification_slice_count"]) for item in classifications
+        ),
         "blocked_non_scoreable": blocked_non_scoreable,
         "ok": model_executed_count > 0 and all(item["ok"] for item in sidecars) and all(item["ok"] for item in bundles),
     }
@@ -2630,12 +2847,24 @@ def build_real_runtime_canary_report(
         prediction_deltas=prediction_deltas,
         phase9_case=phase9_case,
     )
+    pipeline_health_summary = build_operator_pipeline_health_summary(
+        handoff_report=handoff_report,
+        qdt_evidence=qdt_evidence,
+        retrieval_evidence=retrieval_evidence,
+        researcher_evidence=researcher_evidence,
+        verification_evidence=verification_evidence,
+        scae_evidence=scae_evidence,
+        prediction_deltas=prediction_deltas,
+        runtime_criteria=runtime_criteria,
+        issues=issues,
+    )
     return {
         "schema_version": REAL_RUNTIME_CANARY_REPORT_SCHEMA_VERSION,
         "criteria_schema_version": REAL_RUNTIME_CANARY_CRITERIA_SCHEMA_VERSION,
         "ok": not issues,
         "issues": issues,
         "first_failing_gate": first_failing_gate,
+        "postflight_reason_order": pipeline_health_summary["postflight_reason_order"],
         "warnings": warnings,
         "db_path": str(path),
         "pipeline_run_id": resolved_run_id,
@@ -2662,6 +2891,7 @@ def build_real_runtime_canary_report(
         "retry_summary": retry_summary,
         "recent_run_failure_taxonomy": current_audit_gap_summary["recent_run_failure_taxonomy"],
         "source_retrieval_pipeline_health_taxonomy": source_retrieval_pipeline_health_taxonomy,
+        "pipeline_health_summary": pipeline_health_summary,
         "source_retrieval_phase0_audit_expectations": dict(SOURCE_RETRIEVAL_PHASE0_AUDIT_EXPECTATIONS),
         "current_audit_gap_summary": current_audit_gap_summary,
         "phase9_representative_case": phase9_case,
@@ -2893,7 +3123,9 @@ __all__ = [
     "qdt_runtime_counters",
     "SOURCE_RETRIEVAL_PHASE0_AUDIT_EXPECTATIONS",
     "build_current_audit_gap_summary",
+    "build_operator_pipeline_health_summary",
     "build_real_runtime_canary_report",
+    "OPERATOR_PIPELINE_HEALTH_SUMMARY_SCHEMA_VERSION",
     "phase9_leaf_retrieval_statuses",
     "summarize_retrieval_transport_diagnostics",
 ]
