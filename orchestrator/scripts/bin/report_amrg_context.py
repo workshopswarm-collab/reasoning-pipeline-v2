@@ -97,6 +97,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Build an AMRG operator report.")
     parser.add_argument("related_market_context", type=Path, nargs="?")
     parser.add_argument("--question-decomposition", type=Path)
+    parser.add_argument("--retrieval-packet", type=Path)
     parser.add_argument("--vector-preflight", action="store_true")
     parser.add_argument("--vector-required", action="store_true")
     parser.add_argument("--allow-vector-pull", action="store_true")
@@ -130,7 +131,16 @@ def main(argv: list[str] | None = None) -> int:
         if args.question_decomposition
         else None
     )
-    report = build_amrg_operator_report(context, question_decomposition=qdt)
+    retrieval_packet = (
+        json.loads(args.retrieval_packet.read_text(encoding="utf-8"))
+        if args.retrieval_packet
+        else None
+    )
+    report = build_amrg_operator_report(
+        context,
+        question_decomposition=qdt,
+        retrieval_packet=retrieval_packet,
+    )
     if args.include_alerts:
         report = attach_alerts(report)
     if args.pretty:

@@ -4723,10 +4723,89 @@ def compact_vector_runtime_metadata(vector_runtime: dict[str, Any] | None) -> di
     }
 
 
+def _retrieval_hint_consumption_by_ref(retrieval_packet: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
+    if not isinstance(retrieval_packet, dict):
+        return {}
+    contexts = retrieval_packet.get("leaf_query_contexts")
+    if not isinstance(contexts, list):
+        return {}
+    by_ref: dict[str, dict[str, Any]] = {}
+    for context in contexts:
+        if not isinstance(context, dict):
+            continue
+        leaf_id = str(context.get("leaf_id") or "")
+        query_context_ref = str(context.get("query_context_ref") or "")
+        hint_text_sha256s = {
+            str(item)
+            for item in context.get("amrg_retrieval_hint_text_sha256", [])
+            if isinstance(item, str) and item
+        }
+        hint_refs = context.get("amrg_hint_refs")
+        if not isinstance(hint_refs, list):
+            continue
+        for item in hint_refs:
+            if isinstance(item, dict):
+                hint_ref = str(item.get("hint_ref") or "")
+                hint_source = str(item.get("hint_source") or "unknown")
+                hint_category = str(item.get("hint_category") or "unknown")
+                query_authority = str(
+                    item.get("query_authority")
+                    or "context_hint_only_no_retrieval_sufficiency_authority"
+                )
+            else:
+                hint_ref = str(item or "")
+                hint_source = "legacy_amrg_hint_ref"
+                hint_category = "unknown"
+                query_authority = "context_hint_only_no_retrieval_sufficiency_authority"
+            if not hint_ref:
+                continue
+            row = by_ref.setdefault(
+                hint_ref,
+                {
+                    "hint_ref": hint_ref,
+                    "retrieval_query_leaf_ids": set(),
+                    "retrieval_query_context_refs": set(),
+                    "hint_sources": set(),
+                    "hint_categories": set(),
+                    "query_authorities": set(),
+                    "hint_text_sha256s": set(),
+                },
+            )
+            if leaf_id:
+                row["retrieval_query_leaf_ids"].add(leaf_id)
+            if query_context_ref:
+                row["retrieval_query_context_refs"].add(query_context_ref)
+            row["hint_sources"].add(hint_source)
+            row["hint_categories"].add(hint_category)
+            row["query_authorities"].add(query_authority)
+            row["hint_text_sha256s"].update(hint_text_sha256s)
+    return {
+        hint_ref: {
+            "hint_ref": hint_ref,
+            "retrieval_query_leaf_ids": sorted(row["retrieval_query_leaf_ids"]),
+            "retrieval_query_context_refs": sorted(row["retrieval_query_context_refs"]),
+            "hint_sources": sorted(row["hint_sources"]),
+            "hint_categories": sorted(row["hint_categories"]),
+            "query_authorities": sorted(row["query_authorities"]),
+            "hint_text_sha256s": sorted(row["hint_text_sha256s"]),
+            "query_authority": "query_context_only_no_retrieval_sufficiency_authority",
+            "retrieval_sufficiency_authority": False,
+            "disallowed_authority_effects": [
+                "retrieval_sufficiency",
+                "scae_delta",
+                "probability_authority",
+            ],
+            "reason_codes": ["amrg_hint_used_as_retrieval_query_context_only"],
+        }
+        for hint_ref, row in sorted(by_ref.items())
+    }
+
+
 def build_amrg_operator_report(
     context: dict[str, Any],
     *,
     question_decomposition: dict[str, Any] | None = None,
+    retrieval_packet: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if context.get("artifact_type") == "related_live_market_context":
         validate_related_live_market_context(context)
@@ -4782,6 +4861,7 @@ def build_amrg_operator_report(
                 if not isinstance(item, dict) or not item.get("hint_ref"):
                     continue
                 qdt_consumption_by_ref[str(item["hint_ref"])] = item
+    retrieval_consumption_by_ref = _retrieval_hint_consumption_by_ref(retrieval_packet)
     consumed_by_ref: dict[str, dict[str, list[str]]] = {
         str(hint.get("hint_ref")): {"leaf_ids": [], "branch_ids": []}
         for hint in hints
@@ -4805,6 +4885,8 @@ def build_amrg_operator_report(
         if not isinstance(hint, dict):
             continue
         hint_ref = str(hint.get("hint_ref"))
+        retrieval_consumption = retrieval_consumption_by_ref.get(hint_ref, {})
+        retrieval_query_consumed = bool(retrieval_consumption)
         consumed = bool(
             consumed_by_ref.get(hint_ref, {}).get("leaf_ids")
             or consumed_by_ref.get(hint_ref, {}).get("branch_ids")
@@ -4823,6 +4905,21 @@ def build_amrg_operator_report(
                 "decomposer_consumed": consumed,
                 "consumed_by_leaf_ids": sorted(consumed_by_ref.get(hint_ref, {}).get("leaf_ids", [])),
                 "consumed_by_branch_ids": sorted(consumed_by_ref.get(hint_ref, {}).get("branch_ids", [])),
+                "retrieval_query_consumed": retrieval_query_consumed,
+                "retrieval_query_leaf_ids": retrieval_consumption.get("retrieval_query_leaf_ids", []),
+                "retrieval_query_context_refs": retrieval_consumption.get("retrieval_query_context_refs", []),
+                "retrieval_query_hint_text_sha256s": retrieval_consumption.get("hint_text_sha256s", []),
+                "retrieval_consumption_authority": (
+                    "query_context_only_no_retrieval_sufficiency_authority"
+                    if retrieval_query_consumed
+                    else "not_used_for_retrieval_query_context"
+                ),
+                "retrieval_sufficiency_authority": False,
+                "disallowed_authority_effects": [
+                    "retrieval_sufficiency",
+                    "scae_delta",
+                    "probability_authority",
+                ],
                 "ignored_reason_codes": qdt_consumption_by_ref.get(hint_ref, {}).get(
                     "ignored_reason_codes",
                     [] if consumed else ["not_referenced_by_qdt_branch_or_leaf"],
@@ -4836,6 +4933,13 @@ def build_amrg_operator_report(
             }
         )
     consumed_hint_count = sum(1 for item in hint_consumption if item["decomposer_consumed"])
+    retrieval_hint_consumption = [
+        retrieval_consumption_by_ref[str(item["hint_ref"])]
+        for item in hint_consumption
+        if item.get("retrieval_query_consumed") and str(item.get("hint_ref")) in retrieval_consumption_by_ref
+    ]
+    retrieval_hint_consumption_count = len(retrieval_hint_consumption)
+    known_hint_refs = {str(hint.get("hint_ref")) for hint in hints if isinstance(hint, dict) and hint.get("hint_ref")}
     ignored_reason_counts = Counter(
         reason
         for item in hint_consumption
@@ -4919,9 +5023,24 @@ def build_amrg_operator_report(
             if isinstance(question_decomposition, dict)
             else "pending_decomposition"
         ),
+        "retrieval_consumption_status": (
+            "evaluated"
+            if isinstance(retrieval_packet, dict)
+            else "pending_retrieval"
+        ),
         "consumed_hint_count": consumed_hint_count,
         "ignored_hint_count": len(hint_consumption) - consumed_hint_count,
         "ignored_hint_count_by_reason": dict(ignored_reason_counts),
+        "retrieval_hint_consumption_count": retrieval_hint_consumption_count,
+        "retrieval_hint_consumption": retrieval_hint_consumption,
+        "retrieval_unknown_hint_refs": sorted(set(retrieval_consumption_by_ref) - known_hint_refs),
+        "retrieval_consumption_authority": "query_context_only_no_retrieval_sufficiency_authority",
+        "retrieval_sufficiency_authority": False,
+        "disallowed_authority_effects": [
+            "retrieval_sufficiency",
+            "scae_delta",
+            "probability_authority",
+        ],
         "hint_consumption": hint_consumption,
         "authority": "operator_audit_only_no_forecast_authority",
     }

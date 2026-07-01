@@ -824,6 +824,90 @@ class AMRGContextTest(unittest.TestCase):
         self.assertEqual(report["ignored_hint_count_by_reason"], {"declared_in_related_context_usage_only": 1})
         self.assertIn("high_relevance", report["candidate_relevance_counts"])
 
+    def test_operator_report_tracks_retrieval_query_hint_consumption_without_authority(self):
+        artifact = enrich_related_live_market_context(
+            self.build_artifact([self.market(2), self.market(3)]),
+            evidence_packet=self.evidence_packet(),
+        )
+        artifact["amrg_decomposer_context"] = build_amrg_decomposer_context(artifact)
+        hint = next(
+            item
+            for item in artifact["amrg_decomposer_context"]["hints"]
+            if "retrieval_query_hint" in item["allowed_use"]
+        )
+        hint_ref = hint["hint_ref"]
+        qdt = {
+            "required_leaf_questions": [
+                {"leaf_id": "leaf-amrg-context", "amrg_usage_refs": [hint_ref]}
+            ],
+            "branches": [],
+            "related_market_context_usage": {
+                "usage_status": "related_context_used",
+                "related_context_artifact_ref": "artifact:related-live-market-context",
+                "amrg_usage_refs": [hint_ref],
+                "weak_context_only": False,
+                "anchor_dependency_status": "none",
+            },
+        }
+        retrieval_packet = {
+            "artifact_type": "retrieval_packet",
+            "leaf_query_contexts": [
+                {
+                    "leaf_id": "leaf-amrg-context",
+                    "query_context_ref": "leaf-query-context:amrg",
+                    "amrg_hint_refs": [
+                        {
+                            "hint_ref": hint_ref,
+                            "hint_source": "amrg_decomposer_context.hints",
+                            "hint_category": hint["hint_category"],
+                            "leaf_id": "leaf-amrg-context",
+                            "query_authority": "context_hint_only_no_retrieval_sufficiency_authority",
+                        }
+                    ],
+                    "amrg_retrieval_hint_text_sha256": ["sha256:" + "a" * 64],
+                }
+            ],
+        }
+
+        initial = build_amrg_operator_report(artifact)
+        report = build_amrg_operator_report(
+            artifact,
+            question_decomposition=qdt,
+            retrieval_packet=retrieval_packet,
+        )
+
+        self.assertEqual(initial["decomposer_consumption_status"], "pending_decomposition")
+        self.assertEqual(initial["retrieval_consumption_status"], "pending_retrieval")
+        self.assertEqual(report["decomposer_consumption_status"], "evaluated")
+        self.assertEqual(report["retrieval_consumption_status"], "evaluated")
+        self.assertEqual(report["consumed_hint_count"], 1)
+        self.assertEqual(report["retrieval_hint_consumption_count"], 1)
+        self.assertEqual(report["retrieval_unknown_hint_refs"], [])
+        retrieval = report["retrieval_hint_consumption"][0]
+        self.assertEqual(retrieval["hint_ref"], hint_ref)
+        self.assertEqual(retrieval["retrieval_query_leaf_ids"], ["leaf-amrg-context"])
+        self.assertEqual(retrieval["retrieval_query_context_refs"], ["leaf-query-context:amrg"])
+        self.assertEqual(
+            retrieval["query_authority"],
+            "query_context_only_no_retrieval_sufficiency_authority",
+        )
+        self.assertFalse(retrieval["retrieval_sufficiency_authority"])
+        self.assertEqual(
+            retrieval["disallowed_authority_effects"],
+            ["retrieval_sufficiency", "scae_delta", "probability_authority"],
+        )
+        consumption = {item["hint_ref"]: item for item in report["hint_consumption"]}
+        self.assertTrue(consumption[hint_ref]["retrieval_query_consumed"])
+        self.assertEqual(
+            consumption[hint_ref]["retrieval_consumption_authority"],
+            "query_context_only_no_retrieval_sufficiency_authority",
+        )
+        self.assertFalse(consumption[hint_ref]["retrieval_sufficiency_authority"])
+        self.assertEqual(
+            consumption[hint_ref]["disallowed_authority_effects"],
+            ["retrieval_sufficiency", "scae_delta", "probability_authority"],
+        )
+
     def test_relationship_typing_and_timing_alignment_can_add_safe_context_status(self):
         packet = self.evidence_packet()
         artifact = self.build_artifact([self.market(2)])

@@ -730,7 +730,7 @@ Completion notes:
 
 ## Phase 7 - AMRG Consumption And Reporting Accuracy
 
-Status: pending
+Status: completed 2026-07-01
 
 Goal: keep AMRG advisory while making its consumption and readiness status accurate across QDT and
 retrieval.
@@ -780,12 +780,27 @@ Success criteria:
 
 Checklist:
 
-- [ ] AMRG consumption finalization is implemented.
-- [ ] QDT consumed/ignored counts are tested.
-- [ ] Retrieval hint usage remains authority-bounded.
-- [ ] Assist not-requested status is not claimed as executed.
-- [ ] Temp artifacts and scripts are deleted.
-- [ ] `git diff --check` passes.
+- [x] AMRG consumption finalization is implemented.
+- [x] QDT consumed/ignored counts are tested.
+- [x] Retrieval hint usage remains authority-bounded.
+- [x] Assist not-requested status is not claimed as executed.
+- [x] Temp artifacts and scripts are deleted.
+- [x] `git diff --check` passes.
+
+Completion note, 2026-07-01:
+
+- AMRG operator reports now accept the accepted QDT artifact and retrieval packet together, keeping initial
+  context reports in `pending_decomposition` / `pending_retrieval` and later reports in evaluated state.
+- Retrieval query hint consumption is reported with leaf/query-context refs, bounded hint-text hashes,
+  unknown hint refs, and explicit `query_context_only_no_retrieval_sufficiency_authority` semantics.
+- AMRG reports keep retrieval sufficiency authority false and list disallowed downstream authority effects
+  without using forbidden RET-001 raw authority key fragments.
+- Operator review, real-runtime canary AMRG reports, and the `report_amrg_context.py` CLI now pass through
+  retrieval packets when available.
+- Verification passed: focused AMRG retrieval/report/operator-review tests, affected `test_retrieval`,
+  `test_amrg_context`, and `test_ads_operator_review` suites, full Researcher suite (`254` tests), full
+  Orchestrator suite (`336` tests), py_compile for changed modules/tests, cleanup check for phase temp
+  directories, and `git diff --check`.
 
 ## Phase 8 - SCAE, Decision, Training Trace, And Replay Authority Proof
 

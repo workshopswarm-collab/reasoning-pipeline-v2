@@ -363,6 +363,62 @@ class RetrievalPacketContractTest(unittest.TestCase):
                 amrg_context={"candidate_refs": ["amrg:1"], "probability": 0.9},
             )
 
+    def test_amrg_decomposer_hints_are_query_context_only_refs(self) -> None:
+        qdt = copy.deepcopy(self.qdt)
+        leaf = qdt["required_leaf_questions"][0]
+        leaf["amrg_usage_refs"] = ["amrg-edge:related-1"]
+        amrg_context = {
+            "artifact_type": "related_live_market_context",
+            "amrg_decomposer_context": {
+                "hints": [
+                    {
+                        "hint_ref": "amrg-edge:related-1",
+                        "hint_category": "deterministic_relationship_hint",
+                        "candidate_ref": "amrg-candidate:related-1",
+                        "relation_type": "shared_named_entity",
+                        "allowed_use": ["decomposition_context_hint", "retrieval_query_hint"],
+                        "source_market_ref": {
+                            "candidate_id": "amrg-candidate:related-1",
+                            "external_market_id": "poly-related-1",
+                        },
+                    },
+                    {
+                        "hint_ref": "amrg-edge:weak-only",
+                        "hint_category": "weak_context_hint",
+                        "candidate_ref": "amrg-candidate:weak",
+                        "relation_type": "generic_theme",
+                        "allowed_use": ["decomposition_context_hint"],
+                    },
+                ]
+            },
+        }
+
+        context = build_retrieval_query_contexts(
+            qdt,
+            evidence_packet=self.evidence_packet,
+            amrg_context=amrg_context,
+        )[0]
+
+        self.assertEqual(
+            context["amrg_hint_refs"],
+            [
+                {
+                    "hint_ref": "amrg-edge:related-1",
+                    "hint_source": "amrg_decomposer_context.hints",
+                    "hint_category": "deterministic_relationship_hint",
+                    "leaf_id": leaf["leaf_id"],
+                    "query_authority": "context_hint_only_no_retrieval_sufficiency_authority",
+                }
+            ],
+        )
+        self.assertEqual(len(context["amrg_retrieval_hint_text_sha256"]), 1)
+        self.assertTrue(
+            all(
+                digest.startswith("sha256:")
+                for digest in context["amrg_retrieval_hint_text_sha256"]
+            )
+        )
+
     def test_active_retrieval_rejects_replay_outcome_and_scoring_surface_inputs(self) -> None:
         forbidden_amrg_inputs = [
             {"candidate_refs": ["amrg:1"], "replay_result_ref": "replay-result:case-1"},

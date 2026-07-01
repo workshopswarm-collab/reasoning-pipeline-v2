@@ -896,28 +896,61 @@ def allowed_amrg_hint_refs(amrg_context: dict[str, Any] | None, leaf: dict[str, 
     _ensure_no_forbidden_keys(amrg_context, "amrg_context")
     leaf_id = leaf.get("leaf_id")
     refs: list[dict[str, Any]] = []
+    seen: set[str] = set()
     for key in ("amrg_usage_refs", "related_market_refs", "candidate_refs"):
         raw = amrg_context.get(key)
         if isinstance(raw, list):
             for idx, item in enumerate(raw[:12]):
                 if isinstance(item, str) and item:
+                    if item in seen:
+                        continue
+                    seen.add(item)
                     refs.append(
                         {
                             "hint_ref": item,
                             "hint_source": key,
                             "leaf_id": leaf_id,
-                            "query_authority": "context_hint_only",
+                            "query_authority": "context_hint_only_no_retrieval_sufficiency_authority",
                         }
                     )
                 elif isinstance(item, dict) and _is_non_empty_string(item.get("artifact_id")):
+                    hint_ref = str(item["artifact_id"])
+                    if hint_ref in seen:
+                        continue
+                    seen.add(hint_ref)
                     refs.append(
                         {
-                            "hint_ref": item["artifact_id"],
+                            "hint_ref": hint_ref,
                             "hint_source": key,
                             "leaf_id": leaf_id,
-                            "query_authority": "context_hint_only",
+                            "query_authority": "context_hint_only_no_retrieval_sufficiency_authority",
                         }
                     )
+    leaf_refs = {str(ref) for ref in leaf.get("amrg_usage_refs", []) if _is_non_empty_string(ref)}
+    decomposer_context = amrg_context.get("amrg_decomposer_context")
+    decomposer_hints = decomposer_context.get("hints") if isinstance(decomposer_context, dict) else []
+    if isinstance(decomposer_hints, list):
+        for hint in decomposer_hints[:12]:
+            if not isinstance(hint, dict) or not _is_non_empty_string(hint.get("hint_ref")):
+                continue
+            hint_ref = str(hint["hint_ref"])
+            if leaf_refs and hint_ref not in leaf_refs:
+                continue
+            allowed_use = hint.get("allowed_use") if isinstance(hint.get("allowed_use"), list) else []
+            if "retrieval_query_hint" not in set(str(item) for item in allowed_use):
+                continue
+            if hint_ref in seen:
+                continue
+            seen.add(hint_ref)
+            refs.append(
+                {
+                    "hint_ref": hint_ref,
+                    "hint_source": "amrg_decomposer_context.hints",
+                    "hint_category": hint.get("hint_category"),
+                    "leaf_id": leaf_id,
+                    "query_authority": "context_hint_only_no_retrieval_sufficiency_authority",
+                }
+            )
     return refs
 
 
@@ -963,6 +996,27 @@ def amrg_retrieval_hint_texts(amrg_context: dict[str, Any] | None, leaf: dict[st
                 or item.get("question_text")
                 or item.get("market_question")
                 or item.get("title")
+            )
+    decomposer_context = amrg_context.get("amrg_decomposer_context")
+    decomposer_hints = decomposer_context.get("hints") if isinstance(decomposer_context, dict) else []
+    if isinstance(decomposer_hints, list):
+        for hint in decomposer_hints:
+            if len(hints) >= limit:
+                break
+            if not isinstance(hint, dict):
+                continue
+            hint_ref = str(hint.get("hint_ref") or "")
+            if leaf_refs and hint_ref and hint_ref not in leaf_refs:
+                continue
+            allowed_use = hint.get("allowed_use") if isinstance(hint.get("allowed_use"), list) else []
+            if "retrieval_query_hint" not in set(str(item) for item in allowed_use):
+                continue
+            source_market_ref = hint.get("source_market_ref") if isinstance(hint.get("source_market_ref"), dict) else {}
+            add_hint(
+                source_market_ref.get("external_market_id")
+                or source_market_ref.get("candidate_id")
+                or hint.get("candidate_ref")
+                or hint.get("relation_type")
             )
     direct_hints = amrg_context.get("retrieval_query_hints")
     if isinstance(direct_hints, list):

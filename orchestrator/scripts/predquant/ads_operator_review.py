@@ -594,6 +594,8 @@ def _qdt_summary(manifests: list[dict[str, Any]]) -> dict[str, Any]:
 def _amrg_summaries(manifests: list[dict[str, Any]]) -> list[dict[str, Any]]:
     qdt_manifest = next((m for m in manifests if m.get("artifact_type") == "question-decomposition"), None)
     qdt = _load_manifest_payload(qdt_manifest) if qdt_manifest else None
+    retrieval_manifest = next((m for m in manifests if m.get("artifact_type") == "retrieval-packet"), None)
+    retrieval_packet = _load_manifest_payload(retrieval_manifest) if retrieval_manifest else None
     summaries = []
     for manifest in manifests:
         if manifest.get("artifact_type") not in {"related-live-market-context", "no-related-context-waiver"}:
@@ -602,7 +604,11 @@ def _amrg_summaries(manifests: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if not isinstance(payload, dict):
             summaries.append({"artifact_id": manifest.get("artifact_id"), "ok": False, "error": "payload_unreadable"})
             continue
-        report = build_amrg_operator_report(payload, question_decomposition=qdt if isinstance(qdt, dict) else None)
+        report = build_amrg_operator_report(
+            payload,
+            question_decomposition=qdt if isinstance(qdt, dict) else None,
+            retrieval_packet=retrieval_packet if isinstance(retrieval_packet, dict) else None,
+        )
         relationship_status_counts = {
             str(key or "missing"): value
             for key, value in (report.get("relationship_status_counts") or {}).items()
@@ -636,6 +642,11 @@ def _amrg_summaries(manifests: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "consumed_hint_count": report.get("consumed_hint_count", len(consumed)),
                 "ignored_hint_count": report.get("ignored_hint_count", 0),
                 "ignored_hint_count_by_reason": report.get("ignored_hint_count_by_reason", {}),
+                "retrieval_consumption_status": report.get("retrieval_consumption_status"),
+                "retrieval_hint_consumption_count": report.get("retrieval_hint_consumption_count", 0),
+                "retrieval_hint_consumption": report.get("retrieval_hint_consumption", []),
+                "retrieval_unknown_hint_refs": report.get("retrieval_unknown_hint_refs", []),
+                "retrieval_consumption_authority": report.get("retrieval_consumption_authority"),
                 "relationship_status_counts": relationship_status_counts,
                 "refresh_status_counts": refresh_status_counts,
                 "missing_refresh_status_refs": missing_refresh,

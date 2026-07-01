@@ -4,10 +4,12 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from predquant.ads_operator_review import (
+    _amrg_summaries,
     _build_alerts,
     _operator_retry_summary,
     _qdt_summary,
@@ -17,6 +19,75 @@ from predquant.ads_operator_review import (
 
 
 class AdsOperatorReviewTest(unittest.TestCase):
+    def test_amrg_summaries_pass_retrieval_packet_to_operator_report(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            base = Path(tempdir)
+            related_path = base / "related.json"
+            qdt_path = base / "qdt.json"
+            retrieval_path = base / "retrieval.json"
+            related_path.write_text(json.dumps({"artifact_type": "related_live_market_context"}), encoding="utf-8")
+            qdt_path.write_text(json.dumps({"artifact_type": "question_decomposition"}), encoding="utf-8")
+            retrieval_path.write_text(json.dumps({"artifact_type": "retrieval_packet"}), encoding="utf-8")
+            manifests = [
+                {
+                    "artifact_id": "artifact:related",
+                    "artifact_type": "related-live-market-context",
+                    "artifact_path": str(related_path),
+                },
+                {
+                    "artifact_id": "artifact:qdt",
+                    "artifact_type": "question-decomposition",
+                    "artifact_path": str(qdt_path),
+                },
+                {
+                    "artifact_id": "artifact:retrieval",
+                    "artifact_type": "retrieval-packet",
+                    "artifact_path": str(retrieval_path),
+                },
+            ]
+
+            def fake_report(payload, *, question_decomposition=None, retrieval_packet=None):
+                self.assertEqual(payload["artifact_type"], "related_live_market_context")
+                self.assertEqual(question_decomposition["artifact_type"], "question_decomposition")
+                self.assertEqual(retrieval_packet["artifact_type"], "retrieval_packet")
+                return {
+                    "candidate_set_id": "amrg-candidate-set:test",
+                    "artifact_type": "related_live_market_context",
+                    "vector_status": "not_requested",
+                    "candidate_count": 1,
+                    "candidate_relevance_counts": {"high_relevance": 1},
+                    "high_relevance_candidate_count": 1,
+                    "weak_context_only_candidate_count": 0,
+                    "filtered_weak_context_candidate_count": 0,
+                    "consumed_hint_count": 1,
+                    "ignored_hint_count": 0,
+                    "ignored_hint_count_by_reason": {},
+                    "retrieval_consumption_status": "evaluated",
+                    "retrieval_hint_consumption_count": 1,
+                    "retrieval_hint_consumption": [
+                        {
+                            "hint_ref": "amrg-edge:1",
+                            "query_authority": "query_context_only_no_retrieval_sufficiency_authority",
+                        }
+                    ],
+                    "retrieval_unknown_hint_refs": [],
+                    "retrieval_consumption_authority": "query_context_only_no_retrieval_sufficiency_authority",
+                    "relationship_status_counts": {},
+                    "refresh_status_counts": {},
+                    "hint_consumption": [],
+                }
+
+            with patch("predquant.ads_operator_review.build_amrg_operator_report", side_effect=fake_report):
+                summaries = _amrg_summaries(manifests)
+
+        self.assertEqual(len(summaries), 1)
+        self.assertEqual(summaries[0]["retrieval_consumption_status"], "evaluated")
+        self.assertEqual(summaries[0]["retrieval_hint_consumption_count"], 1)
+        self.assertEqual(
+            summaries[0]["retrieval_consumption_authority"],
+            "query_context_only_no_retrieval_sufficiency_authority",
+        )
+
     def test_retrieval_summary_treats_null_lists_as_empty(self):
         with tempfile.TemporaryDirectory() as tempdir:
             artifact_path = Path(tempdir) / "retrieval.json"

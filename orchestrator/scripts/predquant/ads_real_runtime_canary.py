@@ -2208,6 +2208,12 @@ def _amrg_reports(manifests: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if item.get("artifact_type") == "question-decomposition"
     ]
     qdt_payload = next((payload for payload in qdt_payloads if isinstance(payload, dict)), None)
+    retrieval_payloads = [
+        _load_manifest_payload(item)
+        for item in manifests
+        if item.get("artifact_type") == "retrieval-packet"
+    ]
+    retrieval_payload = next((payload for payload in retrieval_payloads if isinstance(payload, dict)), None)
     reports = []
     for manifest in manifests:
         if manifest.get("artifact_type") not in {"related-live-market-context", "no-related-context-waiver"}:
@@ -2217,7 +2223,11 @@ def _amrg_reports(manifests: list[dict[str, Any]]) -> list[dict[str, Any]]:
             reports.append({"artifact_id": manifest.get("artifact_id"), "ok": False, "error": "payload_unreadable"})
             continue
         try:
-            report = build_amrg_operator_report(payload, question_decomposition=qdt_payload)
+            report = build_amrg_operator_report(
+                payload,
+                question_decomposition=qdt_payload,
+                retrieval_packet=retrieval_payload,
+            )
             reports.append({"artifact_id": manifest.get("artifact_id"), "ok": True, "report": report})
         except Exception as exc:
             reports.append({"artifact_id": manifest.get("artifact_id"), "ok": False, "error": str(exc)})
