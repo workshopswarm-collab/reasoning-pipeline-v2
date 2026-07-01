@@ -2555,6 +2555,17 @@ def build_stage_handlers(
             decision_output = stage_outputs.get("decision") or {}
             decision_metadata = decision_output.get("safe_metadata") or {}
             scoreable = bool(decision_metadata.get("scoreable_forecast_output"))
+            market_prediction_written = bool(decision_metadata.get("market_prediction_written"))
+            non_scoreable_reason_codes = (
+                []
+                if scoreable
+                else [
+                    str(
+                        decision_metadata.get("block_reason_code")
+                        or "non_scoreable_readiness_run"
+                    )
+                ]
+            )
             payload = {
                 "artifact_type": STAGE_ARTIFACT_TYPES[stage].replace("-", "_"),
                 "schema_version": STAGE_SCHEMA_VERSIONS[stage],
@@ -2570,12 +2581,21 @@ def build_stage_handlers(
                     else "recorded_non_scoreable_readiness_run"
                 ),
                 "scoreable_forecast_output": scoreable,
-                "writes_production_forecast": scoreable,
-                "reason_codes": (
-                    ["scoreable_production_pilot_run"]
-                    if scoreable
-                    else ["non_scoreable_readiness_run"]
-                ),
+                "upstream_market_prediction_written": market_prediction_written,
+                "lineage_authority": "lineage_only_no_forecast_or_scoring_authority",
+                "writes_production_forecast": False,
+                "writes_market_prediction": False,
+                "scoring_authority": False,
+                "replay_scoring_authority": False,
+                "non_scoreable_reason_codes": non_scoreable_reason_codes,
+                "reason_codes": [
+                    *(
+                        ["scoreable_lineage_recorded"]
+                        if scoreable
+                        else ["non_scoreable_readiness_run", *non_scoreable_reason_codes]
+                    ),
+                    "lineage_only_no_forecast_or_scoring_authority",
+                ],
             }
             manifest, validation_id = _write_payload_manifest(
                 conn,
@@ -2598,7 +2618,13 @@ def build_stage_handlers(
                 [manifest["artifact_id"]],
                 [validation_id],
                 lease,
-                {**factory_metadata, "record_status": payload["record_status"]},
+                {
+                    **factory_metadata,
+                    "record_status": payload["record_status"],
+                    "lineage_scoreable_context": scoreable,
+                    "upstream_market_prediction_written": market_prediction_written,
+                    "non_scoreable_reason_codes": non_scoreable_reason_codes,
+                },
             )
 
         return handler

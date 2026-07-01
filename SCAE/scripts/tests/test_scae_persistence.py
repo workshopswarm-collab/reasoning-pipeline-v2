@@ -125,6 +125,12 @@ class ScaePersistenceTest(unittest.TestCase):
         finalized["case_key"] = "case:key:1"
         finalized["forecast_timestamp"] = "2026-06-25T12:00:00+00:00"
         finalized["run_id"] = "run-1"
+        finalized["scae_valid_forecast_requires_evidence_delta_refs"] = True
+        finalized["scae_evidence_delta_ref_requirement_status"] = "satisfied"
+        finalized["scae_evidence_delta_ref_count"] = 1
+        finalized["scae_evidence_delta_refs"] = ["log-odds:1"]
+        finalized["scoreable_forecast_output"] = True
+        finalized["market_prediction_write_expected"] = True
         return finalized
 
     def log_odds_slice(self):
@@ -256,6 +262,8 @@ class ScaePersistenceTest(unittest.TestCase):
         invalid["execution_authority_status"] = "forbidden"
         invalid["final_probability_fields_status"] = "blocked_invalid_for_forecast"
         invalid["production_forecast_authority"] = False
+        invalid["scoreable_forecast_output"] = False
+        invalid["market_prediction_write_expected"] = False
         for field in ("debt_adjusted_probability", "production_forecast_prob", "canonical_probability"):
             invalid.pop(field, None)
         invalid["final_probability_ledger_id"] = "scae-final-probability-ledger:invalid"
@@ -819,6 +827,60 @@ class ScaePersistenceTest(unittest.TestCase):
             metadata = json.loads(row[12])
             self.assertEqual(metadata["scoreable_prediction_source"], "scae.production_forecast_prob")
             self.assertEqual(metadata["contract_market_snapshot_id"], snapshot_id)
+
+    def test_scae_market_prediction_bridge_blocks_valid_non_scoreable_ledger_without_prediction_row(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "predictions.sqlite3"
+            market_id, snapshot_id, _ = self.seed_prediction_market(db_path)
+            ledger = self.finalized_ledger()
+            ledger["scoreable_forecast_output"] = False
+            ledger["market_prediction_write_expected"] = False
+            gate = self.decision_gate(ledger)
+            contract = self.ads_case_contract(ledger, market_id, snapshot_id)
+
+            result = write_scae_market_prediction(db_path, ledger, gate, contract)
+
+            self.assertFalse(result["market_prediction_written"])
+            self.assertFalse(result["scoreable_forecast_output"])
+            self.assertEqual(result["block_reason_code"], "scoreable_forecast_output_not_expected")
+            self.assertTrue(result["forecast_decision_id"].startswith("forecast-decision-"))
+            with sqlite3.connect(db_path) as conn:
+                prediction_count = conn.execute("SELECT COUNT(*) FROM market_predictions").fetchone()[0]
+                decision = conn.execute(
+                    f"""
+                    SELECT production_persistence_status, production_forecast_persisted,
+                           production_forecast_prob, scoreable_forecast_output,
+                           writes_market_prediction
+                    FROM {FORECAST_DECISION_TABLE}
+                    """
+                ).fetchone()
+            self.assertEqual(prediction_count, 0)
+            self.assertEqual(decision[0], "production_forecast_persisted_from_scae")
+            self.assertEqual(decision[1], 1)
+            self.assertEqual(decision[2], ledger["production_forecast_prob"])
+            self.assertEqual(decision[3:], (0, 0))
+
+    def test_scae_market_prediction_bridge_blocks_scoreable_ledger_without_verified_delta_refs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "predictions.sqlite3"
+            market_id, snapshot_id, _ = self.seed_prediction_market(db_path)
+            ledger = self.finalized_ledger()
+            ledger["scae_evidence_delta_ref_requirement_status"] = "verified_scae_evidence_delta_refs_missing"
+            ledger["scae_evidence_delta_ref_count"] = 0
+            ledger["scae_evidence_delta_refs"] = []
+            gate = self.decision_gate(ledger)
+            contract = self.ads_case_contract(ledger, market_id, snapshot_id)
+
+            result = write_scae_market_prediction(db_path, ledger, gate, contract)
+
+            self.assertFalse(result["market_prediction_written"])
+            self.assertFalse(result["scoreable_forecast_output"])
+            self.assertEqual(result["block_reason_code"], "verified_scae_evidence_delta_refs_missing")
+            with sqlite3.connect(db_path) as conn:
+                prediction_count = conn.execute("SELECT COUNT(*) FROM market_predictions").fetchone()[0]
+                decision_count = conn.execute(f"SELECT COUNT(*) FROM {FORECAST_DECISION_TABLE}").fetchone()[0]
+            self.assertEqual(prediction_count, 0)
+            self.assertEqual(decision_count, 1)
 
     def test_scae_market_prediction_bridge_scores_against_prediction_time_market_baseline(self):
         with tempfile.TemporaryDirectory() as tmp:

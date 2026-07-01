@@ -804,7 +804,7 @@ Completion note, 2026-07-01:
 
 ## Phase 8 - SCAE, Decision, Training Trace, And Replay Authority Proof
 
-Status: pending
+Status: completed 2026-07-01
 
 Goal: prove downstream stages remain fail-closed for insufficient inputs and produce valid artifacts
 only with verified SCAE-ready deltas.
@@ -860,12 +860,27 @@ Success criteria:
 
 Checklist:
 
-- [ ] Invalid upstream fail-closed tests pass.
-- [ ] Valid-delta SCAE positive tests pass.
-- [ ] Decision write rules are tested.
-- [ ] Training/replay lineage is tested.
-- [ ] Temp artifacts and scripts are deleted.
-- [ ] `git diff --check` passes.
+- [x] Invalid upstream fail-closed tests pass.
+- [x] Valid-delta SCAE positive tests pass.
+- [x] Decision write rules are tested.
+- [x] Training/replay lineage is tested.
+- [x] Temp artifacts and scripts are deleted.
+- [x] `git diff --check` passes.
+
+Completion note, 2026-07-01:
+
+- The SCAE market-prediction bridge now fails closed unless the ledger is explicitly scoreable,
+  explicitly expects a market-prediction write, and carries satisfied verified SCAE evidence-delta refs.
+- Valid but non-scoreable SCAE ledgers still write the audit decision record, but they do not write
+  `market_predictions`; missing verified delta refs also block the market-prediction bridge.
+- Scoreable canary and pipeline-runner fixture ledgers now carry explicit evidence-delta refs and
+  scoreable write-expectation fields.
+- Training trace and replay readiness records now carry lineage-only authority, upstream write status,
+  non-scoreable reason codes, and explicit false write/scoring authority flags.
+- Verification passed: focused SCAE bridge tests, operational canary scoreable and missing-delta proofs,
+  training trace and replay suites, full SCAE suite (`111` tests), full Orchestrator suite (`336` tests),
+  full Researcher suite (`254` tests), py_compile for changed modules/tests, cleanup check for phase temp
+  directories, and `git diff --check`.
 
 ## Phase 9 - Operator Reporting, Handoffs, And Health Semantics
 

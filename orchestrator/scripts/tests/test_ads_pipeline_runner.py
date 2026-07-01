@@ -165,6 +165,12 @@ class AdsPipelineRunnerTest(unittest.TestCase):
             "canonical_probability": probability,
             "writes_persistence": False,
             "writes_production_forecast": False,
+            "scae_valid_forecast_requires_evidence_delta_refs": True,
+            "scae_evidence_delta_ref_requirement_status": "satisfied",
+            "scae_evidence_delta_ref_count": 1,
+            "scae_evidence_delta_refs": [f"scae-evidence-delta:auto005:{ordinal}:{lease['case_id']}"],
+            "scoreable_forecast_output": True,
+            "market_prediction_write_expected": True,
             "final_probability_ledger_id": f"scae-final-probability-ledger:auto005:{ordinal}:{lease['case_id']}",
             "final_probability_ledger_digest": self.sha256_ref("auto005-ledger", ordinal, lease["case_id"]),
         }

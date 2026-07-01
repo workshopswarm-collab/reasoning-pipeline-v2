@@ -1375,6 +1375,28 @@ def write_scae_market_prediction(
             block_reason="forecast_decision_non_scoreable",
             contract_values=contract_values,
         )
+    if (
+        scae_ledger.get("scoreable_forecast_output") is not True
+        or scae_ledger.get("market_prediction_write_expected") is not True
+    ):
+        return _blocked_market_prediction_result(
+            decision_result=decision_result,
+            block_reason="scoreable_forecast_output_not_expected",
+            contract_values=contract_values,
+        )
+    evidence_delta_refs = scae_ledger.get("scae_evidence_delta_refs")
+    if (
+        scae_ledger.get("scae_valid_forecast_requires_evidence_delta_refs") is not True
+        or scae_ledger.get("scae_evidence_delta_ref_requirement_status") != "satisfied"
+        or not isinstance(evidence_delta_refs, list)
+        or not any(_is_non_empty_string(ref) for ref in evidence_delta_refs)
+        or int(scae_ledger.get("scae_evidence_delta_ref_count") or 0) <= 0
+    ):
+        return _blocked_market_prediction_result(
+            decision_result=decision_result,
+            block_reason="verified_scae_evidence_delta_refs_missing",
+            contract_values=contract_values,
+        )
     if contract_values["snapshot_block_reason"] and fresh_snapshot_payload is None:
         return _blocked_market_prediction_result(
             decision_result=decision_result,

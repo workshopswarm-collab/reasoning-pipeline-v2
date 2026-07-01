@@ -1559,6 +1559,14 @@ class AdsOperationalCanaryTest(unittest.TestCase):
                 FROM market_predictions
                 """
             ).fetchone()
+            terminal_rows = conn.execute(
+                """
+                SELECT stage, artifact_path
+                FROM case_artifact_manifest
+                WHERE stage IN ('training_trace', 'replay_record')
+                ORDER BY stage
+                """
+            ).fetchall()
         scae = json.loads(Path(scae_row["artifact_path"]).read_text(encoding="utf-8"))
         self.assertEqual(scae["forecast_validity_status"], "valid_for_forecast")
         self.assertEqual(scae["forecast_authority_policy"], "scae_only")
@@ -1581,6 +1589,20 @@ class AdsOperationalCanaryTest(unittest.TestCase):
         self.assertEqual(prediction["predicted_probability"], scae["production_forecast_prob"])
         self.assertEqual(prediction["engine_stage"], "scae")
         self.assertEqual(prediction["prediction_source"], "ads_pipeline")
+        terminal_payloads = {
+            row["stage"]: json.loads(Path(row["artifact_path"]).read_text(encoding="utf-8"))
+            for row in terminal_rows
+        }
+        self.assertEqual(set(terminal_payloads), {"training_trace", "replay_record"})
+        for payload in terminal_payloads.values():
+            self.assertTrue(payload["scoreable_forecast_output"])
+            self.assertTrue(payload["upstream_market_prediction_written"])
+            self.assertEqual(payload["lineage_authority"], "lineage_only_no_forecast_or_scoring_authority")
+            self.assertFalse(payload["writes_production_forecast"])
+            self.assertFalse(payload["writes_market_prediction"])
+            self.assertFalse(payload["scoring_authority"])
+            self.assertFalse(payload["replay_scoring_authority"])
+            self.assertEqual(payload["non_scoreable_reason_codes"], [])
 
     def test_phase8_clone_metadata_propagates_to_runtime_phase9_and_operator_reports(self):
         live_counts_before = self.protected_counts_for(self.db_path)
@@ -1687,6 +1709,14 @@ class AdsOperationalCanaryTest(unittest.TestCase):
                 """
             ).fetchone()
             prediction_count = conn.execute("SELECT COUNT(*) FROM market_predictions").fetchone()[0]
+            terminal_rows = conn.execute(
+                """
+                SELECT stage, artifact_path
+                FROM case_artifact_manifest
+                WHERE stage IN ('training_trace', 'replay_record')
+                ORDER BY stage
+                """
+            ).fetchall()
         scae = json.loads(Path(scae_row["artifact_path"]).read_text(encoding="utf-8"))
         self.assertEqual(scae["forecast_validity_status"], "invalid_for_forecast")
         self.assertTrue(scae["scae_valid_forecast_requires_evidence_delta_refs"])
@@ -1706,6 +1736,20 @@ class AdsOperationalCanaryTest(unittest.TestCase):
         self.assertIsNone(decision["production_forecast_prob"])
         self.assertEqual(decision["non_scoreable_reason_code"], "forecast_validity_invalid_for_forecast")
         self.assertEqual(prediction_count, 0)
+        terminal_payloads = {
+            row["stage"]: json.loads(Path(row["artifact_path"]).read_text(encoding="utf-8"))
+            for row in terminal_rows
+        }
+        self.assertEqual(set(terminal_payloads), {"training_trace", "replay_record"})
+        for payload in terminal_payloads.values():
+            self.assertFalse(payload["scoreable_forecast_output"])
+            self.assertFalse(payload["upstream_market_prediction_written"])
+            self.assertEqual(payload["lineage_authority"], "lineage_only_no_forecast_or_scoring_authority")
+            self.assertFalse(payload["writes_production_forecast"])
+            self.assertFalse(payload["writes_market_prediction"])
+            self.assertFalse(payload["scoring_authority"])
+            self.assertFalse(payload["replay_scoring_authority"])
+            self.assertEqual(payload["non_scoreable_reason_codes"], ["forecast_decision_non_scoreable"])
 
     def test_phase6_runtime_criteria_reports_first_failing_gate(self):
         base = {
