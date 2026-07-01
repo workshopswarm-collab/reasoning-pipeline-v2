@@ -253,6 +253,7 @@ class RetrievalProviderPolicy:
     retrieval_stage_timeout_seconds: float = 300.0
     max_provider_call_timeout_seconds: float = 120.0
     child_process_termination_grace_seconds: float = 2.0
+    max_retrieval_heartbeat_records: int = 64
 
 
 @dataclass
@@ -268,6 +269,9 @@ class RetrievalTransportResult:
 
 RETRIEVAL_STAGE_TIMEOUT_REASON_CODE = "retrieval_stage_hard_timeout"
 RETRIEVAL_PROVIDER_CALL_TIMEOUT_REASON_CODE = "retrieval_provider_call_timeout"
+RETRIEVAL_HEARTBEAT_SCHEMA_VERSION = "ads-retrieval-heartbeat/v1"
+RETRIEVAL_PARTIAL_DIAGNOSTICS_SCHEMA_VERSION = "ads-retrieval-partial-diagnostics/v1"
+RETRIEVAL_HEARTBEAT_AUTHORITY = "diagnostic_only_no_retrieval_sufficiency_authority"
 
 
 class RetrievalStageTimeout(Exception):
@@ -279,6 +283,9 @@ class RetrievalStageTimeout(Exception):
 
     def attach_child_process_registry(self, summary: dict[str, Any]) -> None:
         self.timeout_diagnostics["child_process_registry"] = summary
+
+    def attach_retrieval_partial_diagnostics(self, summary: dict[str, Any]) -> None:
+        self.timeout_diagnostics["retrieval_partial_diagnostics"] = summary
 
 
 class RetrievalChildProcessRegistry:
@@ -439,6 +446,149 @@ class RetrievalChildProcessRegistry:
         )
 
 
+def _retrieval_diagnostic_authority_boundary() -> dict[str, Any]:
+    return {
+        "schema_version": "ads-retrieval-diagnostic-authority-boundary/v1",
+        "diagnostics_certify_retrieval_sufficiency": False,
+        "diagnostics_certify_source_class": False,
+        "diagnostics_certify_claim_family": False,
+        "diagnostics_certify_temporal_safety": False,
+        "diagnostics_unblock_researchers": False,
+    }
+
+
+def _heartbeat_record_limit(policy: RetrievalProviderPolicy) -> int:
+    return max(1, int(policy.max_retrieval_heartbeat_records or 1))
+
+
+def _bounded_heartbeat_counts(counts: dict[str, Any] | None) -> dict[str, int]:
+    bounded: dict[str, int] = {}
+    for key, value in (counts or {}).items():
+        if not isinstance(key, str):
+            continue
+        try:
+            bounded[key[:80]] = max(0, int(value))
+        except (TypeError, ValueError):
+            continue
+    return bounded
+
+
+class RetrievalHeartbeatRecorder:
+    """Bounded diagnostic-only progress records for live retrieval lanes."""
+
+    def __init__(
+        self,
+        *,
+        max_records: int,
+        collection_started_at: float,
+        deadline: float | None,
+        monotonic_fn: Callable[[], float],
+        diagnostic_context: dict[str, Any] | None = None,
+    ) -> None:
+        self.max_records = max(1, int(max_records or 1))
+        self.collection_started_at = collection_started_at
+        self.deadline = deadline
+        self.monotonic_fn = monotonic_fn
+        self.diagnostic_context = copy.deepcopy(diagnostic_context or {})
+        self.total_count = 0
+        self.truncated_count = 0
+        self.records: list[dict[str, Any]] = []
+
+    def emit(
+        self,
+        *,
+        context: dict[str, Any] | None,
+        lane: str,
+        provider_id: str,
+        counts: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        now = self.monotonic_fn()
+        elapsed_seconds = max(0.0, now - self.collection_started_at)
+        remaining_seconds = _remaining_retrieval_seconds(self.deadline, monotonic_fn=self.monotonic_fn)
+        leaf_id = None
+        parent_branch_id = None
+        if isinstance(context, dict):
+            leaf_id = context.get("leaf_id")
+            parent_branch_id = context.get("parent_branch_id")
+        self.total_count += 1
+        record = {
+            "schema_version": RETRIEVAL_HEARTBEAT_SCHEMA_VERSION,
+            "heartbeat_ref": f"retrieval-heartbeat-{_hash_suffix((self.total_count, leaf_id, lane, provider_id, round(elapsed_seconds, 3)), 16)}",
+            "sequence_index": self.total_count,
+            "pipeline_run_id": self.diagnostic_context.get("pipeline_run_id"),
+            "case_id": self.diagnostic_context.get("case_id"),
+            "dispatch_id": self.diagnostic_context.get("dispatch_id"),
+            "leaf_id": str(leaf_id) if leaf_id is not None else None,
+            "parent_branch_id": str(parent_branch_id) if parent_branch_id is not None else None,
+            "lane": str(lane or "retrieval_provider_call")[:120],
+            "provider_id": str(provider_id or "unknown_provider")[:160],
+            "elapsed_seconds": round(elapsed_seconds, 3),
+            "remaining_deadline_seconds": round(remaining_seconds, 3)
+            if remaining_seconds is not None
+            else None,
+            "counts": _bounded_heartbeat_counts(counts),
+            "authority": RETRIEVAL_HEARTBEAT_AUTHORITY,
+            "authority_boundary": _retrieval_diagnostic_authority_boundary(),
+        }
+        self.records.append(record)
+        if len(self.records) > self.max_records:
+            overflow = len(self.records) - self.max_records
+            self.records = self.records[overflow:]
+            self.truncated_count += overflow
+        return copy.deepcopy(record)
+
+    def latest(self) -> dict[str, Any] | None:
+        if not self.records:
+            return None
+        return copy.deepcopy(self.records[-1])
+
+    def summary(self, *, terminal_status: str) -> dict[str, Any]:
+        latest = self.latest()
+        return {
+            "schema_version": RETRIEVAL_PARTIAL_DIAGNOSTICS_SCHEMA_VERSION,
+            "terminal_status": str(terminal_status or "unknown"),
+            "heartbeat_count": self.total_count,
+            "persisted_heartbeat_count": len(self.records),
+            "truncated_heartbeat_count": self.truncated_count,
+            "heartbeat_refs": [str(item.get("heartbeat_ref")) for item in self.records],
+            "heartbeats": copy.deepcopy(self.records),
+            "latest_heartbeat": latest,
+            "active_leaf_id": latest.get("leaf_id") if latest else None,
+            "active_lane": latest.get("lane") if latest else None,
+            "active_provider_id": latest.get("provider_id") if latest else None,
+            "partial_candidate_counts": copy.deepcopy(latest.get("counts") if latest else {}),
+            "authority": RETRIEVAL_HEARTBEAT_AUTHORITY,
+            "authority_boundary": _retrieval_diagnostic_authority_boundary(),
+        }
+
+
+def _attach_partial_diagnostics_to_timeout(
+    exc: RetrievalStageTimeout,
+    *,
+    heartbeat_recorder: RetrievalHeartbeatRecorder | None,
+    terminal_status: str = "timeout",
+) -> None:
+    if heartbeat_recorder is None:
+        return
+    exc.attach_retrieval_partial_diagnostics(
+        heartbeat_recorder.summary(terminal_status=terminal_status)
+    )
+
+
+def _resolve_heartbeat_counts(
+    counts: dict[str, Any] | Callable[[], dict[str, Any]] | None,
+) -> dict[str, Any]:
+    if counts is None:
+        return {}
+    if callable(counts):
+        try:
+            resolved = counts()
+        except Exception:  # noqa: BLE001 - heartbeat diagnostics must not affect retrieval
+            return {}
+        return resolved if isinstance(resolved, dict) else {}
+    return counts if isinstance(counts, dict) else {}
+
+
 def _safe_getattr(value: Any, attr_name: str) -> Any:
     try:
         return getattr(value, attr_name)
@@ -560,6 +710,7 @@ def _raise_retrieval_timeout(
     deadline: float | None,
     child_registry: RetrievalChildProcessRegistry,
     provider_timeout_seconds: float | None = None,
+    heartbeat_recorder: RetrievalHeartbeatRecorder | None = None,
 ) -> None:
     exc = _retrieval_timeout_exception(
         policy=policy,
@@ -573,6 +724,7 @@ def _raise_retrieval_timeout(
     )
     child_summary = child_registry.terminate_all(reason_code=reason_code)
     exc.attach_child_process_registry(child_summary)
+    _attach_partial_diagnostics_to_timeout(exc, heartbeat_recorder=heartbeat_recorder)
     raise exc
 
 
@@ -585,6 +737,7 @@ def _check_retrieval_deadline(
     provider_id: str,
     collection_started_at: float,
     child_registry: RetrievalChildProcessRegistry,
+    heartbeat_recorder: RetrievalHeartbeatRecorder | None = None,
 ) -> None:
     remaining = _remaining_retrieval_seconds(deadline, monotonic_fn=monotonic_fn)
     if remaining is not None and remaining <= 0.0:
@@ -598,6 +751,7 @@ def _check_retrieval_deadline(
             deadline=deadline,
             child_registry=child_registry,
             provider_timeout_seconds=0.0,
+            heartbeat_recorder=heartbeat_recorder,
         )
 
 
@@ -612,6 +766,10 @@ def _call_with_retrieval_deadline(
     provider_id: str,
     collection_started_at: float,
     child_registry: RetrievalChildProcessRegistry,
+    heartbeat_recorder: RetrievalHeartbeatRecorder | None = None,
+    heartbeat_context: dict[str, Any] | None = None,
+    heartbeat_lane: str | None = None,
+    heartbeat_counts: dict[str, Any] | Callable[[], dict[str, Any]] | None = None,
 ) -> Any:
     _check_retrieval_deadline(
         policy=policy,
@@ -621,6 +779,7 @@ def _call_with_retrieval_deadline(
         provider_id=provider_id,
         collection_started_at=collection_started_at,
         child_registry=child_registry,
+        heartbeat_recorder=heartbeat_recorder,
     )
     provider_timeout_seconds, timeout_reason_code = _effective_provider_timeout_seconds(
         policy=policy,
@@ -638,6 +797,14 @@ def _call_with_retrieval_deadline(
             deadline=deadline,
             child_registry=child_registry,
             provider_timeout_seconds=provider_timeout_seconds,
+            heartbeat_recorder=heartbeat_recorder,
+        )
+    if heartbeat_recorder is not None:
+        heartbeat_recorder.emit(
+            context=heartbeat_context,
+            lane=heartbeat_lane or operation,
+            provider_id=provider_id,
+            counts=_resolve_heartbeat_counts(heartbeat_counts),
         )
     child_registry.track_provider(provider, provider_id=provider_id, operation=operation)
     old_handler = None
@@ -675,6 +842,7 @@ def _call_with_retrieval_deadline(
             reason_code=str(exc.timeout_diagnostics.get("reason_code") or RETRIEVAL_STAGE_TIMEOUT_REASON_CODE)
         )
         exc.attach_child_process_registry(child_summary)
+        _attach_partial_diagnostics_to_timeout(exc, heartbeat_recorder=heartbeat_recorder)
         raise
     finally:
         if alarm_enabled:
@@ -690,6 +858,7 @@ def _call_with_retrieval_deadline(
         provider_id=provider_id,
         collection_started_at=collection_started_at,
         child_registry=child_registry,
+        heartbeat_recorder=heartbeat_recorder,
     )
     return result
 
@@ -718,6 +887,28 @@ def build_retrieval_timeout_transport_diagnostics(
     )
     timeout_diagnostics = copy.deepcopy(exc.timeout_diagnostics)
     child_registry_summary = timeout_diagnostics.get("child_process_registry")
+    partial_diagnostics = (
+        timeout_diagnostics.get("retrieval_partial_diagnostics")
+        if isinstance(timeout_diagnostics.get("retrieval_partial_diagnostics"), dict)
+        else {}
+    )
+    if not partial_diagnostics:
+        partial_diagnostics = {
+            "schema_version": RETRIEVAL_PARTIAL_DIAGNOSTICS_SCHEMA_VERSION,
+            "terminal_status": "timeout",
+            "heartbeat_count": 0,
+            "persisted_heartbeat_count": 0,
+            "truncated_heartbeat_count": 0,
+            "heartbeat_refs": [],
+            "heartbeats": [],
+            "latest_heartbeat": None,
+            "active_leaf_id": None,
+            "active_lane": timeout_diagnostics.get("operation"),
+            "active_provider_id": timeout_diagnostics.get("provider_id"),
+            "partial_candidate_counts": {},
+            "authority": RETRIEVAL_HEARTBEAT_AUTHORITY,
+            "authority_boundary": _retrieval_diagnostic_authority_boundary(),
+        }
     return {
         "schema_version": "ads-retrieval-transport-diagnostics/v1",
         "browser_provider_status": "timeout",
@@ -763,6 +954,10 @@ def build_retrieval_timeout_transport_diagnostics(
         "retrieval_stage_timeout_provider_id": timeout_diagnostics.get("provider_id"),
         "retrieval_stage_timeout_seconds": timeout_diagnostics.get("retrieval_stage_timeout_seconds"),
         "retrieval_stage_timeout_diagnostics": timeout_diagnostics,
+        "retrieval_heartbeat_count": int(partial_diagnostics.get("heartbeat_count") or 0),
+        "latest_retrieval_heartbeat": copy.deepcopy(partial_diagnostics.get("latest_heartbeat")),
+        "retrieval_heartbeat_diagnostics": copy.deepcopy(partial_diagnostics.get("heartbeats") or []),
+        "retrieval_partial_diagnostics": copy.deepcopy(partial_diagnostics),
         "child_process_registry": child_registry_summary
         or {
             "schema_version": "ads-retrieval-child-process-registry/v1",
@@ -786,6 +981,7 @@ def build_retrieval_timeout_transport_diagnostics(
             "retrieval_stage_timeout_seconds": _retrieval_stage_timeout_seconds(policy),
             "max_provider_call_timeout_seconds": _max_provider_call_timeout_seconds(policy),
             "child_process_termination_grace_seconds": _child_process_termination_grace_seconds(policy),
+            "max_retrieval_heartbeat_records": _heartbeat_record_limit(policy),
         },
         "direct_url_fetch_attempt_count": 0,
         "direct_url_fetch_skipped_count": 0,
@@ -1037,6 +1233,7 @@ def collect_live_retrieval_candidates(
     native_candidate_provider: Callable[[dict[str, Any], dict[str, Any]], Any] | None = None,
     sleep_fn: Callable[[float], None] | None = None,
     monotonic_fn: Callable[[], float] | None = None,
+    diagnostic_context: dict[str, Any] | None = None,
 ) -> RetrievalTransportResult:
     """Collect live retrieval candidate inputs without granting evidence authority."""
 
@@ -1049,6 +1246,13 @@ def collect_live_retrieval_candidates(
     deadline = collection_started_at + retrieval_timeout_seconds if retrieval_timeout_seconds else None
     child_registry = RetrievalChildProcessRegistry(
         grace_seconds=_child_process_termination_grace_seconds(policy)
+    )
+    heartbeat_recorder = RetrievalHeartbeatRecorder(
+        max_records=_heartbeat_record_limit(policy),
+        collection_started_at=collection_started_at,
+        deadline=deadline,
+        monotonic_fn=monotonic,
+        diagnostic_context=diagnostic_context,
     )
     browser_provider_diagnostics = _provider_diagnostics(browser_provider)
     browser_fetch_configured = _provider_capability_configured(
@@ -1123,6 +1327,37 @@ def collect_live_retrieval_candidates(
     native_research_trigger_diagnostics: list[dict[str, Any]] = []
     native_research_call_diagnostics: list[dict[str, Any]] = []
     fetch_cache: dict[tuple[str, str], dict[str, Any]] = {}
+
+    def _partial_counts(extra: dict[str, Any] | None = None) -> dict[str, Any]:
+        admitted_candidate_count = sum(
+            1 for item in result.fetched_candidates if item.get("admission_status") == "admitted"
+        )
+        counts: dict[str, Any] = {
+            "direct_url_candidate_count": len(result.direct_url_candidates),
+            "fetched_candidate_count": len(result.fetched_candidates),
+            "admitted_candidate_count": admitted_candidate_count,
+            "rejected_or_omitted_candidate_count": max(
+                0,
+                len(result.fetched_candidates) - admitted_candidate_count + len(result.omitted_candidates),
+            ),
+            "search_candidate_url_count": len(result.search_candidate_urls),
+            "native_research_candidate_count": len(result.native_research_candidates),
+            "native_candidate_url_count": sum(
+                len(item.get("candidate_urls") or [])
+                for item in result.native_research_candidates
+                if isinstance(item, dict)
+            ),
+            "direct_url_fetch_attempt_count": direct_fetch_count,
+            "search_call_count": search_call_count,
+            "search_retry_attempt_count": search_retry_attempt_count,
+            "search_result_fetch_attempt_count": search_result_fetch_count,
+            "native_research_call_count": native_research_call_count,
+            "native_candidate_fetch_attempt_count": native_candidate_fetch_count,
+        }
+        if extra:
+            counts.update(extra)
+        return counts
+
     _check_retrieval_deadline(
         policy=policy,
         deadline=deadline,
@@ -1131,6 +1366,7 @@ def collect_live_retrieval_candidates(
         provider_id="retrieval_transport",
         collection_started_at=collection_started_at,
         child_registry=child_registry,
+        heartbeat_recorder=heartbeat_recorder,
     )
     direct_fetch_started_at = collection_started_at
 
@@ -1144,6 +1380,7 @@ def collect_live_retrieval_candidates(
                 provider_id=_search_provider_id(browser_provider),
                 collection_started_at=collection_started_at,
                 child_registry=child_registry,
+                heartbeat_recorder=heartbeat_recorder,
             )
             if not _direct_hint_targets_context(hint, context):
                 direct_fetch_leaf_scope_skipped_count += 1
@@ -1168,6 +1405,9 @@ def collect_live_retrieval_candidates(
                 child_registry=child_registry,
                 monotonic_fn=monotonic,
                 collection_started_at=collection_started_at,
+                heartbeat_recorder=heartbeat_recorder,
+                heartbeat_lane="direct_url_fetch",
+                heartbeat_counts=lambda: _partial_counts({"next_direct_url_rank": rank}),
             )
             if candidate.get("canonical_fetch_cache_status") == "hit":
                 direct_fetch_cache_hit_count += 1
@@ -1203,6 +1443,7 @@ def collect_live_retrieval_candidates(
                     provider_id=_search_provider_id(browser_provider),
                     collection_started_at=collection_started_at,
                     child_registry=child_registry,
+                    heartbeat_recorder=heartbeat_recorder,
                 )
                 if not browser_search_configured:
                     search_call_skipped_count += 1
@@ -1269,6 +1510,10 @@ def collect_live_retrieval_candidates(
                     child_registry=child_registry,
                     monotonic_fn=monotonic,
                     collection_started_at=collection_started_at,
+                    heartbeat_recorder=heartbeat_recorder,
+                    heartbeat_counts=lambda: _partial_counts(
+                        {"next_query_variant_index": variant_index}
+                    ),
                 )
                 provider_elapsed = max(0.0, monotonic() - provider_started)
                 search_safe_error = None
@@ -1384,6 +1629,11 @@ def collect_live_retrieval_candidates(
                         child_registry=child_registry,
                         monotonic_fn=monotonic,
                         collection_started_at=collection_started_at,
+                        heartbeat_recorder=heartbeat_recorder,
+                        heartbeat_lane="browser_search_fetch_extraction",
+                        heartbeat_counts=lambda: _partial_counts(
+                            {"next_search_result_rank": search_rank}
+                        ),
                     )
                     if candidate.get("canonical_fetch_cache_status") == "hit":
                         search_result_fetch_cache_hit_count += 1
@@ -1406,6 +1656,7 @@ def collect_live_retrieval_candidates(
                 provider_id="native_research_candidate_discovery",
                 collection_started_at=collection_started_at,
                 child_registry=child_registry,
+                heartbeat_recorder=heartbeat_recorder,
             )
             trigger_reasons = _native_discovery_trigger_reasons(
                 context,
@@ -1470,6 +1721,12 @@ def collect_live_retrieval_candidates(
                     provider_id="native_research_candidate_discovery",
                     collection_started_at=collection_started_at,
                     child_registry=child_registry,
+                    heartbeat_recorder=heartbeat_recorder,
+                    heartbeat_context=context,
+                    heartbeat_lane="native_research_candidate_discovery",
+                    heartbeat_counts=lambda: _partial_counts(
+                        {"next_native_research_call_index": native_research_call_count}
+                    ),
                 )
             except RetrievalStageTimeout:
                 raise
@@ -1663,6 +1920,11 @@ def collect_live_retrieval_candidates(
                         child_registry=child_registry,
                         monotonic_fn=monotonic,
                         collection_started_at=collection_started_at,
+                        heartbeat_recorder=heartbeat_recorder,
+                        heartbeat_lane="native_candidate_fetch_extraction",
+                        heartbeat_counts=lambda: _partial_counts(
+                            {"next_native_candidate_rank": native_rank}
+                        ),
                     )
                     if candidate.get("canonical_fetch_cache_status") != "hit":
                         native_candidate_fetch_count += 1
@@ -1738,6 +2000,7 @@ def collect_live_retrieval_candidates(
         official_direct_adapter_candidate_count=official_direct_adapter_candidate_count,
         official_direct_adapter_fetch_attempt_count=official_direct_adapter_fetch_attempt_count,
     )
+    retrieval_partial_diagnostics = heartbeat_recorder.summary(terminal_status="completed")
     result.transport_diagnostics = {
         "schema_version": "ads-retrieval-transport-diagnostics/v1",
         "browser_provider_status": "available"
@@ -1801,6 +2064,14 @@ def collect_live_retrieval_candidates(
             native_research_runtime_calls=native_research_runtime_calls,
             checked_at=forecast_timestamp,
         ),
+        "retrieval_heartbeat_count": retrieval_partial_diagnostics["heartbeat_count"],
+        "latest_retrieval_heartbeat": copy.deepcopy(
+            retrieval_partial_diagnostics.get("latest_heartbeat")
+        ),
+        "retrieval_heartbeat_diagnostics": copy.deepcopy(
+            retrieval_partial_diagnostics.get("heartbeats") or []
+        ),
+        "retrieval_partial_diagnostics": retrieval_partial_diagnostics,
         "bounded_retrieval_policy": {
             "max_direct_urls": policy.max_direct_urls,
             "max_total_direct_fetches": policy.max_total_direct_fetches,
@@ -1826,6 +2097,7 @@ def collect_live_retrieval_candidates(
             "retrieval_stage_timeout_seconds": _retrieval_stage_timeout_seconds(policy),
             "max_provider_call_timeout_seconds": _max_provider_call_timeout_seconds(policy),
             "child_process_termination_grace_seconds": _child_process_termination_grace_seconds(policy),
+            "max_retrieval_heartbeat_records": _heartbeat_record_limit(policy),
             "search_elapsed_budget_scope": "per_leaf_browser_search_lane",
         },
         "direct_url_fetch_attempt_count": direct_fetch_count,
@@ -2396,6 +2668,9 @@ def _fetch_candidate(
     child_registry: RetrievalChildProcessRegistry | None = None,
     monotonic_fn: Callable[[], float] | None = None,
     collection_started_at: float | None = None,
+    heartbeat_recorder: RetrievalHeartbeatRecorder | None = None,
+    heartbeat_lane: str | None = None,
+    heartbeat_counts: dict[str, Any] | Callable[[], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     active_policy = policy or RetrievalProviderPolicy()
     active_monotonic = monotonic_fn or time.monotonic
@@ -2465,6 +2740,10 @@ def _fetch_candidate(
             provider_id=_search_provider_id(browser_provider),
             collection_started_at=active_collection_started_at,
             child_registry=active_child_registry,
+            heartbeat_recorder=heartbeat_recorder,
+            heartbeat_context=context,
+            heartbeat_lane=heartbeat_lane or f"{navigation_mode}_fetch",
+            heartbeat_counts=heartbeat_counts,
         )
         if fetch_cache is not None and cache_key is not None:
             fetch_cache[cache_key] = copy.deepcopy(fetched)
@@ -3167,6 +3446,8 @@ def _search_candidate_urls_with_retry(
     child_registry: RetrievalChildProcessRegistry | None = None,
     monotonic_fn: Callable[[], float] | None = None,
     collection_started_at: float | None = None,
+    heartbeat_recorder: RetrievalHeartbeatRecorder | None = None,
+    heartbeat_counts: dict[str, Any] | Callable[[], dict[str, Any]] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     monotonic = monotonic_fn or time.monotonic
     active_child_registry = child_registry or RetrievalChildProcessRegistry(
@@ -3198,6 +3479,14 @@ def _search_candidate_urls_with_retry(
                 provider_id=_search_provider_id(browser_provider),
                 collection_started_at=active_collection_started_at,
                 child_registry=active_child_registry,
+                heartbeat_recorder=heartbeat_recorder,
+                heartbeat_context=context,
+                heartbeat_lane="browser_search",
+                heartbeat_counts=lambda: {
+                    **_resolve_heartbeat_counts(heartbeat_counts),
+                    "browser_search_attempt": attempt,
+                    "query_variant_index": start_variant_index + attempt - 1,
+                },
             )
         except RetrievalStageTimeout:
             raise
@@ -3291,6 +3580,13 @@ def _search_candidate_urls_with_retry(
             provider_id=_search_provider_id(browser_provider),
             collection_started_at=active_collection_started_at,
             child_registry=active_child_registry,
+            heartbeat_recorder=heartbeat_recorder,
+            heartbeat_context=context,
+            heartbeat_lane="browser_search_retry_backoff",
+            heartbeat_counts=lambda: {
+                **_resolve_heartbeat_counts(heartbeat_counts),
+                "browser_search_attempt": attempt,
+            },
         )
     return [], failures, retry_events
 

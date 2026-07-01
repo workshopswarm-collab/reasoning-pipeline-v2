@@ -1172,15 +1172,28 @@ class AdsOperationalCanaryTest(unittest.TestCase):
         runtime_summary = retrieval["retrieval_runtime_summary"]
         timeout_block = retrieval["retrieval_timeout_readiness_block"]
         diagnostics = retrieval["ads_retrieval_transport_diagnostics"]
+        partial_diagnostics = diagnostics["retrieval_partial_diagnostics"]
+        latest_heartbeat = partial_diagnostics["latest_heartbeat"]
 
         self.assertEqual(retrieval["adapter_mode"], "source_populated_live_retrieval_runtime")
         self.assertTrue(runtime_summary["retrieval_stage_timeout"])
         self.assertEqual(runtime_summary["retrieval_stage_timeout_reason_code"], "retrieval_stage_hard_timeout")
+        self.assertEqual(
+            runtime_summary["retrieval_heartbeat_count"],
+            partial_diagnostics["heartbeat_count"],
+        )
+        self.assertEqual(runtime_summary["latest_retrieval_heartbeat"], latest_heartbeat)
         self.assertEqual(timeout_block["readiness_status"], "blocked")
         self.assertFalse(timeout_block["scoreable_write_allowed"])
         self.assertEqual(diagnostics["browser_provider_status"], "timeout")
         self.assertTrue(diagnostics["retrieval_stage_timeout"])
         self.assertEqual(diagnostics["bounded_retrieval_reason_codes"], ["retrieval_stage_hard_timeout"])
+        self.assertEqual(partial_diagnostics["terminal_status"], "timeout")
+        self.assertEqual(latest_heartbeat["lane"], "direct_url_fetch")
+        self.assertEqual(latest_heartbeat["provider_id"], "hanging-canary-retrieval-provider")
+        self.assertFalse(
+            partial_diagnostics["authority_boundary"]["diagnostics_unblock_researchers"]
+        )
         self.assertEqual(
             retrieval["research_sufficiency_summary"]["classification_dispatch_status"],
             "blocked_insufficient_research",
@@ -1190,6 +1203,28 @@ class AdsOperationalCanaryTest(unittest.TestCase):
                 event["event"] == "provider_cancel_called"
                 for event in timeout_block["child_process_registry"]["events"]
             )
+        )
+        operator_report = build_ads_operator_review_report(
+            self.db_path,
+            pipeline_run_id=result["result"]["pipeline_run_id"],
+            max_market_snapshot_age_seconds=10_000_000_000,
+            max_resolution_sync_age_seconds=10_000_000_000,
+        )
+        retrieval_summary = operator_report["cases"][0]["retrieval_sufficiency"]
+        self.assertEqual(
+            retrieval_summary["retrieval_partial_diagnostics_terminal_status"],
+            "timeout",
+        )
+        self.assertTrue(
+            retrieval_summary["retrieval_partial_diagnostics_are_diagnostic_only"]
+        )
+        self.assertEqual(
+            retrieval_summary["latest_retrieval_heartbeat_lane"],
+            "direct_url_fetch",
+        )
+        self.assertEqual(
+            retrieval_summary["latest_retrieval_heartbeat_provider_id"],
+            "hanging-canary-retrieval-provider",
         )
 
     def test_true_production_factory_clone_canary_blocks_at_leaf_research_barrier(self):

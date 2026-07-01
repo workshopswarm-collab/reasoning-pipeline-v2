@@ -1228,6 +1228,43 @@ def summarize_retrieval_transport_diagnostics(packet: dict[str, Any]) -> dict[st
             claim_accepted_count += 1
             accepted_claim_family_ids.update(claim_ids)
 
+    partial_diagnostics = (
+        transport.get("retrieval_partial_diagnostics")
+        if isinstance(transport.get("retrieval_partial_diagnostics"), dict)
+        else runtime_summary.get("retrieval_partial_diagnostics")
+        if isinstance(runtime_summary.get("retrieval_partial_diagnostics"), dict)
+        else {}
+    )
+    latest_heartbeat = (
+        transport.get("latest_retrieval_heartbeat")
+        if isinstance(transport.get("latest_retrieval_heartbeat"), dict)
+        else runtime_summary.get("latest_retrieval_heartbeat")
+        if isinstance(runtime_summary.get("latest_retrieval_heartbeat"), dict)
+        else partial_diagnostics.get("latest_heartbeat")
+        if isinstance(partial_diagnostics.get("latest_heartbeat"), dict)
+        else None
+    )
+    heartbeat_refs = (
+        partial_diagnostics.get("heartbeat_refs")
+        if isinstance(partial_diagnostics.get("heartbeat_refs"), list)
+        else []
+    )
+    heartbeat_authority_boundary = (
+        partial_diagnostics.get("authority_boundary")
+        if isinstance(partial_diagnostics.get("authority_boundary"), dict)
+        else {}
+    )
+    heartbeat_diagnostic_only = bool(partial_diagnostics) and not any(
+        bool(heartbeat_authority_boundary.get(key))
+        for key in (
+            "diagnostics_certify_retrieval_sufficiency",
+            "diagnostics_certify_source_class",
+            "diagnostics_certify_claim_family",
+            "diagnostics_certify_temporal_safety",
+            "diagnostics_unblock_researchers",
+        )
+    )
+
     return {
         "search_call_count": search_call_count,
         "search_succeeded_count": max(0, search_call_count - search_failure_count),
@@ -1251,6 +1288,27 @@ def summarize_retrieval_transport_diagnostics(packet: dict[str, Any]) -> dict[st
         "claim_family_accepted_count": claim_accepted_count,
         "accepted_claim_family_count": len(accepted_claim_family_ids),
         "accepted_claim_family_ids": sorted(accepted_claim_family_ids),
+        "retrieval_heartbeat_count": max(
+            _int_value(transport.get("retrieval_heartbeat_count")),
+            _int_value(runtime_summary.get("retrieval_heartbeat_count")),
+            _int_value(partial_diagnostics.get("heartbeat_count")),
+        ),
+        "retrieval_partial_diagnostics_terminal_status": partial_diagnostics.get(
+            "terminal_status"
+        ),
+        "retrieval_partial_diagnostics_are_diagnostic_only": heartbeat_diagnostic_only,
+        "retrieval_diagnostic_authority": partial_diagnostics.get("authority"),
+        "retrieval_heartbeat_refs": [str(item) for item in heartbeat_refs],
+        "latest_retrieval_heartbeat": latest_heartbeat,
+        "latest_retrieval_heartbeat_leaf_id": (
+            latest_heartbeat.get("leaf_id") if latest_heartbeat else None
+        ),
+        "latest_retrieval_heartbeat_lane": (
+            latest_heartbeat.get("lane") if latest_heartbeat else None
+        ),
+        "latest_retrieval_heartbeat_provider_id": (
+            latest_heartbeat.get("provider_id") if latest_heartbeat else None
+        ),
     }
 
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import sys
 import time
 import unittest
@@ -1822,6 +1823,94 @@ class AdsRetrievalTransportTest(unittest.TestCase):
         )
         self.assertFalse(packet["leaf_evidence_dockets"][0]["admitted_evidence_refs"])
 
+    def test_retrieval_heartbeats_record_normal_provider_sequence(self) -> None:
+        provider = FakeBrowserProvider(search_results=[{"url": "https://secondary.example/report"}])
+
+        transport = collect_live_retrieval_candidates(
+            qdt=self._resolution_mechanics_qdt(),
+            evidence_packet={**self.evidence_packet, "official_source_hints": []},
+            case_contract=self.case_contract,
+            amrg_context=None,
+            source_cutoff_timestamp=CUTOFF_AT,
+            forecast_timestamp=FORECAST_AT,
+            provider_policy=RetrievalProviderPolicy(
+                max_direct_urls=0,
+                max_total_search_calls=1,
+                max_search_results_per_variant=1,
+                max_total_search_result_fetches=1,
+                max_retrieval_heartbeat_records=8,
+            ),
+            browser_provider=provider,
+            diagnostic_context={
+                "pipeline_run_id": "run-heartbeat",
+                "case_id": "case-1",
+                "dispatch_id": "dispatch-1",
+            },
+        )
+
+        diagnostics = transport.transport_diagnostics
+        partial = diagnostics["retrieval_partial_diagnostics"]
+        heartbeats = partial["heartbeats"]
+        lanes = [heartbeat["lane"] for heartbeat in heartbeats]
+
+        self.assertEqual(partial["schema_version"], "ads-retrieval-partial-diagnostics/v1")
+        self.assertEqual(partial["terminal_status"], "completed")
+        self.assertGreaterEqual(partial["heartbeat_count"], 2)
+        self.assertIn("browser_search", lanes)
+        self.assertIn("browser_search_fetch_extraction", lanes)
+        self.assertEqual(diagnostics["retrieval_heartbeat_count"], partial["heartbeat_count"])
+        self.assertEqual(heartbeats[0]["pipeline_run_id"], "run-heartbeat")
+        self.assertEqual(heartbeats[0]["case_id"], "case-1")
+        self.assertEqual(heartbeats[0]["dispatch_id"], "dispatch-1")
+        self.assertFalse(
+            partial["authority_boundary"]["diagnostics_certify_retrieval_sufficiency"]
+        )
+        for heartbeat in heartbeats:
+            self.assertEqual(
+                heartbeat["authority"],
+                "diagnostic_only_no_retrieval_sufficiency_authority",
+            )
+            self.assertIn("leaf_id", heartbeat)
+            self.assertIn("remaining_deadline_seconds", heartbeat)
+            self.assertNotIn("url", heartbeat)
+            self.assertNotIn("content", heartbeat)
+            self.assertNotIn("requested_url", heartbeat)
+
+    def test_retrieval_heartbeats_are_bounded_and_redacted(self) -> None:
+        provider = FlakySearchBrowserProvider(failures_by_leaf={})
+
+        transport = collect_live_retrieval_candidates(
+            qdt=self._two_leaf_qdt(),
+            evidence_packet={**self.evidence_packet, "official_source_hints": []},
+            case_contract=self.case_contract,
+            amrg_context=None,
+            source_cutoff_timestamp=CUTOFF_AT,
+            forecast_timestamp=FORECAST_AT,
+            provider_policy=RetrievalProviderPolicy(
+                max_direct_urls=0,
+                max_total_search_calls=2,
+                max_search_variants_per_leaf=1,
+                max_search_results_per_variant=1,
+                max_total_search_result_fetches=2,
+                max_retrieval_heartbeat_records=2,
+            ),
+            browser_provider=provider,
+        )
+
+        partial = transport.transport_diagnostics["retrieval_partial_diagnostics"]
+        serialized = json.dumps(partial, sort_keys=True)
+
+        self.assertGreater(partial["heartbeat_count"], 2)
+        self.assertLessEqual(partial["persisted_heartbeat_count"], 2)
+        self.assertGreater(partial["truncated_heartbeat_count"], 0)
+        self.assertLess(len(serialized), 8000)
+        self.assertNotIn("https://secondary.example", serialized)
+        self.assertNotIn("Fetched content", serialized)
+        for heartbeat in partial["heartbeats"]:
+            self.assertFalse(
+                heartbeat["authority_boundary"]["diagnostics_unblock_researchers"]
+            )
+
     def test_hanging_browser_fetch_raises_stage_timeout_and_terminates_children(self) -> None:
         provider = HangingFetchBrowserProvider()
 
@@ -1845,8 +1934,19 @@ class AdsRetrievalTransportTest(unittest.TestCase):
 
         diagnostics = caught.exception.timeout_diagnostics
         child_registry = diagnostics["child_process_registry"]
+        partial = diagnostics["retrieval_partial_diagnostics"]
+        latest_heartbeat = partial["latest_heartbeat"]
         self.assertEqual(diagnostics["reason_code"], "retrieval_stage_hard_timeout")
         self.assertEqual(diagnostics["operation"], "direct_url_fetch")
+        self.assertEqual(partial["terminal_status"], "timeout")
+        self.assertEqual(partial["active_lane"], "direct_url_fetch")
+        self.assertEqual(partial["active_provider_id"], "hanging-fetch-provider")
+        self.assertEqual(latest_heartbeat["lane"], "direct_url_fetch")
+        self.assertEqual(latest_heartbeat["provider_id"], "hanging-fetch-provider")
+        self.assertEqual(latest_heartbeat["leaf_id"], "leaf-resolution-mechanics")
+        self.assertFalse(
+            latest_heartbeat["authority_boundary"]["diagnostics_certify_retrieval_sufficiency"]
+        )
         self.assertTrue(provider.terminated_children)
         self.assertTrue(provider.child.terminated)
         self.assertGreaterEqual(child_registry["tracked_child_process_count"], 1)

@@ -444,6 +444,15 @@ def _attach_live_retrieval_transport_metadata(
                 "retrieval_stage_timeout_seconds": transport_diagnostics.get(
                     "retrieval_stage_timeout_seconds"
                 ),
+                "retrieval_heartbeat_count": int(
+                    transport_diagnostics.get("retrieval_heartbeat_count") or 0
+                ),
+                "latest_retrieval_heartbeat": transport_diagnostics.get(
+                    "latest_retrieval_heartbeat"
+                ),
+                "retrieval_partial_diagnostics": transport_diagnostics.get(
+                    "retrieval_partial_diagnostics"
+                ),
                 "retrieval_child_process_registry": transport_diagnostics.get(
                     "child_process_registry"
                 ),
@@ -1861,6 +1870,11 @@ def build_stage_handlers(
                     provider_policy=retrieval_provider_policy,
                     browser_provider=retrieval_browser_provider,
                     native_candidate_provider=native_candidate_provider,
+                    diagnostic_context={
+                        "pipeline_run_id": context.pipeline_run_id,
+                        "case_id": lease["case_id"],
+                        "dispatch_id": lease["dispatch_id"],
+                    },
                 )
             except RetrievalStageTimeout as exc:
                 retrieval_timed_out = True

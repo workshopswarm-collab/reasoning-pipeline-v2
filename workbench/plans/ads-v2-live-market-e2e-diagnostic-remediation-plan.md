@@ -477,7 +477,7 @@ Completion notes:
 
 ## Phase 4 - Retrieval Hard Timeout And Child-Process Cancellation
 
-Status: pending
+Status: complete
 
 Goal: ensure retrieval cannot hang indefinitely or leave active clone work/processes behind.
 
@@ -539,17 +539,17 @@ Success criteria:
 
 Checklist:
 
-- [ ] Retrieval hard timeout implemented.
-- [ ] Provider child registry implemented.
-- [ ] Timeout readiness block/artifact implemented.
-- [ ] Hanging-provider tests pass.
-- [ ] Active work cleanup tests pass.
-- [ ] No temp artifacts remain.
-- [ ] `git diff --check` passes.
+- [x] Retrieval hard timeout implemented.
+- [x] Provider child registry implemented.
+- [x] Timeout readiness block/artifact implemented.
+- [x] Hanging-provider tests pass.
+- [x] Active work cleanup tests pass.
+- [x] No temp artifacts remain.
+- [x] `git diff --check` passes.
 
 ## Phase 5 - Retrieval Heartbeats And Partial Lane Diagnostics
 
-Status: pending
+Status: complete
 
 Goal: make retrieval progress visible while it is running and useful when it times out.
 
@@ -607,12 +607,12 @@ Success criteria:
 
 Checklist:
 
-- [ ] Heartbeat schema added.
-- [ ] Heartbeat writer integrated.
-- [ ] Timeout partial diagnostics integrated.
-- [ ] Heartbeat/report tests pass.
-- [ ] No temp artifacts remain.
-- [ ] `git diff --check` passes.
+- [x] Heartbeat schema added.
+- [x] Heartbeat writer integrated.
+- [x] Timeout partial diagnostics integrated.
+- [x] Heartbeat/report tests pass.
+- [x] No temp artifacts remain.
+- [x] `git diff --check` passes.
 
 ## Phase 6 - Operator Report Semantics For Upstream Blocks
 
