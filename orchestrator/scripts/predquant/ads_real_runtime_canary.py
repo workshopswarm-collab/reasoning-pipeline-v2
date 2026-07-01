@@ -1615,6 +1615,31 @@ def _retry_summary(
     }
 
 
+def _metadata_dict(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _run_metadata(run: dict[str, Any] | None) -> dict[str, Any]:
+    return _metadata_dict(run.get("metadata")) if isinstance(run, dict) else {}
+
+
+def _canary_metadata(canary_result: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(canary_result, dict):
+        return {}
+    metadata = _metadata_dict(canary_result.get("metadata"))
+    if metadata:
+        return metadata
+    result = _metadata_dict(canary_result.get("result"))
+    return _metadata_dict(result.get("metadata"))
+
+
+def _resolve_live_db_mutation(*metadata_sources: dict[str, Any]) -> str:
+    for metadata in metadata_sources:
+        if _metadata_dict(metadata).get("live_db_mutation") == "clone_only":
+            return "clone_only"
+    return "unknown_or_live"
+
+
 def build_current_audit_gap_summary(
     *,
     qdt_evidence: dict[str, Any],
@@ -2240,6 +2265,8 @@ def build_real_runtime_canary_report(
         errors=errors,
     )
     first_failing_gate = _first_failing_gate(runtime_criteria)
+    retry_summary = _retry_summary(qdt_evidence, errors)
+    live_db_mutation = _resolve_live_db_mutation(_canary_metadata(canary_result), _run_metadata(run))
     criteria_summary = {
         "first_failing_gate": first_failing_gate,
         "passed_count": sum(1 for item in runtime_criteria if item.get("status") == "passed"),
@@ -2258,6 +2285,8 @@ def build_real_runtime_canary_report(
         active=active,
         handoff_report=handoff_report,
         errors=errors,
+        live_db_mutation=live_db_mutation,
+        retry_summary=retry_summary,
     )
     current_audit_gap_summary = build_current_audit_gap_summary(
         qdt_evidence=qdt_evidence,
@@ -2291,6 +2320,9 @@ def build_real_runtime_canary_report(
         },
         "run": run,
         "run_duration_seconds": run_duration,
+        "live_db_mutation": live_db_mutation,
+        "clone_only": live_db_mutation == "clone_only",
+        "retry_summary": retry_summary,
         "current_audit_gap_summary": current_audit_gap_summary,
         "phase9_representative_case": phase9_case,
         "active_work": active,
@@ -2388,10 +2420,12 @@ def _phase9_representative_case(
     active: dict[str, int],
     handoff_report: dict[str, Any],
     errors: dict[str, Any],
+    live_db_mutation: str | None = None,
+    retry_summary: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     reason_codes: list[str] = []
-    metadata = run.get("metadata") if isinstance(run, dict) and isinstance(run.get("metadata"), dict) else {}
-    clone_only = metadata.get("live_db_mutation") == "clone_only"
+    mutation = live_db_mutation or _resolve_live_db_mutation(_run_metadata(run))
+    clone_only = mutation == "clone_only"
     unexpected_blockers = {
         "active_work_not_drained": bool(active.get("active_runs") or active.get("active_leases")),
         "unresolved_handoff_refs": not bool(handoff_report.get("ok")),
@@ -2464,6 +2498,8 @@ def _phase9_representative_case(
         "classification": classification,
         "reason_codes": sorted(set(reason_codes)),
         "clone_only": clone_only,
+        "live_db_mutation": mutation,
+        "retry_summary": retry_summary or _retry_summary(qdt_evidence, errors),
         "no_scoreable_write_when_blocked": (
             not blocked_case
             or (

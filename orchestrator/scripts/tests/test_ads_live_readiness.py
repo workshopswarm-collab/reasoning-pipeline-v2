@@ -403,6 +403,10 @@ class AdsLiveReadinessTest(unittest.TestCase):
                 "scae_evidence_delta_ref_count": 0,
                 "supplied_scae_evidence_delta_ref_count": 0,
                 "strict_non_scoreable_canary_status": "missing",
+                "live_db_mutation": "unknown_or_live",
+                "clone_only": False,
+                "retry_attempt_count": 0,
+                "retry_final_outcome": "no_retries_recorded",
             },
         )
 
@@ -595,6 +599,40 @@ class AdsLiveReadinessTest(unittest.TestCase):
         self.assertIn("operator_review_report", report)
         self.assertIsInstance(report["operator_review_report"], dict)
         self.assertIn("alerts", report["operator_review_report"])
+
+    def test_live_readiness_propagates_clone_only_and_retry_diagnostics_from_operator_review(self):
+        ensure_pipeline_runner_schema(self.conn)
+        write_pipeline_run(
+            self.conn,
+            build_pipeline_run(
+                policy=PipelineRunnerPolicy(runner_mode="calibration_debt_production", max_cases=1),
+                pipeline_run_id="run:phase8-clone-readiness",
+                status="stopped",
+                started_at="2100-01-01T00:00:00+00:00",
+                stopped_at="2100-01-01T00:01:00+00:00",
+                metadata={
+                    "handler_factory": "predquant.ads_production_handlers",
+                    "live_db_mutation": "clone_only",
+                },
+            ),
+        )
+        self.conn.commit()
+
+        report = build_live_readiness_report(
+            self.db_path,
+            handler_factory="predquant.ads_production_handlers:build_stage_handlers",
+            include_operator_review=True,
+            operator_review_pipeline_run_id="run:phase8-clone-readiness",
+        )
+
+        self.assertEqual(report["status"], "blocked_true_runtime_cutover")
+        self.assertEqual(report["true_runtime_cutover_status"], "blocked_clone_only_canary")
+        self.assertEqual(report["live_db_mutation"], "clone_only")
+        self.assertTrue(report["clone_only"])
+        self.assertEqual(report["retry_summary"]["final_retry_outcome"], "no_retries_recorded")
+        self.assertEqual(report["reported_runtime_signals"]["live_db_mutation"], "clone_only")
+        self.assertTrue(report["reported_runtime_signals"]["clone_only"])
+        self.assertEqual(report["reported_runtime_signals"]["retry_attempt_count"], 0)
 
     def test_scoreable_gate_blocks_overlarge_debt_canary_batch(self):
         report = build_live_readiness_report(

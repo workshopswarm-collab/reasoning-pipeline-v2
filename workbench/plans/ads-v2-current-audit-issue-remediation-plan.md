@@ -1145,7 +1145,7 @@ Completion note, 2026-06-30:
 
 ## Phase 8 - Reporting, Clone Metadata, And Operator Readiness Semantics
 
-Status: pending
+Status: complete
 
 Goal: fix reporting polish and ensure operator/readiness surfaces accurately describe clone-only runs and remaining cutover blockers.
 
@@ -1220,12 +1220,21 @@ Success criteria:
 
 Checklist:
 
-- [ ] Clone metadata propagated.
-- [ ] Retry/backoff diagnostics propagated.
-- [ ] Missing metadata is conservative.
-- [ ] Readiness remains fail-closed.
-- [ ] Report tests pass.
-- [ ] Temporary artifacts deleted.
+- [x] Clone metadata propagated.
+- [x] Retry/backoff diagnostics propagated.
+- [x] Missing metadata is conservative.
+- [x] Readiness remains fail-closed.
+- [x] Report tests pass.
+- [x] Temporary artifacts deleted.
+
+Completion note, 2026-06-30:
+
+- Propagated explicit canary metadata into ADS pipeline-run metadata through `PipelineRunnerPolicy.safe_metadata`, then exposed `live_db_mutation`, `clone_only`, and normalized retry summaries in the real-runtime canary report, Phase 9 representative classifier, operator review report, and live-readiness diagnostics.
+- Kept clone-only inference conservative: cloned DB paths alone do not set `clone_only=true`; only explicit `live_db_mutation=clone_only` metadata does.
+- Added `blocked_clone_only_canary` as a true-runtime cutover status so even a complete scoreable clone proof stays blocked for live cutover until VM authorizes live mutation and strict readiness evidence exists.
+- Added permanent tests proving explicit clone metadata reaches real-runtime, Phase 9, operator, and readiness surfaces; missing metadata stays `unknown_or_live`; retry summaries are present and bounded; and clone-only readiness remains fail-closed.
+- Verification passed: `python3 -m unittest scripts.tests.test_ads_operator_review scripts.tests.test_ads_live_readiness scripts.tests.test_ads_operational_canary`, `python3 -m unittest scripts.tests.test_ads_pipeline_runner`, report CLI help checks for real-runtime canary, operator review, and live readiness, and no generated artifacts were created.
+- Current-repo note: the plan's `scripts.tests.test_ads_real_runtime_canary` target remains stale; real-runtime canary criteria coverage is still in `scripts.tests.test_ads_operational_canary`.
 
 ## Phase 9 - Final Representative Clone Batch
 

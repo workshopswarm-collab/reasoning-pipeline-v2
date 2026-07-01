@@ -603,7 +603,11 @@ class AdsOperationalCanaryTest(unittest.TestCase):
         require_manifest_handoffs=False,
         require_real_runtime_canary_criteria=False,
         require_researcher_model_executed=False,
+        metadata=None,
     ):
+        resolved_metadata = {"test_scope": "operational_canary"}
+        if metadata:
+            resolved_metadata.update(metadata)
         return OperationalCanaryConfig(
             db_path=Path(db_path) if db_path is not None else self.db_path,
             runner_mode="fixture",
@@ -613,7 +617,7 @@ class AdsOperationalCanaryTest(unittest.TestCase):
             reason="unit-test one-case canary",
             require_scoreable_prediction=require_scoreable_prediction,
             require_manifest_handoffs=require_manifest_handoffs,
-            metadata={"test_scope": "operational_canary"},
+            metadata=resolved_metadata,
             require_real_runtime_canary_criteria=require_real_runtime_canary_criteria,
             require_researcher_model_executed=require_researcher_model_executed,
         )
@@ -1481,8 +1485,14 @@ class AdsOperationalCanaryTest(unittest.TestCase):
         self.assertEqual(self.protected_counts_for(self.db_path), live_counts_before)
         self.assertEqual(result["protected_count_deltas"]["forecast_decision_records"], 1)
         self.assertEqual(result["protected_count_deltas"]["market_predictions"], 1)
-        self.assertEqual(result["real_runtime_canary_report"]["scae_runtime_evidence"]["valid_forecast_count"], 1)
-        self.assertGreater(result["real_runtime_canary_report"]["scae_runtime_evidence"]["delta_ref_count"], 0)
+        criteria_report = result["real_runtime_canary_report"]
+        self.assertEqual(criteria_report["live_db_mutation"], "unknown_or_live")
+        self.assertFalse(criteria_report["clone_only"])
+        self.assertFalse(criteria_report["phase9_representative_case"]["clone_only"])
+        self.assertEqual(criteria_report["phase9_representative_case"]["live_db_mutation"], "unknown_or_live")
+        self.assertEqual(criteria_report["retry_summary"]["final_retry_outcome"], "no_retries_recorded")
+        self.assertEqual(criteria_report["scae_runtime_evidence"]["valid_forecast_count"], 1)
+        self.assertGreater(criteria_report["scae_runtime_evidence"]["delta_ref_count"], 0)
         with sqlite3.connect(clone_path) as conn:
             conn.row_factory = sqlite3.Row
             scae_row = conn.execute(
@@ -1511,6 +1521,65 @@ class AdsOperationalCanaryTest(unittest.TestCase):
         self.assertEqual(decision["production_forecast_persisted"], 1)
         self.assertEqual(decision["probability_source"], "SCAE-012.production_forecast_prob")
         self.assertEqual(decision["writes_market_prediction"], 0)
+
+    def test_phase8_clone_metadata_propagates_to_runtime_phase9_and_operator_reports(self):
+        live_counts_before = self.protected_counts_for(self.db_path)
+        clone_path = self.clone_db_path("phase8-scoreable-clone-metadata.sqlite3")
+        config = self.config(
+            db_path=clone_path,
+            require_scoreable_prediction=True,
+            require_manifest_handoffs=True,
+            require_real_runtime_canary_criteria=True,
+            require_researcher_model_executed=True,
+            metadata={"live_db_mutation": "clone_only"},
+        )
+        handlers = build_true_production_handlers(
+            db_path=config.db_path,
+            runner_mode=config.runner_mode,
+            forecast_timestamp=config.forecast_timestamp,
+            max_cases=config.max_cases,
+            metadata=config.metadata,
+            decomposer_runtime_transport_response_path=self._decomposer_live_response_path(),
+            retrieval_browser_provider=_SearchProofRetrievalProvider(),
+            retrieval_provider_policy=RetrievalProviderPolicy(
+                max_direct_urls=0,
+                max_total_search_calls=10,
+                max_search_results_per_variant=5,
+                max_total_search_result_fetches=50,
+            ),
+            researcher_swarm_runtime_runner=_fake_researcher_runtime_bundle_all_evidence_accepted,
+        )
+
+        result = run_one_case_canary(config, handlers)
+
+        self.assertTrue(result["ok"], result["errors"])
+        self.assertEqual(self.protected_counts_for(self.db_path), live_counts_before)
+        criteria_report = result["real_runtime_canary_report"]
+        self.assertEqual(criteria_report["run"]["metadata"]["live_db_mutation"], "clone_only")
+        self.assertEqual(criteria_report["live_db_mutation"], "clone_only")
+        self.assertTrue(criteria_report["clone_only"])
+        self.assertEqual(criteria_report["retry_summary"]["final_retry_outcome"], "no_retries_recorded")
+        self.assertEqual(
+            criteria_report["current_audit_gap_summary"]["retry_summary"],
+            criteria_report["retry_summary"],
+        )
+        phase9_case = criteria_report["phase9_representative_case"]
+        self.assertTrue(phase9_case["clone_only"])
+        self.assertEqual(phase9_case["live_db_mutation"], "clone_only")
+        self.assertEqual(phase9_case["retry_summary"], criteria_report["retry_summary"])
+        self.assertEqual(phase9_case["classification"], "scoreable_success")
+
+        operator_report = build_ads_operator_review_report(
+            clone_path,
+            pipeline_run_id=result["result"]["pipeline_run_id"],
+            max_market_snapshot_age_seconds=10_000_000_000,
+            max_resolution_sync_age_seconds=10_000_000_000,
+        )
+        self.assertEqual(operator_report["live_db_mutation"], "clone_only")
+        self.assertTrue(operator_report["clone_only"])
+        self.assertEqual(operator_report["retry_summary"]["final_retry_outcome"], "no_retries_recorded")
+        self.assertEqual(operator_report["true_runtime_cutover_status"], "blocked_clone_only_canary")
+        self.assertFalse(operator_report["true_runtime_cutover_ready"])
 
     def test_phase7_missing_verified_scae_delta_refs_invalidates_forecast_without_prediction(self):
         config = self.config(

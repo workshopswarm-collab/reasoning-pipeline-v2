@@ -11,6 +11,7 @@ from typing import Any
 from predquant.ads_handoff import ensure_artifact_manifest_schema
 from predquant.ads_handoff_report import build_handoff_report
 from predquant.ads_pipeline_runner import (
+    PIPELINE_LOOP_ITERATION_TABLE,
     PIPELINE_RUN_TABLE,
     ensure_pipeline_runner_schema,
     read_pipeline_control_state,
@@ -54,6 +55,7 @@ RESEARCH_SUFFICIENCY_BLOCKED_CODES = {
 }
 TRUE_RUNTIME_CUTOVER_STATUSES = {
     "ready",
+    "blocked_clone_only_canary",
     "blocked_stage_failure",
     "blocked_missing_retrieval_cert",
     "blocked_missing_researcher_model_execution",
@@ -134,10 +136,84 @@ def _row_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
         ("replay_manifest_refs", []),
         ("allowed_uses", []),
         ("forbidden_uses", []),
+        ("retry_summary", {}),
     ):
         if field in result:
             result[field] = _decode_json(result[field], fallback)
     return result
+
+
+def _int_value(value: Any) -> int:
+    if isinstance(value, bool):
+        return int(value)
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _metadata_dict(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _live_db_mutation_from_run(run: dict[str, Any] | None) -> str:
+    metadata = _metadata_dict(run.get("metadata")) if isinstance(run, dict) else {}
+    if metadata.get("live_db_mutation") == "clone_only":
+        return "clone_only"
+    return "unknown_or_live"
+
+
+def _operator_retry_summary(
+    *,
+    run: dict[str, Any] | None,
+    loop_iterations: list[dict[str, Any]],
+) -> dict[str, Any]:
+    retry_records = [
+        _metadata_dict(item.get("retry_summary"))
+        for item in loop_iterations
+        if _metadata_dict(item.get("retry_summary"))
+    ]
+    run_metadata = _metadata_dict(run.get("metadata")) if isinstance(run, dict) else {}
+    if not retry_records and run_metadata.get("retry_policy_ref"):
+        retry_records.append(
+            {
+                "retry_stage": run_metadata.get("retry_stage"),
+                "retry_policy_ref": run_metadata.get("retry_policy_ref"),
+                "retry_after_seconds": run_metadata.get("retry_after_seconds"),
+            }
+        )
+    retry_backoff_seconds = [
+        _int_value(item.get("retry_after_seconds"))
+        for item in retry_records
+        if item.get("retry_after_seconds") is not None
+    ]
+    retry_policy_refs = sorted(
+        {
+            str(item["retry_policy_ref"])
+            for item in retry_records
+            if item.get("retry_policy_ref")
+        }
+    )
+    components = sorted(
+        {
+            str(item["retry_stage"])
+            for item in retry_records
+            if item.get("retry_stage")
+        }
+    )
+    retry_attempt_count = len(retry_records)
+    return {
+        "retry_attempt_count": retry_attempt_count,
+        "retryable_failure_count": retry_attempt_count,
+        "non_retryable_failure_count": 0,
+        "terminal_retry_exhausted_count": 0,
+        "stage_retry_scheduled_count": retry_attempt_count,
+        "qdt_model_transport_retry_count": 0,
+        "retry_backoff_seconds": retry_backoff_seconds,
+        "retry_policy_refs": retry_policy_refs,
+        "components": components,
+        "final_retry_outcome": "retry_recorded" if retry_attempt_count else "no_retries_recorded",
+    }
 
 
 def _run_row(conn: sqlite3.Connection, pipeline_run_id: str | None) -> dict[str, Any] | None:
@@ -148,6 +224,21 @@ def _run_row(conn: sqlite3.Connection, pipeline_run_id: str | None) -> dict[str,
         (pipeline_run_id,),
     ).fetchone()
     return _row_dict(row)
+
+
+def _loop_iteration_rows(conn: sqlite3.Connection, pipeline_run_id: str | None) -> list[dict[str, Any]]:
+    if not pipeline_run_id or not _table_exists(conn, PIPELINE_LOOP_ITERATION_TABLE):
+        return []
+    rows = conn.execute(
+        f"""
+        SELECT *
+        FROM {PIPELINE_LOOP_ITERATION_TABLE}
+        WHERE pipeline_run_id = ?
+        ORDER BY iteration_number, rowid
+        """,
+        (pipeline_run_id,),
+    ).fetchall()
+    return [_row_dict(row) or {} for row in rows]
 
 
 def _run_age_seconds(run: dict[str, Any]) -> float | None:
@@ -882,6 +973,8 @@ def _true_runtime_cutover_status(
 ) -> str:
     if run_kind != "true_production" or not run:
         return "blocked_missing_strict_canary"
+    if _live_db_mutation_from_run(run) == "clone_only":
+        return "blocked_clone_only_canary"
     if _run_stage_failed(run):
         return "blocked_stage_failure"
     if not cases:
@@ -1318,6 +1411,7 @@ def build_ads_operator_review_report(
         ensure_artifact_manifest_schema(conn)
         resolved_run_id = pipeline_run_id or _latest_run_id(conn)
         run = _run_row(conn, resolved_run_id)
+        loop_iterations = _loop_iteration_rows(conn, resolved_run_id)
         leases = _lease_rows(conn, resolved_run_id)
         manifests = _manifest_rows(conn, resolved_run_id)
         decisions = _forecast_decision_rows(conn, resolved_run_id)
@@ -1346,6 +1440,8 @@ def build_ads_operator_review_report(
     )
     run_kind = _infer_run_kind(run, manifests)
     cases = _case_reports(leases, manifests, decisions, predictions, traces)
+    live_db_mutation = _live_db_mutation_from_run(run)
+    retry_summary = _operator_retry_summary(run=run, loop_iterations=loop_iterations)
     alerts = _build_alerts(
         pipeline_run_id=resolved_run_id,
         run_kind=run_kind,
@@ -1388,6 +1484,9 @@ def build_ads_operator_review_report(
         "pipeline_run_id": resolved_run_id,
         "run": run,
         "run_kind": run_kind,
+        "live_db_mutation": live_db_mutation,
+        "clone_only": live_db_mutation == "clone_only",
+        "retry_summary": retry_summary,
         "pipeline_control": control,
         "alert_counts_by_severity": counts,
         "alerts": alerts,

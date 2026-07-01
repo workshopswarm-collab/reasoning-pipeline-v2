@@ -9,6 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from predquant.ads_operator_review import (
     _build_alerts,
+    _operator_retry_summary,
     _qdt_summary,
     _retrieval_summary,
     _true_runtime_cutover_status,
@@ -234,6 +235,57 @@ class AdsOperatorReviewTest(unittest.TestCase):
         )
 
         self.assertEqual(status, "blocked_missing_retrieval_cert")
+
+    def test_true_runtime_cutover_status_blocks_explicit_clone_only_run(self):
+        status = _true_runtime_cutover_status(
+            run={
+                "runner_mode": "calibration_debt_production",
+                "status": "stopped",
+                "terminal_reason": "auto003_single_case_complete",
+                "metadata": {
+                    "handler_factory": "predquant.ads_production_handlers",
+                    "live_db_mutation": "clone_only",
+                },
+            },
+            run_kind="true_production",
+            cases=[
+                {
+                    "retrieval_sufficiency": {
+                        "all_required_leaves_certified": True,
+                        "admitted_evidence_ref_count": 2,
+                    },
+                    "researcher_model_provenance": {"model_executed_count": 1},
+                    "scae_readiness": {
+                        "artifact_id": "artifact:scae-ledger:1",
+                        "forecast_validity_status": "valid_for_forecast",
+                    },
+                }
+            ],
+        )
+
+        self.assertEqual(status, "blocked_clone_only_canary")
+
+    def test_operator_retry_summary_exposes_stage_retry_backoff(self):
+        summary = _operator_retry_summary(
+            run={"metadata": {}},
+            loop_iterations=[
+                {
+                    "retry_summary": {
+                        "retry_stage": "retrieval",
+                        "retry_after_seconds": 60,
+                        "retry_policy_ref": "auto004-transient-stage-retry/v1",
+                    }
+                }
+            ],
+        )
+
+        self.assertEqual(summary["retry_attempt_count"], 1)
+        self.assertEqual(summary["retryable_failure_count"], 1)
+        self.assertEqual(summary["stage_retry_scheduled_count"], 1)
+        self.assertEqual(summary["retry_backoff_seconds"], [60])
+        self.assertEqual(summary["retry_policy_refs"], ["auto004-transient-stage-retry/v1"])
+        self.assertEqual(summary["components"], ["retrieval"])
+        self.assertEqual(summary["final_retry_outcome"], "retry_recorded")
 
     def test_true_runtime_cutover_status_blocks_failed_stage(self):
         status = _true_runtime_cutover_status(

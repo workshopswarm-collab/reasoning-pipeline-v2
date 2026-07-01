@@ -50,6 +50,7 @@ SCAE_EVIDENCE_REF_FIELDS = (
 )
 TRUE_RUNTIME_CUTOVER_STATUSES = {
     "ready",
+    "blocked_clone_only_canary",
     "blocked_stage_failure",
     "blocked_missing_retrieval_cert",
     "blocked_missing_researcher_model_execution",
@@ -107,6 +108,27 @@ def _int_value(value: Any) -> int:
         return int(value or 0)
     except (TypeError, ValueError):
         return 0
+
+
+def _empty_retry_summary() -> dict[str, Any]:
+    return {
+        "retry_attempt_count": 0,
+        "retryable_failure_count": 0,
+        "non_retryable_failure_count": 0,
+        "terminal_retry_exhausted_count": 0,
+        "stage_retry_scheduled_count": 0,
+        "qdt_model_transport_retry_count": 0,
+        "retry_backoff_seconds": [],
+        "retry_policy_refs": [],
+        "components": [],
+        "final_retry_outcome": "no_retries_recorded",
+    }
+
+
+def _operator_review_retry_summary(operator_review: dict[str, Any] | None) -> dict[str, Any]:
+    if isinstance(operator_review, dict) and isinstance(operator_review.get("retry_summary"), dict):
+        return dict(operator_review["retry_summary"])
+    return _empty_retry_summary()
 
 
 def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
@@ -523,6 +545,11 @@ def build_live_readiness_report(
         issues=issues,
         true_runtime_cutover_status=true_runtime_cutover_status,
     )
+    live_db_mutation = "unknown_or_live"
+    if isinstance(operator_review, dict) and operator_review.get("live_db_mutation") == "clone_only":
+        live_db_mutation = "clone_only"
+    clone_only = live_db_mutation == "clone_only"
+    retry_summary = _operator_review_retry_summary(operator_review)
 
     return {
         "schema_version": LIVE_READINESS_SCHEMA_VERSION,
@@ -533,6 +560,9 @@ def build_live_readiness_report(
         "base_infrastructure_issues": base_infrastructure_issues,
         "true_runtime_cutover_status": true_runtime_cutover_status,
         "true_runtime_cutover_ready": true_runtime_cutover_status == "ready",
+        "live_db_mutation": live_db_mutation,
+        "clone_only": clone_only,
+        "retry_summary": retry_summary,
         "issues": issues,
         "db_path": str(path),
         "runner_mode": runner_mode,
@@ -552,6 +582,10 @@ def build_live_readiness_report(
             ),
             "supplied_scae_evidence_delta_ref_count": len(scae_evidence_delta_refs or []),
             "strict_non_scoreable_canary_status": strict_canary_signals["status"],
+            "live_db_mutation": live_db_mutation,
+            "clone_only": clone_only,
+            "retry_attempt_count": retry_summary["retry_attempt_count"],
+            "retry_final_outcome": retry_summary["final_retry_outcome"],
         },
         "amrg_dependency_readiness": amrg_dependency_readiness,
         "amrg_assist_policy_signoff": amrg_dependency_readiness["assist_policy_signoff"],

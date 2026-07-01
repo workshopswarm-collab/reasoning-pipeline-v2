@@ -220,6 +220,7 @@ def run_one_case_canary(
             allow_forecast_persistence=True,
             retry_backoff_seconds=config.retry_backoff_seconds,
             require_manifest_handoffs=config.require_manifest_handoffs,
+            safe_metadata=dict(config.metadata),
         )
         result = run_ads_pipeline_loop(
             conn,
@@ -292,6 +293,7 @@ def run_one_case_canary(
         "protected_count_deltas": deltas,
         "active_after": active_after,
         "control_after": control_after,
+        "metadata": dict(config.metadata),
     }
     criteria_report = build_real_runtime_canary_report(
         config.db_path,

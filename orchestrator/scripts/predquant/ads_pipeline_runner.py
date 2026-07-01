@@ -215,6 +215,7 @@ class PipelineRunnerPolicy:
     allow_forecast_persistence: bool = False
     retry_backoff_seconds: int = 60
     require_manifest_handoffs: bool = False
+    safe_metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -550,6 +551,7 @@ def validate_pipeline_runner_policy(policy: PipelineRunnerPolicy) -> None:
         raise PipelineRunnerContractError("retry_backoff_seconds must be a non-negative integer")
     if not isinstance(policy.require_manifest_handoffs, bool):
         raise PipelineRunnerContractError("require_manifest_handoffs must be boolean")
+    ensure_safe_metadata(policy.safe_metadata)
     policy.idle_policy.to_record()
     if policy.allow_forecast_persistence and not policy.allow_downstream_execution:
         raise PipelineRunnerContractError("forecast persistence requires downstream stage execution")
@@ -623,6 +625,7 @@ def build_pipeline_run(
         "auto003_state_machine": is_auto003,
         "live_stage_execution": bool(policy.allow_downstream_execution),
     }
+    metadata_record.update(ensure_safe_metadata(policy.safe_metadata))
     metadata_record.update(ensure_safe_metadata(metadata))
     record = {
         "schema_version": PIPELINE_RUN_SCHEMA_VERSION,
