@@ -603,6 +603,16 @@ def build_non_scae_probability_authority_report() -> dict[str, Any]:
     )
     checks.append(
         _expect_rejection(
+            "synthesis_rejects_scae_delta_summary",
+            "scae_delta",
+            lambda: build_synthesis_annotation(
+                scae_ledger=scae_ledger,
+                research_summaries={"summary": "bad", "scae_delta": 0.02},
+            ),
+        )
+    )
+    checks.append(
+        _expect_rejection(
             "decision_rejects_replacement_probability",
             "replacement_probability",
             lambda: build_decision_gate(
@@ -618,6 +628,16 @@ def build_non_scae_probability_authority_report() -> dict[str, Any]:
             lambda: build_decision_gate(
                 scae_ledger=scae_ledger,
                 decision_request={"rationale": "I would set the probability to 61%."},
+            ),
+        )
+    )
+    checks.append(
+        _expect_rejection(
+            "decision_rejects_market_prediction_write",
+            "writes_market_prediction",
+            lambda: build_decision_gate(
+                scae_ledger=scae_ledger,
+                decision_request={"writes_market_prediction": True},
             ),
         )
     )

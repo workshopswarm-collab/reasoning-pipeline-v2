@@ -947,7 +947,7 @@ Completion note:
 
 ## Phase 9 - SCAE Valid Forecast Positive Path And Authority Guard
 
-Status: planned
+Status: completed
 
 Goal: prove SCAE can produce a valid forecast from verified evidence-delta refs and remains the only numeric forecast authority.
 
@@ -1010,11 +1010,19 @@ Success criteria:
 
 Checklist:
 
-- [ ] Positive SCAE ledger test passes.
-- [ ] Zero-delta invalid ledger test passes.
-- [ ] Clone-only valid decision persistence test passes.
-- [ ] Non-SCAE authority check passes.
-- [ ] Temp artifacts and one-off scripts removed.
+- [x] Positive SCAE ledger test passes.
+- [x] Zero-delta invalid ledger test passes.
+- [x] Clone-only valid decision persistence test passes.
+- [x] Non-SCAE authority check passes.
+- [x] Temp artifacts and one-off scripts removed.
+
+Completion note:
+
+- Removed the structured-metadata pilot exception from the SCAE evidence-delta guard. Any SCAE ledger that remains valid for forecast now requires nonzero verified evidence-delta refs and records `scae_valid_forecast_requires_evidence_delta_refs=true`.
+- Added explicit scoreable prediction expectation metadata for the strict true-production clone path while keeping production-readiness and structured-metadata pilot runs fail-closed when verified delta refs are missing.
+- Strengthened Phase 9 operational canary coverage for a valid clone-only SCAE forecast, zero-delta invalid forecast, blocked structured-metadata pilot output, SCAE-only probability source persistence, accepted delta-ref proof counts, and no non-SCAE probability inputs.
+- Expanded the non-SCAE authority scan with direct SCAE-delta and market-prediction-write rejection checks.
+- Verification passed: `SCAE` SCAE unittest discovery (`109 tests OK`), `orchestrator` `scripts.tests.test_ads_operational_canary` (`29 tests OK`), `scripts.tests.test_ads_production_handlers` (`10 tests OK`), `scripts/bin/check_ads_non_scae_authority.py`, and `git diff --check`.
 
 ## Phase 10 - Representative Clone Batch And Closure
 

@@ -252,6 +252,7 @@ def build_stage_handlers(**kwargs: Any) -> dict[str, Callable[..., Any]]:
     kwargs.pop("handler_factory_ref", None)
     kwargs.pop("handler_scope", None)
     kwargs.pop("scoreable_pilot", None)
+    kwargs.pop("scoreable_prediction_expected", None)
     kwargs.pop("decomposer_runtime", None)
     kwargs.pop("live_policy_overlay", None)
     kwargs.pop("live_retrieval_runtime", None)
@@ -277,6 +278,7 @@ def build_stage_handlers(**kwargs: Any) -> dict[str, Callable[..., Any]]:
         handler_factory_ref=TRUE_PRODUCTION_HANDLER_FACTORY_REF,
         handler_scope=TRUE_PRODUCTION_HANDLER_SCOPE,
         scoreable_pilot=False,
+        scoreable_prediction_expected=True,
         decomposer_runtime=True,
         decomposer_runtime_mode=runtime_mode,
         live_policy_overlay=True,

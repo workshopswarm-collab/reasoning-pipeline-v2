@@ -1200,6 +1200,7 @@ def _build_scae_ledger(
     verification_payload: dict[str, Any] | None = None,
     forecast_timestamp: str,
     scoreable_pilot: bool = False,
+    scoreable_prediction_expected: bool = False,
 ) -> dict[str, Any]:
     contract_case_id = case_contract["case_id"]
     contract_case_key = case_contract["case_key"]
@@ -1316,13 +1317,15 @@ def _build_scae_ledger(
         qdt=qdt,
         sufficiency_reconciliations=sufficiency_rows,
     )
-    if (
-        not scoreable_pilot
-        and guarded.get("forecast_validity_status") != "invalid_for_forecast"
-        and not verified_delta_refs
-    ):
+    if guarded.get("forecast_validity_status") != "invalid_for_forecast" and not verified_delta_refs:
         guarded = _block_scae_ledger_without_verified_delta_refs(guarded)
     finalized = finalize_scae_probability_fields(guarded)
+    valid_verified_forecast = bool(
+        finalized.get("forecast_validity_status") != "invalid_for_forecast" and verified_delta_refs
+    )
+    scoreable_forecast_expected = bool(
+        (scoreable_pilot or scoreable_prediction_expected) and valid_verified_forecast
+    )
     finalized.update(
         {
             "case_id": contract_case_id,
@@ -1336,23 +1339,15 @@ def _build_scae_ledger(
                 else "production_readiness_fail_closed"
             ),
             "forecast_authority_policy": "scae_only",
-            "scae_valid_forecast_requires_evidence_delta_refs": not scoreable_pilot,
+            "scae_valid_forecast_requires_evidence_delta_refs": True,
             "scae_evidence_delta_ref_requirement_status": (
-                "not_applicable_structured_market_metadata_pilot"
-                if scoreable_pilot
-                else "satisfied"
-                if verified_delta_refs
-                else "verified_scae_evidence_delta_refs_missing"
+                "satisfied" if verified_delta_refs else "verified_scae_evidence_delta_refs_missing"
             ),
             "scae_evidence_delta_ref_count": len(verified_delta_refs),
             "scae_evidence_delta_refs": verified_delta_refs,
             "non_scae_probability_inputs": [],
-            "scoreable_forecast_output": bool(
-                scoreable_pilot and finalized.get("forecast_validity_status") != "invalid_for_forecast"
-            ),
-            "market_prediction_write_expected": bool(
-                scoreable_pilot and finalized.get("forecast_validity_status") != "invalid_for_forecast"
-            ),
+            "scoreable_forecast_output": scoreable_forecast_expected,
+            "market_prediction_write_expected": scoreable_forecast_expected,
         }
     )
     return finalized
@@ -1474,6 +1469,7 @@ def build_stage_handlers(
     metadata: dict[str, Any] | None = None,
     artifact_dir: Path | str | None = None,
     scoreable_pilot: bool = False,
+    scoreable_prediction_expected: bool = False,
     handler_factory_ref: str | None = None,
     handler_scope: str | None = None,
     decomposer_runtime: bool = False,
@@ -1512,9 +1508,12 @@ def build_stage_handlers(
         "scoreable_forecast_policy": (
             "structured_market_metadata_scoreable_under_calibration_debt_controls"
             if scoreable_pilot
+            else "scae_valid_forecast_clone_prediction_expected"
+            if scoreable_prediction_expected
             else "blocked_until_research_sufficiency_certified"
         ),
         "scoreable_pilot": bool(scoreable_pilot),
+        "scoreable_prediction_expected": bool(scoreable_prediction_expected),
         "decomposer_runtime": bool(decomposer_runtime),
         "decomposer_runtime_mode": decomposer_runtime_mode,
         "live_policy_overlay": bool(live_policy_overlay),
@@ -2345,6 +2344,7 @@ def build_stage_handlers(
             verification_payload=verification_payload,
             forecast_timestamp=_forecast_timestamp(forecast_timestamp, lease),
             scoreable_pilot=scoreable_pilot,
+            scoreable_prediction_expected=scoreable_prediction_expected,
         )
         manifest, validation_id = _write_payload_manifest(
             conn,
@@ -2378,7 +2378,8 @@ def build_stage_handlers(
                 **factory_metadata,
                 "forecast_validity_status": ledger.get("forecast_validity_status"),
                 "final_probability_fields_status": ledger.get("final_probability_fields_status"),
-                "scoreable_forecast_output": bool(ledger.get("scoreable_forecast_output")),
+                "scae_scoreable_forecast_output": bool(ledger.get("scoreable_forecast_output")),
+                "scoreable_forecast_output": False,
             },
         )
 

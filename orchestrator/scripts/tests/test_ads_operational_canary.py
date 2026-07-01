@@ -1457,15 +1457,16 @@ class AdsOperationalCanaryTest(unittest.TestCase):
         )
         self.assertTrue(operator_report["cases"][0]["retrieval_sufficiency"]["leaf_retrieval_statuses"])
 
-    def test_phase7_valid_scae_forecast_writes_clone_only_without_live_db_mutation(self):
+    def test_phase9_valid_scae_forecast_writes_clone_only_without_live_db_mutation(self):
         live_counts_before = self.protected_counts_for(self.db_path)
-        clone_path = self.clone_db_path("phase7-scoreable-clone.sqlite3")
+        clone_path = self.clone_db_path("phase9-scoreable-clone.sqlite3")
         config = self.config(
             db_path=clone_path,
             require_scoreable_prediction=True,
             require_manifest_handoffs=True,
             require_real_runtime_canary_criteria=True,
             require_researcher_model_executed=True,
+            metadata={"live_db_mutation": "clone_only"},
         )
         handlers = build_true_production_handlers(
             db_path=config.db_path,
@@ -1491,10 +1492,10 @@ class AdsOperationalCanaryTest(unittest.TestCase):
         self.assertEqual(result["protected_count_deltas"]["forecast_decision_records"], 1)
         self.assertEqual(result["protected_count_deltas"]["market_predictions"], 1)
         criteria_report = result["real_runtime_canary_report"]
-        self.assertEqual(criteria_report["live_db_mutation"], "unknown_or_live")
-        self.assertFalse(criteria_report["clone_only"])
-        self.assertFalse(criteria_report["phase9_representative_case"]["clone_only"])
-        self.assertEqual(criteria_report["phase9_representative_case"]["live_db_mutation"], "unknown_or_live")
+        self.assertEqual(criteria_report["live_db_mutation"], "clone_only")
+        self.assertTrue(criteria_report["clone_only"])
+        self.assertTrue(criteria_report["phase9_representative_case"]["clone_only"])
+        self.assertEqual(criteria_report["phase9_representative_case"]["live_db_mutation"], "clone_only")
         self.assertEqual(criteria_report["retry_summary"]["final_retry_outcome"], "no_retries_recorded")
         self.assertEqual(criteria_report["scae_runtime_evidence"]["valid_forecast_count"], 1)
         self.assertGreater(criteria_report["scae_runtime_evidence"]["delta_ref_count"], 0)
@@ -1512,20 +1513,39 @@ class AdsOperationalCanaryTest(unittest.TestCase):
             decision = conn.execute(
                 """
                 SELECT production_persistence_status, production_forecast_persisted,
-                       probability_source, writes_market_prediction
+                       production_forecast_prob, probability_source,
+                       writes_market_prediction, scoreable_forecast_output
                 FROM forecast_decision_records
+                """
+            ).fetchone()
+            prediction = conn.execute(
+                """
+                SELECT predicted_probability, engine_stage, prediction_source
+                FROM market_predictions
                 """
             ).fetchone()
         scae = json.loads(Path(scae_row["artifact_path"]).read_text(encoding="utf-8"))
         self.assertEqual(scae["forecast_validity_status"], "valid_for_forecast")
         self.assertEqual(scae["forecast_authority_policy"], "scae_only")
+        self.assertTrue(scae["scae_valid_forecast_requires_evidence_delta_refs"])
         self.assertEqual(scae["scae_evidence_delta_ref_requirement_status"], "satisfied")
         self.assertGreater(scae["scae_evidence_delta_ref_count"], 0)
+        proof = scae["scae_evidence_delta_verification_proof"]
+        self.assertEqual(proof["accepted_delta_ref_count"], scae["scae_evidence_delta_ref_count"])
+        self.assertTrue(proof["all_accepted_delta_refs_have_direction_and_quality_verification"])
+        self.assertTrue(all(row["proof_status"] == "verified_scae_delta_ref" for row in proof["proof_rows"]))
         self.assertEqual(scae["non_scae_probability_inputs"], [])
+        self.assertTrue(scae["scoreable_forecast_output"])
+        self.assertTrue(scae["market_prediction_write_expected"])
         self.assertEqual(decision["production_persistence_status"], "production_forecast_persisted_from_scae")
         self.assertEqual(decision["production_forecast_persisted"], 1)
+        self.assertEqual(decision["production_forecast_prob"], scae["production_forecast_prob"])
         self.assertEqual(decision["probability_source"], "SCAE-012.production_forecast_prob")
         self.assertEqual(decision["writes_market_prediction"], 0)
+        self.assertEqual(decision["scoreable_forecast_output"], 0)
+        self.assertEqual(prediction["predicted_probability"], scae["production_forecast_prob"])
+        self.assertEqual(prediction["engine_stage"], "scae")
+        self.assertEqual(prediction["prediction_source"], "ads_pipeline")
 
     def test_phase8_clone_metadata_propagates_to_runtime_phase9_and_operator_reports(self):
         live_counts_before = self.protected_counts_for(self.db_path)
@@ -1586,7 +1606,7 @@ class AdsOperationalCanaryTest(unittest.TestCase):
         self.assertEqual(operator_report["true_runtime_cutover_status"], "blocked_clone_only_canary")
         self.assertFalse(operator_report["true_runtime_cutover_ready"])
 
-    def test_phase7_missing_verified_scae_delta_refs_invalidates_forecast_without_prediction(self):
+    def test_phase9_missing_verified_scae_delta_refs_invalidates_forecast_without_prediction(self):
         config = self.config(
             require_scoreable_prediction=False,
             require_manifest_handoffs=True,
@@ -1634,12 +1654,17 @@ class AdsOperationalCanaryTest(unittest.TestCase):
             prediction_count = conn.execute("SELECT COUNT(*) FROM market_predictions").fetchone()[0]
         scae = json.loads(Path(scae_row["artifact_path"]).read_text(encoding="utf-8"))
         self.assertEqual(scae["forecast_validity_status"], "invalid_for_forecast")
+        self.assertTrue(scae["scae_valid_forecast_requires_evidence_delta_refs"])
         self.assertEqual(
             scae["scae_evidence_delta_ref_requirement_status"],
             "verified_scae_evidence_delta_refs_missing",
         )
         self.assertEqual(scae["scae_evidence_delta_ref_count"], 0)
+        proof = scae["scae_evidence_delta_verification_proof"]
+        self.assertEqual(proof["accepted_delta_ref_count"], 0)
         self.assertEqual(scae["non_scae_probability_inputs"], [])
+        self.assertFalse(scae["scoreable_forecast_output"])
+        self.assertFalse(scae["market_prediction_write_expected"])
         self.assertNotIn("production_forecast_prob", scae)
         self.assertEqual(decision["production_persistence_status"], "blocked_invalid_scae_forecast")
         self.assertEqual(decision["production_forecast_persisted"], 0)
@@ -2756,8 +2781,8 @@ class AdsOperationalCanaryTest(unittest.TestCase):
         self.assertEqual(report["alert_counts_by_severity"]["blocker"], 1)
         self.assertIn("non_scae_probability_authority", {alert["code"] for alert in report["alerts"]})
 
-    def test_production_pilot_factory_writes_scoreable_prediction_with_manifest_handoffs(self):
-        config = self.config(require_scoreable_prediction=True, require_manifest_handoffs=True)
+    def test_production_pilot_factory_blocks_scoreable_prediction_without_verified_delta_refs(self):
+        config = self.config(require_scoreable_prediction=False, require_manifest_handoffs=True)
         handlers = build_production_pilot_handlers(
             db_path=config.db_path,
             runner_mode=config.runner_mode,
@@ -2771,7 +2796,7 @@ class AdsOperationalCanaryTest(unittest.TestCase):
         self.assertTrue(result["ok"], result["errors"])
         self.assertEqual(result["result"]["completed_stage_count"], len(ADS_PIPELINE_STAGE_ORDER))
         self.assertEqual(result["protected_count_deltas"]["forecast_decision_records"], 1)
-        self.assertEqual(result["protected_count_deltas"]["market_predictions"], 1)
+        self.assertEqual(result["protected_count_deltas"]["market_predictions"], 0)
         with sqlite3.connect(self.db_path) as conn:
             decision = conn.execute(
                 """
@@ -2786,6 +2811,15 @@ class AdsOperationalCanaryTest(unittest.TestCase):
                 FROM market_predictions
                 """
             ).fetchone()
+            scae_row = conn.execute(
+                """
+                SELECT artifact_path
+                FROM case_artifact_manifest
+                WHERE stage = 'scae'
+                ORDER BY id DESC
+                LIMIT 1
+                """
+            ).fetchone()
             retrieval_row = conn.execute(
                 """
                 SELECT artifact_path
@@ -2795,14 +2829,24 @@ class AdsOperationalCanaryTest(unittest.TestCase):
                 LIMIT 1
                 """
             ).fetchone()
-            self.assertEqual(decision[0], "production_forecast_persisted_from_scae")
-            self.assertEqual(decision[1], 1)
-            self.assertIsNotNone(decision[2])
-            self.assertIsNone(decision[3])
-            self.assertEqual(prediction[0], "ads_pipeline")
-            self.assertEqual(prediction[1], "v2_scae")
-            self.assertIsNotNone(prediction[2])
+            self.assertEqual(decision[0], "blocked_invalid_scae_forecast")
+            self.assertEqual(decision[1], 0)
+            self.assertIsNone(decision[2])
+            self.assertEqual(decision[3], "forecast_validity_invalid_for_forecast")
+            self.assertIsNone(prediction)
+            self.assertIsNotNone(scae_row)
             self.assertIsNotNone(retrieval_row)
+
+        scae = json.loads(Path(scae_row[0]).read_text(encoding="utf-8"))
+        self.assertEqual(scae["forecast_validity_status"], "invalid_for_forecast")
+        self.assertTrue(scae["scae_valid_forecast_requires_evidence_delta_refs"])
+        self.assertEqual(
+            scae["scae_evidence_delta_ref_requirement_status"],
+            "verified_scae_evidence_delta_refs_missing",
+        )
+        self.assertEqual(scae["scae_evidence_delta_ref_count"], 0)
+        self.assertFalse(scae["scoreable_forecast_output"])
+        self.assertFalse(scae["market_prediction_write_expected"])
 
         retrieval_payload = json.loads(Path(retrieval_row[0]).read_text(encoding="utf-8"))
         boundary = retrieval_payload["structured_market_metadata_pilot_proof_boundary"]
@@ -2836,7 +2880,7 @@ class AdsOperationalCanaryTest(unittest.TestCase):
             len(ADS_PIPELINE_STAGE_ORDER),
         )
 
-    def test_production_pilot_factory_runs_bounded_batch(self):
+    def test_production_pilot_factory_runs_bounded_batch_without_predictions_when_delta_refs_missing(self):
         self._seed_market(
             external_market_id="operational-pilot-b",
             slug="operational-pilot-b",
@@ -2845,7 +2889,7 @@ class AdsOperationalCanaryTest(unittest.TestCase):
             best_ask=0.62,
         )
         self.conn.commit()
-        config = self.config(require_scoreable_prediction=True, max_cases=2, require_manifest_handoffs=True)
+        config = self.config(require_scoreable_prediction=False, max_cases=2, require_manifest_handoffs=True)
         handlers = build_production_pilot_handlers(
             db_path=config.db_path,
             runner_mode=config.runner_mode,
@@ -2859,7 +2903,7 @@ class AdsOperationalCanaryTest(unittest.TestCase):
         self.assertTrue(result["ok"], result["errors"])
         self.assertEqual(result["result"]["terminal_status"], "auto005_max_cases_complete")
         self.assertEqual(result["protected_count_deltas"]["forecast_decision_records"], 2)
-        self.assertEqual(result["protected_count_deltas"]["market_predictions"], 2)
+        self.assertEqual(result["protected_count_deltas"]["market_predictions"], 0)
 
 
 if __name__ == "__main__":
