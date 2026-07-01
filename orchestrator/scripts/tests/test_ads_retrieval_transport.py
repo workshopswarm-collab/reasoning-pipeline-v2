@@ -21,8 +21,12 @@ from ads_decomposer.handoff import (  # noqa: E402
 )
 from ads_decomposer.qdt import build_fixture_qdt_candidate, select_qdt_candidate  # noqa: E402
 from predquant.ads_retrieval_transport import (  # noqa: E402
+    BROWSER_SEARCH_SOURCE_PROVIDER_KIND,
+    DIRECT_URL_SOURCE_PROVIDER_KIND,
     RetrievalProviderPolicy,
+    SOURCE_PROVIDER_RUNTIME_REF_SCHEMA_VERSION,
     collect_live_retrieval_candidates,
+    normalize_source_provider_result,
 )
 from researcher_swarm.retrieval import (  # noqa: E402
     build_live_retrieval_packet_from_candidates,
@@ -253,6 +257,32 @@ class AdsRetrievalTransportTest(unittest.TestCase):
         leaf["required_evidence_fields"] = ["official_status", "bank_of_israel_decision"]
         return qdt
 
+    def test_source_provider_result_normalizes_candidate_authority_metadata(self) -> None:
+        runtime_ref = {
+            "schema_version": SOURCE_PROVIDER_RUNTIME_REF_SCHEMA_VERSION,
+            "runtime_ref": "source-provider-runtime:unit",
+            "provider_id": "unit-search-provider",
+            "provider_kind": BROWSER_SEARCH_SOURCE_PROVIDER_KIND,
+            "status": "succeeded",
+        }
+
+        result = normalize_source_provider_result(
+            provider_id="unit-search-provider",
+            provider_kind=BROWSER_SEARCH_SOURCE_PROVIDER_KIND,
+            status="succeeded",
+            candidates=[{"url": "https://secondary.example/report"}],
+            runtime_ref=runtime_ref,
+        )
+        payload = result.to_dict()
+        candidate = payload["candidates"][0]
+
+        self.assertEqual(payload["schema_version"], "ads-source-discovery-provider-result/v1")
+        self.assertEqual(candidate["source_discovery_provider_id"], "unit-search-provider")
+        self.assertEqual(candidate["source_discovery_provider_kind"], BROWSER_SEARCH_SOURCE_PROVIDER_KIND)
+        self.assertEqual(candidate["source_provider_runtime_ref"], "source-provider-runtime:unit")
+        self.assertTrue(candidate["source_discovery_authority_boundary"]["candidate_discovery"])
+        self.assertFalse(candidate["source_discovery_authority_boundary"]["forecast_authority"])
+
     def test_direct_url_collection_prioritizes_source_truth_before_broad_search(self) -> None:
         provider = FakeBrowserProvider(search_results=[{"url": "https://secondary.example/report"}])
 
@@ -298,6 +328,15 @@ class AdsRetrievalTransportTest(unittest.TestCase):
         self.assertFalse(diagnostics["native_research_model_executed"])
         self.assertEqual(diagnostics["native_research_status"], "disabled")
         self.assertEqual(diagnostics["search_candidate_url_count"], 1)
+        direct_runtime_ref = next(
+            item
+            for item in diagnostics["source_provider_runtime_refs"]
+            if item["provider_kind"] == DIRECT_URL_SOURCE_PROVIDER_KIND
+        )
+        self.assertEqual(transport.direct_url_candidates[0]["source_provider_runtime_ref"], direct_runtime_ref["runtime_ref"])
+        self.assertFalse(
+            transport.direct_url_candidates[0]["source_discovery_authority_boundary"]["forecast_authority"]
+        )
         search_candidate = transport.search_candidate_urls[0]
         self.assertEqual(search_candidate["schema_version"], "search-candidate-url/v1")
         self.assertEqual(search_candidate["artifact_type"], "search_candidate_url")
@@ -307,6 +346,8 @@ class AdsRetrievalTransportTest(unittest.TestCase):
         self.assertTrue(search_candidate["query_variant_id"])
         self.assertEqual(search_candidate["rank"], 1)
         self.assertEqual(search_candidate["provider_id"], "openclaw_web_fetch_browser")
+        self.assertEqual(search_candidate["source_discovery_provider_kind"], BROWSER_SEARCH_SOURCE_PROVIDER_KIND)
+        self.assertTrue(search_candidate["source_provider_runtime_ref"])
         self.assertEqual(search_candidate["searched_at"], FORECAST_AT)
         self.assertFalse(search_candidate["web_fetch_used_for_search"])
         self.assertTrue(search_candidate["fetch_required_before_admission"])
@@ -948,15 +989,26 @@ class AdsRetrievalTransportTest(unittest.TestCase):
         self.assertEqual(transport.transport_diagnostics["native_candidate_url_count"], 1)
         self.assertEqual(transport.transport_diagnostics["native_candidate_fetch_attempt_count"], 1)
         self.assertEqual(transport.transport_diagnostics["native_research_failure_count"], 0)
+        native_runtime_ref = next(
+            item
+            for item in transport.transport_diagnostics["source_provider_runtime_refs"]
+            if item["provider_kind"] == "native_gpt_research_candidates"
+        )
+        self.assertEqual(native_runtime_ref["schema_version"], SOURCE_PROVIDER_RUNTIME_REF_SCHEMA_VERSION)
+        self.assertEqual(native_runtime_ref["provider_id"], "native_research_candidate_discovery")
+        self.assertEqual(native_runtime_ref["status"], "succeeded")
         self.assertEqual(native_candidate["url"], "https://native.example/source")
         self.assertEqual(native_candidate["source_type_hint"], "official_site_or_independent_reporting")
         self.assertEqual(native_candidate["reason"], "May contain source material for this leaf.")
+        self.assertEqual(native_candidate["source_provider_runtime_ref"], native_runtime_ref["runtime_ref"])
         self.assertEqual(transport.fetched_candidates[0]["retrieval_transport"], "native_gpt_research")
         self.assertEqual(transport.fetched_candidates[0]["navigation_mode"], "native_gpt_research")
         self.assertEqual(transport.fetched_candidates[0]["native_research_attempt_ref"], None)
+        self.assertEqual(transport.fetched_candidates[0]["source_provider_runtime_ref"], native_runtime_ref["runtime_ref"])
         self.assertNotEqual(transport.fetched_candidates[0].get("source_class"), "official_or_primary")
         call_diagnostic = transport.transport_diagnostics["native_research_call_diagnostics"][0]
         self.assertEqual(call_diagnostic["event"], "native_discovery_call_completed")
+        self.assertEqual(call_diagnostic["source_provider_runtime_ref"], native_runtime_ref["runtime_ref"])
         self.assertEqual(call_diagnostic["output_parse_status"], "validated_with_candidates")
         self.assertEqual(call_diagnostic["candidate_url_count"], 1)
         self.assertEqual(call_diagnostic["validation_rejection_reasons"], [])
@@ -970,6 +1022,7 @@ class AdsRetrievalTransportTest(unittest.TestCase):
             fetched_candidates=transport.fetched_candidates,
             search_candidate_urls=transport.search_candidate_urls,
             native_research_candidates=transport.native_research_candidates,
+            source_provider_runtime_refs=transport.transport_diagnostics["source_provider_runtime_refs"],
             forecast_timestamp=FORECAST_AT,
             source_cutoff_timestamp=CUTOFF_AT,
             live_policy_overlay=True,
@@ -980,6 +1033,11 @@ class AdsRetrievalTransportTest(unittest.TestCase):
         self.assertEqual(runtime_summary["native_research_status"], "executed")
         self.assertFalse(runtime_summary["browser_search_executed"])
         self.assertEqual(runtime_summary["metadata_classifier_assist_status"], "not_executed")
+        self.assertEqual(discovery["source_provider_runtime_ref"], native_runtime_ref["runtime_ref"])
+        self.assertEqual(
+            runtime_summary["source_provider_runtime_ref_count"],
+            len(transport.transport_diagnostics["source_provider_runtime_refs"]),
+        )
         self.assertFalse(discovery["authority_boundary"]["research_sufficiency_authority"])
         self.assertTrue(discovery["fetch_required_before_admission"])
 
@@ -1017,15 +1075,79 @@ class AdsRetrievalTransportTest(unittest.TestCase):
         self.assertEqual(diagnostics["native_research_call_count"], 1)
         self.assertEqual(diagnostics["native_research_failure_count"], 1)
         failure = diagnostics["native_research_failure_diagnostics"][0]
+        failed_runtime_ref = next(
+            item
+            for item in diagnostics["source_provider_runtime_refs"]
+            if item["provider_kind"] == "native_gpt_research_candidates"
+        )
         self.assertEqual(failure["event"], "native_discovery_failed")
+        self.assertEqual(failure["provider_id"], "native_research_candidate_discovery")
+        self.assertEqual(failure["source_provider_runtime_ref"], failed_runtime_ref["runtime_ref"])
+        self.assertEqual(failure["safe_failure"]["safe_class"], "NativeResearchOutputValidationError")
+        self.assertIn("source_class", failure["safe_failure"]["safe_reason"])
         self.assertIn("native_research_forbidden_or_invalid_output", failure["reason_codes"])
         self.assertEqual(failure["error_class"], "NativeResearchOutputValidationError")
         self.assertIn("source_class", failure["detail"])
         call_diagnostic = diagnostics["native_research_call_diagnostics"][0]
+        self.assertEqual(call_diagnostic["source_provider_runtime_ref"], failed_runtime_ref["runtime_ref"])
         self.assertEqual(call_diagnostic["output_parse_status"], "validation_failed")
         self.assertEqual(call_diagnostic["candidate_url_count"], 0)
         self.assertTrue(any("source_class" in reason for reason in call_diagnostic["validation_rejection_reasons"]))
         self.assertFalse(call_diagnostic["authority_boundary"]["source_metadata_final_authority"])
+
+    def test_native_provider_failure_keeps_other_leaf_discovery_diagnostics(self) -> None:
+        def native_provider(context: dict, _variant: dict) -> list[dict]:
+            leaf_id = str(context["leaf_id"])
+            if leaf_id == "leaf-source-of-truth":
+                raise TimeoutError("simulated native provider timeout")
+            return [
+                {
+                    "url": f"https://native.example/{leaf_id}",
+                    "source_label": "Native candidate",
+                    "why_it_may_matter": "May contain source material for this leaf.",
+                    "candidate_claim_text": "Candidate claim only.",
+                }
+            ]
+
+        provider = FakeBrowserProvider()
+        transport = collect_live_retrieval_candidates(
+            qdt=self._two_leaf_qdt(),
+            evidence_packet={**self.evidence_packet, "official_source_hints": []},
+            case_contract={**self.case_contract, "market_identity": {}},
+            amrg_context=None,
+            source_cutoff_timestamp=CUTOFF_AT,
+            forecast_timestamp=FORECAST_AT,
+            provider_policy=RetrievalProviderPolicy(
+                max_direct_urls=0,
+                broad_search_enabled=False,
+                native_enabled=True,
+                max_native_research_calls=4,
+            ),
+            browser_provider=provider,
+            native_candidate_provider=native_provider,
+        )
+
+        diagnostics = transport.transport_diagnostics
+        native_refs = [
+            item
+            for item in diagnostics["source_provider_runtime_refs"]
+            if item["provider_kind"] == "native_gpt_research_candidates"
+        ]
+        failed_refs = [item for item in native_refs if item["status"] == "failed"]
+        succeeded_refs = [item for item in native_refs if item["status"] == "succeeded"]
+
+        self.assertEqual(diagnostics["native_research_failure_count"], 1)
+        self.assertEqual(len(failed_refs), 1)
+        self.assertEqual(len(succeeded_refs), 1)
+        self.assertEqual(failed_refs[0]["safe_error"]["safe_class"], "TimeoutError")
+        self.assertEqual(diagnostics["native_research_failure_diagnostics"][0]["leaf_id"], "leaf-source-of-truth")
+        self.assertEqual(
+            diagnostics["native_research_failure_diagnostics"][0]["source_provider_runtime_ref"],
+            failed_refs[0]["runtime_ref"],
+        )
+        self.assertTrue(transport.native_research_candidates)
+        self.assertTrue(transport.fetched_candidates)
+        self.assertEqual(transport.fetched_candidates[0]["source_provider_runtime_ref"], succeeded_refs[0]["runtime_ref"])
 
     def test_source_populated_attempts_fail_closed_when_secondary_class_is_not_deterministic(self) -> None:
         provider = FakeBrowserProvider(search_results=[{"url": "https://secondary.example/report"}])

@@ -307,7 +307,7 @@ Completion note, 2026-07-01:
 
 ## Phase 2 - Source Provider Abstraction And Runtime Artifact Persistence
 
-Status: pending
+Status: completed 2026-07-01
 
 Goal: make source discovery a first-class provider layer, and make every model/search provider call
 observable enough to diagnose failures.
@@ -377,12 +377,20 @@ Success criteria:
 
 Checklist:
 
-- [ ] Provider abstraction exists and is tested.
-- [ ] Native runtime call refs are persisted or safely summarized.
-- [ ] Forbidden native outputs are rejected.
-- [ ] Failure diagnostics include enough detail to act on.
-- [ ] Temp artifacts and scripts are deleted.
-- [ ] `git diff --check` passes.
+- [x] Provider abstraction exists and is tested.
+- [x] Native runtime call refs are persisted or safely summarized.
+- [x] Forbidden native outputs are rejected.
+- [x] Failure diagnostics include enough detail to act on.
+- [x] Temp artifacts and scripts are deleted.
+- [x] `git diff --check` passes.
+
+Completion note, 2026-07-01:
+
+- Added an explicit `SourceDiscoveryProvider` / `SourceDiscoveryProviderResult` contract and normalized direct URL, browser search, and native GPT research candidates with provider ids, provider kinds, authority boundaries, and runtime refs.
+- Added bounded `ads-source-provider-runtime-ref/v1` records for direct, search, and native provider calls, including safe failure payloads for browser/native failures without granting source, sufficiency, or forecast authority.
+- Kept native GPT research URL-candidate-only: forbidden source/sufficiency/forecast authority output is still rejected before fetch/admission, and native candidate discovery artifacts carry runtime refs without embedding forbidden authority fields in candidate payloads.
+- Materialized source-provider runtime refs into retrieval transport diagnostics and retrieval packets so native failures and successful discoveries are diagnosable from packet artifacts.
+- Verification passed: focused Orchestrator provider/native suite (`test_ads_retrieval_transport`, `test_ads_native_research`, 33 tests), full Orchestrator discovery (328 tests), full Researcher discovery (252 tests), `py_compile` for changed implementation/tests, and `git diff --check`.
 
 ## Phase 3 - Official And Direct Source Priority Adapters
 

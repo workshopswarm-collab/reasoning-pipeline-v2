@@ -81,6 +81,16 @@ NATIVE_RESEARCH_PROMPT_TEMPLATE = {
     "forbidden_key_fragments": list(NATIVE_FORBIDDEN_KEY_FRAGMENTS),
 }
 
+NATIVE_RESEARCH_SOURCE_DISCOVERY_AUTHORITY = {
+    "candidate_discovery": True,
+    "candidate_discovery_only": True,
+    "source_metadata_final_authority": False,
+    "claim_family_final_authority": False,
+    "temporal_safety_final_authority": False,
+    "research_sufficiency_authority": False,
+    "forecast_authority": False,
+}
+
 
 NATIVE_CANDIDATE_CONTAINER_KEYS = ("native_research_candidates", "candidate_urls")
 NATIVE_CANDIDATE_URL_KEYS = ("url", "candidate_url", "canonical_url")
@@ -244,6 +254,9 @@ def _native_request_payload(query_context: dict[str, Any], query_variant: dict[s
 class NativeResearchCandidateProvider:
     """Callable provider used by Orchestrator live retrieval."""
 
+    provider_id = NATIVE_RESEARCH_MODEL_LANE_ID
+    authority = NATIVE_RESEARCH_SOURCE_DISCOVERY_AUTHORITY
+
     def __init__(
         self,
         *,
@@ -271,6 +284,20 @@ class NativeResearchCandidateProvider:
             model=str(lane.get("resolved_model_id") or "gpt-5.5-high"),
             prompt_builder=_native_research_prompt,
         )
+
+    def discover(
+        self,
+        leaf: dict[str, Any],
+        query_context: dict[str, Any],
+        budget: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        budget = budget or {}
+        query_variant = budget.get("query_variant")
+        if not isinstance(query_variant, dict):
+            variants = query_context.get("query_variants")
+            query_variant = variants[0] if isinstance(variants, list) and variants else {}
+        context = {**query_context, "leaf": copy.deepcopy(leaf)}
+        return self(context, query_variant)
 
     def __call__(self, query_context: dict[str, Any], query_variant: dict[str, Any]) -> dict[str, Any]:
         lane = self._lane()
@@ -319,6 +346,7 @@ __all__ = [
     "NATIVE_ALLOWED_FIELDS",
     "NATIVE_FORBIDDEN_KEY_FRAGMENTS",
     "NATIVE_RESEARCH_MODEL_LANE_ID",
+    "NATIVE_RESEARCH_SOURCE_DISCOVERY_AUTHORITY",
     "NativeResearchCandidateProvider",
     "build_native_candidate_provider",
     "build_provider",

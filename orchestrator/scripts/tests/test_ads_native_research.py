@@ -14,7 +14,10 @@ from ads_decomposer.model_runtime import (  # noqa: E402
     MODEL_RUNTIME_TRANSPORT_RESPONSE_SCHEMA_VERSION,
     ModelRuntimeError,
 )
-from predquant.ads_native_research import NativeResearchCandidateProvider  # noqa: E402
+from predquant.ads_native_research import (  # noqa: E402
+    NATIVE_RESEARCH_MODEL_LANE_ID,
+    NativeResearchCandidateProvider,
+)
 
 
 class AdsNativeResearchTest(unittest.TestCase):
@@ -85,6 +88,8 @@ class AdsNativeResearchTest(unittest.TestCase):
             },
         )
 
+        self.assertEqual(provider.provider_id, NATIVE_RESEARCH_MODEL_LANE_ID)
+        self.assertFalse(provider.authority["forecast_authority"])
         result = provider(self.context, self.variant)
 
         self.assertEqual(result["native_research_candidates"][0]["url"], "https://native.example/repaired")
@@ -94,6 +99,13 @@ class AdsNativeResearchTest(unittest.TestCase):
         self.assertIn("schema_repair_attempted", runtime["runtime_reason_codes"])
         self.assertTrue(runtime["schema_repair_diagnostics"][0]["repair_attempted"])
         self.assertEqual(runtime["schema_repair_diagnostics"][0]["remaining_errors"], [])
+
+        discovered = provider.discover(
+            {},
+            {**self.context, "query_variants": [self.variant]},
+            {"query_variant": self.variant},
+        )
+        self.assertEqual(discovered["native_research_candidates"][0]["url"], "https://native.example/repaired")
 
     def test_native_provider_rejects_forbidden_authority_fields(self) -> None:
         provider = NativeResearchCandidateProvider(

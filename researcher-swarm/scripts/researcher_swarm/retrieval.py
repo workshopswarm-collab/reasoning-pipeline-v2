@@ -1208,6 +1208,7 @@ def build_native_research_candidate_discovery(
     candidate_urls: list[dict[str, Any]],
     *,
     attempt_ref: str | None = None,
+    source_provider_runtime_ref: str | None = None,
     resolved_model_id: str = "gpt-5.5-high",
     discovered_at: str | None = None,
 ) -> dict[str, Any]:
@@ -1229,6 +1230,7 @@ def build_native_research_candidate_discovery(
         "query_context_ref": query_context.get("query_context_ref"),
         "query_variant_id": query_variant.get("query_variant_id"),
         "native_research_attempt_ref": attempt_ref,
+        "source_provider_runtime_ref": source_provider_runtime_ref,
         "model_lane_id": "native_research_candidate_discovery",
         "resolved_model_id": resolved_model_id,
         "candidate_cap": cap,
@@ -5678,6 +5680,7 @@ def _materialize_native_candidate_discoveries(
                 variant,
                 candidate_urls,
                 attempt_ref=raw.get("native_research_attempt_ref") or raw.get("attempt_ref"),
+                source_provider_runtime_ref=raw.get("source_provider_runtime_ref"),
                 resolved_model_id=str(raw.get("resolved_model_id") or "gpt-5.5-high"),
                 discovered_at=str(raw.get("discovered_at") or discovered_at),
             )
@@ -5709,6 +5712,7 @@ def build_live_retrieval_packet_from_candidates(
     fetched_candidates: list[dict[str, Any]] | None = None,
     search_candidate_urls: list[dict[str, Any]] | None = None,
     native_research_candidates: list[dict[str, Any]] | None = None,
+    source_provider_runtime_refs: list[dict[str, Any]] | None = None,
     supplemental_candidates: list[dict[str, Any]] | None = None,
     question_decomposition_artifact_id: str | None = None,
     policy_context_ref: str | None = None,
@@ -6040,6 +6044,7 @@ def build_live_retrieval_packet_from_candidates(
     packet["search_candidate_urls"] = search_candidate_records
     packet["search_candidate_url_omissions"] = search_candidate_omissions
     packet["native_research_candidate_discoveries"] = native_candidate_discoveries
+    packet["source_provider_runtime_refs"] = copy.deepcopy(source_provider_runtime_refs or [])
     packet["browser_search_provider_diagnostics"] = [
         build_browser_search_provider_diagnostic(
             availability_status="available" if browser_attempts else "unavailable",
@@ -6060,6 +6065,18 @@ def build_live_retrieval_packet_from_candidates(
     native_candidate_discovery_count = len(native_candidate_discoveries)
     native_candidate_url_count = sum(
         len(item.get("candidate_urls", [])) for item in native_candidate_discoveries
+    )
+    source_provider_runtime_ref_count = len(
+        packet.get("source_provider_runtime_refs", [])
+        if isinstance(packet.get("source_provider_runtime_refs"), list)
+        else []
+    )
+    native_runtime_call_refs = sorted(
+        {
+            str(item.get("runtime_call_ref"))
+            for item in packet.get("source_provider_runtime_refs", [])
+            if isinstance(item, dict) and _is_non_empty_string(item.get("runtime_call_ref"))
+        }
     )
     metadata_classifier_slice_count = len(
         packet.get("source_metadata_classifier_slices", [])
@@ -6099,6 +6116,8 @@ def build_live_retrieval_packet_from_candidates(
         "search_failure_blocks_sufficiency": False,
         "native_research_model_executed": native_candidate_discovery_count > 0,
         "native_research_status": "executed" if native_candidate_discovery_count > 0 else "not_executed",
+        "source_provider_runtime_ref_count": source_provider_runtime_ref_count,
+        "native_runtime_call_refs": native_runtime_call_refs,
         "metadata_classifier_assist_executed": metadata_classifier_slice_count > 0,
         "metadata_classifier_assist_status": "executed"
         if metadata_classifier_slice_count > 0

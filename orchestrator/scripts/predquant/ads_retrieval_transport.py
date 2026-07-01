@@ -13,7 +13,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable
+from typing import Any, Callable, Protocol
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from predquant.ads_native_research import (
@@ -169,6 +169,49 @@ LEGACY_DEFAULT_MAX_TOTAL_SEARCH_CALLS = 2
 BROWSER_SEARCH_RETRY_POLICY_REF = "ads-browser-search-retry/v1"
 BROWSER_SEARCH_RETRY_DIAGNOSTIC_SCHEMA_VERSION = "ads-browser-search-retry-diagnostic/v1"
 NATIVE_RESEARCH_TRANSPORT_DIAGNOSTIC_SCHEMA_VERSION = "ads-native-research-transport-diagnostic/v1"
+SOURCE_DISCOVERY_PROVIDER_RESULT_SCHEMA_VERSION = "ads-source-discovery-provider-result/v1"
+SOURCE_PROVIDER_RUNTIME_REF_SCHEMA_VERSION = "ads-source-provider-runtime-ref/v1"
+DIRECT_URL_SOURCE_PROVIDER_ID = "direct_official_url_candidates"
+BROWSER_SEARCH_SOURCE_PROVIDER_KIND = "browser_search_candidates"
+DIRECT_URL_SOURCE_PROVIDER_KIND = "direct_official_url_candidates"
+NATIVE_RESEARCH_SOURCE_PROVIDER_KIND = "native_gpt_research_candidates"
+
+
+class SourceDiscoveryProvider(Protocol):
+    provider_id: str
+    authority: dict[str, Any]
+
+    def discover(
+        self,
+        leaf: dict[str, Any],
+        query_context: dict[str, Any],
+        budget: dict[str, Any],
+    ) -> dict[str, Any]:
+        ...
+
+
+@dataclass(frozen=True)
+class SourceDiscoveryProviderResult:
+    provider_id: str
+    provider_kind: str
+    status: str
+    candidates: tuple[dict[str, Any], ...] = ()
+    runtime_ref: dict[str, Any] | None = None
+    safe_error: dict[str, Any] | None = None
+    authority_boundary: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": SOURCE_DISCOVERY_PROVIDER_RESULT_SCHEMA_VERSION,
+            "provider_id": self.provider_id,
+            "provider_kind": self.provider_kind,
+            "status": self.status,
+            "candidate_count": len(self.candidates),
+            "candidates": [copy.deepcopy(item) for item in self.candidates],
+            "runtime_ref": copy.deepcopy(self.runtime_ref),
+            "safe_error": copy.deepcopy(self.safe_error),
+            "authority_boundary": copy.deepcopy(self.authority_boundary),
+        }
 
 
 @dataclass(frozen=True)
@@ -223,6 +266,129 @@ def _canonical_fetch_ref(canonical_url: str, source_cutoff_timestamp: str) -> st
             "canonical_url": canonical_url,
             "source_cutoff_timestamp": source_cutoff_timestamp,
         }
+    )
+
+
+def _source_discovery_authority_boundary(provider_kind: str) -> dict[str, Any]:
+    return {
+        "candidate_discovery": True,
+        "candidate_discovery_only": provider_kind != DIRECT_URL_SOURCE_PROVIDER_KIND,
+        "direct_url_hint": provider_kind == DIRECT_URL_SOURCE_PROVIDER_KIND,
+        "source_metadata_final_authority": False,
+        "claim_family_final_authority": False,
+        "temporal_safety_final_authority": False,
+        "research_sufficiency_authority": False,
+        "forecast_authority": False,
+    }
+
+
+def _source_provider_runtime_ref(
+    *,
+    provider_id: str,
+    provider_kind: str,
+    status: str,
+    candidate_count: int,
+    context: dict[str, Any] | None = None,
+    variant: dict[str, Any] | None = None,
+    runtime_call: dict[str, Any] | None = None,
+    safe_error: dict[str, Any] | None = None,
+    elapsed_seconds: float | None = None,
+) -> dict[str, Any]:
+    runtime_call_id = None
+    if isinstance(runtime_call, dict) and runtime_call.get("runtime_call_id"):
+        runtime_call_id = str(runtime_call["runtime_call_id"])
+    leaf_id = context.get("leaf_id") if isinstance(context, dict) else None
+    query_context_ref = context.get("query_context_ref") if isinstance(context, dict) else None
+    query_variant_id = variant.get("query_variant_id") if isinstance(variant, dict) else None
+    runtime_ref_id = "source-provider-runtime-" + _hash_suffix(
+        {
+            "provider_id": provider_id,
+            "provider_kind": provider_kind,
+            "status": status,
+            "leaf_id": leaf_id,
+            "query_context_ref": query_context_ref,
+            "query_variant_id": query_variant_id,
+            "runtime_call_id": runtime_call_id,
+            "safe_error": safe_error,
+            "candidate_count": candidate_count,
+        }
+    )
+    ref = {
+        "schema_version": SOURCE_PROVIDER_RUNTIME_REF_SCHEMA_VERSION,
+        "runtime_ref": runtime_ref_id,
+        "provider_id": provider_id,
+        "provider_kind": provider_kind,
+        "status": status,
+        "leaf_id": leaf_id,
+        "query_context_ref": query_context_ref,
+        "query_variant_id": query_variant_id,
+        "candidate_count": max(0, int(candidate_count)),
+        "runtime_call_ref": runtime_call_id,
+        "safe_error": copy.deepcopy(safe_error),
+        "authority_boundary": _source_discovery_authority_boundary(provider_kind),
+    }
+    if elapsed_seconds is not None:
+        ref["elapsed_seconds"] = round(max(0.0, float(elapsed_seconds)), 3)
+    return ref
+
+
+def _safe_provider_error(
+    *,
+    error_class: str,
+    reason: str,
+    reason_codes: list[str] | None = None,
+) -> dict[str, Any]:
+    return {
+        "schema_version": "ads-source-provider-safe-error/v1",
+        "safe_class": str(error_class)[:160],
+        "safe_reason": str(reason)[:500],
+        "reason_codes": [str(reason)[:120] for reason in (reason_codes or [])[:10]],
+    }
+
+
+def _attach_source_provider_metadata(
+    record: dict[str, Any],
+    runtime_ref: dict[str, Any] | None,
+    *,
+    provider_id: str,
+    provider_kind: str,
+) -> dict[str, Any]:
+    enriched = copy.deepcopy(record)
+    enriched["source_discovery_provider_id"] = provider_id
+    enriched["source_discovery_provider_kind"] = provider_kind
+    enriched["source_discovery_authority_boundary"] = _source_discovery_authority_boundary(provider_kind)
+    if isinstance(runtime_ref, dict):
+        enriched["source_provider_runtime_ref"] = runtime_ref.get("runtime_ref")
+    return enriched
+
+
+def normalize_source_provider_result(
+    *,
+    provider_id: str,
+    provider_kind: str,
+    status: str,
+    candidates: list[dict[str, Any]] | tuple[dict[str, Any], ...] | None = None,
+    runtime_ref: dict[str, Any] | None = None,
+    safe_error: dict[str, Any] | None = None,
+) -> SourceDiscoveryProviderResult:
+    normalized = tuple(
+        _attach_source_provider_metadata(
+            candidate,
+            runtime_ref,
+            provider_id=provider_id,
+            provider_kind=provider_kind,
+        )
+        for candidate in (candidates or [])
+        if isinstance(candidate, dict)
+    )
+    return SourceDiscoveryProviderResult(
+        provider_id=provider_id,
+        provider_kind=provider_kind,
+        status=status,
+        candidates=normalized,
+        runtime_ref=copy.deepcopy(runtime_ref),
+        safe_error=copy.deepcopy(safe_error),
+        authority_boundary=_source_discovery_authority_boundary(provider_kind),
     )
 
 
@@ -324,8 +490,23 @@ def collect_live_retrieval_candidates(
         forecast_timestamp=forecast_timestamp,
         source_cutoff_timestamp=source_cutoff_timestamp,
     )
-    direct_urls = _collect_direct_url_hints(case_contract, evidence_packet, amrg_context)[: policy.max_direct_urls]
+    raw_direct_urls = _collect_direct_url_hints(case_contract, evidence_packet, amrg_context)[: policy.max_direct_urls]
+    direct_runtime_ref = _source_provider_runtime_ref(
+        provider_id=DIRECT_URL_SOURCE_PROVIDER_ID,
+        provider_kind=DIRECT_URL_SOURCE_PROVIDER_KIND,
+        status="succeeded" if raw_direct_urls else "succeeded_no_candidates",
+        candidate_count=len(raw_direct_urls),
+    )
+    direct_provider_result = normalize_source_provider_result(
+        provider_id=DIRECT_URL_SOURCE_PROVIDER_ID,
+        provider_kind=DIRECT_URL_SOURCE_PROVIDER_KIND,
+        status=str(direct_runtime_ref["status"]),
+        candidates=raw_direct_urls,
+        runtime_ref=direct_runtime_ref,
+    )
+    direct_urls = list(direct_provider_result.candidates)
     result = RetrievalTransportResult(direct_url_candidates=direct_urls)
+    source_provider_runtime_refs: list[dict[str, Any]] = [direct_runtime_ref]
     direct_fetch_count = 0
     direct_fetch_skipped_count = 0
     direct_fetch_cache_hit_count = 0
@@ -441,6 +622,8 @@ def collect_live_retrieval_candidates(
                     continue
                 search_primary_call_count += 1
                 leaf_search_call_counts[leaf_id] = leaf_search_call_counts.get(leaf_id, 0) + 1
+                search_provider_id = _search_provider_id(browser_provider)
+                provider_started = time.monotonic()
                 search_records, attempt_failures, attempt_retry_events = _search_candidate_urls_with_retry(
                     browser_provider=browser_provider,
                     context=context,
@@ -450,6 +633,47 @@ def collect_live_retrieval_candidates(
                     policy=policy,
                     sleep_fn=sleep,
                 )
+                provider_elapsed = max(0.0, time.monotonic() - provider_started)
+                search_safe_error = None
+                search_provider_status = "succeeded"
+                if attempt_failures:
+                    search_provider_status = "partial" if search_records else "failed"
+                    first_failure = attempt_failures[0]
+                    search_safe_error = _safe_provider_error(
+                        error_class=str(first_failure.get("error_class") or "BrowserSearchProviderError"),
+                        reason=str(first_failure.get("detail") or first_failure.get("reason_code") or "browser_search_failed"),
+                        reason_codes=[
+                            str(item.get("reason_code"))
+                            for item in attempt_failures
+                            if isinstance(item, dict) and item.get("reason_code")
+                        ],
+                    )
+                elif not search_records:
+                    search_provider_status = "succeeded_no_candidates"
+                search_runtime_ref = _source_provider_runtime_ref(
+                    provider_id=search_provider_id,
+                    provider_kind=BROWSER_SEARCH_SOURCE_PROVIDER_KIND,
+                    status=search_provider_status,
+                    candidate_count=len(search_records),
+                    context=context,
+                    variant=variant,
+                    safe_error=search_safe_error,
+                    elapsed_seconds=provider_elapsed,
+                )
+                source_provider_runtime_refs.append(search_runtime_ref)
+                search_provider_result = normalize_source_provider_result(
+                    provider_id=search_provider_id,
+                    provider_kind=BROWSER_SEARCH_SOURCE_PROVIDER_KIND,
+                    status=search_provider_status,
+                    candidates=search_records,
+                    runtime_ref=search_runtime_ref,
+                    safe_error=search_safe_error,
+                )
+                search_records = list(search_provider_result.candidates)
+                for failure in attempt_failures:
+                    failure["provider_id"] = search_provider_id
+                    failure["source_provider_runtime_ref"] = search_runtime_ref["runtime_ref"]
+                    failure["safe_failure"] = copy.deepcopy(search_safe_error)
                 search_call_count += 1 + sum(
                     1 for item in attempt_retry_events if item.get("event") == "local_retry"
                 )
@@ -576,18 +800,38 @@ def collect_live_retrieval_candidates(
                     reason_codes=trigger_reasons,
                 )
             )
+            native_provider_started = time.monotonic()
             try:
                 raw_native = native_candidate_provider(context, variants[0])
             except Exception as exc:  # noqa: BLE001 - transport boundary records safe class only
                 runtime_summary = native_runtime_call_summary(getattr(exc, "runtime_call", None))
                 if runtime_summary is not None:
                     native_research_runtime_calls.append(runtime_summary)
+                safe_error = _safe_provider_error(
+                    error_class=exc.__class__.__name__,
+                    reason=str(exc)[:500] or exc.__class__.__name__,
+                    reason_codes=["native_research_transport_failed", *trigger_reasons],
+                )
+                native_runtime_ref = _source_provider_runtime_ref(
+                    provider_id="native_research_candidate_discovery",
+                    provider_kind=NATIVE_RESEARCH_SOURCE_PROVIDER_KIND,
+                    status="failed",
+                    candidate_count=0,
+                    context=context,
+                    variant=variants[0],
+                    runtime_call=runtime_summary,
+                    safe_error=safe_error,
+                    elapsed_seconds=max(0.0, time.monotonic() - native_provider_started),
+                )
+                source_provider_runtime_refs.append(native_runtime_ref)
                 native_research_call_diagnostics.append(
                     _native_research_diagnostic(
                         context,
                         variants[0],
                         event="native_discovery_call_completed",
                         reason_codes=["native_research_transport_failed", *trigger_reasons],
+                        source_provider_runtime_ref=native_runtime_ref["runtime_ref"],
+                        safe_error=safe_error,
                         detail=str(exc)[:500] or exc.__class__.__name__,
                         error_class=exc.__class__.__name__,
                         runtime_call=runtime_summary,
@@ -602,6 +846,8 @@ def collect_live_retrieval_candidates(
                         variants[0],
                         event="native_discovery_failed",
                         reason_codes=["native_research_transport_failed", *trigger_reasons],
+                        source_provider_runtime_ref=native_runtime_ref["runtime_ref"],
+                        safe_error=safe_error,
                         detail=str(exc)[:500] or exc.__class__.__name__,
                         error_class=exc.__class__.__name__,
                         runtime_call=runtime_summary,
@@ -613,12 +859,31 @@ def collect_live_retrieval_candidates(
                 native_research_runtime_calls.append(runtime_summary)
             validation_errors = native_candidate_payload_errors(raw_native)
             if validation_errors:
+                safe_error = _safe_provider_error(
+                    error_class="NativeResearchOutputValidationError",
+                    reason="; ".join(validation_errors[:5]),
+                    reason_codes=["native_research_forbidden_or_invalid_output", *trigger_reasons],
+                )
+                native_runtime_ref = _source_provider_runtime_ref(
+                    provider_id="native_research_candidate_discovery",
+                    provider_kind=NATIVE_RESEARCH_SOURCE_PROVIDER_KIND,
+                    status="failed",
+                    candidate_count=0,
+                    context=context,
+                    variant=variants[0],
+                    runtime_call=runtime_summary,
+                    safe_error=safe_error,
+                    elapsed_seconds=max(0.0, time.monotonic() - native_provider_started),
+                )
+                source_provider_runtime_refs.append(native_runtime_ref)
                 native_research_call_diagnostics.append(
                     _native_research_diagnostic(
                         context,
                         variants[0],
                         event="native_discovery_call_completed",
                         reason_codes=["native_research_forbidden_or_invalid_output", *trigger_reasons],
+                        source_provider_runtime_ref=native_runtime_ref["runtime_ref"],
+                        safe_error=safe_error,
                         detail="; ".join(validation_errors[:5]),
                         error_class="NativeResearchOutputValidationError",
                         runtime_call=runtime_summary,
@@ -633,6 +898,8 @@ def collect_live_retrieval_candidates(
                         variants[0],
                         event="native_discovery_failed",
                         reason_codes=["native_research_forbidden_or_invalid_output", *trigger_reasons],
+                        source_provider_runtime_ref=native_runtime_ref["runtime_ref"],
+                        safe_error=safe_error,
                         detail="; ".join(validation_errors[:5]),
                         error_class="NativeResearchOutputValidationError",
                         runtime_call=runtime_summary,
@@ -640,12 +907,24 @@ def collect_live_retrieval_candidates(
                 )
                 continue
             native_candidates = _native_candidate_list(raw_native)
+            native_runtime_ref = _source_provider_runtime_ref(
+                provider_id="native_research_candidate_discovery",
+                provider_kind=NATIVE_RESEARCH_SOURCE_PROVIDER_KIND,
+                status="succeeded" if native_candidates else "succeeded_no_candidates",
+                candidate_count=len(native_candidates),
+                context=context,
+                variant=variants[0],
+                runtime_call=runtime_summary,
+                elapsed_seconds=max(0.0, time.monotonic() - native_provider_started),
+            )
+            source_provider_runtime_refs.append(native_runtime_ref)
             native_research_call_diagnostics.append(
                 _native_research_diagnostic(
                     context,
                     variants[0],
                     event="native_discovery_call_completed",
                     reason_codes=["native_research_output_validated", *trigger_reasons],
+                    source_provider_runtime_ref=native_runtime_ref["runtime_ref"],
                     runtime_call=runtime_summary,
                     output_parse_status="validated_with_candidates" if native_candidates else "validated_empty",
                     candidate_url_count=len(native_candidates),
@@ -658,12 +937,25 @@ def collect_live_retrieval_candidates(
                     _sanitize_native_candidate(item, context["leaf_id"])
                     for item in native_candidates
                 ]
+                native_provider_result = normalize_source_provider_result(
+                    provider_id="native_research_candidate_discovery",
+                    provider_kind=NATIVE_RESEARCH_SOURCE_PROVIDER_KIND,
+                    status="succeeded",
+                    candidates=sanitized_candidates,
+                    runtime_ref=native_runtime_ref,
+                )
+                sanitized_candidates = []
+                for item in native_provider_result.candidates:
+                    candidate = dict(item)
+                    candidate.pop("source_discovery_authority_boundary", None)
+                    sanitized_candidates.append(candidate)
                 result.native_research_candidates.append(
                     {
                         "leaf_id": context["leaf_id"],
                         "query_variant_id": variants[0]["query_variant_id"],
                         "candidate_urls": sanitized_candidates,
                         "native_research_attempt_ref": attempt_ref,
+                        "source_provider_runtime_ref": native_runtime_ref["runtime_ref"],
                         "resolved_model_id": _native_resolved_model_id(raw_native, runtime_summary),
                         "discovered_at": forecast_timestamp,
                     }
@@ -679,6 +971,10 @@ def collect_live_retrieval_candidates(
                         "source_class": None,
                         "source_class_resolution_method": None,
                         "deterministic_source_class_proof": False,
+                        "source_discovery_provider_id": native_candidate.get("source_discovery_provider_id"),
+                        "source_discovery_provider_kind": native_candidate.get("source_discovery_provider_kind"),
+                        "source_provider_runtime_ref": native_candidate.get("source_provider_runtime_ref"),
+                        "source_discovery_authority_boundary": native_candidate.get("source_discovery_authority_boundary"),
                     }
                     candidate = _fetch_candidate(
                         context=context,
@@ -777,6 +1073,8 @@ def collect_live_retrieval_candidates(
         "native_research_skip_diagnostics": native_research_skip_diagnostics,
         "native_research_call_diagnostics": native_research_call_diagnostics,
         "native_research_runtime_calls": native_research_runtime_calls,
+        "source_provider_runtime_refs": source_provider_runtime_refs,
+        "source_provider_runtime_ref_count": len(source_provider_runtime_refs),
         "native_research_transport_diagnostics": _native_transport_diagnostics(
             policy=policy,
             native_candidate_provider=native_candidate_provider,
@@ -916,6 +1214,9 @@ def _native_research_diagnostic(
     *,
     event: str,
     reason_codes: list[str],
+    provider_id: str = "native_research_candidate_discovery",
+    source_provider_runtime_ref: str | None = None,
+    safe_error: dict[str, Any] | None = None,
     detail: str | None = None,
     error_class: str | None = None,
     runtime_call: dict[str, Any] | None = None,
@@ -928,6 +1229,7 @@ def _native_research_diagnostic(
         "schema_version": NATIVE_RESEARCH_TRANSPORT_DIAGNOSTIC_SCHEMA_VERSION,
         "event": event,
         "component": "native_research_candidate_discovery",
+        "provider_id": provider_id,
         "leaf_id": context.get("leaf_id"),
         "parent_branch_id": context.get("parent_branch_id"),
         "query_context_ref": context.get("query_context_ref"),
@@ -943,6 +1245,10 @@ def _native_research_diagnostic(
             "forecast_authority": False,
         },
     }
+    if source_provider_runtime_ref:
+        diagnostic["source_provider_runtime_ref"] = source_provider_runtime_ref
+    if safe_error:
+        diagnostic["safe_failure"] = copy.deepcopy(safe_error)
     if runtime_call is not None:
         diagnostic["runtime_call"] = runtime_call
         diagnostic["model_execution_status"] = runtime_call.get("execution_status")
@@ -1197,6 +1503,12 @@ def _fetch_candidate(
         "native_research_attempt_ref": native_research_attempt_ref
         if retrieval_transport == "native_gpt_research"
         else None,
+        "source_discovery_provider_id": hint.get("source_discovery_provider_id"),
+        "source_discovery_provider_kind": hint.get("source_discovery_provider_kind"),
+        "source_provider_runtime_ref": hint.get("source_provider_runtime_ref"),
+        "source_discovery_authority_boundary": copy.deepcopy(
+            hint.get("source_discovery_authority_boundary") or {}
+        ),
     }
     if not _valid_http_url(url):
         return {
