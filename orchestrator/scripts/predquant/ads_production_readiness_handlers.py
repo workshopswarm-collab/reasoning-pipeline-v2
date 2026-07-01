@@ -1000,6 +1000,66 @@ def _runtime_bundle_verification_payload(
     }
 
 
+def _scae_delta_verification_proof(
+    candidate_slices: list[dict[str, Any]],
+    *,
+    ready_refs: set[str] | None,
+) -> dict[str, Any]:
+    proof_rows = []
+    accepted_count = 0
+    for candidate in candidate_slices:
+        if not isinstance(candidate, dict):
+            continue
+        direction_passed = bool(
+            candidate.get("direction_verification_status") == "accepted"
+            and candidate.get("direction_verification_slice_ref")
+        )
+        quality_passed = bool(
+            candidate.get("quality_status") == "accepted"
+            and candidate.get("quality_verification_slice_ref")
+        )
+        classification_ref = str(candidate.get("classification_slice_ref") or "")
+        readiness_passed = ready_refs is None or classification_ref in ready_refs
+        accepted = candidate.get("accepted_for_ledger_input") is True
+        if accepted:
+            accepted_count += 1
+        proof_rows.append(
+            {
+                "candidate_slice_ref": candidate.get("candidate_slice_id"),
+                "classification_slice_ref": candidate.get("classification_slice_ref"),
+                "direction_verification_slice_ref": candidate.get("direction_verification_slice_ref"),
+                "direction_verification_status": candidate.get("direction_verification_status"),
+                "quality_verification_slice_ref": candidate.get("quality_verification_slice_ref"),
+                "quality_status": candidate.get("quality_status"),
+                "scae_readiness_ref_passed": readiness_passed,
+                "accepted_for_ledger_input": accepted,
+                "proof_status": (
+                    "verified_scae_delta_ref"
+                    if accepted and direction_passed and quality_passed and readiness_passed
+                    else "not_scae_delta_ref"
+                ),
+                "candidate_status": candidate.get("candidate_status"),
+            }
+        )
+    return {
+        "schema_version": "scae-delta-verification-proof/v1",
+        "accepted_delta_ref_count": accepted_count,
+        "candidate_count": len(proof_rows),
+        "all_accepted_delta_refs_have_direction_and_quality_verification": all(
+            row["proof_status"] == "verified_scae_delta_ref"
+            for row in proof_rows
+            if row["accepted_for_ledger_input"]
+        ),
+        "proof_rows": sorted(
+            proof_rows,
+            key=lambda row: (
+                str(row.get("candidate_slice_ref")),
+                str(row.get("classification_slice_ref")),
+            ),
+        ),
+    }
+
+
 def _verified_evidence_delta_context(verification_payload: dict[str, Any] | None) -> dict[str, Any] | None:
     if not isinstance(verification_payload, dict):
         return None
@@ -1060,10 +1120,12 @@ def _verified_evidence_delta_context(verification_payload: dict[str, Any] | None
         policy=verification_payload.get("scae_policy"),
     )
     candidate_slices = candidate_bundle["candidate_slices"]
+    verification_proof = _scae_delta_verification_proof(candidate_slices, ready_refs=ready_refs)
     return {
         "candidate_bundle": candidate_bundle,
         "netting_bundle": netting_bundle,
         "ledger_evidence_delta_slices": netting_bundle["cluster_slices"],
+        "verification_delta_proof": verification_proof,
         "candidate_slice_refs": sorted(
             str(candidate["candidate_slice_id"])
             for candidate in candidate_slices
@@ -1210,6 +1272,17 @@ def _build_scae_ledger(
                 verified_evidence_context["netting_bundle"]["cluster_count"]
                 if verified_evidence_context is not None
                 else 0
+            ),
+            "scae_evidence_delta_verification_proof": (
+                verified_evidence_context["verification_delta_proof"]
+                if verified_evidence_context is not None
+                else {
+                    "schema_version": "scae-delta-verification-proof/v1",
+                    "accepted_delta_ref_count": 0,
+                    "candidate_count": 0,
+                    "all_accepted_delta_refs_have_direction_and_quality_verification": True,
+                    "proof_rows": [],
+                }
             ),
             "scae_evidence_delta_candidate_slice_refs": (
                 verified_evidence_context["candidate_slice_refs"]

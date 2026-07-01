@@ -33,6 +33,7 @@ from researcher_swarm.classification import (  # noqa: E402
     FORBIDDEN_OUTPUT_FIELDS,
     RESEARCHER_NLI_PROMPT_TEMPLATE_ID,
     RESEARCHER_NLI_PROMPT_TEMPLATE_SHA256,
+    build_researcher_sidecar_v2,
 )
 from researcher_swarm.model_context import (  # noqa: E402
     RESEARCHER_MODEL_ID,
@@ -40,6 +41,7 @@ from researcher_swarm.model_context import (  # noqa: E402
     RESEARCHER_PROVIDER_ROUTE,
     RESEARCHER_PROVIDER_MODEL_KEY,
     RESEARCHER_RUNTIME_AGENT_ID,
+    resolve_researcher_leaf_nli_model_context,
 )
 from researcher_swarm.openclaw_runtime import parse_openclaw_researcher_swarm_stdout  # noqa: E402
 from researcher_swarm.retrieval import (  # noqa: E402
@@ -205,6 +207,80 @@ class LeafResearchAssignmentContractTest(unittest.TestCase):
         finalized = finalize_retrieval_packet_for_dispatch(packet)
         self.assertEqual(finalized["research_sufficiency_summary"]["classification_dispatch_status"], "allowed")
         return finalized
+
+    def _accepted_classification(self, assignment: dict[str, Any]) -> dict[str, Any]:
+        evidence = assignment["assigned_evidence_refs"][0]
+        return {
+            "leaf_id": assignment["leaf_id"],
+            "leaf_condition_scope": assignment["condition_scope"],
+            "research_sufficiency_certificate_ref": assignment["research_sufficiency_certificate_ref"],
+            "coverage_proof_ref": assignment["artifact_outputs"]["coverage_proof_ref"],
+            "evidence_ref": evidence["evidence_ref"],
+            "evidence_refs": [evidence["evidence_ref"]],
+            "provenance_refs": evidence.get("source_metadata_refs")
+            or [evidence["source_metadata_resolution_ref"]],
+            "impact_direction": "supports_yes",
+            "evidence_strength": "strong",
+            "classification_confidence": "high",
+            "classification_quality": "high",
+            "classification_acceptance_status": "accepted_for_verification",
+            "evidence_delta_eligible_for_scae": True,
+            "answer_value_extraction": {
+                "field_name": "outcome",
+                "value": "market_resolves_yes",
+                "normalization_status": "parsed",
+            },
+            "evidence_quality_dimensions": {
+                "source_authority": "high",
+                "directness": "direct",
+                "recency": "fresh",
+                "specificity": "specific",
+            },
+        }
+
+    def _coverage_proof(self, assignment: dict[str, Any]) -> dict[str, Any]:
+        evidence_refs = [item["evidence_ref"] for item in assignment["assigned_evidence_refs"]]
+        source_classes = sorted(
+            {
+                item["source_class"]
+                for item in assignment["assigned_evidence_refs"]
+                if item.get("source_class")
+            }
+        )
+        source_family_ids = sorted(
+            {
+                item["source_family_id"]
+                for item in assignment["assigned_evidence_refs"]
+                if item.get("source_family_id")
+            }
+        )
+        claim_family_ids = sorted(
+            {
+                ref
+                for item in assignment["assigned_evidence_refs"]
+                for ref in item.get("claim_family_ids", [])
+                if ref
+            }
+        )
+        return {
+            "coverage_proof_id": assignment["artifact_outputs"]["coverage_proof_ref"],
+            "leaf_id": assignment["leaf_id"],
+            "research_sufficiency_certificate_ref": assignment["research_sufficiency_certificate_ref"],
+            "retrieval_breadth_coverage_ref": assignment["retrieval_breadth_coverage_ref"],
+            "evidence_refs_assigned": evidence_refs,
+            "evidence_refs_reviewed": evidence_refs,
+            "source_class_ids_reviewed": source_classes,
+            "claim_family_ids_reviewed": claim_family_ids,
+            "source_family_ids_reviewed": source_family_ids,
+            "requirements_reviewed": list(assignment["sufficiency_requirement_refs"]),
+            "requirements_answered": list(assignment["sufficiency_requirement_refs"]),
+            "requirements_unanswered": [],
+            "required_value_fields_extracted": list(assignment["required_value_field_ids"]),
+            "required_negative_checks_completed": list(assignment["required_negative_check_ids"]),
+            "source_gap_flags": [],
+            "structural_unanswerability_acknowledged": False,
+            "machine_readability_status": "schema_valid",
+        }
 
     def test_builds_compact_primary_assignment_for_each_dispatchable_leaf(self) -> None:
         packet = self._certifiable_packet()
@@ -440,6 +516,74 @@ class LeafResearchAssignmentContractTest(unittest.TestCase):
 
         with self.assertRaisesRegex(LeafResearchAssignmentError, "blocked_until_certified"):
             build_leaf_research_assignments(qdt=self.qdt, retrieval_packet=packet)
+
+    def test_phase8_runtime_bundle_proves_certified_evidence_and_model_backed_leaf_scope(self) -> None:
+        packet = self._certifiable_packet()
+        assignments = build_leaf_research_assignments(qdt=self.qdt, retrieval_packet=packet)
+        model_context = resolve_researcher_leaf_nli_model_context()
+        sidecar = build_researcher_sidecar_v2(
+            qdt=self.qdt,
+            required_question_classifications=[
+                self._accepted_classification(assignment)
+                for assignment in assignments
+            ],
+            coverage_proofs=[self._coverage_proof(assignment) for assignment in assignments],
+            model_execution_context_ref="artifact:model-execution-context:researcher-leaf-nli",
+            model_execution_context=model_context,
+        )
+        results = [
+            build_leaf_subagent_result(
+                assignment,
+                terminal_status="accepted_classification",
+                subagent_session_ref=f"session:{idx}",
+                sidecar_refs=[sidecar["sidecar_id"]],
+                classification_refs=[
+                    f"classification:{assignment['leaf_id']}:{item['evidence_ref']}"
+                    for item in assignment["assigned_evidence_refs"]
+                ],
+                runtime_provenance={
+                    "model_executed": True,
+                    "resolved_model_id": RESEARCHER_PROVIDER_MODEL_KEY,
+                    "runtime_call_ref": f"model-runtime-call:{idx}",
+                },
+                reason_codes=["classification_accepted"],
+            )
+            for idx, assignment in enumerate(assignments)
+        ]
+
+        bundle = build_researcher_swarm_runtime_bundle(
+            assignments,
+            qdt=self.qdt,
+            retrieval_packet=packet,
+            sidecars=[sidecar],
+            subagent_results=results,
+            true_production_mode=True,
+        )
+
+        validation = validate_researcher_swarm_runtime_bundle(bundle)
+        self.assertTrue(validation.valid, validation.errors)
+        self.assertTrue(bundle["proceed_to_verification_scae"])
+        proof = bundle["certified_evidence_runtime_proof"]
+        self.assertEqual(proof["schema_version"], "researcher-runtime-certified-evidence-proof/v1")
+        self.assertEqual(proof["classification_dispatch_status"], "allowed")
+        self.assertTrue(proof["all_required_leaves_certified"])
+        self.assertEqual(proof["assignment_count"], len(assignments))
+        self.assertEqual(proof["dispatch_allowed_leaf_count"], len(assignments))
+        self.assertEqual(proof["model_executed_leaf_count"], len(assignments))
+        self.assertEqual(proof["accepted_classification_leaf_count"], len(assignments))
+        self.assertGreaterEqual(proof["bounded_evidence_ref_count"], len(assignments))
+        self.assertGreaterEqual(proof["certified_snippet_ref_count"], len(assignments))
+        self.assertGreaterEqual(proof["source_metadata_ref_count"], len(assignments))
+        self.assertGreaterEqual(proof["claim_family_ref_count"], len(assignments))
+        self.assertTrue(proof["all_assignment_certificates_dispatch_allowed"])
+        self.assertTrue(proof["all_certified_evidence_lineage_complete"])
+        self.assertTrue(proof["all_runtime_leaves_model_executed"])
+        self.assertTrue(proof["all_sidecars_model_backed_and_leaf_scoped"])
+        self.assertTrue(proof["all_leaves_have_accepted_classification_coverage"])
+        self.assertTrue(all(row["lineage_complete"] for row in proof["leaf_evidence_lineage"]))
+        self.assertEqual(proof["sidecar_lineage"][0]["classification_leaf_ids"], sorted(self.qdt["research_coverage_graph"]["dispatchable_pre_resolution_leaf_ids"]))
+        self.assertTrue(proof["sidecar_lineage"][0]["model_backed"])
+        self.assertTrue(proof["sidecar_lineage"][0]["leaf_scoped"])
 
     def test_validator_rejects_probability_decision_fields_and_embedded_payloads(self) -> None:
         assignment = build_leaf_research_assignments(qdt=self.qdt, retrieval_packet=self._certifiable_packet())[0]

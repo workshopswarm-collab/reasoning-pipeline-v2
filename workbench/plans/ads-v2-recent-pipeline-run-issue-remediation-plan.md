@@ -865,7 +865,7 @@ Completion note:
 
 ## Phase 8 - Researcher Runtime Positive Dispatch And Verification Proof
 
-Status: planned
+Status: complete
 
 Goal: prove researcher execution and verification on certified bounded evidence, without relaxing retrieval gates.
 
@@ -930,12 +930,20 @@ Success criteria:
 
 Checklist:
 
-- [ ] Certified retrieval positive fixture exists.
-- [ ] Blocked dispatch test passes.
-- [ ] Positive researcher dispatch test passes.
-- [ ] Authority leakage quarantine test passes.
-- [ ] Verification-to-SCAE-ready delta test passes.
-- [ ] Temp artifacts and one-off scripts removed.
+- [x] Certified retrieval positive fixture exists.
+- [x] Blocked dispatch test passes.
+- [x] Positive researcher dispatch test passes.
+- [x] Authority leakage quarantine test passes.
+- [x] Verification-to-SCAE-ready delta test passes.
+- [x] Temp artifacts and one-off scripts removed.
+
+Completion note:
+
+- Added `researcher-runtime-certified-evidence-proof/v1` to researcher runtime bundles. It summarizes the retrieval dispatch gate, per-leaf certified bounded evidence lineage, sufficiency certificate dispatch allowance, source metadata refs, claim family refs, model-executed leaf count, and model-backed/leaf-scoped sidecar coverage.
+- Tightened runtime bundle validation so a bundle that proceeds to verification/SCAE must prove certified evidence lineage, dispatch-allowed certificates, model execution for every leaf, model-backed leaf-scoped sidecars, and accepted classification coverage for every assignment.
+- Added `scae-delta-verification-proof/v1` at the SCAE handoff. The SCAE artifact now records accepted delta candidate refs together with their direction verification refs, quality verification refs, readiness gate status, and a proof status showing accepted refs only flow after direction and quality verification pass.
+- Added Phase 8 tests for the certified retrieval fixture, positive model-backed researcher dispatch, rejected-quality verification blocking, and orchestrator verified-delta proof propagation.
+- Verification passed: `researcher-swarm` `scripts.tests.test_assignments`, `scripts.tests.test_verification`, full researcher discovery (`252 tests OK`), `orchestrator` `scripts.tests.test_ads_operational_canary`, `scripts.tests.test_ads_production_handlers`, `py_compile` for changed modules/tests, and `git diff --check`.
 
 ## Phase 9 - SCAE Valid Forecast Positive Path And Authority Guard
 

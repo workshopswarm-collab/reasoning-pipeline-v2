@@ -835,6 +835,206 @@ def _sidecar_id(sidecar: dict[str, Any], index: int) -> str:
     return str(sidecar.get("sidecar_id") or f"sidecar-index:{index}")
 
 
+def _string_refs_from_item(item: dict[str, Any], *fields: str) -> list[str]:
+    refs: list[str] = []
+    for field in fields:
+        value = item.get(field)
+        if _is_non_empty_string(value):
+            refs.append(str(value))
+        elif isinstance(value, list):
+            refs.extend(str(ref) for ref in value if _is_non_empty_string(ref))
+    return list(dict.fromkeys(refs))
+
+
+def _sidecar_classification_leaf_ids(sidecar: dict[str, Any]) -> list[str]:
+    leaf_ids: list[str] = []
+    for classification in sidecar.get("required_question_classifications", []):
+        if isinstance(classification, dict) and _is_non_empty_string(classification.get("leaf_id")):
+            leaf_ids.append(str(classification["leaf_id"]))
+    return sorted(set(leaf_ids))
+
+
+def _certified_evidence_runtime_proof(
+    *,
+    assignments: list[dict[str, Any]],
+    retrieval_packet: dict[str, Any] | None,
+    sidecars: list[dict[str, Any]],
+    sidecar_validations: list[dict[str, Any]],
+    leaf_runtime_status: list[dict[str, Any]],
+) -> dict[str, Any]:
+    retrieval_summary = (
+        retrieval_packet.get("research_sufficiency_summary", {})
+        if isinstance(retrieval_packet, dict)
+        else {}
+    )
+    certificates = (
+        retrieval_packet.get("leaf_research_sufficiency_certificates", [])
+        if isinstance(retrieval_packet, dict)
+        else []
+    )
+    certificate_by_ref = {
+        str(certificate.get("certificate_id")): certificate
+        for certificate in certificates
+        if isinstance(certificate, dict) and _is_non_empty_string(certificate.get("certificate_id"))
+    }
+    runtime_by_assignment = {
+        str(row.get("assignment_ref")): row
+        for row in leaf_runtime_status
+        if isinstance(row, dict) and _is_non_empty_string(row.get("assignment_ref"))
+    }
+    valid_sidecar_ids = {
+        str(row.get("sidecar_id"))
+        for row in sidecar_validations
+        if isinstance(row, dict)
+        and _is_non_empty_string(row.get("sidecar_id"))
+        and isinstance(row.get("validation"), dict)
+        and row["validation"].get("valid") is True
+    }
+    assignment_leaf_ids = {
+        str(assignment.get("leaf_id"))
+        for assignment in assignments
+        if isinstance(assignment, dict) and _is_non_empty_string(assignment.get("leaf_id"))
+    }
+
+    leaf_rows: list[dict[str, Any]] = []
+    bounded_evidence_ref_count = 0
+    certified_snippet_ref_count = 0
+    source_metadata_ref_count = 0
+    claim_family_ref_count = 0
+    dispatch_allowed_leaf_count = 0
+    for assignment in assignments:
+        if not isinstance(assignment, dict):
+            continue
+        assigned_evidence = [
+            item for item in assignment.get("assigned_evidence_refs", []) if isinstance(item, dict)
+        ]
+        snippet_refs = [
+            str(item["certified_snippet"]["snippet_ref"])
+            for item in assigned_evidence
+            if isinstance(item.get("certified_snippet"), dict)
+            and _is_non_empty_string(item["certified_snippet"].get("snippet_ref"))
+        ]
+        source_metadata_refs = sorted(
+            set(
+                ref
+                for item in assigned_evidence
+                for ref in _string_refs_from_item(
+                    item,
+                    "source_metadata_resolution_ref",
+                    "source_metadata_refs",
+                )
+            )
+        )
+        claim_family_refs = sorted(
+            set(
+                ref
+                for item in assigned_evidence
+                for ref in _string_refs_from_item(
+                    item,
+                    "claim_family_id",
+                    "claim_family_ids",
+                    "claim_family_resolution_refs",
+                )
+            )
+        )
+        certificate = certificate_by_ref.get(str(assignment.get("research_sufficiency_certificate_ref")))
+        dispatch_allowed = bool(
+            isinstance(certificate, dict)
+            and certificate.get("classification_dispatch_allowed") is True
+        )
+        if dispatch_allowed:
+            dispatch_allowed_leaf_count += 1
+        bounded_evidence_ref_count += len(assigned_evidence)
+        certified_snippet_ref_count += len(set(snippet_refs))
+        source_metadata_ref_count += len(source_metadata_refs)
+        claim_family_ref_count += len(claim_family_refs)
+        runtime_row = runtime_by_assignment.get(str(assignment.get("assignment_id")), {})
+        leaf_rows.append(
+            {
+                "assignment_ref": assignment.get("assignment_id"),
+                "leaf_id": assignment.get("leaf_id"),
+                "research_sufficiency_certificate_ref": assignment.get(
+                    "research_sufficiency_certificate_ref"
+                ),
+                "classification_dispatch_allowed": dispatch_allowed,
+                "bounded_evidence_ref_count": len(assigned_evidence),
+                "certified_snippet_ref_count": len(set(snippet_refs)),
+                "source_metadata_ref_count": len(source_metadata_refs),
+                "claim_family_ref_count": len(claim_family_refs),
+                "model_executed": runtime_row.get("model_executed") is True,
+                "accepted_classification_coverage": runtime_row.get(
+                    "accepted_classification_coverage"
+                ) is True,
+                "lineage_complete": bool(assigned_evidence)
+                and len(set(snippet_refs)) == len(assigned_evidence)
+                and bool(source_metadata_refs)
+                and bool(claim_family_refs)
+                and dispatch_allowed,
+            }
+        )
+
+    sidecar_rows: list[dict[str, Any]] = []
+    for idx, sidecar in enumerate(sidecars):
+        if not isinstance(sidecar, dict):
+            continue
+        leaf_ids = _sidecar_classification_leaf_ids(sidecar)
+        model_backed = bool(
+            _is_non_empty_string(sidecar.get("model_execution_context_ref"))
+            and _is_sha256_ref(sidecar.get("model_execution_context_sha256"))
+        )
+        leaf_scoped = bool(leaf_ids) and set(leaf_ids) <= assignment_leaf_ids
+        sidecar_rows.append(
+            {
+                "sidecar_index": idx,
+                "sidecar_id": _sidecar_id(sidecar, idx),
+                "validation_valid": _sidecar_id(sidecar, idx) in valid_sidecar_ids,
+                "model_backed": model_backed,
+                "leaf_scoped": leaf_scoped,
+                "classification_leaf_ids": leaf_ids,
+            }
+        )
+
+    assignment_count = len(assignments)
+    valid_sidecar_count = sum(1 for row in sidecar_rows if row["validation_valid"])
+    model_backed_sidecar_count = sum(
+        1 for row in sidecar_rows if row["validation_valid"] and row["model_backed"]
+    )
+    leaf_scoped_sidecar_count = sum(
+        1 for row in sidecar_rows if row["validation_valid"] and row["leaf_scoped"]
+    )
+    model_executed_leaf_count = sum(1 for row in leaf_rows if row["model_executed"])
+    accepted_leaf_count = sum(1 for row in leaf_rows if row["accepted_classification_coverage"])
+    return {
+        "schema_version": "researcher-runtime-certified-evidence-proof/v1",
+        "classification_dispatch_status": retrieval_summary.get("classification_dispatch_status"),
+        "all_required_leaves_certified": retrieval_summary.get("all_required_leaves_certified") is True,
+        "assignment_count": assignment_count,
+        "dispatch_allowed_leaf_count": dispatch_allowed_leaf_count,
+        "bounded_evidence_ref_count": bounded_evidence_ref_count,
+        "certified_snippet_ref_count": certified_snippet_ref_count,
+        "source_metadata_ref_count": source_metadata_ref_count,
+        "claim_family_ref_count": claim_family_ref_count,
+        "valid_sidecar_count": valid_sidecar_count,
+        "model_backed_sidecar_count": model_backed_sidecar_count,
+        "leaf_scoped_sidecar_count": leaf_scoped_sidecar_count,
+        "model_executed_leaf_count": model_executed_leaf_count,
+        "accepted_classification_leaf_count": accepted_leaf_count,
+        "all_assignment_certificates_dispatch_allowed": assignment_count > 0
+        and dispatch_allowed_leaf_count == assignment_count,
+        "all_certified_evidence_lineage_complete": assignment_count > 0
+        and all(row["lineage_complete"] for row in leaf_rows),
+        "all_runtime_leaves_model_executed": assignment_count > 0
+        and model_executed_leaf_count == assignment_count,
+        "all_sidecars_model_backed_and_leaf_scoped": valid_sidecar_count > 0
+        and model_backed_sidecar_count == valid_sidecar_count
+        and leaf_scoped_sidecar_count == valid_sidecar_count,
+        "all_leaves_have_accepted_classification_coverage": assignment_count > 0
+        and accepted_leaf_count == assignment_count,
+        "leaf_evidence_lineage": leaf_rows,
+        "sidecar_lineage": sidecar_rows,
+    }
+
+
 def build_researcher_swarm_runtime_bundle(
     assignments: list[dict[str, Any]],
     *,
@@ -1009,6 +1209,14 @@ def build_researcher_swarm_runtime_bundle(
     else:
         barrier_validation = None
 
+    certified_evidence_proof = _certified_evidence_runtime_proof(
+        assignments=assignments,
+        retrieval_packet=retrieval_packet,
+        sidecars=copy.deepcopy(sidecars or []),
+        sidecar_validations=sidecar_validations,
+        leaf_runtime_status=leaf_runtime_status,
+    )
+
     bundle = {
         "artifact_type": "researcher_swarm_runtime_bundle",
         "schema_version": RESEARCHER_SWARM_RUNTIME_BUNDLE_SCHEMA_VERSION,
@@ -1027,6 +1235,7 @@ def build_researcher_swarm_runtime_bundle(
         "leaf_research_barrier": barrier,
         "leaf_research_barrier_validation": barrier_validation,
         "leaf_runtime_status": leaf_runtime_status,
+        "certified_evidence_runtime_proof": certified_evidence_proof,
         "all_leaves_have_assignment_and_resolution": bool(assignments)
         and all(row["ready_for_reconciliation"] for row in leaf_runtime_status),
         "proceed_to_verification_scae": bool(
@@ -1119,6 +1328,42 @@ def validate_researcher_swarm_runtime_bundle(bundle: Any) -> LeafSubagentContrac
         errors.append("all_leaves_have_assignment_and_resolution must be a boolean")
     if bundle.get("proceed_to_verification_scae") is not True and bundle.get("proceed_to_verification_scae") is not False:
         errors.append("proceed_to_verification_scae must be a boolean")
+    proof = bundle.get("certified_evidence_runtime_proof")
+    if not isinstance(proof, dict):
+        errors.append("certified_evidence_runtime_proof must be an object")
+    else:
+        if proof.get("schema_version") != "researcher-runtime-certified-evidence-proof/v1":
+            errors.append("certified_evidence_runtime_proof.schema_version is invalid")
+        for field in (
+            "assignment_count",
+            "dispatch_allowed_leaf_count",
+            "bounded_evidence_ref_count",
+            "certified_snippet_ref_count",
+            "source_metadata_ref_count",
+            "claim_family_ref_count",
+            "valid_sidecar_count",
+            "model_backed_sidecar_count",
+            "leaf_scoped_sidecar_count",
+            "model_executed_leaf_count",
+            "accepted_classification_leaf_count",
+        ):
+            if not isinstance(proof.get(field), int) or isinstance(proof.get(field), bool):
+                errors.append(f"certified_evidence_runtime_proof.{field} must be an integer")
+        for field in ("leaf_evidence_lineage", "sidecar_lineage"):
+            if not isinstance(proof.get(field), list):
+                errors.append(f"certified_evidence_runtime_proof.{field} must be a list")
+        if bundle.get("proceed_to_verification_scae") is True:
+            required_true_fields = (
+                "all_required_leaves_certified",
+                "all_assignment_certificates_dispatch_allowed",
+                "all_certified_evidence_lineage_complete",
+                "all_runtime_leaves_model_executed",
+                "all_sidecars_model_backed_and_leaf_scoped",
+                "all_leaves_have_accepted_classification_coverage",
+            )
+            for field in required_true_fields:
+                if proof.get(field) is not True:
+                    errors.append(f"certified_evidence_runtime_proof.{field} must be true when proceeding")
     digest = bundle.get("runtime_bundle_digest")
     if not _is_sha256_ref(digest):
         errors.append("runtime_bundle_digest must be a sha256 ref")

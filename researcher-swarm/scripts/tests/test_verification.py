@@ -512,6 +512,27 @@ class ResearcherVerificationTest(unittest.TestCase):
         self.assertFalse(payload["authority_boundary"]["writes_scae_ledger_rows"])
         self.assertEqual(payload["ready_classification_slice_refs"], [matrix["classification_slices"][0]["slice_id"]])
 
+    def test_scae_readiness_blocks_rejected_quality_verification(self) -> None:
+        matrix = self._matrix([self._classification(classification_confidence="low")])
+        direction = build_direction_verification_slices(
+            matrix,
+            market_reality_constraints=self._binary_constraints(),
+        )
+        quality = build_quality_verification_slices(matrix)
+
+        result = build_scae_readiness_reconciliation(
+            matrix,
+            direction,
+            quality,
+            qdt=self._qdt(),
+            coverage_proof_bundle=self._coverage_bundle(matrix),
+            sufficiency_reconciliation=self._sufficiency_reconciliation(),
+        )
+
+        self.assertFalse(result.ready_for_scae)
+        self.assertEqual(result.readiness_reconciliation["ready_classification_slice_refs"], [])
+        self.assertIn("quality_verification_not_accepted", result.readiness_reconciliation["blocker_codes"])
+
     def test_scae_readiness_ignores_non_scoreable_no_delta_rows(self) -> None:
         ready = self._classification(slice_id="classification-ready", classification_id="classification-ready")
         irrelevant = self._classification(

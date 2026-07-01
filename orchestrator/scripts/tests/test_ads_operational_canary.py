@@ -726,6 +726,11 @@ class AdsOperationalCanaryTest(unittest.TestCase):
         self.assertEqual(context["direction_verification_slice_refs"], ["direction-1"])
         self.assertEqual(context["quality_verification_slice_refs"], ["quality-1"])
         self.assertEqual(len(context["ledger_evidence_delta_slices"]), 1)
+        proof = context["verification_delta_proof"]
+        self.assertEqual(proof["schema_version"], "scae-delta-verification-proof/v1")
+        self.assertEqual(proof["accepted_delta_ref_count"], 1)
+        self.assertTrue(proof["all_accepted_delta_refs_have_direction_and_quality_verification"])
+        self.assertEqual(proof["proof_rows"][0]["proof_status"], "verified_scae_delta_ref")
 
     def _decomposer_live_response_path(self):
         path = Path(self.tempdir.name) / "decomposer-live-response.json"
@@ -2542,6 +2547,13 @@ class AdsOperationalCanaryTest(unittest.TestCase):
         self.assertGreater(len(verification["research_sufficiency_reconciliation_slices"]), 0)
         self.assertTrue(verification["scae_readiness_reconciliation"]["ready_for_scae"])
         self.assertGreater(len(scae["scae_evidence_delta_candidate_slice_refs"]), 0)
+        proof = scae["scae_evidence_delta_verification_proof"]
+        self.assertEqual(proof["schema_version"], "scae-delta-verification-proof/v1")
+        self.assertGreater(proof["accepted_delta_ref_count"], 0)
+        self.assertTrue(proof["all_accepted_delta_refs_have_direction_and_quality_verification"])
+        self.assertTrue(
+            all(row["proof_status"] == "verified_scae_delta_ref" for row in proof["proof_rows"])
+        )
         self.assertGreater(scae["scae_leaf_cluster_netting_cluster_count"], 0)
         self.assertEqual(scae["scoreable_forecast_output"], 0)
         self.assertEqual(prediction_count, 0)
