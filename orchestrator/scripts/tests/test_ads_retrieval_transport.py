@@ -609,6 +609,44 @@ class AdsRetrievalTransportTest(unittest.TestCase):
         self.assertEqual(diagnostics["search_call_skipped_count"], 0)
         self.assertEqual([event[0] for event in provider.events].count("search"), 1)
 
+    def test_elapsed_search_budget_records_leaf_skip_diagnostics(self) -> None:
+        clock = {"now": 0.0}
+
+        class SlowSearchProvider(FakeBrowserProvider):
+            def search_candidate_urls(self, query_context: dict, query_variant: dict, *, searched_at=None) -> list[dict]:
+                clock["now"] += 2.0
+                return super().search_candidate_urls(query_context, query_variant, searched_at=searched_at)
+
+        provider = SlowSearchProvider(search_results=[{"url": "https://www.reuters.com/world/example-report"}])
+
+        with patch("predquant.ads_retrieval_transport.time.monotonic", side_effect=lambda: clock["now"]):
+            transport = collect_live_retrieval_candidates(
+                qdt=self.qdt,
+                evidence_packet={**self.evidence_packet, "official_source_hints": []},
+                case_contract={**self.case_contract, "market_identity": {}},
+                amrg_context=None,
+                source_cutoff_timestamp=CUTOFF_AT,
+                forecast_timestamp=FORECAST_AT,
+                provider_policy=RetrievalProviderPolicy(
+                    max_direct_urls=0,
+                    max_total_search_calls=10,
+                    max_total_search_elapsed_seconds=1,
+                    max_search_results_per_variant=1,
+                ),
+                browser_provider=provider,
+            )
+
+        elapsed_skips = [
+            item
+            for item in transport.transport_diagnostics["search_skipped_diagnostics"]
+            if item["reason_code"] == "skipped_elapsed_budget"
+        ]
+        self.assertTrue(elapsed_skips)
+        self.assertTrue(all(item.get("leaf_id") for item in elapsed_skips))
+        self.assertTrue(all(item.get("elapsed_seconds", 0) >= 1 for item in elapsed_skips))
+        self.assertTrue(all(item.get("budget_seconds") == 1 for item in elapsed_skips))
+        self.assertIn("skipped_elapsed_budget", transport.transport_diagnostics["bounded_retrieval_reason_codes"])
+
     def test_tesla_ir_resolution_url_is_deterministic_official_after_fetch(self) -> None:
         provider = FakeBrowserProvider()
         case_contract = copy.deepcopy(self.case_contract)

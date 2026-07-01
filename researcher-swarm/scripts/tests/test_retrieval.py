@@ -1564,6 +1564,11 @@ class RetrievalPacketContractTest(unittest.TestCase):
         self.assertEqual(coverage["admitted_ref_count"], 0)
         self.assertFalse(certificate["evidence_refs"])
         self.assertIn("hash_only_excerpt_not_research_usable", coverage["unsatisfied_breadth_dimensions"])
+        self.assertIn("hash_only_excerpt_not_research_usable", certificate["unsatisfied_requirement_codes"])
+        self.assertEqual(
+            certificate["uncertified_leaf_diagnostics"]["research_usable_ref_count"],
+            0,
+        )
 
     def test_short_chunks_do_not_certify_research_sufficiency(self) -> None:
         qdt = copy.deepcopy(self.qdt)
@@ -1608,6 +1613,12 @@ class RetrievalPacketContractTest(unittest.TestCase):
         self.assertEqual(finalized["research_sufficiency_summary"]["classification_dispatch_status"], "blocked_insufficient_research")
         self.assertEqual(coverage["admitted_ref_count"], 0)
         self.assertIn("snippet_too_short_for_classification", coverage["unsatisfied_breadth_dimensions"])
+        certificate = finalized["leaf_research_sufficiency_certificates"][0]
+        self.assertIn("snippet_too_short_for_classification", certificate["unsatisfied_requirement_codes"])
+        self.assertEqual(
+            certificate["uncertified_leaf_diagnostics"]["diagnostic_admitted_ref_count"],
+            1,
+        )
 
     def test_claim_family_empty_evidence_blocks_claim_breadth(self) -> None:
         qdt = copy.deepcopy(self.qdt)
@@ -1653,6 +1664,8 @@ class RetrievalPacketContractTest(unittest.TestCase):
         self.assertEqual(coverage["claim_family_count"], 0)
         self.assertIn("claim_family_diversity", coverage["unsatisfied_breadth_dimensions"])
         self.assertIn("claim_extraction_not_attempted", coverage["unsatisfied_breadth_dimensions"])
+        certificate = finalized["leaf_research_sufficiency_certificates"][0]
+        self.assertIn("claim_extraction_not_attempted", certificate["unsatisfied_requirement_codes"])
 
     def test_transport_run_without_admissible_evidence_exhausts_expansion(self) -> None:
         qdt = copy.deepcopy(self.qdt)
@@ -2445,7 +2458,7 @@ class RetrievalPacketContractTest(unittest.TestCase):
             "captured_at": "2026-06-24T11:59:00+00:00",
             "extraction_status": "accepted",
             "admission_status": "admitted",
-            "content": "Fetched page text exists, but provider metadata is not resolver metadata.",
+            "content": "Fetched page text exists, but provider metadata is not resolver metadata. " * 8,
         }
 
         packet = build_live_retrieval_packet_from_candidates(
@@ -2464,6 +2477,19 @@ class RetrievalPacketContractTest(unittest.TestCase):
         self.assertFalse(provenance["counts_toward_breadth"])
         self.assertIn("source_class_unknown", provenance["unknown_reason_codes"])
         self.assertIn("claim_family_unknown_not_counted", provenance["unknown_reason_codes"])
+        coverage = packet["retrieval_breadth_coverage_slices"][0]
+        certificate = packet["leaf_research_sufficiency_certificates"][0]
+        reason_codes = {
+            code
+            for omission in coverage["content_usefulness_omissions"]
+            for code in omission["reason_codes"]
+        }
+        self.assertEqual(coverage["admitted_ref_count"], 0)
+        self.assertIn("source_class_unknown", reason_codes)
+        self.assertIn("claim_extraction_not_attempted", reason_codes)
+        self.assertIn("evidence_not_counted_for_breadth", reason_codes)
+        self.assertFalse(certificate["classification_dispatch_allowed"])
+        self.assertIn("source_class_unknown", certificate["unsatisfied_requirement_codes"])
 
     def test_claim_family_for_fetched_url_comes_from_validated_text_not_url(self) -> None:
         qdt = copy.deepcopy(self.qdt)
@@ -3680,7 +3706,10 @@ class RetrievalPacketContractTest(unittest.TestCase):
         cert = finalized["leaf_research_sufficiency_certificates"][0]
         self.assertEqual(cert["status"], "blocked_stale")
         self.assertFalse(cert["classification_dispatch_allowed"])
+        self.assertFalse(cert["evidence_refs"])
         self.assertIn("freshness", cert["unsatisfied_requirement_codes"])
+        self.assertIn("freshness_proof_missing", cert["unsatisfied_requirement_codes"])
+        self.assertEqual(cert["uncertified_leaf_diagnostics"]["fresh_source_count"], 0)
         self.assertTrue(finalized["retrieval_expansion_attempts"])
         self.assertTrue(
             all(

@@ -3067,6 +3067,16 @@ def _claim_family_required(query_context: dict[str, Any], profile: dict[str, Any
     return False
 
 
+def _freshness_required(profile: dict[str, Any] | None = None) -> bool:
+    freshness = (profile or {}).get("freshness_requirement")
+    if not isinstance(freshness, dict):
+        return False
+    try:
+        return int(freshness.get("min_fresh_sources", 0) or 0) > 0
+    except (TypeError, ValueError):
+        return False
+
+
 def _evidence_chunk_refs(item: dict[str, Any]) -> list[str]:
     return [
         str(ref)
@@ -3080,6 +3090,8 @@ def _research_usefulness_reason_codes(
     chunks_by_ref: dict[str, dict[str, Any]],
     *,
     claim_family_required: bool,
+    freshness_required: bool = False,
+    freshness_satisfied: bool = True,
 ) -> list[str]:
     chunk_rejection_codes: list[str] = []
     reason_codes: list[str] = []
@@ -3110,8 +3122,20 @@ def _research_usefulness_reason_codes(
         usable_chunk_seen = True
     if not usable_chunk_seen:
         reason_codes.extend(chunk_rejection_codes or ["snippet_too_short_for_classification"])
+    if not _is_non_empty_string(item.get("source_metadata_resolution_ref")):
+        reason_codes.append("source_metadata_resolution_missing")
+    if item.get("source_class") not in ALLOWED_SOURCE_CLASSES or item.get("source_class") == "unknown":
+        reason_codes.append("source_class_unknown")
+    if not _is_known_source_family_id(item.get("source_family_id")):
+        reason_codes.append("source_family_unknown")
+    if item.get("temporal_gate_status") != "pass":
+        reason_codes.append(f"temporal_{item.get('temporal_gate_status') or 'unknown_not_counted'}")
+    if item.get("counts_toward_breadth") is not True:
+        reason_codes.append("evidence_not_counted_for_breadth")
     if claim_family_required and not _metadata_field_known(item, "claim_family_ids"):
         reason_codes.append("claim_extraction_not_attempted")
+    if freshness_required and not freshness_satisfied:
+        reason_codes.append("freshness_proof_missing")
     metadata_reasons = item.get("metadata_unknown_reason_codes")
     if isinstance(metadata_reasons, list) and "boi_schedule_context_only_not_counted_for_driver_leaf" in metadata_reasons:
         reason_codes.append("boi_schedule_context_only_not_counted_for_driver_leaf")
@@ -3123,7 +3147,10 @@ def _research_usable_selected(
     chunks_by_ref: dict[str, dict[str, Any]],
     *,
     claim_family_required: bool,
+    freshness_required: bool = False,
+    freshness_satisfied_by_ref: dict[str, bool] | None = None,
 ) -> list[dict[str, Any]]:
+    freshness_satisfied_by_ref = freshness_satisfied_by_ref or {}
     return [
         item
         for item in selected
@@ -3131,6 +3158,8 @@ def _research_usable_selected(
             item,
             chunks_by_ref,
             claim_family_required=claim_family_required,
+            freshness_required=freshness_required,
+            freshness_satisfied=freshness_satisfied_by_ref.get(str(item.get("evidence_ref") or ""), True),
         )
     ]
 
@@ -3565,11 +3594,21 @@ def build_retrieval_breadth_coverage_slice(
 ) -> dict[str, Any]:
     diagnostic_selected = _selected_from_result(result)
     claim_required = _claim_family_required(query_context, profile)
+    fresh_required = _freshness_required(profile)
+    freshness_satisfied_by_ref = {
+        str(item.get("evidence_ref")): (
+            _fresh_source_count([item], profile, source_cutoff_timestamp, query_context) > 0
+        )
+        for item in diagnostic_selected
+        if _is_non_empty_string(item.get("evidence_ref"))
+    } if fresh_required else {}
     content_usefulness_omissions = {
         str(item.get("evidence_ref")): _research_usefulness_reason_codes(
             item,
             chunks_by_ref,
             claim_family_required=claim_required,
+            freshness_required=fresh_required,
+            freshness_satisfied=freshness_satisfied_by_ref.get(str(item.get("evidence_ref") or ""), True),
         )
         for item in diagnostic_selected
         if _is_non_empty_string(item.get("evidence_ref"))
@@ -3578,6 +3617,8 @@ def build_retrieval_breadth_coverage_slice(
         diagnostic_selected,
         chunks_by_ref,
         claim_family_required=claim_required,
+        freshness_required=fresh_required,
+        freshness_satisfied_by_ref=freshness_satisfied_by_ref,
     )
     selected = research_usable_selected if enforce_research_usefulness else diagnostic_selected
     omitted = [item for item in (result or {}).get("omitted_candidates", []) if isinstance(item, dict)]
@@ -3687,6 +3728,8 @@ def build_retrieval_breadth_coverage_slice(
             unsatisfied.append(f"negative_check:{check}")
     if protected_status == "blocked":
         unsatisfied.append("protected_primary_blocked")
+    if enforce_research_usefulness and diagnostic_selected and not selected:
+        unsatisfied.append("admitted_evidence_count")
     if enforce_research_usefulness and unsatisfied and content_reason_codes:
         unsatisfied.extend(content_reason_codes)
 
@@ -4619,6 +4662,37 @@ def certify_leaf_research_sufficiency(
         classification_allowed = False
         blocking.add("no_admitted_evidence")
         unsatisfied.add("empty_retrieval")
+        if isinstance(coverage, dict):
+            for omission in coverage.get("content_usefulness_omissions", []):
+                if not isinstance(omission, dict):
+                    continue
+                for code in omission.get("reason_codes", []):
+                    if _is_non_empty_string(code):
+                        unsatisfied.add(str(code))
+
+    leaf_diagnostics = {
+        "diagnostic_admitted_ref_count": int((coverage or {}).get("diagnostic_admitted_ref_count", len(selected)))
+        if isinstance(coverage, dict)
+        else len(selected),
+        "research_usable_ref_count": len(certified_selected),
+        "min_admitted_evidence_items": int((coverage or {}).get("min_admitted_evidence_items", 0))
+        if isinstance(coverage, dict)
+        else 0,
+        "source_family_count": int((coverage or {}).get("source_family_count", 0))
+        if isinstance(coverage, dict)
+        else 0,
+        "claim_family_count": int((coverage or {}).get("claim_family_count", 0))
+        if isinstance(coverage, dict)
+        else 0,
+        "fresh_source_count": int((coverage or {}).get("fresh_source_count", 0))
+        if isinstance(coverage, dict)
+        else 0,
+        "content_usefulness_omissions": list((coverage or {}).get("content_usefulness_omissions", []))
+        if isinstance(coverage, dict)
+        else [],
+        "unsatisfied_requirement_codes": sorted(unsatisfied),
+        "blocking_reason_codes": sorted(blocking),
+    }
 
     certificate_seed = {
         "leaf_id": query_context.get("leaf_id"),
@@ -4648,6 +4722,7 @@ def certify_leaf_research_sufficiency(
         "structural_unanswerability_proof_ref": proof_ref,
         "temporal_validation_status": "invalid" if temporal_invalid else "pass",
         "freshness_status": freshness,
+        "uncertified_leaf_diagnostics": leaf_diagnostics,
         "macro_fallback_sufficiency_status": (
             fallback_state.get("macro_fallback_sufficiency_status")
             if isinstance(fallback_state, dict)

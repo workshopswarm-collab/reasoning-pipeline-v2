@@ -572,7 +572,7 @@ Completion note, 2026-07-01:
 
 ## Phase 5 - Retrieval Meaningful Evidence, Claim Families, And Freshness Certification
 
-Status: planned
+Status: complete
 
 Goal: make retrieval produce certified, classification-usable evidence rather than admitted short chunks that cannot support researcher dispatch.
 
@@ -653,13 +653,23 @@ Success criteria:
 
 Checklist:
 
-- [ ] Meaningful evidence sufficiency gate implemented.
-- [ ] Claim-family certification covered.
-- [ ] Freshness/protected-primary certification covered.
-- [ ] Per-leaf blocker diagnostics covered.
-- [ ] Retrieval and orchestrator tests pass.
-- [ ] Clone proof validates intended behavior.
-- [ ] Temp artifacts and one-off scripts removed.
+- [x] Meaningful evidence sufficiency gate implemented.
+- [x] Claim-family certification covered.
+- [x] Freshness/protected-primary certification covered.
+- [x] Per-leaf blocker diagnostics covered.
+- [x] Retrieval and orchestrator tests pass.
+- [x] Clone proof validates intended behavior.
+- [x] Temp artifacts and one-off scripts removed.
+
+Completion note:
+
+- Tightened Researcher Swarm sufficiency so research-usable evidence now requires meaningful bounded snippet content, resolved source metadata, known source class and source family, breadth-count eligibility, claim family resolution when claim breadth is required, and freshness proof when freshness is required.
+- Preserved short and hash-only chunks as diagnostics while keeping them out of sufficiency and certified evidence refs.
+- Added per-leaf uncertified diagnostics with diagnostic admitted counts, research-usable counts, source/claim/freshness counts, content-usefulness omissions, unsatisfied requirement codes, and blocking reason codes.
+- Added elapsed search-budget skip diagnostics with leaf/query identity, elapsed seconds, and budget seconds so later leaves fail visibly instead of silently starving.
+- Verification passed: `researcher-swarm` `scripts.tests.test_retrieval`, `scripts.tests.test_assignments`, `scripts.tests.test_verification`, and full discovery (`249 tests OK`); `orchestrator` `scripts.tests.test_ads_retrieval_transport`, `scripts.tests.test_ads_operational_canary`, `scripts.tests.test_ads_operator_review` (`71 tests OK` combined); `py_compile` for changed runtime modules; and `git diff --check`.
+- Clone proof: the fully live BOI clone run selected `polymarket:1795635` but blocked before retrieval at decomposition with `policy_violation_quarantine` on forbidden MIG-003 `schema_repair_diagnostics[].repair_decision`; it remained clone-only with no active work and no protected prediction writes. A second BOI clone run using the existing fixture decomposer mode reached live retrieval and failed closed as `structured_non_scoreable_insufficiency`: `source_populated_count=1`, `fetched_attempt_count=22`, `search_candidates_materialized_count=6`, `short_chunk_admitted_count=8`, `meaningful_snippet_admitted_count=0`, `claim_family_extraction_attempted_count=8`, `accepted_claim_family_count=0`, `classification_dispatch_allowed=false`, and explicit per-leaf blockers including short snippet, missing claim family, freshness proof, source-family diversity, and protected-primary gaps. It produced no market prediction or SCAE ledger writes.
+- Temporary clone-run directories under `/tmp` were removed and no one-off scripts were added.
 
 ## Phase 6 - Native Research Candidate Discovery Usefulness
 

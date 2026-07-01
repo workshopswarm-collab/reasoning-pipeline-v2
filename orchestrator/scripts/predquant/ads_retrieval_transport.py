@@ -417,8 +417,22 @@ def collect_live_retrieval_candidates(
                 )
                 if skip_reason:
                     search_call_skipped_count += 1
+                    elapsed_seconds = max(0.0, time.monotonic() - search_started_at)
                     search_skipped_diagnostics.append(
-                        _search_query_diagnostic(context, variant, reason_code=skip_reason)
+                        _search_query_diagnostic(
+                            context,
+                            variant,
+                            reason_code=skip_reason,
+                            detail="search_elapsed_budget_exhausted_before_leaf"
+                            if skip_reason == "skipped_elapsed_budget"
+                            else None,
+                            elapsed_seconds=elapsed_seconds
+                            if skip_reason == "skipped_elapsed_budget"
+                            else None,
+                            budget_seconds=max_total_search_elapsed_seconds
+                            if skip_reason == "skipped_elapsed_budget"
+                            else None,
+                        )
                     )
                     continue
                 search_primary_call_count += 1
@@ -1539,6 +1553,7 @@ def _search_query_diagnostic(
     reason_code: str,
     detail: str | None = None,
     elapsed_seconds: float | None = None,
+    budget_seconds: float | None = None,
     error_class: str | None = None,
 ) -> dict[str, Any]:
     legacy_reason_aliases = {
@@ -1561,6 +1576,8 @@ def _search_query_diagnostic(
         diagnostic["error_class"] = str(error_class)[:160]
     if elapsed_seconds is not None:
         diagnostic["elapsed_seconds"] = round(float(elapsed_seconds), 3)
+    if budget_seconds is not None:
+        diagnostic["budget_seconds"] = round(float(budget_seconds), 3)
     return diagnostic
 
 
