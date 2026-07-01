@@ -79,9 +79,59 @@ class AdsRealRuntimeCanaryTest(unittest.TestCase):
         summary = build_current_audit_gap_summary(qdt_evidence=qdt_evidence, retrieval_evidence={})
         taxonomy = summary["recent_run_failure_taxonomy"]
         self.assertEqual(taxonomy["qdt_runtime_state"], "live_qdt_call_executed_output_rejected")
+        self.assertEqual(qdt_evidence["qdt_live_model_call_attempted_count"], 1)
+        self.assertEqual(qdt_evidence["qdt_live_model_call_executed_count"], 1)
+        self.assertEqual(qdt_evidence["qdt_live_output_schema_rejected_count"], 1)
+        self.assertEqual(qdt_evidence["qdt_live_output_rejected_count"], 1)
+        self.assertEqual(qdt_evidence["qdt_live_output_accepted_count"], 0)
+        self.assertEqual(qdt_evidence["qdt_fixture_or_deterministic_count"], 0)
+        self.assertEqual(taxonomy["qdt_live_model_call_attempted_count"], 1)
         self.assertEqual(taxonomy["qdt_live_model_call_executed_count"], 1)
+        self.assertEqual(taxonomy["qdt_live_output_schema_rejected_count"], 1)
+        self.assertEqual(taxonomy["qdt_live_output_rejected_count"], 1)
         self.assertEqual(taxonomy["qdt_live_output_accepted_count"], 0)
+        self.assertEqual(taxonomy["qdt_fixture_or_deterministic_count"], 0)
         self.assertIn("terminal_verification_leaf_misclassified", taxonomy["qdt_runtime_reason_codes"])
+
+    def test_deterministic_qdt_path_counts_as_fixture_or_deterministic(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            qdt_path = _write_json(
+                root,
+                "deterministic-qdt.json",
+                {
+                    "adapter_mode": "deterministic_decomposer_contract_adapter",
+                    "required_leaf_questions": [
+                        {
+                            "leaf_id": "leaf-current-evidence",
+                            "leaf_question": "What current evidence resolves the market?",
+                        }
+                    ],
+                },
+            )
+
+            qdt_evidence = _model_runtime_evidence(
+                [
+                    {
+                        "artifact_id": "artifact:deterministic-qdt",
+                        "artifact_type": "question-decomposition",
+                        "path": str(qdt_path),
+                    }
+                ]
+            )
+
+        taxonomy = build_current_audit_gap_summary(
+            qdt_evidence=qdt_evidence,
+            retrieval_evidence={},
+        )["recent_run_failure_taxonomy"]
+        self.assertEqual(classify_qdt_runtime_state(qdt_evidence), "qdt_fixture_or_deterministic_path")
+        self.assertEqual(qdt_evidence["qdt_live_model_call_attempted_count"], 0)
+        self.assertEqual(qdt_evidence["qdt_live_model_call_executed_count"], 0)
+        self.assertEqual(qdt_evidence["qdt_live_output_schema_rejected_count"], 0)
+        self.assertEqual(qdt_evidence["qdt_live_output_accepted_count"], 0)
+        self.assertEqual(qdt_evidence["qdt_fixture_or_deterministic_count"], 1)
+        self.assertEqual(taxonomy["qdt_runtime_state"], "qdt_fixture_or_deterministic_path")
+        self.assertEqual(taxonomy["qdt_fixture_or_deterministic_count"], 1)
 
     def test_rbnz_analyst_consensus_temporal_role_drift_is_preserved(self):
         with tempfile.TemporaryDirectory() as tempdir:
@@ -267,6 +317,12 @@ class AdsRealRuntimeCanaryTest(unittest.TestCase):
         }
         taxonomy = classify_recent_run_failure(report)
         self.assertEqual(taxonomy["qdt_runtime_state"], "live_qdt_call_executed_output_accepted")
+        self.assertEqual(taxonomy["qdt_live_model_call_attempted_count"], 1)
+        self.assertEqual(taxonomy["qdt_live_model_call_executed_count"], 1)
+        self.assertEqual(taxonomy["qdt_live_output_schema_rejected_count"], 0)
+        self.assertEqual(taxonomy["qdt_live_output_rejected_count"], 0)
+        self.assertEqual(taxonomy["qdt_live_output_accepted_count"], 1)
+        self.assertEqual(taxonomy["qdt_fixture_or_deterministic_count"], 0)
         self.assertEqual(taxonomy["retrieval_state"], "retrieval_source_populated_but_not_certified")
         self.assertEqual(taxonomy["native_state"], "native_research_executed_no_candidates")
         self.assertEqual(retrieval_evidence["source_populated_count"], 1)

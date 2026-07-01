@@ -97,6 +97,11 @@ FORBIDDEN_QDT_KEY_FRAGMENTS = (
 QDT_RUNTIME_STATE_LIVE_ACCEPTED = "live_qdt_call_executed_output_accepted"
 QDT_RUNTIME_STATE_LIVE_REJECTED = "live_qdt_call_executed_output_rejected"
 QDT_RUNTIME_STATE_DETERMINISTIC = "qdt_fixture_or_deterministic_path"
+QDT_LIVE_OUTPUT_REJECTED_EXECUTION_STATUSES = {
+    "failed_schema_validation",
+    "failed_forbidden_output",
+    "failed_forbidden_output_after_repair",
+}
 RETRIEVAL_STATE_SOURCE_POPULATED_NOT_CERTIFIED = "retrieval_source_populated_but_not_certified"
 RETRIEVAL_STATE_CERTIFIED = "retrieval_certified"
 RETRIEVAL_STATE_NOT_SOURCE_POPULATED = "retrieval_not_source_populated"
@@ -457,6 +462,21 @@ def _live_qdt_runtime_call_executed(runtime: dict[str, Any]) -> bool:
     )
 
 
+def _live_qdt_runtime_call_attempted(runtime: dict[str, Any]) -> bool:
+    return (
+        runtime.get("resolved_model_id") == REQUIRED_RUNTIME_MODEL_ID
+        and runtime.get("mode") == "live"
+        and runtime.get("fixture_mode") is False
+    )
+
+
+def _rejected_live_qdt_runtime_call(runtime: dict[str, Any]) -> bool:
+    return (
+        _live_qdt_runtime_call_executed(runtime)
+        and runtime.get("execution_status") in QDT_LIVE_OUTPUT_REJECTED_EXECUTION_STATUSES
+    )
+
+
 def _accepted_live_qdt_result(qdt_result: dict[str, Any]) -> bool:
     return (
         qdt_result.get("adapter_mode") == "decomposer_model_runtime_live"
@@ -465,14 +485,39 @@ def _accepted_live_qdt_result(qdt_result: dict[str, Any]) -> bool:
     )
 
 
+def qdt_runtime_counters(qdt_evidence: dict[str, Any]) -> dict[str, int]:
+    qdt_results = _list_of_dicts(qdt_evidence.get("qdt_results"))
+    runtime_results = _list_of_dicts(qdt_evidence.get("runtime_results"))
+    live_attempted = [
+        runtime
+        for runtime in runtime_results
+        if _live_qdt_runtime_call_attempted(runtime)
+    ]
+    live_executed = [runtime for runtime in live_attempted if _runtime_model_call_performed(runtime)]
+    live_rejected = [runtime for runtime in live_attempted if _rejected_live_qdt_runtime_call(runtime)]
+    live_accepted = [result for result in qdt_results if _accepted_live_qdt_result(result)]
+    fixture_or_deterministic = [
+        result
+        for result in qdt_results
+        if not _accepted_live_qdt_result(result)
+    ]
+    return {
+        "qdt_live_model_call_attempted_count": len(live_attempted),
+        "qdt_live_model_call_executed_count": len(live_executed),
+        "qdt_live_output_schema_rejected_count": len(live_rejected),
+        "qdt_live_output_rejected_count": max(0, len(live_executed) - len(live_accepted)),
+        "qdt_live_output_accepted_count": len(live_accepted),
+        "qdt_fixture_or_deterministic_count": len(fixture_or_deterministic),
+    }
+
+
 def classify_qdt_runtime_state(qdt_evidence: dict[str, Any]) -> str:
     """Classify live QDT execution separately from accepted artifact persistence."""
 
-    qdt_results = _list_of_dicts(qdt_evidence.get("qdt_results"))
-    runtime_results = _list_of_dicts(qdt_evidence.get("runtime_results"))
-    if any(_accepted_live_qdt_result(result) for result in qdt_results):
+    counters = qdt_runtime_counters(qdt_evidence)
+    if counters["qdt_live_output_accepted_count"]:
         return QDT_RUNTIME_STATE_LIVE_ACCEPTED
-    if any(_live_qdt_runtime_call_executed(result) for result in runtime_results):
+    if counters["qdt_live_model_call_executed_count"]:
         return QDT_RUNTIME_STATE_LIVE_REJECTED
     return QDT_RUNTIME_STATE_DETERMINISTIC
 
@@ -493,6 +538,7 @@ def build_recent_run_failure_taxonomy(
     retrieval_evidence: dict[str, Any],
 ) -> dict[str, Any]:
     qdt_runtime_state = classify_qdt_runtime_state(qdt_evidence)
+    counters = qdt_runtime_counters(qdt_evidence)
     source_populated_count = _int_value(retrieval_evidence.get("source_populated_count"))
     native_model_executed_count = _int_value(retrieval_evidence.get("native_research_model_executed_count"))
     native_candidate_url_count = _int_value(retrieval_evidence.get("native_candidate_url_count"))
@@ -508,20 +554,10 @@ def build_recent_run_failure_taxonomy(
         native_state = NATIVE_RESEARCH_STATE_CANDIDATES_PRESENT
     else:
         native_state = NATIVE_RESEARCH_STATE_NOT_EXECUTED_OR_USEFUL
-    live_executed_count = sum(
-        1 for runtime in _list_of_dicts(qdt_evidence.get("runtime_results"))
-        if _live_qdt_runtime_call_executed(runtime)
-    )
-    accepted_live_count = sum(
-        1 for result in _list_of_dicts(qdt_evidence.get("qdt_results"))
-        if _accepted_live_qdt_result(result)
-    )
     return {
         "schema_version": "ads-recent-run-failure-taxonomy/v1",
         "qdt_runtime_state": qdt_runtime_state,
-        "qdt_live_model_call_executed_count": live_executed_count,
-        "qdt_live_output_accepted_count": accepted_live_count,
-        "qdt_live_output_rejected_count": max(0, live_executed_count - accepted_live_count),
+        **counters,
         "qdt_runtime_execution_statuses": sorted(
             {
                 str(runtime.get("execution_status"))
@@ -647,6 +683,8 @@ def _model_runtime_evidence(manifests: list[dict[str, Any]]) -> dict[str, Any]:
         item["ok"] for item in runtime_results
     )
     qdt_quality_ok = bool(qdt_results) and all(item["qdt_quality_ok"] for item in qdt_results)
+    qdt_runtime_evidence = {"qdt_results": qdt_results, "runtime_results": runtime_results}
+    qdt_counters = qdt_runtime_counters(qdt_runtime_evidence)
     return {
         "required_model_id": REQUIRED_RUNTIME_MODEL_ID,
         "qdt_count": len(qdt_results),
@@ -673,16 +711,9 @@ def _model_runtime_evidence(manifests: list[dict[str, Any]]) -> dict[str, Any]:
         ),
         "runtime_call_count": len(runtime_results),
         "runtime_call_model_executed_count": sum(1 for item in runtime_results if item["ok"]),
-        "qdt_runtime_state": classify_qdt_runtime_state(
-            {"qdt_results": qdt_results, "runtime_results": runtime_results}
-        ),
-        "qdt_live_model_call_executed_count": sum(
-            1 for item in runtime_results if _live_qdt_runtime_call_executed(item)
-        ),
-        "qdt_live_output_accepted_count": sum(1 for item in qdt_results if _accepted_live_qdt_result(item)),
-        "qdt_runtime_reason_codes": _runtime_reason_codes(
-            {"qdt_results": qdt_results, "runtime_results": runtime_results}
-        ),
+        "qdt_runtime_state": classify_qdt_runtime_state(qdt_runtime_evidence),
+        **qdt_counters,
+        "qdt_runtime_reason_codes": _runtime_reason_codes(qdt_runtime_evidence),
         "qdt_results": qdt_results,
         "runtime_results": runtime_results,
         "model_runtime_ok": model_runtime_ok,
@@ -2159,15 +2190,39 @@ def _build_runtime_criteria(
     expected_market_predictions = prediction_deltas.get("expected_market_predictions")
     non_executing_expected = expected_market_predictions == 0 and not require_scoreable_prediction
     return [
-        _criterion(
-            "qdt_model_executed",
-            bool(qdt_evidence.get("ok")),
-            required=require_qdt_model_executed,
-            detail={
-                "qdt_model_executed_count": qdt_evidence.get("qdt_model_executed_count", 0),
-                "runtime_call_model_executed_count": qdt_evidence.get("runtime_call_model_executed_count", 0),
-            },
-        ),
+	        _criterion(
+	            "qdt_model_executed",
+	            bool(qdt_evidence.get("ok")),
+	            required=require_qdt_model_executed,
+	            detail={
+	                "qdt_model_executed_count": qdt_evidence.get("qdt_model_executed_count", 0),
+	                "runtime_call_model_executed_count": qdt_evidence.get("runtime_call_model_executed_count", 0),
+	                "qdt_live_model_call_attempted_count": qdt_evidence.get(
+	                    "qdt_live_model_call_attempted_count",
+	                    0,
+	                ),
+	                "qdt_live_model_call_executed_count": qdt_evidence.get(
+	                    "qdt_live_model_call_executed_count",
+	                    0,
+	                ),
+	                "qdt_live_output_schema_rejected_count": qdt_evidence.get(
+	                    "qdt_live_output_schema_rejected_count",
+	                    0,
+	                ),
+	                "qdt_live_output_rejected_count": qdt_evidence.get(
+	                    "qdt_live_output_rejected_count",
+	                    0,
+	                ),
+	                "qdt_live_output_accepted_count": qdt_evidence.get(
+	                    "qdt_live_output_accepted_count",
+	                    0,
+	                ),
+	                "qdt_fixture_or_deterministic_count": qdt_evidence.get(
+	                    "qdt_fixture_or_deterministic_count",
+	                    0,
+	                ),
+	            },
+	        ),
         _criterion(
             "qdt_end_to_end_quality",
             bool(qdt_evidence.get("qdt_end_to_end_quality_ok", qdt_evidence.get("ok"))),
@@ -2709,6 +2764,7 @@ __all__ = [
     "build_recent_run_failure_taxonomy",
     "classify_qdt_runtime_state",
     "classify_recent_run_failure",
+    "qdt_runtime_counters",
     "build_current_audit_gap_summary",
     "build_real_runtime_canary_report",
     "phase9_leaf_retrieval_statuses",

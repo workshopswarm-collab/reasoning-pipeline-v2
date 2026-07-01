@@ -18,6 +18,7 @@ from predquant.ads_pipeline_runner import (
 )
 from predquant.ads_real_runtime_canary import (
     phase9_leaf_retrieval_statuses,
+    qdt_runtime_counters,
     summarize_retrieval_gap,
     summarize_retrieval_transport_diagnostics,
 )
@@ -50,6 +51,7 @@ WEAK_AMRG_STATUSES = {
 QDT_RUNTIME_STATE_LIVE_ACCEPTED = "live_qdt_call_executed_output_accepted"
 QDT_RUNTIME_STATE_LIVE_REJECTED = "live_qdt_call_executed_output_rejected"
 QDT_RUNTIME_STATE_DETERMINISTIC = "qdt_fixture_or_deterministic_path"
+QDT_ALERT_LIVE_OUTPUT_REJECTED = "live_qdt_output_rejected"
 RESEARCH_SUFFICIENCY_BLOCKED_CODES = {
     "research_sufficiency_not_certified",
     "retrieval_sufficiency_not_certified",
@@ -329,40 +331,40 @@ def _load_manifest_payload(manifest: dict[str, Any]) -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
-def _runtime_model_call_performed(runtime: dict[str, Any]) -> bool:
-    performed = runtime.get("model_call_performed")
-    if performed is not None:
-        return performed is True
-    return runtime.get("execution_status") in {
-        "succeeded",
-        "accepted",
-        "failed_schema_validation",
-        "failed_forbidden_output",
-        "failed_forbidden_output_after_repair",
+def _qdt_counter_result(qdt: dict[str, Any] | None) -> dict[str, Any] | None:
+    context = qdt.get("model_execution_context") if isinstance(qdt, dict) else {}
+    context = context if isinstance(context, dict) else {}
+    runtime_context = context.get("runtime") if isinstance(context.get("runtime"), dict) else {}
+    if not isinstance(qdt, dict):
+        return None
+    return {
+        "adapter_mode": qdt.get("adapter_mode"),
+        "runtime_call_ref": qdt.get("runtime_call_ref"),
+        "resolved_model_id": context.get("resolved_model_id"),
+        "model_call_performed": context.get(
+            "model_call_performed",
+            runtime_context.get("model_call_performed"),
+        ),
+        "model_executed": context.get("model_executed", runtime_context.get("model_executed")),
+        "execution_status": context.get("execution_status", runtime_context.get("execution_status")),
     }
 
 
-def _live_qdt_runtime_call_executed(runtime: dict[str, Any]) -> bool:
-    return (
-        runtime.get("resolved_model_id") == "gpt-5.5-high"
-        and runtime.get("mode") == "live"
-        and runtime.get("fixture_mode") is False
-        and _runtime_model_call_performed(runtime)
+def _qdt_runtime_counters(qdt: dict[str, Any] | None, runtimes: list[dict[str, Any]]) -> dict[str, int]:
+    qdt_result = _qdt_counter_result(qdt)
+    return qdt_runtime_counters(
+        {
+            "qdt_results": [qdt_result] if qdt_result else [],
+            "runtime_results": [runtime for runtime in runtimes if isinstance(runtime, dict)],
+        }
     )
 
 
-def _qdt_runtime_state(qdt: dict[str, Any] | None, runtime: dict[str, Any] | None) -> str:
-    context = qdt.get("model_execution_context") if isinstance(qdt, dict) else {}
-    context = context if isinstance(context, dict) else {}
-    accepted_live_qdt = (
-        isinstance(qdt, dict)
-        and qdt.get("adapter_mode") == "decomposer_model_runtime_live"
-        and bool(qdt.get("runtime_call_ref"))
-        and context.get("resolved_model_id") == "gpt-5.5-high"
-    )
-    if accepted_live_qdt:
+def _qdt_runtime_state(qdt: dict[str, Any] | None, runtimes: list[dict[str, Any]]) -> str:
+    counters = _qdt_runtime_counters(qdt, runtimes)
+    if counters["qdt_live_output_accepted_count"]:
         return QDT_RUNTIME_STATE_LIVE_ACCEPTED
-    if isinstance(runtime, dict) and _live_qdt_runtime_call_executed(runtime):
+    if counters["qdt_live_model_call_executed_count"]:
         return QDT_RUNTIME_STATE_LIVE_REJECTED
     return QDT_RUNTIME_STATE_DETERMINISTIC
 
@@ -511,10 +513,10 @@ def _qdt_summary(manifests: list[dict[str, Any]]) -> dict[str, Any]:
     qdt_manifest = next((m for m in manifests if m.get("artifact_type") == "question-decomposition"), None)
     qdt = _load_manifest_payload(qdt_manifest) if qdt_manifest else None
     runtime_manifests = [m for m in manifests if m.get("artifact_type") == "model-runtime-call"]
-    runtime_payloads = {
-        str((_load_manifest_payload(m) or {}).get("runtime_call_id")): (_load_manifest_payload(m) or {})
-        for m in runtime_manifests
-    }
+    runtime_payloads = {}
+    for manifest in runtime_manifests:
+        payload = _load_manifest_payload(manifest) or {}
+        runtime_payloads[str(payload.get("runtime_call_id"))] = payload
     leaf_ids = []
     coverage_dimensions = []
     required_coverage_dimensions = []
@@ -559,6 +561,7 @@ def _qdt_summary(manifests: list[dict[str, Any]]) -> dict[str, Any]:
     runtime = runtime_payloads.get(str((qdt or {}).get("runtime_call_ref")))
     if runtime is None and runtime_payloads:
         runtime = next(iter(runtime_payloads.values()))
+    qdt_counters = _qdt_runtime_counters(qdt, list(runtime_payloads.values()))
     model_executed = bool(
         runtime
         and runtime.get("resolved_model_id") == "gpt-5.5-high"
@@ -576,7 +579,8 @@ def _qdt_summary(manifests: list[dict[str, Any]]) -> dict[str, Any]:
         "model_call_performed": runtime.get("model_call_performed") if isinstance(runtime, dict) else None,
         "execution_status": runtime.get("execution_status") if isinstance(runtime, dict) else None,
         "runtime_reason_codes": _as_list(runtime.get("runtime_reason_codes")) if isinstance(runtime, dict) else [],
-        "qdt_runtime_state": _qdt_runtime_state(qdt, runtime),
+        "qdt_runtime_state": _qdt_runtime_state(qdt, list(runtime_payloads.values())),
+        **qdt_counters,
         "leaf_count": len(leaf_ids),
         "generic_leaf_ids_present": generic_leaf_ids,
         "question_specific": bool(leaf_ids) and not generic_leaf_ids,
@@ -1221,19 +1225,32 @@ def _build_alerts(
             "dispatch_id": case.get("dispatch_id"),
         }
         qdt = case.get("qdt_model_provenance") or {}
-        if run_kind == "true_production" and qdt.get("qdt_runtime_state") == QDT_RUNTIME_STATE_LIVE_REJECTED:
+        live_output_rejected = (
+            (
+                qdt.get("qdt_live_output_accepted_count", 0) == 0
+                and (
+                    qdt.get("qdt_live_output_schema_rejected_count", 0) > 0
+                    or qdt.get("qdt_live_output_rejected_count", 0) > 0
+                )
+            )
+            or qdt.get("qdt_runtime_state") == QDT_RUNTIME_STATE_LIVE_REJECTED
+        )
+        deterministic_or_fixture_qdt = (
+            qdt.get("qdt_fixture_or_deterministic_count", 0) > 0
+            or qdt.get("adapter_mode") in PILOT_QDT_ADAPTER_MODES
+            or qdt.get("runtime_mode") == "fixture"
+            or qdt.get("fixture_mode") is True
+        )
+        if run_kind == "true_production" and live_output_rejected:
             alerts.append(_alert(
                 "blocker",
-                QDT_RUNTIME_STATE_LIVE_REJECTED,
+                QDT_ALERT_LIVE_OUTPUT_REJECTED,
                 "Live QDT model call executed, but no accepted QDT artifact was persisted.",
                 refs=[qdt.get("artifact_id")] if qdt.get("artifact_id") else [],
                 remediation="Repair the Decomposer live-output schema/semantic contract before retrieval.",
                 **refs,
             ))
-        if run_kind == "true_production" and (
-            qdt.get("adapter_mode") in PILOT_QDT_ADAPTER_MODES
-            or qdt.get("model_executed") is False
-        ) and qdt.get("qdt_runtime_state") != QDT_RUNTIME_STATE_LIVE_REJECTED:
+        if run_kind == "true_production" and deterministic_or_fixture_qdt and not live_output_rejected:
             alerts.append(_alert(
                 "blocker",
                 "true_production_deterministic_qdt",

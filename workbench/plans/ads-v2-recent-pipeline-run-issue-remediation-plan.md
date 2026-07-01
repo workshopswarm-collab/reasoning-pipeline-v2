@@ -482,7 +482,7 @@ Completion note, 2026-07-01:
 
 ## Phase 4 - Runtime Reporting And Operator Review Accuracy
 
-Status: planned
+Status: completed 2026-07-01
 
 Goal: make reports accurately distinguish live model execution, output rejection, deterministic/fixture fallback, and accepted QDT artifacts.
 
@@ -556,11 +556,19 @@ Success criteria:
 
 Checklist:
 
-- [ ] Runtime counters added.
-- [ ] Operator alert split implemented.
-- [ ] Regression tests cover live-rejected and deterministic paths.
-- [ ] Readiness behavior unchanged.
-- [ ] Temp artifacts and one-off scripts removed.
+- [x] Runtime counters added.
+- [x] Operator alert split implemented.
+- [x] Regression tests cover live-rejected and deterministic paths.
+- [x] Readiness behavior unchanged.
+- [x] Temp artifacts and one-off scripts removed.
+
+Completion note, 2026-07-01:
+
+- Added shared QDT runtime counters for attempted live calls, executed live calls, schema-rejected live outputs, accepted live outputs, total live-output rejections, and fixture/deterministic QDT artifacts.
+- Real-runtime canary taxonomy, model-runtime evidence, and gate details now expose the same attempted/executed/rejected/accepted counter vocabulary while preserving the existing readiness block when no accepted live QDT artifact exists.
+- Operator review now emits `live_qdt_output_rejected` for true-production live QDT schema/semantic rejection and reserves `true_production_deterministic_qdt` for actual deterministic/fixture QDT paths.
+- Regression coverage now asserts live-rejected, live-accepted, and deterministic/fixture QDT counter behavior plus the operator alert split.
+- Verification passed: `python3 -m unittest scripts.tests.test_ads_real_runtime_canary`, `python3 -m unittest scripts.tests.test_ads_operator_review`, `python3 -m unittest scripts.tests.test_ads_live_readiness`, `python3 -m unittest scripts.tests.test_ads_operational_canary`, and `git diff --check`.
 
 ## Phase 5 - Retrieval Meaningful Evidence, Claim Families, And Freshness Certification
 

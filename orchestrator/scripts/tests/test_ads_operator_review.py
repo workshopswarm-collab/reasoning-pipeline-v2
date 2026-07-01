@@ -188,6 +188,45 @@ class AdsOperatorReviewTest(unittest.TestCase):
         self.assertIn("timing_deadline_constraints", summary["required_coverage_dimensions"])
         self.assertIn("timing_deadline_constraints", summary["missing_coverage_dimensions"])
 
+    def test_qdt_summary_counts_live_rejected_runtime_without_accepted_artifact(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            runtime_path = Path(tempdir) / "qdt-runtime-rejected.json"
+            runtime_path.write_text(
+                json.dumps(
+                    {
+                        "runtime_call_id": "runtime-call:qdt",
+                        "resolved_model_id": "gpt-5.5-high",
+                        "mode": "live",
+                        "fixture_mode": False,
+                        "model_call_performed": True,
+                        "model_executed": False,
+                        "execution_status": "failed_schema_validation",
+                        "runtime_reason_codes": ["invalid_leaf_purpose"],
+                    },
+                    sort_keys=True,
+                ),
+                encoding="utf-8",
+            )
+
+            summary = _qdt_summary(
+                [
+                    {
+                        "stage": "decomposition",
+                        "artifact_id": "runtime-manifest:1",
+                        "artifact_type": "model-runtime-call",
+                        "artifact_path": str(runtime_path),
+                    }
+                ]
+            )
+
+        self.assertEqual(summary["qdt_runtime_state"], "live_qdt_call_executed_output_rejected")
+        self.assertEqual(summary["qdt_live_model_call_attempted_count"], 1)
+        self.assertEqual(summary["qdt_live_model_call_executed_count"], 1)
+        self.assertEqual(summary["qdt_live_output_schema_rejected_count"], 1)
+        self.assertEqual(summary["qdt_live_output_rejected_count"], 1)
+        self.assertEqual(summary["qdt_live_output_accepted_count"], 0)
+        self.assertEqual(summary["qdt_fixture_or_deterministic_count"], 0)
+
     def test_operator_alert_distinguishes_live_qdt_rejected_from_deterministic_path(self):
         alerts = self._true_production_alerts_for_run(
             {
@@ -198,14 +237,43 @@ class AdsOperatorReviewTest(unittest.TestCase):
                 "artifact_id": None,
                 "model_executed": False,
                 "qdt_runtime_state": "live_qdt_call_executed_output_rejected",
+                "qdt_live_model_call_attempted_count": 1,
+                "qdt_live_model_call_executed_count": 1,
+                "qdt_live_output_schema_rejected_count": 1,
+                "qdt_live_output_rejected_count": 1,
+                "qdt_live_output_accepted_count": 0,
+                "qdt_fixture_or_deterministic_count": 0,
                 "execution_status": "failed_schema_validation",
             },
         )
 
         by_code = {alert["code"]: alert for alert in alerts}
-        self.assertIn("live_qdt_call_executed_output_rejected", by_code)
+        self.assertIn("live_qdt_output_rejected", by_code)
         self.assertNotIn("true_production_deterministic_qdt", by_code)
-        self.assertIn("schema/semantic contract", by_code["live_qdt_call_executed_output_rejected"]["remediation"])
+        self.assertIn("schema/semantic contract", by_code["live_qdt_output_rejected"]["remediation"])
+
+        deterministic_alerts = self._true_production_alerts_for_run(
+            {
+                "runner_mode": "calibration_debt_production",
+                "metadata": {"handler_factory": "predquant.ads_production_handlers"},
+            },
+            qdt_model_provenance={
+                "artifact_id": "qdt-manifest:deterministic",
+                "adapter_mode": "deterministic_decomposer_contract_adapter",
+                "model_executed": False,
+                "qdt_runtime_state": "qdt_fixture_or_deterministic_path",
+                "qdt_live_model_call_attempted_count": 0,
+                "qdt_live_model_call_executed_count": 0,
+                "qdt_live_output_schema_rejected_count": 0,
+                "qdt_live_output_rejected_count": 0,
+                "qdt_live_output_accepted_count": 0,
+                "qdt_fixture_or_deterministic_count": 1,
+            },
+        )
+
+        deterministic_by_code = {alert["code"]: alert for alert in deterministic_alerts}
+        self.assertIn("true_production_deterministic_qdt", deterministic_by_code)
+        self.assertNotIn("live_qdt_output_rejected", deterministic_by_code)
 
     def test_true_production_non_scoreable_alerts_are_warnings(self):
         alerts = self._true_production_alerts_for_run(
