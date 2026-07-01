@@ -1026,7 +1026,7 @@ Completion note:
 
 ## Phase 10 - Representative Clone Batch And Closure
 
-Status: planned
+Status: completed 2026-07-01
 
 Goal: prove the intended current ADS v2 shape across representative clone-only cases after the intelligence-layer fixes.
 
@@ -1112,15 +1112,24 @@ Success criteria:
 
 Checklist:
 
-- [ ] Full decomposer suite passes.
-- [ ] Full researcher-swarm suite passes.
-- [ ] SCAE suite passes.
-- [ ] Full orchestrator suite passes.
-- [ ] Authority/script/canonical checks pass.
-- [ ] Representative clone batch has at least one `scoreable_success`.
-- [ ] Zero unexpected failures.
-- [ ] Live-readiness status is honest.
-- [ ] Temp artifacts and one-off scripts removed.
+- [x] Full decomposer suite passes.
+- [x] Full researcher-swarm suite passes.
+- [x] SCAE suite passes.
+- [x] Full orchestrator suite passes.
+- [x] Authority/script/canonical checks pass.
+- [x] Representative clone batch has at least one `scoreable_success`.
+- [x] Zero unexpected failures.
+- [x] Live-readiness status is honest.
+- [x] Temp artifacts and one-off scripts removed.
+
+Completion note:
+
+- Verification passed: full decomposer discovery (`113 tests OK`), full researcher-swarm discovery (`252 tests OK`), SCAE discovery (`109 tests OK`), full orchestrator discovery (`323 tests OK`), focused operational canary discovery (`29 tests OK`), `check_ads_non_scae_authority.py`, `check_ads_script_placement.py`, `check_ads_canonical_artifacts.py`, Phase 9 representative batch CLI help, current-audit closure CLI help, and `git diff --check`.
+- Representative clone batch passed with four isolated cloned DB cases and no live DB mutation. Batch summary: `case_count=4`, `scoreable_success_count=1`, `unexpected_failure_count=0`, `clone_only_case_count=4`, `missing_representative_tags=[]`, and classifications `{"scoreable_success": 1, "structured_non_scoreable_insufficiency": 3}`.
+- Batch run ids: BOI rate-decrease scoreable case `ads-pipeline-run:2c7a7147dc183ec796c10cf0ed2b06be8fc4732b85b17d83ecaef942b872c8ee`; RBNZ OCR increase blocked case `ads-pipeline-run:93e377556e9775a5357a726140119b6f10ea470198225513ff5889922438bf5e`; protected-primary binary blocked case `ads-pipeline-run:2536554ea40398f08f7eedbffc370bcb2793f8796d2545a81a03d0a828710b23`; BOI no-change sibling blocked case `ads-pipeline-run:38fd24f0b06d942a32334f85d37ce09a36e2915b89364e08a4620c470c08b422`.
+- The scoreable BOI clone wrote exactly one market prediction inside the cloned DB, satisfied all Phase 9 scoreable runtime gates, resolved handoffs, bounded retries, and drained active work to `0/0`. The three blocked representative cases wrote zero market predictions, resolved handoffs, bounded retries, and drained active work to `0/0`.
+- Live-readiness remains honestly blocked rather than cutover-ready. A cloned scoreable readiness check using run `ads-pipeline-run:52aad3c628093fe67cf290102d6245c12830d3f082e386ac851fb0367ad2e60a` reported `status=blocked`, `true_runtime_cutover_status=blocked_missing_strict_canary`, and `true_runtime_cutover_ready=false`, with remaining blockers for strict true-runtime canary evidence, AMRG refresh status for promoted effects, CAL-001 calibration debt, and VM live-mutation authorization.
+- Closure report status was `implementation_ready_for_vm_review` with no implementation issues; remaining blockers are post-remediation cutover blockers rather than Phase 10 implementation failures. Temporary clone DBs, JSON reports, generated response files, and one-off artifacts were deleted.
 
 ## Cross-Phase Bug Accommodation Protocol
 
