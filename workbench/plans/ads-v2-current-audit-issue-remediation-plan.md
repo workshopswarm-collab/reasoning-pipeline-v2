@@ -1356,7 +1356,7 @@ Completion note, 2026-06-30:
 
 ## Phase 10 - Plan Closure And Next-State Decision
 
-Status: pending
+Status: complete
 
 Goal: decide whether ADS v2 current-audit remediation is complete, or document the next blocker with evidence.
 
@@ -1416,11 +1416,19 @@ Success criteria:
 
 Checklist:
 
-- [ ] All phase checklists evaluated.
-- [ ] Final readiness state recorded.
-- [ ] Remaining blockers listed, if any.
-- [ ] Workspace clean except intentional changes.
-- [ ] VM has a compact final summary.
+- [x] All phase checklists evaluated.
+- [x] Final readiness state recorded.
+- [x] Remaining blockers listed, if any.
+- [x] Workspace clean except intentional changes.
+- [x] VM has a compact final summary.
+
+Completion note, 2026-06-30:
+
+- Added `ads-current-audit-plan-closure/v1`, a machine-readable closure report that parses this plan, requires Phases 0-9 to be marked complete, requires the Phase 9 representative batch report to pass, and requires an ADS live-readiness report with honest CAL-001 representation.
+- Added `scripts/bin/report_ads_current_audit_plan_closure.py` so closure can be rerun from the plan, a saved Phase 9 aggregate report, and a saved live-readiness report. The report returns `implementation_ready_for_vm_review` when implementation proof is complete but live mutation has not been authorized.
+- Final readiness state: implementation is ready for VM review; true live cutover is not authorized and remains blocked unless live-readiness reports agree, CAL-001 clears honestly, and VM explicitly authorizes live DB mutation/cutover work.
+- Remaining blockers for live cutover: `vm_live_mutation_authorization_required`, strict current live-readiness evidence, and CAL-001 clearance before any live-mutation path is considered.
+- Verification passed: focused closure unit tests, closure CLI help, closure module/script/test `py_compile`, temp-DB live-readiness check that stayed blocked as expected, and no temp artifacts were retained.
 
 ## Cross-Phase Bug Accommodation Protocol
 
