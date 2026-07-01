@@ -2190,39 +2190,39 @@ def _build_runtime_criteria(
     expected_market_predictions = prediction_deltas.get("expected_market_predictions")
     non_executing_expected = expected_market_predictions == 0 and not require_scoreable_prediction
     return [
-	        _criterion(
-	            "qdt_model_executed",
-	            bool(qdt_evidence.get("ok")),
-	            required=require_qdt_model_executed,
-	            detail={
-	                "qdt_model_executed_count": qdt_evidence.get("qdt_model_executed_count", 0),
-	                "runtime_call_model_executed_count": qdt_evidence.get("runtime_call_model_executed_count", 0),
-	                "qdt_live_model_call_attempted_count": qdt_evidence.get(
-	                    "qdt_live_model_call_attempted_count",
-	                    0,
-	                ),
-	                "qdt_live_model_call_executed_count": qdt_evidence.get(
-	                    "qdt_live_model_call_executed_count",
-	                    0,
-	                ),
-	                "qdt_live_output_schema_rejected_count": qdt_evidence.get(
-	                    "qdt_live_output_schema_rejected_count",
-	                    0,
-	                ),
-	                "qdt_live_output_rejected_count": qdt_evidence.get(
-	                    "qdt_live_output_rejected_count",
-	                    0,
-	                ),
-	                "qdt_live_output_accepted_count": qdt_evidence.get(
-	                    "qdt_live_output_accepted_count",
-	                    0,
-	                ),
-	                "qdt_fixture_or_deterministic_count": qdt_evidence.get(
-	                    "qdt_fixture_or_deterministic_count",
-	                    0,
-	                ),
-	            },
-	        ),
+        _criterion(
+            "qdt_model_executed",
+            bool(qdt_evidence.get("ok")),
+            required=require_qdt_model_executed,
+            detail={
+                "qdt_model_executed_count": qdt_evidence.get("qdt_model_executed_count", 0),
+                "runtime_call_model_executed_count": qdt_evidence.get("runtime_call_model_executed_count", 0),
+                "qdt_live_model_call_attempted_count": qdt_evidence.get(
+                    "qdt_live_model_call_attempted_count",
+                    0,
+                ),
+                "qdt_live_model_call_executed_count": qdt_evidence.get(
+                    "qdt_live_model_call_executed_count",
+                    0,
+                ),
+                "qdt_live_output_schema_rejected_count": qdt_evidence.get(
+                    "qdt_live_output_schema_rejected_count",
+                    0,
+                ),
+                "qdt_live_output_rejected_count": qdt_evidence.get(
+                    "qdt_live_output_rejected_count",
+                    0,
+                ),
+                "qdt_live_output_accepted_count": qdt_evidence.get(
+                    "qdt_live_output_accepted_count",
+                    0,
+                ),
+                "qdt_fixture_or_deterministic_count": qdt_evidence.get(
+                    "qdt_fixture_or_deterministic_count",
+                    0,
+                ),
+            },
+        ),
         _criterion(
             "qdt_end_to_end_quality",
             bool(qdt_evidence.get("qdt_end_to_end_quality_ok", qdt_evidence.get("ok"))),
