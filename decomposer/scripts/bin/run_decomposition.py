@@ -31,13 +31,18 @@ from ads_decomposer.model_runtime import (  # noqa: E402
     prefixed_sha256,
 )
 from ads_decomposer.qdt import (  # noqa: E402
+    ALLOWED_ANSWERABILITY_STATUSES,
     ALLOWED_CONDITION_SCOPES,
+    ALLOWED_COVERAGE_DIMENSIONS,
+    ALLOWED_LEAF_TEMPORAL_ROLES,
     ALLOWED_PURPOSES,
     ALLOWED_RELATED_CONTEXT_USAGE_STATUS,
     ALLOWED_RESEARCH_PRIORITIES,
     COMPACT_DEFAULT_LEAF_BUDGET,
+    FORBIDDEN_LEAF_OUTPUTS,
     QUESTION_DECOMPOSITION_SCHEMA_VERSION,
     QDTError,
+    REQUIRED_LEAF_FIELDS,
     build_qdt_candidate,
     compute_qdt_quality_checks,
     dump_question_decomposition,
@@ -362,6 +367,71 @@ def _normalize_condition_scope(value: Any) -> str:
     return "unconditional"
 
 
+def _model_text_contains_analyst_consensus(value: Any) -> bool:
+    text = _normalized_token(value).replace("_", " ")
+    return bool(
+        ("analyst" in text and "consensus" in text)
+        or ("analyst" in text and "expectation" in text)
+        or ("economist" in text and "consensus" in text)
+        or ("survey" in text and "expectation" in text)
+    )
+
+
+def _leaf_looks_like_analyst_consensus(leaf: dict[str, Any]) -> bool:
+    return any(
+        _model_text_contains_analyst_consensus(leaf.get(field))
+        for field in (
+            "question_text",
+            "leaf_question",
+            "research_factor",
+            "coverage_dimension",
+            "purpose",
+            "required_evidence_fields",
+            "market_component_terms",
+        )
+    )
+
+
+def _normalize_temporal_role(value: Any) -> str:
+    token = _normalized_token(value)
+    if token in ALLOWED_LEAF_TEMPORAL_ROLES:
+        return token
+    if "terminal" in token or "settlement" in token or "final_result" in token:
+        return "terminal_verification"
+    if "mechanic" in token or "rule" in token:
+        return "resolution_mechanics"
+    if "current" in token or "status" in token:
+        return "current_status"
+    if "unknown" in token or "missing" in token:
+        return "material_unknown"
+    return "pre_resolution_forecast_driver"
+
+
+def build_qdt_schema_crib() -> dict[str, Any]:
+    return {
+        "schema_version": "decomposer-qdt-schema-crib/v1",
+        "output_schema_version": QUESTION_DECOMPOSITION_SCHEMA_VERSION,
+        "allowed_purposes": sorted(ALLOWED_PURPOSES),
+        "allowed_required_evidence_purposes": sorted(ALLOWED_PURPOSES),
+        "allowed_leaf_condition_scopes": sorted(ALLOWED_CONDITION_SCOPES),
+        "allowed_leaf_temporal_roles": sorted(ALLOWED_LEAF_TEMPORAL_ROLES),
+        "allowed_answerability_statuses": sorted(ALLOWED_ANSWERABILITY_STATUSES),
+        "allowed_coverage_dimensions": sorted(ALLOWED_COVERAGE_DIMENSIONS),
+        "allowed_research_priorities": sorted(ALLOWED_RESEARCH_PRIORITIES),
+        "required_leaf_fields": sorted(REQUIRED_LEAF_FIELDS),
+        "required_leaf_structural_validation_fields": ["answerability_status", "depth"],
+        "forbidden_leaf_outputs": sorted(FORBIDDEN_LEAF_OUTPUTS),
+        "terminal_verification_rule": (
+            "Post-resolution official-result checks must use leaf_temporal_role=terminal_verification "
+            "and must not be included in dispatchable_pre_resolution_leaf_ids for unresolved markets."
+        ),
+        "analyst_consensus_rule": (
+            "Analyst or economist consensus expectation leaves for unresolved markets are "
+            "pre_resolution_forecast_driver or source_quality leaves, not resolution_mechanics leaves."
+        ),
+    }
+
+
 def _compact_reason_codes(value: Any, fallback: str) -> list[str]:
     if isinstance(value, list):
         codes = []
@@ -423,6 +493,13 @@ def _ensure_model_candidate_contract_shape(repaired: dict[str, Any]) -> dict[str
         membership.setdefault(parent_id, []).append(leaf_id)
         purpose = _normalize_purpose(leaf.get("purpose"))
         leaf["purpose"] = purpose
+        if _leaf_looks_like_analyst_consensus(leaf):
+            leaf["purpose"] = "direct_evidence"
+            leaf["coverage_dimension"] = "source_quality"
+            leaf["leaf_temporal_role"] = "pre_resolution_forecast_driver"
+        else:
+            leaf["leaf_temporal_role"] = _normalize_temporal_role(leaf.get("leaf_temporal_role"))
+        purpose = str(leaf["purpose"])
         leaf_purposes_by_branch.setdefault(parent_id, set()).add(purpose)
         legacy_weighting = leaf.pop("bayesian_weighting", None)
         priority = leaf.get("research_priority")
@@ -439,6 +516,8 @@ def _ensure_model_candidate_contract_shape(repaired: dict[str, Any]) -> dict[str
         leaf["leaf_condition_scope"] = _normalize_condition_scope(leaf.get("leaf_condition_scope"))
         if not isinstance(leaf.get("required_evidence_fields"), list) or not leaf["required_evidence_fields"]:
             leaf["required_evidence_fields"] = [f"{purpose}_status"]
+        if not isinstance(leaf.get("research_sufficiency_requirements"), dict):
+            leaf.pop("research_sufficiency_requirements", None)
         if not isinstance(leaf.get("market_component_terms"), list):
             leaf["market_component_terms"] = []
         if not isinstance(leaf.get("amrg_usage_refs"), list):
@@ -798,6 +877,7 @@ def build_decomposition_prompt_payload(
         case_payload=case_payload,
         evidence_payload=evidence_payload,
     )
+    qdt_schema_crib = build_qdt_schema_crib()
     pre_resolution_instruction = (
         "If market_temporal_state is unresolved, prioritize pre-resolution forecast research. "
         "Ask what current evidence, drivers, blockers, source quality, timing constraints, "
@@ -809,6 +889,7 @@ def build_decomposition_prompt_payload(
     return {
         "prompt_schema_version": "decomposer-qdt-prompt-input/v1",
         "prompt_template_id": handoff["model_execution_context"]["prompt_template_id"],
+        "qdt_schema_crib": qdt_schema_crib,
         "macro_question": handoff["macro_question"],
         "market_temporal_state": market_temporal_state,
         "source_cutoff_timestamp": source_cutoff_timestamp,
@@ -894,6 +975,15 @@ def build_decomposition_prompt_payload(
                     "or negative-market YES/NO semantics."
                 ),
             },
+            {
+                "block_id": "qdt_schema_crib_contract",
+                "text": (
+                    "Use qdt_schema_crib as the authoritative enum and required-field contract. "
+                    "Every leaf must include structural_validation.answerability_status. Branch "
+                    "required_evidence_purposes and leaf purpose values must come from "
+                    "qdt_schema_crib.allowed_purposes."
+                ),
+            },
         ],
         "instructions": {
             "output": "depth_2_research_coverage_decomposition_branches_and_leaves",
@@ -945,6 +1035,13 @@ def build_decomposition_prompt_payload(
                 "leaf_condition_scope",
                 "required_evidence_fields",
             ],
+            "schema_crib_ref": "qdt_schema_crib",
+            "required_leaf_structural_validation_fields": qdt_schema_crib[
+                "required_leaf_structural_validation_fields"
+            ],
+            "allowed_leaf_temporal_roles": qdt_schema_crib["allowed_leaf_temporal_roles"],
+            "allowed_leaf_condition_scopes": qdt_schema_crib["allowed_leaf_condition_scopes"],
+            "allowed_purposes": qdt_schema_crib["allowed_purposes"],
             "amrg_allowed_uses": [
                 "context_leaf",
                 "retrieval_hint",

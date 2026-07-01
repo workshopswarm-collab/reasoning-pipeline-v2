@@ -513,7 +513,7 @@ def _openclaw_agent_prompt(request_payload: dict[str, Any]) -> str:
                     "overlap_risk_with_leaf_ids": [],
                     "missingness_interpretation": "unanswered_material_question_or_structural_unanswerability_candidate",
                     "forbidden_outputs": ["probability", "fair_value", "final_forecast"],
-                    "structural_validation": {"depth": 2},
+                    "structural_validation": {"depth": 2, "answerability_status": "answerable"},
                 }
             ],
             "related_market_context_usage": {
@@ -559,7 +559,11 @@ def _openclaw_agent_prompt(request_payload: dict[str, Any]) -> str:
         "overlap groups, terminal verification leaves, and dispatchable "
         "pre-resolution leaves. Treat weak AMRG context as diagnostic context only; "
         "do not use it for QDT selection, QDT repair, probability authority, SCAE "
-        "delta, or forecast writes unless a strict anchor dependency is validated.\n\n"
+        "delta, or forecast writes unless a strict anchor dependency is validated. "
+        "If the runtime request includes qdt_schema_crib, treat it as authoritative: "
+        "use only its allowed enum values, include structural_validation.answerability_status "
+        "on every leaf, and keep terminal_verification leaves out of dispatchable "
+        "pre-resolution leaf IDs for unresolved markets.\n\n"
         "Required response skeleton:\n"
         + canonical_json(compact_candidate_schema)
         + "\n\n"

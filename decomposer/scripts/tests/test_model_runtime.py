@@ -177,6 +177,17 @@ class ModelRuntimeContractTest(unittest.TestCase):
                 "request_payload": {
                     "macro_question": "Will Victor Marx win the 2026 Colorado primary?",
                     "market_temporal_state": "unresolved",
+                    "qdt_schema_crib": {
+                        "allowed_purposes": ["direct_evidence", "source_of_truth"],
+                        "allowed_leaf_temporal_roles": [
+                            "pre_resolution_forecast_driver",
+                            "terminal_verification",
+                        ],
+                        "required_leaf_structural_validation_fields": [
+                            "answerability_status",
+                            "depth",
+                        ],
+                    },
                 },
             }
         )
@@ -186,6 +197,9 @@ class ModelRuntimeContractTest(unittest.TestCase):
         self.assertIn("dispatchable pre-resolution", prompt)
         self.assertIn("classification targets", prompt)
         self.assertIn("leaf_temporal_role", prompt)
+        self.assertIn("qdt_schema_crib", prompt)
+        self.assertIn("allowed_purposes", prompt)
+        self.assertIn("answerability_status", prompt)
         self.assertIn("weak AMRG context", prompt)
         self.assertIn("gpt-5.5-high", prompt)
 

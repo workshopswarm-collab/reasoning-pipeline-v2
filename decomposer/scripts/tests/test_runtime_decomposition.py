@@ -24,11 +24,19 @@ from ads_decomposer.handoff import (  # noqa: E402
     DECOMPOSER_MODEL_LANE_ID,
     DECOMPOSER_PROMPT_TEMPLATE_ID,
 )
-from ads_decomposer.qdt import validate_question_decomposition  # noqa: E402
+from ads_decomposer.qdt import (  # noqa: E402
+    ALLOWED_ANSWERABILITY_STATUSES,
+    ALLOWED_CONDITION_SCOPES,
+    ALLOWED_LEAF_TEMPORAL_ROLES,
+    ALLOWED_PURPOSES,
+    REQUIRED_LEAF_FIELDS,
+    validate_question_decomposition,
+)
 from run_decomposition import (  # noqa: E402
     build_decomposition_prompt_payload,
     build_question_decomposition_from_handoff,
     build_question_specific_fixture_response,
+    build_qdt_schema_crib,
 )
 
 
@@ -149,6 +157,23 @@ class RuntimeDecompositionEntrypointTest(unittest.TestCase):
                 "dispatchable_pre_resolution_leaf_ids",
             ],
         )
+
+    def test_prompt_payload_embeds_validator_schema_crib(self) -> None:
+        payload = build_decomposition_prompt_payload(self._handoff(), payloads={})
+        crib = payload["qdt_schema_crib"]
+        direct_crib = build_qdt_schema_crib()
+        block_ids = {block["block_id"] for block in payload["instruction_blocks"]}
+
+        self.assertEqual(crib, direct_crib)
+        self.assertEqual(crib["allowed_purposes"], sorted(ALLOWED_PURPOSES))
+        self.assertEqual(crib["allowed_required_evidence_purposes"], sorted(ALLOWED_PURPOSES))
+        self.assertEqual(crib["allowed_leaf_condition_scopes"], sorted(ALLOWED_CONDITION_SCOPES))
+        self.assertEqual(crib["allowed_leaf_temporal_roles"], sorted(ALLOWED_LEAF_TEMPORAL_ROLES))
+        self.assertEqual(crib["allowed_answerability_statuses"], sorted(ALLOWED_ANSWERABILITY_STATUSES))
+        self.assertEqual(crib["required_leaf_fields"], sorted(REQUIRED_LEAF_FIELDS))
+        self.assertIn("answerability_status", crib["required_leaf_structural_validation_fields"])
+        self.assertIn("qdt_schema_crib_contract", block_ids)
+        self.assertEqual(payload["instructions"]["schema_crib_ref"], "qdt_schema_crib")
 
     def test_live_transport_builds_question_specific_qdt_without_fixture_mode(self) -> None:
         handoff = self._handoff()
@@ -332,6 +357,8 @@ class RuntimeDecompositionEntrypointTest(unittest.TestCase):
         repairable["required_leaf_questions"][1]["purpose"] = "candidate_status"
         repairable["required_leaf_questions"][1]["leaf_condition_scope"] = "if_candidate_files"
         repairable["required_leaf_questions"][1]["structural_validation"].pop("answerability_status")
+        for leaf in repairable["required_leaf_questions"]:
+            leaf["research_sufficiency_requirements"] = ["model emitted a list instead of the contract object"]
 
         qdt, runtime = build_question_decomposition_from_handoff(
             handoff,
@@ -350,6 +377,74 @@ class RuntimeDecompositionEntrypointTest(unittest.TestCase):
                 for leaf in qdt["required_leaf_questions"]
             )
         )
+
+    def test_boi_recent_schema_drift_fixture_repairs_to_contract(self) -> None:
+        handoff = self._handoff()
+        handoff["case_id"] = "case-boi-runtime"
+        handoff["case_key"] = "polymarket:boi-2026"
+        handoff["macro_question"] = "Will the BOI candidate formally file before the market deadline?"
+        repairable = build_question_specific_fixture_response(handoff)
+        repairable["branches"][0]["required_evidence_purposes"] = [
+            "official_resolution",
+            "candidate_status",
+        ]
+        repairable["required_leaf_questions"][0]["purpose"] = "official_resolution"
+        repairable["required_leaf_questions"][0]["structural_validation"].pop("answerability_status")
+        repairable["required_leaf_questions"][1]["purpose"] = "candidate_status"
+        repairable["required_leaf_questions"][1]["leaf_condition_scope"] = "if_candidate_files"
+        repairable["required_leaf_questions"][1]["structural_validation"].pop("answerability_status")
+
+        qdt, runtime = build_question_decomposition_from_handoff(
+            handoff,
+            runtime_mode="fixture",
+            fixture_response=repairable,
+        )
+
+        self.assertTrue(validate_question_decomposition(qdt).valid)
+        self.assertEqual(runtime["repair_count"], 1)
+        self.assertTrue(
+            set(qdt["branches"][0]["required_evidence_purposes"]).issubset(ALLOWED_PURPOSES)
+        )
+        for leaf in qdt["required_leaf_questions"]:
+            self.assertIn(leaf["purpose"], ALLOWED_PURPOSES)
+            self.assertIn(leaf["leaf_condition_scope"], ALLOWED_CONDITION_SCOPES)
+            self.assertIn(
+                leaf["structural_validation"]["answerability_status"],
+                ALLOWED_ANSWERABILITY_STATUSES,
+            )
+            self.assertIsInstance(leaf["research_sufficiency_requirements"], dict)
+
+    def test_rbnz_analyst_consensus_temporal_role_fixture_repairs_to_source_quality(self) -> None:
+        handoff = self._handoff()
+        handoff["case_id"] = "case-rbnz-runtime"
+        handoff["case_key"] = "polymarket:rbnz-july-ocr"
+        handoff["macro_question"] = "Will the RBNZ cut the OCR at the July 2026 meeting?"
+        repairable = build_question_specific_fixture_response(handoff)
+        leaf = repairable["required_leaf_questions"][0]
+        question = (
+            "What is the analyst consensus or economist survey expectation for the "
+            "RBNZ July OCR decision before cutoff?"
+        )
+        leaf["question_text"] = question
+        leaf["leaf_question"] = question
+        leaf["purpose"] = "resolution_mechanics"
+        leaf["coverage_dimension"] = "resolution_mechanics"
+        leaf["leaf_temporal_role"] = "resolution_mechanics"
+        leaf["required_evidence_fields"] = ["analyst_consensus", "economist_survey_expectation"]
+        leaf.pop("research_sufficiency_requirements", None)
+
+        qdt, runtime = build_question_decomposition_from_handoff(
+            handoff,
+            runtime_mode="fixture",
+            fixture_response=repairable,
+        )
+
+        repaired_leaf = next(item for item in qdt["required_leaf_questions"] if item["leaf_id"] == leaf["leaf_id"])
+        self.assertTrue(validate_question_decomposition(qdt).valid)
+        self.assertEqual(runtime["repair_count"], 1)
+        self.assertEqual(repaired_leaf["purpose"], "direct_evidence")
+        self.assertEqual(repaired_leaf["coverage_dimension"], "source_quality")
+        self.assertEqual(repaired_leaf["leaf_temporal_role"], "pre_resolution_forecast_driver")
 
     def test_invalid_related_context_usage_status_falls_back_to_handoff(self) -> None:
         handoff = self._handoff()

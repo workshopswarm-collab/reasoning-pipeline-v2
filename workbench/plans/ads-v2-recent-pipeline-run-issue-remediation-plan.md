@@ -206,7 +206,7 @@ Completion note, 2026-07-01:
 
 ## Phase 1 - Live QDT Schema Contract Hardening
 
-Status: planned
+Status: completed 2026-07-01
 
 Goal: make live Decomposer outputs reliably conform to `question-decomposition/v1` without relaxing validation.
 
@@ -279,12 +279,20 @@ Success criteria:
 
 Checklist:
 
-- [ ] Prompt/runtime schema crib implemented.
-- [ ] BOI invalid enum/missing-field fixture covered.
-- [ ] RBNZ consensus-role fixture covered.
-- [ ] Full decomposer tests pass.
-- [ ] Clone proof no longer fails on basic QDT schema drift.
-- [ ] Temp artifacts and one-off scripts removed.
+- [x] Prompt/runtime schema crib implemented.
+- [x] BOI invalid enum/missing-field fixture covered.
+- [x] RBNZ consensus-role fixture covered.
+- [x] Full decomposer tests pass.
+- [x] Clone proof no longer fails on basic QDT schema drift.
+- [x] Temp artifacts and one-off scripts removed.
+
+Completion note, 2026-07-01:
+
+- Added `decomposer-qdt-schema-crib/v1`, generated from QDT validator constants, to the Decomposer prompt payload and live OpenClaw prompt contract.
+- Hardened mechanical live-output repair for purpose aliases, invalid condition scopes, invalid temporal roles, missing `structural_validation.answerability_status`, analyst-consensus role drift, and malformed `research_sufficiency_requirements` values while keeping forbidden-output scanning ahead of schema acceptance.
+- Added focused fixtures for BOI enum/missing-field drift, RBNZ analyst-consensus role drift, malformed sufficiency contracts, and prompt/schema-crib parity.
+- Clone proof run `ads-pipeline-run:7021276fdab6a019923947b8cba20eac0327f8b6adbc613e59b52ecf3cd5e7de` executed live QDT via OpenClaw, repaired once, passed forbidden-output scan, validated the output schema, and accepted the QDT. The clone-only canary completed all 13 stages, drained active work to 0/0, wrote zero market predictions, and reported remaining criteria failures at QDT end-to-end quality, retrieval live acceptance, and researcher runtime verification.
+- Verification passed: `python3 -m unittest scripts.tests.test_qdt`, `python3 -m unittest scripts.tests.test_model_runtime`, `python3 -m unittest scripts.tests.test_runtime_decomposition`, full decomposer discovery, `python3 -m unittest scripts.tests.test_ads_operational_canary`, temp-artifact cleanup check, and `git diff --check`.
 
 ## Phase 2 - QDT Repair Resilience And Semantic Failure Separation
 
