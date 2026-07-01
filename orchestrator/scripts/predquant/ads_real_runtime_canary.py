@@ -94,6 +94,15 @@ FORBIDDEN_QDT_KEY_FRAGMENTS = (
     "trade_decision",
     "final_forecast",
 )
+QDT_RUNTIME_STATE_LIVE_ACCEPTED = "live_qdt_call_executed_output_accepted"
+QDT_RUNTIME_STATE_LIVE_REJECTED = "live_qdt_call_executed_output_rejected"
+QDT_RUNTIME_STATE_DETERMINISTIC = "qdt_fixture_or_deterministic_path"
+RETRIEVAL_STATE_SOURCE_POPULATED_NOT_CERTIFIED = "retrieval_source_populated_but_not_certified"
+RETRIEVAL_STATE_CERTIFIED = "retrieval_certified"
+RETRIEVAL_STATE_NOT_SOURCE_POPULATED = "retrieval_not_source_populated"
+NATIVE_RESEARCH_STATE_EXECUTED_NO_CANDIDATES = "native_research_executed_no_candidates"
+NATIVE_RESEARCH_STATE_CANDIDATES_PRESENT = "native_research_candidate_urls_present"
+NATIVE_RESEARCH_STATE_NOT_EXECUTED_OR_USEFUL = "native_research_not_executed_or_useful"
 
 
 def _decode_json(value: Any, fallback: Any) -> Any:
@@ -426,6 +435,121 @@ def _qdt_end_to_end_quality(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _runtime_model_call_performed(runtime: dict[str, Any]) -> bool:
+    performed = runtime.get("model_call_performed")
+    if performed is not None:
+        return performed is True
+    return runtime.get("execution_status") in {
+        "succeeded",
+        "accepted",
+        "failed_schema_validation",
+        "failed_forbidden_output",
+        "failed_forbidden_output_after_repair",
+    }
+
+
+def _live_qdt_runtime_call_executed(runtime: dict[str, Any]) -> bool:
+    return (
+        runtime.get("resolved_model_id") == REQUIRED_RUNTIME_MODEL_ID
+        and runtime.get("mode") == "live"
+        and runtime.get("fixture_mode") is False
+        and _runtime_model_call_performed(runtime)
+    )
+
+
+def _accepted_live_qdt_result(qdt_result: dict[str, Any]) -> bool:
+    return (
+        qdt_result.get("adapter_mode") == "decomposer_model_runtime_live"
+        and qdt_result.get("runtime_call_ref") not in {None, ""}
+        and qdt_result.get("resolved_model_id") == REQUIRED_RUNTIME_MODEL_ID
+    )
+
+
+def classify_qdt_runtime_state(qdt_evidence: dict[str, Any]) -> str:
+    """Classify live QDT execution separately from accepted artifact persistence."""
+
+    qdt_results = _list_of_dicts(qdt_evidence.get("qdt_results"))
+    runtime_results = _list_of_dicts(qdt_evidence.get("runtime_results"))
+    if any(_accepted_live_qdt_result(result) for result in qdt_results):
+        return QDT_RUNTIME_STATE_LIVE_ACCEPTED
+    if any(_live_qdt_runtime_call_executed(result) for result in runtime_results):
+        return QDT_RUNTIME_STATE_LIVE_REJECTED
+    return QDT_RUNTIME_STATE_DETERMINISTIC
+
+
+def _runtime_reason_codes(qdt_evidence: dict[str, Any]) -> list[str]:
+    return sorted(
+        {
+            code
+            for runtime in _list_of_dicts(qdt_evidence.get("runtime_results"))
+            for code in _string_list(runtime.get("runtime_reason_codes"))
+        }
+    )
+
+
+def build_recent_run_failure_taxonomy(
+    *,
+    qdt_evidence: dict[str, Any],
+    retrieval_evidence: dict[str, Any],
+) -> dict[str, Any]:
+    qdt_runtime_state = classify_qdt_runtime_state(qdt_evidence)
+    source_populated_count = _int_value(retrieval_evidence.get("source_populated_count"))
+    native_model_executed_count = _int_value(retrieval_evidence.get("native_research_model_executed_count"))
+    native_candidate_url_count = _int_value(retrieval_evidence.get("native_candidate_url_count"))
+    if source_populated_count > 0 and not retrieval_evidence.get("live_acceptance_ok"):
+        retrieval_state = RETRIEVAL_STATE_SOURCE_POPULATED_NOT_CERTIFIED
+    elif retrieval_evidence.get("live_acceptance_ok"):
+        retrieval_state = RETRIEVAL_STATE_CERTIFIED
+    else:
+        retrieval_state = RETRIEVAL_STATE_NOT_SOURCE_POPULATED
+    if native_model_executed_count > 0 and native_candidate_url_count == 0:
+        native_state = NATIVE_RESEARCH_STATE_EXECUTED_NO_CANDIDATES
+    elif native_candidate_url_count > 0:
+        native_state = NATIVE_RESEARCH_STATE_CANDIDATES_PRESENT
+    else:
+        native_state = NATIVE_RESEARCH_STATE_NOT_EXECUTED_OR_USEFUL
+    live_executed_count = sum(
+        1 for runtime in _list_of_dicts(qdt_evidence.get("runtime_results"))
+        if _live_qdt_runtime_call_executed(runtime)
+    )
+    accepted_live_count = sum(
+        1 for result in _list_of_dicts(qdt_evidence.get("qdt_results"))
+        if _accepted_live_qdt_result(result)
+    )
+    return {
+        "schema_version": "ads-recent-run-failure-taxonomy/v1",
+        "qdt_runtime_state": qdt_runtime_state,
+        "qdt_live_model_call_executed_count": live_executed_count,
+        "qdt_live_output_accepted_count": accepted_live_count,
+        "qdt_live_output_rejected_count": max(0, live_executed_count - accepted_live_count),
+        "qdt_runtime_execution_statuses": sorted(
+            {
+                str(runtime.get("execution_status"))
+                for runtime in _list_of_dicts(qdt_evidence.get("runtime_results"))
+                if runtime.get("execution_status")
+            }
+        ),
+        "qdt_runtime_reason_codes": _runtime_reason_codes(qdt_evidence),
+        "retrieval_state": retrieval_state,
+        "source_populated_count": source_populated_count,
+        "retrieval_live_acceptance_ok": bool(retrieval_evidence.get("live_acceptance_ok")),
+        "native_state": native_state,
+        "native_research_model_executed_count": native_model_executed_count,
+        "native_candidate_url_count": native_candidate_url_count,
+    }
+
+
+def classify_recent_run_failure(report: dict[str, Any]) -> dict[str, Any]:
+    return build_recent_run_failure_taxonomy(
+        qdt_evidence=report.get("model_runtime_evidence") if isinstance(report.get("model_runtime_evidence"), dict) else {},
+        retrieval_evidence=(
+            report.get("retrieval_runtime_evidence")
+            if isinstance(report.get("retrieval_runtime_evidence"), dict)
+            else {}
+        ),
+    )
+
+
 def _model_runtime_evidence(manifests: list[dict[str, Any]]) -> dict[str, Any]:
     qdt_manifests = [item for item in manifests if item.get("artifact_type") == "question-decomposition"]
     runtime_manifests = [item for item in manifests if item.get("artifact_type") == "model-runtime-call"]
@@ -433,6 +557,16 @@ def _model_runtime_evidence(manifests: list[dict[str, Any]]) -> dict[str, Any]:
     runtime_results = []
     for manifest in qdt_manifests:
         payload = _load_manifest_payload(manifest) or {}
+        model_context = (
+            payload.get("model_execution_context")
+            if isinstance(payload.get("model_execution_context"), dict)
+            else {}
+        )
+        runtime_context = (
+            model_context.get("runtime")
+            if isinstance(model_context.get("runtime"), dict)
+            else {}
+        )
         leaf_ids = [
             str(leaf.get("leaf_id"))
             for leaf in payload.get("required_leaf_questions", [])
@@ -451,6 +585,13 @@ def _model_runtime_evidence(manifests: list[dict[str, Any]]) -> dict[str, Any]:
                 "artifact_id": manifest.get("artifact_id"),
                 "adapter_mode": payload.get("adapter_mode"),
                 "runtime_call_ref": payload.get("runtime_call_ref"),
+                "resolved_model_id": model_context.get("resolved_model_id"),
+                "model_call_performed": model_context.get(
+                    "model_call_performed",
+                    runtime_context.get("model_call_performed"),
+                ),
+                "model_executed": model_context.get("model_executed", runtime_context.get("model_executed")),
+                "execution_status": model_context.get("execution_status", runtime_context.get("execution_status")),
                 "leaf_count": len(leaf_ids),
                 "generic_leaf_ids_present": generic_leaf_ids,
                 "question_specific": question_specific,
@@ -478,6 +619,8 @@ def _model_runtime_evidence(manifests: list[dict[str, Any]]) -> dict[str, Any]:
                 "resolved_model_id": payload.get("resolved_model_id"),
                 "mode": payload.get("mode"),
                 "fixture_mode": payload.get("fixture_mode"),
+                "model_call_performed": payload.get("model_call_performed"),
+                "model_executed": payload.get("model_executed"),
                 "execution_status": payload.get("execution_status"),
                 "retry_count": _int_value(payload.get("retry_count")),
                 "transport_retry_policy": payload.get("transport_retry_policy")
@@ -529,6 +672,16 @@ def _model_runtime_evidence(manifests: list[dict[str, Any]]) -> dict[str, Any]:
         ),
         "runtime_call_count": len(runtime_results),
         "runtime_call_model_executed_count": sum(1 for item in runtime_results if item["ok"]),
+        "qdt_runtime_state": classify_qdt_runtime_state(
+            {"qdt_results": qdt_results, "runtime_results": runtime_results}
+        ),
+        "qdt_live_model_call_executed_count": sum(
+            1 for item in runtime_results if _live_qdt_runtime_call_executed(item)
+        ),
+        "qdt_live_output_accepted_count": sum(1 for item in qdt_results if _accepted_live_qdt_result(item)),
+        "qdt_runtime_reason_codes": _runtime_reason_codes(
+            {"qdt_results": qdt_results, "runtime_results": runtime_results}
+        ),
         "qdt_results": qdt_results,
         "runtime_results": runtime_results,
         "model_runtime_ok": model_runtime_ok,
@@ -1446,6 +1599,7 @@ def _retrieval_runtime_evidence(manifests: list[dict[str, Any]]) -> dict[str, An
         "search_candidates_materialized_count": sum(
             int(item["search_candidates_materialized_count"]) for item in retrieval_packets
         ),
+        "native_candidate_url_count": sum(int(item["native_candidate_url_count"]) for item in retrieval_packets),
         "search_call_count": sum(int(item["search_call_count"]) for item in retrieval_packets),
         "search_succeeded_count": sum(int(item["search_succeeded_count"]) for item in retrieval_packets),
         "search_failure_count": sum(int(item["search_failure_count"]) for item in retrieval_packets),
@@ -1702,6 +1856,10 @@ def build_current_audit_gap_summary(
                 )
     return {
         "schema_version": "ads-current-audit-gap-summary/v1",
+        "recent_run_failure_taxonomy": build_recent_run_failure_taxonomy(
+            qdt_evidence=qdt_evidence,
+            retrieval_evidence=retrieval_evidence,
+        ),
         "qdt_required_coverage_dimensions": required_dimensions,
         "qdt_observed_coverage_dimensions": observed_dimensions,
         "qdt_missing_coverage_dimensions": missing_dimensions,
@@ -2323,6 +2481,7 @@ def build_real_runtime_canary_report(
         "live_db_mutation": live_db_mutation,
         "clone_only": live_db_mutation == "clone_only",
         "retry_summary": retry_summary,
+        "recent_run_failure_taxonomy": current_audit_gap_summary["recent_run_failure_taxonomy"],
         "current_audit_gap_summary": current_audit_gap_summary,
         "phase9_representative_case": phase9_case,
         "active_work": active,
@@ -2546,6 +2705,9 @@ def _phase9_representative_case(
 __all__ = [
     "REAL_RUNTIME_CANARY_CRITERIA_SCHEMA_VERSION",
     "REAL_RUNTIME_CANARY_REPORT_SCHEMA_VERSION",
+    "build_recent_run_failure_taxonomy",
+    "classify_qdt_runtime_state",
+    "classify_recent_run_failure",
     "build_current_audit_gap_summary",
     "build_real_runtime_canary_report",
     "phase9_leaf_retrieval_statuses",

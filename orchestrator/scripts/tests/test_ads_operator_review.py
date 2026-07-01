@@ -188,6 +188,25 @@ class AdsOperatorReviewTest(unittest.TestCase):
         self.assertIn("timing_deadline_constraints", summary["required_coverage_dimensions"])
         self.assertIn("timing_deadline_constraints", summary["missing_coverage_dimensions"])
 
+    def test_operator_alert_distinguishes_live_qdt_rejected_from_deterministic_path(self):
+        alerts = self._true_production_alerts_for_run(
+            {
+                "runner_mode": "calibration_debt_production",
+                "metadata": {"handler_factory": "predquant.ads_production_handlers"},
+            },
+            qdt_model_provenance={
+                "artifact_id": None,
+                "model_executed": False,
+                "qdt_runtime_state": "live_qdt_call_executed_output_rejected",
+                "execution_status": "failed_schema_validation",
+            },
+        )
+
+        by_code = {alert["code"]: alert for alert in alerts}
+        self.assertIn("live_qdt_call_executed_output_rejected", by_code)
+        self.assertNotIn("true_production_deterministic_qdt", by_code)
+        self.assertIn("schema/semantic contract", by_code["live_qdt_call_executed_output_rejected"]["remediation"])
+
     def test_true_production_non_scoreable_alerts_are_warnings(self):
         alerts = self._true_production_alerts_for_run(
             {
@@ -397,7 +416,7 @@ class AdsOperatorReviewTest(unittest.TestCase):
             "blocker",
         )
 
-    def _true_production_alerts_for_run(self, run):
+    def _true_production_alerts_for_run(self, run, qdt_model_provenance=None):
         return _build_alerts(
             pipeline_run_id="ads-pipeline-run:test",
             run_kind="true_production",
@@ -412,7 +431,7 @@ class AdsOperatorReviewTest(unittest.TestCase):
                     "case_id": "case:test",
                     "case_key": "polymarket:test",
                     "dispatch_id": "dispatch:test",
-                    "qdt_model_provenance": {"model_executed": True},
+                    "qdt_model_provenance": qdt_model_provenance or {"model_executed": True},
                     "amrg_consumed_hints": [],
                     "retrieval_sufficiency": {
                         "artifact_id": "retrieval-manifest:1",

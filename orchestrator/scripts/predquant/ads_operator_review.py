@@ -47,6 +47,9 @@ WEAK_AMRG_STATUSES = {
     "timing_mismatch_weak_context_only",
     "model_assisted_weak_context_only",
 }
+QDT_RUNTIME_STATE_LIVE_ACCEPTED = "live_qdt_call_executed_output_accepted"
+QDT_RUNTIME_STATE_LIVE_REJECTED = "live_qdt_call_executed_output_rejected"
+QDT_RUNTIME_STATE_DETERMINISTIC = "qdt_fixture_or_deterministic_path"
 RESEARCH_SUFFICIENCY_BLOCKED_CODES = {
     "research_sufficiency_not_certified",
     "retrieval_sufficiency_not_certified",
@@ -326,6 +329,44 @@ def _load_manifest_payload(manifest: dict[str, Any]) -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
+def _runtime_model_call_performed(runtime: dict[str, Any]) -> bool:
+    performed = runtime.get("model_call_performed")
+    if performed is not None:
+        return performed is True
+    return runtime.get("execution_status") in {
+        "succeeded",
+        "accepted",
+        "failed_schema_validation",
+        "failed_forbidden_output",
+        "failed_forbidden_output_after_repair",
+    }
+
+
+def _live_qdt_runtime_call_executed(runtime: dict[str, Any]) -> bool:
+    return (
+        runtime.get("resolved_model_id") == "gpt-5.5-high"
+        and runtime.get("mode") == "live"
+        and runtime.get("fixture_mode") is False
+        and _runtime_model_call_performed(runtime)
+    )
+
+
+def _qdt_runtime_state(qdt: dict[str, Any] | None, runtime: dict[str, Any] | None) -> str:
+    context = qdt.get("model_execution_context") if isinstance(qdt, dict) else {}
+    context = context if isinstance(context, dict) else {}
+    accepted_live_qdt = (
+        isinstance(qdt, dict)
+        and qdt.get("adapter_mode") == "decomposer_model_runtime_live"
+        and bool(qdt.get("runtime_call_ref"))
+        and context.get("resolved_model_id") == "gpt-5.5-high"
+    )
+    if accepted_live_qdt:
+        return QDT_RUNTIME_STATE_LIVE_ACCEPTED
+    if isinstance(runtime, dict) and _live_qdt_runtime_call_executed(runtime):
+        return QDT_RUNTIME_STATE_LIVE_REJECTED
+    return QDT_RUNTIME_STATE_DETERMINISTIC
+
+
 def _latest_row_by_stage(manifests: list[dict[str, Any]], stage: str) -> dict[str, Any] | None:
     rows = [manifest for manifest in manifests if manifest.get("stage") == stage]
     return rows[-1] if rows else None
@@ -532,7 +573,10 @@ def _qdt_summary(manifests: list[dict[str, Any]]) -> dict[str, Any]:
         "resolved_model_id": runtime.get("resolved_model_id") if isinstance(runtime, dict) else None,
         "runtime_mode": runtime.get("mode") if isinstance(runtime, dict) else None,
         "fixture_mode": runtime.get("fixture_mode") if isinstance(runtime, dict) else None,
+        "model_call_performed": runtime.get("model_call_performed") if isinstance(runtime, dict) else None,
         "execution_status": runtime.get("execution_status") if isinstance(runtime, dict) else None,
+        "runtime_reason_codes": _as_list(runtime.get("runtime_reason_codes")) if isinstance(runtime, dict) else [],
+        "qdt_runtime_state": _qdt_runtime_state(qdt, runtime),
         "leaf_count": len(leaf_ids),
         "generic_leaf_ids_present": generic_leaf_ids,
         "question_specific": bool(leaf_ids) and not generic_leaf_ids,
@@ -1177,10 +1221,19 @@ def _build_alerts(
             "dispatch_id": case.get("dispatch_id"),
         }
         qdt = case.get("qdt_model_provenance") or {}
+        if run_kind == "true_production" and qdt.get("qdt_runtime_state") == QDT_RUNTIME_STATE_LIVE_REJECTED:
+            alerts.append(_alert(
+                "blocker",
+                QDT_RUNTIME_STATE_LIVE_REJECTED,
+                "Live QDT model call executed, but no accepted QDT artifact was persisted.",
+                refs=[qdt.get("artifact_id")] if qdt.get("artifact_id") else [],
+                remediation="Repair the Decomposer live-output schema/semantic contract before retrieval.",
+                **refs,
+            ))
         if run_kind == "true_production" and (
             qdt.get("adapter_mode") in PILOT_QDT_ADAPTER_MODES
             or qdt.get("model_executed") is False
-        ):
+        ) and qdt.get("qdt_runtime_state") != QDT_RUNTIME_STATE_LIVE_REJECTED:
             alerts.append(_alert(
                 "blocker",
                 "true_production_deterministic_qdt",
