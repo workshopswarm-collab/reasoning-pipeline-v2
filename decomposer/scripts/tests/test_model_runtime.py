@@ -14,12 +14,14 @@ sys.path.insert(0, str(ROOT / "decomposer" / "scripts"))
 from ads_decomposer.model_runtime import (  # noqa: E402
     MODEL_RUNTIME_CALL_SCHEMA_VERSION,
     MODEL_RUNTIME_RETRY_DIAGNOSTIC_SCHEMA_VERSION,
+    MODEL_RUNTIME_SCHEMA_REPAIR_DIAGNOSTIC_SCHEMA_VERSION,
     MODEL_RUNTIME_TIMEOUTS,
     MODEL_RUNTIME_TRANSPORT_REQUEST_SCHEMA_VERSION,
     MODEL_RUNTIME_TRANSPORT_RESPONSE_SCHEMA_VERSION,
     MODEL_TRANSPORT_RETRY_POLICY,
     MODEL_TRANSPORT_RETRY_POLICY_REF,
     ModelRuntimeError,
+    classify_qdt_validation_errors,
     execute_model_runtime_call,
     execute_model_runtime_call_for_lane,
     model_execution_context_from_runtime_call,
@@ -255,6 +257,95 @@ class ModelRuntimeContractTest(unittest.TestCase):
         self.assertEqual(result.response_payload, {"ok": True})
         self.assertEqual(result.runtime_call["repair_count"], 1)
         self.assertEqual(result.runtime_call["execution_status"], "succeeded")
+        diagnostics = result.runtime_call["schema_repair_diagnostics"]
+        self.assertEqual(len(diagnostics), 1)
+        self.assertEqual(
+            diagnostics[0]["schema_version"],
+            MODEL_RUNTIME_SCHEMA_REPAIR_DIAGNOSTIC_SCHEMA_VERSION,
+        )
+        self.assertEqual(diagnostics[0]["repair_decision"], "mechanical_schema_repair_available")
+        self.assertTrue(diagnostics[0]["repair_attempted"])
+        self.assertEqual(diagnostics[0]["remaining_error_counts"]["mechanical_schema"], 0)
+
+    def test_classifies_validation_errors_for_bounded_qdt_repair(self) -> None:
+        groups = classify_qdt_validation_errors(
+            [
+                "required_leaf_questions[0].purpose is invalid",
+                "terminal_verification_leaf_misclassified_as_pre_resolution: leaf-final",
+                "required_coverage_dimension_missing: source_quality",
+                "model output authority forbidden",
+            ]
+        )
+
+        self.assertEqual(groups["mechanical_schema"], ["required_leaf_questions[0].purpose is invalid"])
+        self.assertEqual(
+            groups["terminal_temporal_role"],
+            ["terminal_verification_leaf_misclassified_as_pre_resolution: leaf-final"],
+        )
+        self.assertEqual(groups["semantic_quality"], ["required_coverage_dimension_missing: source_quality"])
+        self.assertEqual(groups["forbidden_authority"], ["model output authority forbidden"])
+
+    def test_mixed_mechanical_and_semantic_errors_repair_then_fail_closed(self) -> None:
+        def validator(value: Any) -> tuple[bool, list[str]]:
+            if isinstance(value, dict) and value.get("shape_fixed") is True:
+                return False, ["terminal_verification_dominates_unresolved_forecast_qdt"]
+            return False, [
+                "required_leaf_questions[0].purpose is invalid",
+                "terminal_verification_dominates_unresolved_forecast_qdt",
+            ]
+
+        def repairer(value: Any, _errors: list[str]) -> dict[str, Any]:
+            self.assertIsInstance(value, dict)
+            repaired = dict(value)
+            repaired["shape_fixed"] = True
+            return repaired
+
+        with self.assertRaises(ModelRuntimeError) as raised:
+            self._call(fixture_response={"ok": False}, output_validator=validator, repairer=repairer)
+
+        runtime = raised.exception.runtime_call
+        self.assertIsInstance(runtime, dict)
+        self.assertEqual(runtime["execution_status"], "failed_schema_validation")
+        self.assertEqual(runtime["repair_count"], 1)
+        self.assertIn("schema_repair_attempted", runtime["runtime_reason_codes"])
+        self.assertIn("schema_repair_remaining_terminal_temporal_role", runtime["runtime_reason_codes"])
+        diagnostic = runtime["schema_repair_diagnostics"][0]
+        self.assertTrue(diagnostic["repair_attempted"])
+        self.assertIn(
+            "required_leaf_questions[0].purpose is invalid",
+            diagnostic["pre_repair_error_groups"]["mechanical_schema"],
+        )
+        self.assertIn(
+            "terminal_verification_dominates_unresolved_forecast_qdt",
+            diagnostic["pre_repair_error_groups"]["terminal_temporal_role"],
+        )
+        self.assertEqual(
+            diagnostic["remaining_error_groups"]["terminal_temporal_role"],
+            ["terminal_verification_dominates_unresolved_forecast_qdt"],
+        )
+        self.assertIn("response.shape_fixed", diagnostic["repaired_fields"])
+
+    def test_forbidden_authority_validation_error_does_not_repair(self) -> None:
+        repair_calls = {"count": 0}
+
+        def validator(_value: Any) -> tuple[bool, list[str]]:
+            return False, ["model output authority forbidden"]
+
+        def repairer(value: Any, _errors: list[str]) -> Any:
+            repair_calls["count"] += 1
+            return value
+
+        with self.assertRaises(ModelRuntimeError) as raised:
+            self._call(fixture_response={"ok": "not true"}, output_validator=validator, repairer=repairer)
+
+        runtime = raised.exception.runtime_call
+        self.assertIsInstance(runtime, dict)
+        self.assertEqual(repair_calls["count"], 0)
+        self.assertEqual(runtime["repair_count"], 0)
+        diagnostic = runtime["schema_repair_diagnostics"][0]
+        self.assertFalse(diagnostic["repair_attempted"])
+        self.assertEqual(diagnostic["repair_skipped_reason"], "forbidden_authority_not_repairable")
+        self.assertIn("schema_repair_skipped_forbidden_authority_not_repairable", runtime["runtime_reason_codes"])
 
     def test_wrapped_json_text_response_is_parsed_before_validation(self) -> None:
         result = self._call(fixture_response='```json\\n{"ok": true}\\n```')

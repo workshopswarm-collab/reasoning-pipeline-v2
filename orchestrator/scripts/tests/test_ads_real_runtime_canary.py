@@ -22,7 +22,13 @@ def _write_json(root: Path, name: str, payload: dict) -> Path:
     return path
 
 
-def _runtime_payload(*, execution_status: str, reason_codes: list[str], repair_count: int = 0) -> dict:
+def _runtime_payload(
+    *,
+    execution_status: str,
+    reason_codes: list[str],
+    repair_count: int = 0,
+    schema_repair_diagnostics=None,
+) -> dict:
     return {
         "schema_version": "model-runtime-call-summary/v1",
         "runtime_call_id": "runtime-call:qdt-live",
@@ -34,6 +40,7 @@ def _runtime_payload(*, execution_status: str, reason_codes: list[str], repair_c
         "execution_status": execution_status,
         "repair_count": repair_count,
         "retry_count": 0,
+        "schema_repair_diagnostics": list(schema_repair_diagnostics or []),
         "runtime_reason_codes": reason_codes,
     }
 
@@ -86,6 +93,14 @@ class AdsRealRuntimeCanaryTest(unittest.TestCase):
                     execution_status="failed_schema_validation",
                     repair_count=1,
                     reason_codes=["analyst_consensus_leaf_wrong_temporal_role"],
+                    schema_repair_diagnostics=[
+                        {
+                            "schema_version": "model-runtime-schema-repair-diagnostic/v1",
+                            "repair_attempted": True,
+                            "repair_decision": "mechanical_schema_repair_available",
+                            "remaining_error_counts": {"terminal_temporal_role": 1},
+                        }
+                    ],
                 ),
             )
 
@@ -106,6 +121,10 @@ class AdsRealRuntimeCanaryTest(unittest.TestCase):
         self.assertEqual(taxonomy["qdt_runtime_state"], "live_qdt_call_executed_output_rejected")
         self.assertIn("analyst_consensus_leaf_wrong_temporal_role", taxonomy["qdt_runtime_reason_codes"])
         self.assertEqual(taxonomy["qdt_runtime_execution_statuses"], ["failed_schema_validation"])
+        self.assertEqual(
+            qdt_evidence["runtime_results"][0]["schema_repair_diagnostics"][0]["repair_decision"],
+            "mechanical_schema_repair_available",
+        )
 
     def test_boi_source_populated_retrieval_without_certified_evidence_is_taxonomized(self):
         with tempfile.TemporaryDirectory() as tempdir:

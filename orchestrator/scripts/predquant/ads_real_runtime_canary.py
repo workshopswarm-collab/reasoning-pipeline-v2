@@ -627,6 +627,7 @@ def _model_runtime_evidence(manifests: list[dict[str, Any]]) -> dict[str, Any]:
                 if isinstance(payload.get("transport_retry_policy"), dict)
                 else {},
                 "retry_diagnostics": _list_of_dicts(payload.get("retry_diagnostics")),
+                "schema_repair_diagnostics": _list_of_dicts(payload.get("schema_repair_diagnostics")),
                 "runtime_reason_codes": [
                     str(code)
                     for code in payload.get("runtime_reason_codes", [])

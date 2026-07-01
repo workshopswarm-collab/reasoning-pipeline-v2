@@ -30,6 +30,7 @@ MODEL_RUNTIME_TIMEOUTS = {
 }
 DEFAULT_TIMEOUT_SECONDS = 180
 MODEL_RUNTIME_RETRY_DIAGNOSTIC_SCHEMA_VERSION = "model-runtime-retry-diagnostic/v1"
+MODEL_RUNTIME_SCHEMA_REPAIR_DIAGNOSTIC_SCHEMA_VERSION = "model-runtime-schema-repair-diagnostic/v1"
 MODEL_TRANSPORT_RETRY_POLICY_REF = "ads-model-transport-retry/v1"
 MODEL_TRANSPORT_RETRY_POLICY = {
     "policy_ref": MODEL_TRANSPORT_RETRY_POLICY_REF,
@@ -94,6 +95,53 @@ NON_REPAIRABLE_VALIDATION_ERROR_MARKERS = (
     "terminal_verification_dominates_unresolved_forecast_qdt",
     "terminal_verification_leaf_misclassified_as_pre_resolution",
 )
+TERMINAL_TEMPORAL_ROLE_VALIDATION_ERROR_MARKERS = (
+    "terminal_verification_dominates_unresolved_forecast_qdt",
+    "terminal_verification_leaf_misclassified_as_pre_resolution",
+    "dispatchable_pre_resolution_leaf_ids contains terminal verification leaves",
+)
+FORBIDDEN_AUTHORITY_VALIDATION_ERROR_MARKERS = (
+    "forbidden",
+    "probability_authority",
+    "forecast authority",
+    "model output authority",
+    "scae_delta",
+    "fair_value",
+    "decision_output",
+    "production_forecast",
+)
+SEMANTIC_QUALITY_VALIDATION_ERROR_MARKERS = tuple(
+    marker
+    for marker in NON_REPAIRABLE_VALIDATION_ERROR_MARKERS
+    if marker not in TERMINAL_TEMPORAL_ROLE_VALIDATION_ERROR_MARKERS
+) + (
+    "required_purpose_coverage_missing",
+    "critical/source-of-truth leaves require protected primary or unanswerability proof",
+    "critical/source-of-truth leaves cannot allow macro fallback",
+)
+MECHANICAL_SCHEMA_VALIDATION_ERROR_MARKERS = (
+    "analyst_consensus_leaf_must_be_pre_resolution_or_source_quality",
+    "analyst_consensus_leaf_wrong_temporal_role",
+    " is invalid",
+    " is required",
+    " is duplicated",
+    " must be ",
+    " must contain",
+    " must equal",
+    " must match",
+    " must reference",
+    " must start",
+    " missing ",
+    " references unknown ",
+    "not valid json",
+)
+VALIDATION_ERROR_GROUPS = (
+    "forbidden_authority",
+    "mechanical_schema",
+    "semantic_quality",
+    "terminal_temporal_role",
+)
+SCHEMA_REPAIR_CHANGED_PATH_LIMIT = 80
 
 
 class ModelRuntimeError(RuntimeError):
@@ -274,9 +322,92 @@ def scan_forbidden_model_outputs(value: Any) -> dict[str, Any]:
     }
 
 
+def _contains_marker(text: str, markers: tuple[str, ...]) -> bool:
+    normalized = text.lower()
+    return any(marker.lower() in normalized for marker in markers)
+
+
+def classify_qdt_validation_errors(errors: list[str]) -> dict[str, list[str]]:
+    groups = {group: [] for group in VALIDATION_ERROR_GROUPS}
+    for error in errors:
+        text = str(error)
+        normalized = text.lower()
+        if _contains_marker(normalized, FORBIDDEN_AUTHORITY_VALIDATION_ERROR_MARKERS):
+            groups["forbidden_authority"].append(text)
+            continue
+        matched = False
+        if _contains_marker(normalized, TERMINAL_TEMPORAL_ROLE_VALIDATION_ERROR_MARKERS):
+            groups["terminal_temporal_role"].append(text)
+            matched = True
+        if _contains_marker(normalized, SEMANTIC_QUALITY_VALIDATION_ERROR_MARKERS):
+            groups["semantic_quality"].append(text)
+            matched = True
+        if _contains_marker(normalized, MECHANICAL_SCHEMA_VALIDATION_ERROR_MARKERS):
+            groups["mechanical_schema"].append(text)
+            matched = True
+        if not matched:
+            groups["semantic_quality"].append(text)
+    return groups
+
+
+def _validation_error_group_counts(groups: dict[str, list[str]]) -> dict[str, int]:
+    return {group: len(groups.get(group, [])) for group in VALIDATION_ERROR_GROUPS}
+
+
+def _schema_repair_decision(
+    groups: dict[str, list[str]],
+    *,
+    max_schema_repairs: int,
+    repairer_configured: bool,
+) -> tuple[bool, str]:
+    if groups.get("forbidden_authority"):
+        return False, "forbidden_authority_not_repairable"
+    if not repairer_configured:
+        return False, "no_repairer_configured"
+    if max_schema_repairs <= 0:
+        return False, "repair_budget_exhausted"
+    if groups.get("mechanical_schema"):
+        return True, "mechanical_schema_repair_available"
+    return False, "no_mechanical_schema_errors"
+
+
 def _validation_errors_are_repairable(errors: list[str]) -> bool:
-    text = "\n".join(str(error) for error in errors)
-    return not any(marker in text for marker in NON_REPAIRABLE_VALIDATION_ERROR_MARKERS)
+    groups = classify_qdt_validation_errors(errors)
+    should_repair, _reason = _schema_repair_decision(
+        groups,
+        max_schema_repairs=DEFAULT_MAX_SCHEMA_REPAIRS,
+        repairer_configured=True,
+    )
+    return should_repair
+
+
+def _changed_json_paths(before: Any, after: Any, path: str = "response") -> list[str]:
+    if before == after:
+        return []
+    if type(before) is not type(after):
+        return [path]
+    if isinstance(before, dict):
+        changed: list[str] = []
+        keys = sorted(set(before) | set(after), key=str)
+        for key in keys:
+            child_path = f"{path}.{key}"
+            if key not in before or key not in after:
+                changed.append(child_path)
+            else:
+                changed.extend(_changed_json_paths(before[key], after[key], child_path))
+            if len(changed) >= SCHEMA_REPAIR_CHANGED_PATH_LIMIT:
+                return changed[:SCHEMA_REPAIR_CHANGED_PATH_LIMIT]
+        return changed
+    if isinstance(before, list):
+        changed = []
+        for idx, (before_item, after_item) in enumerate(zip(before, after)):
+            changed.extend(_changed_json_paths(before_item, after_item, f"{path}[{idx}]"))
+            if len(changed) >= SCHEMA_REPAIR_CHANGED_PATH_LIMIT:
+                return changed[:SCHEMA_REPAIR_CHANGED_PATH_LIMIT]
+        if len(before) != len(after):
+            changed.append(f"{path}.length")
+        return changed[:SCHEMA_REPAIR_CHANGED_PATH_LIMIT]
+    return [path]
 
 
 def _json_payload(value: Any) -> Any:
@@ -765,6 +896,7 @@ def _base_runtime_call(
             "jitter_fraction": MODEL_TRANSPORT_RETRY_POLICY["jitter_fraction"],
         },
         "retry_diagnostics": [],
+        "schema_repair_diagnostics": [],
         "runtime_reason_codes": [],
     }
 
@@ -919,25 +1051,79 @@ def execute_model_runtime_call(
     validation_errors: list[str] = []
     if output_validator is not None:
         valid, validation_errors = output_validator(response)
-        repairable_errors = _validation_errors_are_repairable(validation_errors)
-        if not valid and repairer is not None and max_schema_repairs > 0 and repairable_errors:
-            runtime_call["repair_count"] = 1
-            repaired = repairer(copy.deepcopy(response), list(validation_errors))
-            repaired = _json_payload(repaired)
-            repair_scan = scan_forbidden_model_outputs(repaired)
-            runtime_call["forbidden_output_scan"] = repair_scan
-            runtime_call["response_sha256"] = prefixed_sha256(repaired)
-            if repair_scan["status"] != "passed":
-                runtime_call["execution_status"] = "failed_forbidden_output_after_repair"
-                runtime_call["latency_ms"] = int((time.monotonic() - started) * 1000)
-                raise ModelRuntimeError(
-                    "repaired model output contained forbidden authority fields",
-                    runtime_call=runtime_call,
-                )
-            valid, validation_errors = output_validator(repaired)
-            response = repaired
-        elif not valid and repairer is not None and max_schema_repairs > 0:
-            runtime_call["runtime_reason_codes"].append("schema_repair_skipped_non_repairable_validation")
+        if not valid:
+            pre_repair_groups = classify_qdt_validation_errors(validation_errors)
+            should_repair, repair_decision = _schema_repair_decision(
+                pre_repair_groups,
+                max_schema_repairs=max_schema_repairs,
+                repairer_configured=repairer is not None,
+            )
+            repair_diagnostic: dict[str, Any] = {
+                "schema_version": MODEL_RUNTIME_SCHEMA_REPAIR_DIAGNOSTIC_SCHEMA_VERSION,
+                "event": "schema_repair_evaluation",
+                "repair_attempted": False,
+                "repair_decision": repair_decision,
+                "repair_skipped_reason": None if should_repair else repair_decision,
+                "pre_repair_errors": list(validation_errors),
+                "pre_repair_error_groups": pre_repair_groups,
+                "pre_repair_error_counts": _validation_error_group_counts(pre_repair_groups),
+                "repaired_fields": [],
+                "remaining_errors": list(validation_errors),
+                "remaining_error_groups": pre_repair_groups,
+                "remaining_error_counts": _validation_error_group_counts(pre_repair_groups),
+            }
+            if should_repair and repairer is not None:
+                runtime_call["repair_count"] = 1
+                runtime_call["runtime_reason_codes"].append("schema_repair_attempted")
+                runtime_call["runtime_reason_codes"].append(repair_decision)
+                original_response = copy.deepcopy(response)
+                repaired = repairer(copy.deepcopy(response), list(validation_errors))
+                repaired = _json_payload(repaired)
+                repair_diagnostic["repair_attempted"] = True
+                repair_diagnostic["repair_skipped_reason"] = None
+                repair_diagnostic["repaired_fields"] = _changed_json_paths(original_response, repaired)
+                repair_scan = scan_forbidden_model_outputs(repaired)
+                runtime_call["forbidden_output_scan"] = repair_scan
+                runtime_call["response_sha256"] = prefixed_sha256(repaired)
+                if repair_scan["status"] != "passed":
+                    repair_diagnostic["remaining_errors"] = [
+                        "repaired_model_output_contained_forbidden_authority_fields"
+                    ]
+                    repair_diagnostic["remaining_error_groups"] = {
+                        "forbidden_authority": repair_diagnostic["remaining_errors"],
+                        "mechanical_schema": [],
+                        "semantic_quality": [],
+                        "terminal_temporal_role": [],
+                    }
+                    repair_diagnostic["remaining_error_counts"] = _validation_error_group_counts(
+                        repair_diagnostic["remaining_error_groups"]
+                    )
+                    runtime_call["schema_repair_diagnostics"].append(repair_diagnostic)
+                    runtime_call["execution_status"] = "failed_forbidden_output_after_repair"
+                    runtime_call["latency_ms"] = int((time.monotonic() - started) * 1000)
+                    raise ModelRuntimeError(
+                        "repaired model output contained forbidden authority fields",
+                        runtime_call=runtime_call,
+                    )
+                valid, validation_errors = output_validator(repaired)
+                remaining_groups = classify_qdt_validation_errors(validation_errors)
+                repair_diagnostic["remaining_errors"] = list(validation_errors)
+                repair_diagnostic["remaining_error_groups"] = remaining_groups
+                repair_diagnostic["remaining_error_counts"] = _validation_error_group_counts(remaining_groups)
+                response = repaired
+                runtime_call["schema_repair_diagnostics"].append(repair_diagnostic)
+                if not valid:
+                    runtime_call["runtime_reason_codes"].append("schema_repair_remaining_validation_errors")
+                    for group, errors in remaining_groups.items():
+                        if errors:
+                            runtime_call["runtime_reason_codes"].append(f"schema_repair_remaining_{group}")
+            else:
+                runtime_call["schema_repair_diagnostics"].append(repair_diagnostic)
+                runtime_call["runtime_reason_codes"].append(f"schema_repair_skipped_{repair_decision}")
+                if repairer is not None and max_schema_repairs > 0:
+                    runtime_call["runtime_reason_codes"].append(
+                        "schema_repair_skipped_non_repairable_validation"
+                    )
         if not valid:
             runtime_call["execution_status"] = "failed_schema_validation"
             runtime_call["latency_ms"] = int((time.monotonic() - started) * 1000)
@@ -1022,6 +1208,9 @@ def model_execution_context_from_runtime_call(
             "repair_count": runtime_call.get("repair_count"),
             "transport_retry_policy": copy.deepcopy(runtime_call.get("transport_retry_policy")),
             "retry_diagnostics": copy.deepcopy(runtime_call.get("retry_diagnostics", [])),
+            "schema_repair_diagnostics": copy.deepcopy(
+                runtime_call.get("schema_repair_diagnostics", [])
+            ),
             "fixture_mode": runtime_call.get("fixture_mode"),
             "model_call_performed": runtime_call.get("model_call_performed"),
             "model_executed": runtime_call.get("model_executed"),
@@ -1042,6 +1231,7 @@ def model_execution_context_from_runtime_call(
         "repair_count": runtime_call.get("repair_count"),
         "transport_retry_policy": copy.deepcopy(runtime_call.get("transport_retry_policy")),
         "retry_diagnostics": copy.deepcopy(runtime_call.get("retry_diagnostics", [])),
+        "schema_repair_diagnostics": copy.deepcopy(runtime_call.get("schema_repair_diagnostics", [])),
         "runtime_reason_codes": list(runtime_call.get("runtime_reason_codes", [])),
         "fallback_reason_codes": list(context.get("fallback_reason_codes", ["no_fallback_required"])),
     }
@@ -1052,11 +1242,13 @@ __all__ = [
     "MODEL_RUNTIME_CALL_ARTIFACT_TYPE",
     "MODEL_RUNTIME_CALL_SCHEMA_VERSION",
     "MODEL_RUNTIME_RETRY_DIAGNOSTIC_SCHEMA_VERSION",
+    "MODEL_RUNTIME_SCHEMA_REPAIR_DIAGNOSTIC_SCHEMA_VERSION",
     "MODEL_RUNTIME_TIMEOUTS",
     "MODEL_TRANSPORT_RETRY_POLICY",
     "MODEL_TRANSPORT_RETRY_POLICY_REF",
     "ModelRuntimeError",
     "ModelRuntimeResult",
+    "classify_qdt_validation_errors",
     "execute_model_runtime_call",
     "execute_model_runtime_call_for_lane",
     "model_execution_context_from_runtime_call",

@@ -314,9 +314,53 @@ class RuntimeDecompositionEntrypointTest(unittest.TestCase):
         self.assertEqual(runtime["execution_status"], "failed_schema_validation")
         self.assertEqual(runtime["repair_count"], 0)
         self.assertIn("schema_repair_skipped_non_repairable_validation", runtime["runtime_reason_codes"])
+        diagnostic = runtime["schema_repair_diagnostics"][0]
+        self.assertFalse(diagnostic["repair_attempted"])
+        self.assertEqual(diagnostic["repair_skipped_reason"], "no_mechanical_schema_errors")
+        self.assertGreater(diagnostic["pre_repair_error_counts"]["terminal_temporal_role"], 0)
         self.assertIn(
             "terminal_verification_dominates_unresolved_forecast_qdt",
             "; ".join(runtime["runtime_reason_codes"]),
+        )
+
+    def test_mixed_schema_and_terminal_semantic_errors_repair_once_then_fail_closed(self) -> None:
+        handoff = self._handoff()
+        bad_response = build_question_specific_fixture_response(handoff)
+        bad_response["branches"][0]["required_evidence_purposes"] = ["official_resolution"]
+        first_leaf = bad_response["required_leaf_questions"][0]
+        first_leaf["purpose"] = "official_resolution"
+        first_leaf["leaf_condition_scope"] = "if_candidate_files"
+        first_leaf["structural_validation"].pop("answerability_status")
+        for leaf in bad_response["required_leaf_questions"]:
+            question = (
+                "What did the final official result say about whether Acme shipped "
+                "the Atlas update before July 2026?"
+            )
+            leaf["question_text"] = question
+            leaf["leaf_question"] = question
+
+        with self.assertRaises(ModelRuntimeError) as raised:
+            build_question_decomposition_from_handoff(
+                handoff,
+                runtime_mode="fixture",
+                fixture_response=bad_response,
+            )
+
+        runtime = raised.exception.runtime_call
+        self.assertIsInstance(runtime, dict)
+        self.assertEqual(runtime["execution_status"], "failed_schema_validation")
+        self.assertEqual(runtime["repair_count"], 1)
+        self.assertIn("schema_repair_attempted", runtime["runtime_reason_codes"])
+        self.assertIn("schema_repair_remaining_terminal_temporal_role", runtime["runtime_reason_codes"])
+        diagnostic = runtime["schema_repair_diagnostics"][0]
+        self.assertTrue(diagnostic["repair_attempted"])
+        self.assertGreater(diagnostic["pre_repair_error_counts"]["mechanical_schema"], 0)
+        self.assertGreater(diagnostic["pre_repair_error_counts"]["terminal_temporal_role"], 0)
+        self.assertEqual(diagnostic["remaining_error_counts"]["mechanical_schema"], 0)
+        self.assertGreater(diagnostic["remaining_error_counts"]["terminal_temporal_role"], 0)
+        self.assertTrue(
+            any(path.endswith(".purpose") for path in diagnostic["repaired_fields"]),
+            diagnostic["repaired_fields"],
         )
 
     def test_unresolved_election_fixture_stays_pre_resolution_dispatchable(self) -> None:

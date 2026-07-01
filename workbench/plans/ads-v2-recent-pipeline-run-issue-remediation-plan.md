@@ -296,7 +296,7 @@ Completion note, 2026-07-01:
 
 ## Phase 2 - QDT Repair Resilience And Semantic Failure Separation
 
-Status: planned
+Status: completed 2026-07-01
 
 Goal: make QDT repair useful for mechanical schema drift while preserving semantic fail-closed behavior.
 
@@ -375,12 +375,20 @@ Success criteria:
 
 Checklist:
 
-- [ ] Validation error classifier implemented.
-- [ ] Mixed-error repair test added.
-- [ ] Forbidden-authority no-repair test still passes.
-- [ ] Repair diagnostics surfaced.
-- [ ] Full decomposer tests pass.
-- [ ] Temp artifacts and one-off scripts removed.
+- [x] Validation error classifier implemented.
+- [x] Mixed-error repair test added.
+- [x] Forbidden-authority no-repair test still passes.
+- [x] Repair diagnostics surfaced.
+- [x] Full decomposer tests pass.
+- [x] Temp artifacts and one-off scripts removed.
+
+Completion note, 2026-07-01:
+
+- Added `model-runtime-schema-repair-diagnostic/v1` records to model-runtime calls and model execution context. Diagnostics now include pre-repair error groups/counts, repair decision or skipped reason, bounded repaired JSON paths, and remaining post-repair errors/groups/counts.
+- Added QDT validation error grouping for `forbidden_authority`, `mechanical_schema`, `semantic_quality`, and `terminal_temporal_role`. Aggregate validator errors can populate multiple groups, so wrapped candidate-rejection messages still expose mixed mechanical/semantic failures.
+- Updated schema repair gating to attempt one repair when mechanical schema errors are present, even if semantic/terminal errors are also present. Forbidden-authority validation errors still skip repair, and remaining semantic/terminal errors fail closed after repair.
+- Threaded schema repair diagnostics into real-runtime canary model-runtime evidence so reports can surface repair decisions.
+- Verification passed: `python3 -m unittest scripts.tests.test_model_runtime`, `python3 -m unittest scripts.tests.test_runtime_decomposition`, `python3 -m unittest scripts.tests.test_qdt`, full decomposer discovery, `python3 -m unittest scripts.tests.test_ads_real_runtime_canary`, `python3 -m unittest scripts.tests.test_ads_operational_canary`, temp-artifact cleanup check, and `git diff --check`.
 
 ## Phase 3 - QDT Coverage Semantics And Source Quality Mapping
 
