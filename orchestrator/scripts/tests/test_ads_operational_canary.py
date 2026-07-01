@@ -40,6 +40,11 @@ from predquant.ads_real_runtime_canary import (
 )
 from predquant.ads_retrieval_transport import RetrievalProviderPolicy
 from predquant.ads_scoreable_canary_handlers import build_stage_handlers
+from predquant.ads_stage_health import (
+    ATTEMPTED_AND_ACCEPTED,
+    ATTEMPTED_AND_TIMED_OUT,
+    NOT_ATTEMPTED_DUE_UPSTREAM_BLOCK,
+)
 from predquant.sqlite_store import SCHEMA
 from researcher_swarm.classification import build_researcher_sidecar_v2
 from researcher_swarm.isolation import build_researcher_context_isolation_audit
@@ -1226,6 +1231,22 @@ class AdsOperationalCanaryTest(unittest.TestCase):
             retrieval_summary["latest_retrieval_heartbeat_provider_id"],
             "hanging-canary-retrieval-provider",
         )
+        runtime_report = build_real_runtime_canary_report(
+            self.db_path,
+            pipeline_run_id=result["result"]["pipeline_run_id"],
+            expected_cases=1,
+            expected_forecast_decision_records=1,
+            expected_market_predictions=0,
+        )
+        stage_health = {item["stage"]: item for item in runtime_report["stage_health"]}
+        self.assertEqual(stage_health["decomposition"]["health"], ATTEMPTED_AND_ACCEPTED)
+        self.assertEqual(stage_health["retrieval"]["health"], ATTEMPTED_AND_TIMED_OUT)
+        self.assertEqual(
+            stage_health["researcher_classification"]["health"],
+            NOT_ATTEMPTED_DUE_UPSTREAM_BLOCK,
+        )
+        self.assertEqual(stage_health["researcher_classification"]["blocked_by"], "retrieval")
+        self.assertEqual(stage_health["scae"]["blocked_by"], "retrieval")
 
     def test_true_production_factory_clone_canary_blocks_at_leaf_research_barrier(self):
         config = self.config(
@@ -1549,6 +1570,18 @@ class AdsOperationalCanaryTest(unittest.TestCase):
         criteria_report = result["real_runtime_canary_report"]
         self.assertTrue(criteria_report["ok"], criteria_report["issues"])
         self.assertIsNone(criteria_report["first_failing_gate"])
+        stage_health = {item["stage"]: item for item in criteria_report["stage_health"]}
+        self.assertEqual(stage_health["decomposition"]["health"], ATTEMPTED_AND_ACCEPTED)
+        self.assertEqual(stage_health["retrieval"]["health"], ATTEMPTED_AND_ACCEPTED)
+        self.assertEqual(
+            stage_health["researcher_classification"]["health"],
+            ATTEMPTED_AND_ACCEPTED,
+        )
+        self.assertEqual(stage_health["scae"]["health"], ATTEMPTED_AND_ACCEPTED)
+        self.assertNotIn(
+            NOT_ATTEMPTED_DUE_UPSTREAM_BLOCK,
+            criteria_report["stage_health_summary"]["counts_by_health"],
+        )
         phase9_case = criteria_report["phase9_representative_case"]
         self.assertEqual(phase9_case["classification"], "scoreable_success")
         self.assertIn("all_scoreable_runtime_gates_passed", phase9_case["reason_codes"])
@@ -1957,6 +1990,36 @@ class AdsOperationalCanaryTest(unittest.TestCase):
             _first_failing_gate(retrieval_failed),
             "retrieval_source_populated_or_structural_unanswerability",
         )
+
+        qdt_failed = _build_runtime_criteria(
+            **{
+                **base,
+                "qdt_evidence": {
+                    "ok": False,
+                    "qdt_end_to_end_quality_ok": False,
+                    "qdt_live_model_call_attempted_count": 1,
+                    "qdt_live_model_call_executed_count": 1,
+                    "qdt_live_output_rejected_count": 1,
+                },
+                "retrieval_evidence": {
+                    "ok": False,
+                    "source_populated_ok": False,
+                    "live_acceptance_ok": False,
+                    "retrieval_packet_count": 0,
+                    "source_populated_count": 0,
+                    "classification_dispatch_allowed": False,
+                },
+                "scae_evidence": {"ok": False, "valid_forecast_count": 0, "delta_ref_count": 0},
+            }
+        )
+        qdt_failed_statuses = {item["gate"]: item["status"] for item in qdt_failed}
+        self.assertEqual(_first_failing_gate(qdt_failed), "qdt_model_executed")
+        self.assertEqual(
+            qdt_failed_statuses["retrieval_source_populated_or_structural_unanswerability"],
+            "skipped",
+        )
+        self.assertEqual(qdt_failed_statuses["retrieval_live_acceptance_requirements"], "skipped")
+        self.assertEqual(qdt_failed_statuses["scae_delta_refs_if_valid_forecast"], "skipped")
 
         researcher_failed = _build_runtime_criteria(
             **{

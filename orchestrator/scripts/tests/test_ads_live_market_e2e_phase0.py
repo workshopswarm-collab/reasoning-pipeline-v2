@@ -19,6 +19,10 @@ from predquant.ads_live_market_e2e_phase0 import (
     classify_live_market_audit,
     load_live_market_phase0_fixture,
 )
+from predquant.ads_stage_health import (
+    ATTEMPTED_AND_FAILED,
+    build_stage_health_from_handoff,
+)
 
 
 FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures" / "ads_live_market_e2e_phase0"
@@ -45,6 +49,25 @@ class AdsLiveMarketE2EPhase0Test(unittest.TestCase):
         self.assertNotIn(RETRIEVAL_STAGE_TIMEOUT, taxonomy["status_codes"])
         self.assertTrue(taxonomy["qdt_schema_repair_attempted"])
         self.assertFalse(taxonomy["scoreable_write_observed"])
+
+        stage_health = build_stage_health_from_handoff(
+            stage_order=fixture["run"]["stage_order"],
+            stages=[
+                {
+                    "stage": "decomposition",
+                    "status": "failed",
+                    "reason_codes": [taxonomy["primary_qdt_blocker"]],
+                    "output_manifests": [],
+                }
+            ],
+        )
+        by_stage = {item["stage"]: item for item in stage_health}
+        self.assertEqual(by_stage["decomposition"]["health"], ATTEMPTED_AND_FAILED)
+        self.assertEqual(by_stage["retrieval"]["health"], NOT_ATTEMPTED_DUE_UPSTREAM_BLOCK)
+        self.assertEqual(by_stage["retrieval"]["blocked_by"], "decomposition")
+        self.assertIn(BLOCKED_BY_UPSTREAM_QDT, by_stage["retrieval"]["reason_codes"])
+        self.assertEqual(by_stage["researcher"]["health"], NOT_ATTEMPTED_DUE_UPSTREAM_BLOCK)
+        self.assertEqual(by_stage["scae"]["health"], NOT_ATTEMPTED_DUE_UPSTREAM_BLOCK)
 
     def test_downstream_isolation_fixture_preserves_retrieval_timeout_and_orphan(self):
         fixture = load_live_market_phase0_fixture(FIXTURE_DIR / "downstream-retrieval-hang.json")

@@ -1062,6 +1062,10 @@ def _true_runtime_cutover_status(
         return "blocked_missing_strict_canary"
     if _live_db_mutation_from_run(run) == "clone_only":
         return "blocked_clone_only_canary"
+    for case in cases:
+        qdt = case.get("qdt_model_provenance") or {}
+        if qdt.get("qdt_runtime_state") == QDT_RUNTIME_STATE_LIVE_REJECTED:
+            return "blocked_upstream_qdt"
     if _run_stage_failed(run):
         return "blocked_stage_failure"
     if not cases:
@@ -1280,6 +1284,7 @@ def _build_alerts(
             or qdt.get("runtime_mode") == "fixture"
             or qdt.get("fixture_mode") is True
         )
+        qdt_upstream_block = bool(live_output_rejected)
         if run_kind == "true_production" and live_output_rejected:
             alerts.append(_alert(
                 "blocker",
@@ -1297,9 +1302,9 @@ def _build_alerts(
                 refs=[qdt.get("artifact_id")] if qdt.get("artifact_id") else [],
                 remediation="Use predquant.ads_production_handlers with decomposer_model_runtime_live.",
                 **refs,
-            ))
+        ))
         researcher = case.get("researcher_model_provenance") or {}
-        if run_kind == "true_production" and researcher.get("metadata_only"):
+        if run_kind == "true_production" and researcher.get("metadata_only") and not qdt_upstream_block:
             alerts.append(_alert(
                 "blocker",
                 "true_production_metadata_only_researcher",
@@ -1312,7 +1317,11 @@ def _build_alerts(
                 remediation="Require model-executed researcher sidecars/runtime bundles before scoreable expansion.",
                 **refs,
             ))
-        if run_kind == "true_production" and int(researcher.get("model_executed_count") or 0) == 0:
+        if (
+            run_kind == "true_production"
+            and int(researcher.get("model_executed_count") or 0) == 0
+            and not qdt_upstream_block
+        ):
             alerts.append(_alert(
                 true_production_issue_severity,
                 "true_production_researcher_runtime_missing",
@@ -1363,7 +1372,11 @@ def _build_alerts(
             isinstance(item, dict) and item.get("availability_status") == "unavailable"
             for item in retrieval.get("native_research_transport_diagnostics", [])
         )
-        if run_kind == "true_production" and not retrieval.get("all_required_leaves_certified"):
+        if (
+            run_kind == "true_production"
+            and not retrieval.get("all_required_leaves_certified")
+            and not qdt_upstream_block
+        ):
             alerts.append(_alert(
                 true_production_issue_severity,
                 "true_production_retrieval_not_certified",
@@ -1374,7 +1387,11 @@ def _build_alerts(
                 remediation="Repair retrieval sufficiency before release or cutover.",
                 **refs,
             ))
-        if run_kind == "true_production" and int(retrieval.get("admitted_evidence_ref_count") or 0) == 0:
+        if (
+            run_kind == "true_production"
+            and int(retrieval.get("admitted_evidence_ref_count") or 0) == 0
+            and not qdt_upstream_block
+        ):
             alerts.append(_alert(
                 true_production_issue_severity,
                 "true_production_zero_admitted_evidence_refs",
@@ -1389,6 +1406,7 @@ def _build_alerts(
             run_kind == "true_production"
             and int(retrieval.get("browser_retrieval_attempt_count") or 0) == 0
             and native_unavailable
+            and not qdt_upstream_block
         ):
             alerts.append(_alert(
                 true_production_issue_severity,
@@ -1411,7 +1429,7 @@ def _build_alerts(
             ))
         scae = case.get("scae_readiness") or {}
         verification = case.get("verification_readiness") or {}
-        if run_kind == "true_production" and not scae.get("artifact_id"):
+        if run_kind == "true_production" and not scae.get("artifact_id") and not qdt_upstream_block:
             alerts.append(_alert(
                 true_production_issue_severity,
                 "true_production_scae_ledger_missing",
@@ -1426,6 +1444,7 @@ def _build_alerts(
             run_kind == "true_production"
             and scae.get("artifact_id")
             and scae.get("forecast_validity_status") != "valid_for_forecast"
+            and not qdt_upstream_block
         ):
             alerts.append(_alert(
                 true_production_issue_severity,
@@ -1437,7 +1456,11 @@ def _build_alerts(
                 remediation="Repair verification-to-SCAE inputs or keep the run explicitly non-scoreable before release or cutover.",
                 **refs,
             ))
-        if run_kind == "true_production" and _scae_invalid_research_sufficiency_blocked(scae, verification):
+        if (
+            run_kind == "true_production"
+            and _scae_invalid_research_sufficiency_blocked(scae, verification)
+            and not qdt_upstream_block
+        ):
             alerts.append(_alert(
                 true_production_issue_severity,
                 "true_production_scae_invalid_research_sufficiency_blocked",
@@ -1618,6 +1641,8 @@ def build_ads_operator_review_report(
         "alerts": alerts,
         "postflight_reason_order": pipeline_health_summary["postflight_reason_order"],
         "pipeline_health_summary": pipeline_health_summary,
+        "stage_health": pipeline_health_summary.get("stage_health", []),
+        "stage_health_summary": pipeline_health_summary.get("stage_health_summary", {}),
         "active_work": {
             "active_runs": len(active_runs),
             "active_leases": len(active_leases),

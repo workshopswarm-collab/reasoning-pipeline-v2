@@ -616,7 +616,7 @@ Checklist:
 
 ## Phase 6 - Operator Report Semantics For Upstream Blocks
 
-Status: pending
+Status: complete
 
 Goal: make reports distinguish attempted failures from stages that were correctly not attempted
 because an upstream gate failed.
@@ -678,13 +678,13 @@ Success criteria:
 
 Checklist:
 
-- [ ] Stage health vocabulary updated.
-- [ ] Real-runtime report updated.
-- [ ] Operator review updated.
-- [ ] Handoff/closure-lens report updated.
-- [ ] Fixture tests pass.
-- [ ] No temp artifacts remain.
-- [ ] `git diff --check` passes.
+- [x] Stage health vocabulary updated.
+- [x] Real-runtime report updated.
+- [x] Operator review updated.
+- [x] Handoff/closure-lens report updated.
+- [x] Fixture tests pass.
+- [x] No temp artifacts remain.
+- [x] `git diff --check` passes.
 
 ## Phase 7 - Same-Market Clone Proof: Live QDT To Bounded Retrieval
 

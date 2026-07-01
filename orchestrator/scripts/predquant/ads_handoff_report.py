@@ -17,6 +17,7 @@ from predquant.ads_pipeline_runner import (
 )
 from predquant.ads_stage_logging import STAGE_STATUS_TABLE, ensure_stage_logging_schema
 from predquant.ads_stage_logging import STAGE_EXECUTION_EVENT_TABLE
+from predquant.ads_stage_health import build_stage_health_from_handoff, summarize_stage_health
 
 
 ACCEPTED_VALIDATION_STATUSES = {"valid", "valid_with_warnings"}
@@ -281,6 +282,7 @@ def _handoff_health_summary(
     *,
     stages: list[dict[str, Any]],
     unresolved: list[dict[str, Any]],
+    stage_health: list[dict[str, Any]],
 ) -> dict[str, Any]:
     readiness_block_count = sum(
         1
@@ -303,6 +305,7 @@ def _handoff_health_summary(
         "unresolved_output_manifest_ref_count": len(unresolved),
         "handoff_counts_by_status": _handoff_status_counts_for_stages(stages),
         "manifest_counts_by_validation_status": _manifest_counts_for_stages(stages),
+        "stage_health": summarize_stage_health(stage_health),
     }
 
 
@@ -332,19 +335,28 @@ def build_handoff_report(
                 "error": f"pipeline run not found: {selected_run_id}",
             }
         stages = _annotate_handoff_semantics(_stage_rows(conn, selected_run_id))
+        stage_health = build_stage_health_from_handoff(
+            stage_order=list(run.get("stage_order") or ADS_PIPELINE_STAGE_ORDER),
+            stages=stages,
+        )
         unresolved = [
             manifest
             for stage in stages
             for manifest in stage["output_manifests"]
             if not manifest.get("resolved")
         ]
-        handoff_health = _handoff_health_summary(stages=stages, unresolved=unresolved)
+        handoff_health = _handoff_health_summary(
+            stages=stages,
+            unresolved=unresolved,
+            stage_health=stage_health,
+        )
         return {
             "schema_version": "ads-handoff-operator-report/v1",
             "ok": not unresolved,
             "pipeline_run": run,
             "loop_iterations": _loop_rows(conn, selected_run_id),
             "stages": stages,
+            "stage_health": stage_health,
             "unresolved_output_manifest_refs": unresolved,
             "stage_completion_count": handoff_health["stage_completion_count"],
             "readiness_block_count": handoff_health["readiness_block_count"],

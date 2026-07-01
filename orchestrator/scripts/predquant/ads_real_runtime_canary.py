@@ -17,6 +17,11 @@ from predquant.ads_pipeline_runner import (
     read_pipeline_control_state,
 )
 from predquant.ads_stage_logging import PIPELINE_ERROR_EVENT_TABLE, ensure_stage_logging_schema
+from predquant.ads_stage_health import (
+    NOT_ATTEMPTED_DUE_UPSTREAM_BLOCK,
+    build_stage_health_from_runtime_evidence,
+    summarize_stage_health,
+)
 from predquant.ads_storage_maintenance import build_storage_maintenance_plan
 from predquant.amrg import build_amrg_operator_report
 from predquant.calibration_debt import build_calibration_debt_clearance_report
@@ -614,6 +619,7 @@ def build_source_retrieval_pipeline_health_taxonomy(
     runtime_criteria: list[dict[str, Any]],
     prediction_deltas: dict[str, Any],
     phase9_case: dict[str, Any],
+    stage_health: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     stage_order = run.get("stage_order") if isinstance(run, dict) and isinstance(run.get("stage_order"), list) else []
     expected_stage_count = len(stage_order) if stage_order else len(ADS_PIPELINE_STAGE_ORDER)
@@ -672,6 +678,8 @@ def build_source_retrieval_pipeline_health_taxonomy(
         "market_predictions_delta": market_predictions_delta,
         "no_scoreable_write_when_blocked": bool(phase9_case.get("no_scoreable_write_when_blocked")),
         "phase0_audit_expectations": dict(SOURCE_RETRIEVAL_PHASE0_AUDIT_EXPECTATIONS),
+        "stage_health": stage_health or [],
+        "stage_health_summary": summarize_stage_health(stage_health or []),
     }
 
 
@@ -727,6 +735,7 @@ def _postflight_reason_order(
     *,
     issues: list[str] | tuple[str, ...] | None = None,
     runtime_criteria: list[dict[str, Any]] | tuple[dict[str, Any], ...] | None = None,
+    stage_health: list[dict[str, Any]] | tuple[dict[str, Any], ...] | None = None,
 ) -> list[dict[str, Any]]:
     ordered: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -754,6 +763,22 @@ def _postflight_reason_order(
                     "required": item.get("required"),
                 },
             )
+    for item in _list_of_dicts(stage_health):
+        if item.get("health") == NOT_ATTEMPTED_DUE_UPSTREAM_BLOCK:
+            reason_codes = [
+                str(code)
+                for code in (item.get("reason_codes") or [])
+                if code
+            ]
+            add(
+                "stage_health",
+                reason_codes[0] if reason_codes else "not_attempted_due_upstream_block",
+                {
+                    "stage": item.get("stage"),
+                    "health": item.get("health"),
+                    "blocked_by": item.get("blocked_by"),
+                },
+            )
     for issue in issues or []:
         add("issue", str(issue))
     return ordered
@@ -771,6 +796,7 @@ def build_operator_pipeline_health_summary(
     runtime_criteria: list[dict[str, Any]] | tuple[dict[str, Any], ...] | None = None,
     issues: list[str] | tuple[str, ...] | None = None,
     cases: list[dict[str, Any]] | tuple[dict[str, Any], ...] | None = None,
+    stage_health: list[dict[str, Any]] | tuple[dict[str, Any], ...] | None = None,
 ) -> dict[str, Any]:
     handoff = handoff_report if isinstance(handoff_report, dict) else {}
     handoff_health = (
@@ -843,7 +869,14 @@ def build_operator_pipeline_health_summary(
         "expected_forecast_decision_records": deltas.get("expected_forecast_decision_records"),
         "expected_market_predictions": deltas.get("expected_market_predictions"),
     }
-    postflight_reasons = _postflight_reason_order(issues=issues, runtime_criteria=runtime_criteria)
+    stage_health_records = _list_of_dicts(stage_health)
+    if not stage_health_records and handoff.get("stage_health"):
+        stage_health_records = _list_of_dicts(handoff.get("stage_health"))
+    postflight_reasons = _postflight_reason_order(
+        issues=issues,
+        runtime_criteria=runtime_criteria,
+        stage_health=stage_health_records,
+    )
     return {
         "schema_version": OPERATOR_PIPELINE_HEALTH_SUMMARY_SCHEMA_VERSION,
         "stage_completion_count": _int_value(
@@ -865,6 +898,8 @@ def build_operator_pipeline_health_summary(
         "scae_delta_ref_count": scae_delta_ref_count,
         "protected_write_deltas": protected_write_deltas,
         "handoff_health": handoff_health,
+        "stage_health": stage_health_records,
+        "stage_health_summary": summarize_stage_health(stage_health_records),
         "postflight_reason_order": postflight_reasons,
         "first_postflight_reason": postflight_reasons[0]["reason"] if postflight_reasons else None,
     }
@@ -1264,6 +1299,11 @@ def summarize_retrieval_transport_diagnostics(packet: dict[str, Any]) -> dict[st
             "diagnostics_unblock_researchers",
         )
     )
+    retrieval_stage_timeout = bool(
+        transport.get("retrieval_stage_timeout")
+        or runtime_summary.get("retrieval_stage_timeout")
+        or partial_diagnostics.get("terminal_status") == "timeout"
+    )
 
     return {
         "search_call_count": search_call_count,
@@ -1292,6 +1332,15 @@ def summarize_retrieval_transport_diagnostics(packet: dict[str, Any]) -> dict[st
             _int_value(transport.get("retrieval_heartbeat_count")),
             _int_value(runtime_summary.get("retrieval_heartbeat_count")),
             _int_value(partial_diagnostics.get("heartbeat_count")),
+        ),
+        "retrieval_stage_timeout": retrieval_stage_timeout,
+        "retrieval_stage_timeout_reason_code": (
+            transport.get("retrieval_stage_timeout_reason_code")
+            or runtime_summary.get("retrieval_stage_timeout_reason_code")
+        ),
+        "retrieval_stage_timeout_operation": (
+            transport.get("retrieval_stage_timeout_operation")
+            or runtime_summary.get("retrieval_stage_timeout_operation")
         ),
         "retrieval_partial_diagnostics_terminal_status": partial_diagnostics.get(
             "terminal_status"
@@ -2032,6 +2081,9 @@ def _retrieval_runtime_evidence(manifests: list[dict[str, Any]]) -> dict[str, An
         "search_skipped_by_elapsed_budget_count": sum(
             int(item["search_skipped_by_elapsed_budget_count"]) for item in retrieval_packets
         ),
+        "retrieval_stage_timeout_count": sum(
+            1 for item in retrieval_packets if item.get("retrieval_stage_timeout")
+        ),
         "provider_failure_summaries": [
             failure
             for item in retrieval_packets
@@ -2587,6 +2639,13 @@ def _build_runtime_criteria(
     researcher_required = bool(
         require_researcher_model_executed or retrieval_evidence.get("classification_dispatch_allowed")
     )
+    qdt_blocks_downstream = bool(
+        require_qdt_model_executed
+        and (
+            not qdt_evidence.get("ok")
+            or not qdt_evidence.get("qdt_end_to_end_quality_ok", qdt_evidence.get("ok"))
+        )
+    )
     expected_market_predictions = prediction_deltas.get("expected_market_predictions")
     non_executing_expected = expected_market_predictions == 0 and not require_scoreable_prediction
     return [
@@ -2655,6 +2714,7 @@ def _build_runtime_criteria(
         _criterion(
             "retrieval_source_populated_or_structural_unanswerability",
             bool(retrieval_evidence.get("source_populated_ok", retrieval_evidence.get("ok"))),
+            required=not qdt_blocks_downstream,
             detail={
                 "retrieval_packet_count": retrieval_evidence.get("retrieval_packet_count", 0),
                 "source_populated_count": retrieval_evidence.get("source_populated_count", 0),
@@ -2671,6 +2731,7 @@ def _build_runtime_criteria(
         _criterion(
             "retrieval_live_acceptance_requirements",
             bool(retrieval_evidence.get("live_acceptance_ok", retrieval_evidence.get("ok"))),
+            required=not qdt_blocks_downstream,
             detail={
                 "retrieval_packet_count": retrieval_evidence.get("retrieval_packet_count", 0),
                 "source_collation_acceptance_proven_count": retrieval_evidence.get(
@@ -2708,6 +2769,7 @@ def _build_runtime_criteria(
         _criterion(
             "scae_delta_refs_if_valid_forecast",
             bool(scae_evidence.get("ok")),
+            required=not qdt_blocks_downstream,
             detail={
                 "valid_forecast_count": scae_evidence.get("valid_forecast_count", 0),
                 "delta_ref_count": scae_evidence.get("delta_ref_count", 0),
@@ -2811,6 +2873,21 @@ def build_real_runtime_canary_report(
     researcher_evidence = _researcher_runtime_evidence(manifests)
     verification_evidence = _classification_verification_evidence(manifests)
     scae_evidence = _scae_runtime_evidence(manifests)
+    stage_health = build_stage_health_from_runtime_evidence(
+        qdt_evidence=qdt_evidence,
+        retrieval_evidence=retrieval_evidence,
+        researcher_evidence=researcher_evidence,
+        verification_evidence=verification_evidence,
+        scae_evidence=scae_evidence,
+        prediction_deltas=prediction_deltas,
+    )
+    stage_health_summary = summarize_stage_health(stage_health)
+    qdt_blocks_downstream = any(
+        item.get("stage") == "retrieval"
+        and item.get("health") == NOT_ATTEMPTED_DUE_UPSTREAM_BLOCK
+        and item.get("blocked_by") == "decomposition"
+        for item in stage_health
+    )
     storage = build_storage_maintenance_plan(path, retention_days=storage_retention_days)
     scoring = brier_score_report(path, prediction_source=prediction_source, prediction_label=prediction_label, evaluation_cluster_id=evaluation_cluster_id)
     calibration = _calibration_report(
@@ -2844,15 +2921,15 @@ def build_real_runtime_canary_report(
         issues.append("qdt_model_runtime_not_verified")
     if require_qdt_model_executed and not qdt_evidence.get("qdt_end_to_end_quality_ok", qdt_evidence["ok"]):
         issues.append("qdt_end_to_end_quality_not_verified")
-    if not retrieval_evidence["source_populated_ok"]:
+    if not qdt_blocks_downstream and not retrieval_evidence["source_populated_ok"]:
         issues.append("retrieval_runtime_not_source_populated_or_structurally_unanswerable")
-    if not retrieval_evidence["live_acceptance_ok"]:
+    if not qdt_blocks_downstream and not retrieval_evidence["live_acceptance_ok"]:
         issues.append("retrieval_live_acceptance_requirements_not_met")
     if (
         require_researcher_model_executed or retrieval_evidence["classification_dispatch_allowed"]
     ) and not researcher_evidence["ok"]:
         issues.append("researcher_model_runtime_not_verified")
-    if not scae_evidence["ok"]:
+    if not qdt_blocks_downstream and not scae_evidence["ok"]:
         issues.append("scae_valid_forecast_missing_evidence_delta_refs")
     _check_prediction_deltas(prediction_deltas, issues)
     _check_resource_gates(
@@ -2887,6 +2964,7 @@ def build_real_runtime_canary_report(
         "failed_count": sum(1 for item in runtime_criteria if item.get("status") == "failed"),
         "skipped_count": sum(1 for item in runtime_criteria if item.get("status") == "skipped"),
         "gate_order": [str(item.get("gate")) for item in runtime_criteria],
+        "stage_health": stage_health_summary,
     }
     phase9_case = _phase9_representative_case(
         run=run,
@@ -2920,6 +2998,7 @@ def build_real_runtime_canary_report(
         runtime_criteria=runtime_criteria,
         prediction_deltas=prediction_deltas,
         phase9_case=phase9_case,
+        stage_health=stage_health,
     )
     pipeline_health_summary = build_operator_pipeline_health_summary(
         handoff_report=handoff_report,
@@ -2931,6 +3010,7 @@ def build_real_runtime_canary_report(
         prediction_deltas=prediction_deltas,
         runtime_criteria=runtime_criteria,
         issues=issues,
+        stage_health=stage_health,
     )
     return {
         "schema_version": REAL_RUNTIME_CANARY_REPORT_SCHEMA_VERSION,
@@ -2957,6 +3037,7 @@ def build_real_runtime_canary_report(
             "runtime_gates": runtime_criteria,
             "first_failing_gate": first_failing_gate,
             "summary": criteria_summary,
+            "stage_health": stage_health,
         },
         "run": run,
         "run_duration_seconds": run_duration,
@@ -2966,6 +3047,8 @@ def build_real_runtime_canary_report(
         "recent_run_failure_taxonomy": current_audit_gap_summary["recent_run_failure_taxonomy"],
         "source_retrieval_pipeline_health_taxonomy": source_retrieval_pipeline_health_taxonomy,
         "pipeline_health_summary": pipeline_health_summary,
+        "stage_health": stage_health,
+        "stage_health_summary": stage_health_summary,
         "source_retrieval_phase0_audit_expectations": dict(SOURCE_RETRIEVAL_PHASE0_AUDIT_EXPECTATIONS),
         "current_audit_gap_summary": current_audit_gap_summary,
         "phase9_representative_case": phase9_case,
