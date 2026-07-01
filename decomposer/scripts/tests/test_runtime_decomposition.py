@@ -138,6 +138,7 @@ class RuntimeDecompositionEntrypointTest(unittest.TestCase):
     def test_prompt_payload_contains_phase3_temporal_contract(self) -> None:
         payload = build_decomposition_prompt_payload(self._handoff(), payloads={})
         instruction_text = json.dumps(payload["instruction_blocks"], sort_keys=True)
+        payload_text = json.dumps(payload, sort_keys=True)
 
         self.assertEqual(payload["prompt_schema_version"], "decomposer-qdt-prompt-input/v1")
         self.assertEqual(payload["market_temporal_state"], "unresolved")
@@ -145,6 +146,9 @@ class RuntimeDecompositionEntrypointTest(unittest.TestCase):
         self.assertIn("pre-resolution forecast research", instruction_text)
         self.assertIn("terminal_verification", instruction_text)
         self.assertIn("weak_context_only=true", instruction_text)
+        self.assertIn("consume_relevant_hints_by_ref", payload_text)
+        self.assertIn("ignored_reason_codes", payload_text)
+        self.assertIn("retrieval sufficiency", instruction_text)
         self.assertIn("Schema repair may normalize shape", instruction_text)
         self.assertEqual(
             payload["instructions"]["required_leaf_partitions"],
@@ -667,7 +671,7 @@ class RuntimeDecompositionEntrypointTest(unittest.TestCase):
         self.assertEqual(consumption["hint-1"]["consumed_by_leaf_ids"], ["leaf-current-decision-status"])
         self.assertEqual(consumption["hint-1"]["consumed_by_branch_ids"], [qdt["branches"][0]["branch_id"]])
         self.assertEqual(consumption["hint-1"]["ignored_reason_codes"], [])
-        self.assertEqual(consumption["hint-1"]["effect_status"], "context_only_no_authority")
+        self.assertEqual(consumption["hint-1"]["effect_status"], "consumed_context_only_no_authority")
         self.assertFalse(consumption["hint-2"]["decomposer_consumed"])
         self.assertEqual(
             consumption["hint-2"]["ignored_reason_codes"],

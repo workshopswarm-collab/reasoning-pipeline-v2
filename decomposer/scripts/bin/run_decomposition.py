@@ -787,7 +787,7 @@ def _amrg_operator_metadata(
                 "consumed_by_leaf_ids": leaf_ids,
                 "ignored_reason_codes": ignored_reasons,
                 "effect_status": (
-                    "context_only_no_authority"
+                    "consumed_context_only_no_authority"
                     if consumed
                     else "not_consumed_context_only_no_authority"
                 ),
@@ -962,9 +962,12 @@ def build_decomposition_prompt_payload(
             {
                 "block_id": "amrg_context_boundary",
                 "text": (
-                    "AMRG hints are bounded context only. Weak or generic AMRG refs must remain "
-                    "weak_context_only=true unless a strict anchor dependency is validated, and must not be "
-                    "used for QDT selection, QDT repair, probability authority, SCAE delta, or forecast writes."
+                    "AMRG hints are bounded context only. Consume relevant AMRG hints by writing their "
+                    "hint_ref into branch or leaf amrg_usage_refs. Ignore irrelevant AMRG hints by leaving "
+                    "them unreferenced so operator metadata can emit ignored reason codes. Weak or generic "
+                    "AMRG refs must remain weak_context_only=true unless a strict anchor dependency is "
+                    "validated, and must not be used for QDT selection, QDT repair, probability authority, "
+                    "retrieval sufficiency, SCAE delta, or forecast writes."
                 ),
             },
             {
@@ -1048,8 +1051,24 @@ def build_decomposition_prompt_payload(
                 "conditional_anchor_dependency_request",
             ],
             "amrg_weak_context_policy": (
-                "Weak AMRG refs remain weak_context_only=true unless a strict anchor dependency is validated."
+                "Weak AMRG refs remain weak_context_only=true unless a strict anchor dependency is validated. "
+                "Relevant hints may be consumed only as context refs; irrelevant hints must be ignored with "
+                "operator-visible reason codes."
             ),
+            "amrg_consumption_contract": {
+                "consume_relevant_hints_by_ref": "branches[].amrg_usage_refs or required_leaf_questions[].amrg_usage_refs",
+                "ignore_irrelevant_hints": "omit unused hint refs so ignored_reason_codes can be emitted",
+                "consumed_effect_status": "consumed_context_only_no_authority",
+                "ignored_effect_status": "not_consumed_context_only_no_authority",
+                "never_use_for": [
+                    "probability",
+                    "retrieval_sufficiency",
+                    "scae_delta",
+                    "qdt_selection",
+                    "qdt_repair",
+                    "forecast_write",
+                ],
+            },
             "amrg_forbidden_uses": [
                 "qdt_selection",
                 "qdt_repair",

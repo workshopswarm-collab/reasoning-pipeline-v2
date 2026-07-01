@@ -243,6 +243,29 @@ CANDIDATE_SOURCE_PRIORITY = {
     source: idx
     for idx, source in enumerate(DETERMINISTIC_CANDIDATE_SOURCES + OPTIONAL_CANDIDATE_SOURCES)
 }
+AMRG_HIGH_RELEVANCE_THRESHOLD = 45
+AMRG_MODERATE_RELEVANCE_THRESHOLD = 20
+AMRG_CANDIDATE_RELEVANCE_TIERS = {
+    "high_relevance",
+    "moderate_relevance",
+    "weak_context_only",
+}
+AMRG_WEAK_FILTER_STATUSES = {
+    "retained_high_relevance",
+    "retained_context",
+    "filtered_weak_context_only",
+}
+AMRG_DIRECT_COMPLEMENT_CONSTRAINT_TERMS = {
+    "complement",
+    "complementary",
+    "exclusive",
+    "exactly_one",
+    "mutually_exclusive",
+    "only_one",
+    "one_child",
+    "one_resolves_yes",
+}
+AMRG_EXPLICIT_ANCHOR_SOURCES = {"contract_source_match", "shared_resolution_source"}
 AMRG_FORBIDDEN_ARTIFACT_KEYS = UNSAFE_MARKET_FIELDS | {
     "raw_payload",
     "payload",
@@ -2088,6 +2111,148 @@ def market_record_tokens(record: dict[str, Any]) -> dict[str, set[str]]:
     }
 
 
+def selected_decision_window_tokens(evidence_packet: dict[str, Any]) -> set[str]:
+    identity = evidence_packet.get("market_identity", {})
+    constraints = evidence_packet.get("market_reality_constraints", {})
+    tokens: set[str] = set()
+    for value in (
+        identity.get("closes_at"),
+        identity.get("close_timestamp"),
+        identity.get("resolves_at"),
+        identity.get("resolve_timestamp"),
+        constraints.get("close_timestamp"),
+        constraints.get("resolve_timestamp"),
+    ):
+        if not value:
+            continue
+        text = str(value)
+        tokens.add(text[:10])
+        tokens.add(text[:16])
+    return {token for token in tokens if token}
+
+
+def candidate_decision_window_tokens(candidate: dict[str, Any]) -> set[str]:
+    timing = candidate.get("timing_inputs") if isinstance(candidate.get("timing_inputs"), dict) else {}
+    tokens: set[str] = set()
+    for value in (
+        timing.get("candidate_close_timestamp"),
+        timing.get("candidate_resolve_timestamp"),
+    ):
+        if not value:
+            continue
+        text = str(value)
+        tokens.add(text[:10])
+        tokens.add(text[:16])
+    return {token for token in tokens if token}
+
+
+def candidate_source_overlap_tokens(candidate: dict[str, Any]) -> set[str]:
+    overlaps: set[str] = set()
+    for ref in candidate.get("source_refs") or []:
+        if not isinstance(ref, dict):
+            continue
+        details = ref.get("details")
+        if isinstance(details, dict):
+            overlaps.update(text_tokens(details.get("overlap_tokens")))
+    return overlaps
+
+
+def family_has_direct_complement_constraint(evidence_packet: dict[str, Any]) -> bool:
+    family = evidence_packet.get("family_context", {})
+    if not isinstance(family, dict):
+        return False
+    raw_constraints = normalize_list(family.get("relation_constraints"))
+    lowered = {str(item).lower().replace("-", "_").replace(" ", "_") for item in raw_constraints}
+    tokens = text_tokens(raw_constraints)
+    return bool(
+        lowered & AMRG_DIRECT_COMPLEMENT_CONSTRAINT_TERMS
+        or ("exactly" in tokens and "one" in tokens)
+        or ("mutually" in tokens and "exclusive" in tokens)
+    )
+
+
+def candidate_relevance_details(
+    evidence_packet: dict[str, Any],
+    candidate: dict[str, Any],
+) -> dict[str, Any]:
+    sources = set(candidate.get("candidate_sources") or [candidate.get("candidate_source")])
+    selected_tokens = selected_case_tokens(evidence_packet)
+    source_overlap_tokens = candidate_source_overlap_tokens(candidate)
+    same_market_family = "platform_family_context" in sources or "family_sibling_context_only" in set(
+        candidate.get("reason_codes") or []
+    )
+    direct_complement = same_market_family and family_has_direct_complement_constraint(evidence_packet)
+    explicit_anchor_overlap = bool(sources & AMRG_EXPLICIT_ANCHOR_SOURCES)
+    same_institution = bool(
+        explicit_anchor_overlap
+        or ("entity_match" in sources and source_overlap_tokens & selected_tokens["entities"])
+    )
+    same_decision_window = bool(
+        selected_decision_window_tokens(evidence_packet)
+        & candidate_decision_window_tokens(candidate)
+    )
+    broad_context_only = (
+        sources <= {"generic_theme_match", AMRG_VECTOR_CANDIDATE_SOURCE}
+        or (sources == {"entity_match"} and not same_institution)
+    )
+    reason_codes: list[str] = []
+    score = 0
+    if same_market_family:
+        score += 50
+        reason_codes.append("same_market_family")
+    if direct_complement:
+        score += 40
+        reason_codes.append("direct_complement_relation")
+    if same_institution:
+        score += 25
+        reason_codes.append("same_institution")
+    if same_decision_window:
+        score += 20
+        reason_codes.append("same_decision_window")
+    if explicit_anchor_overlap:
+        score += 35
+        reason_codes.append("explicit_resolution_anchor_overlap")
+    if broad_context_only:
+        score -= 30
+        reason_codes.append("broad_entity_or_macro_only")
+
+    retainers = {
+        "same_market_family": same_market_family,
+        "direct_complement_relation": direct_complement,
+        "same_institution": same_institution,
+        "same_decision_window": same_decision_window,
+        "explicit_resolution_anchor_overlap": explicit_anchor_overlap,
+    }
+    retained_by = sorted(code for code, present in retainers.items() if present)
+    if broad_context_only and not retained_by:
+        filter_status = "filtered_weak_context_only"
+        filter_reasons = ["weak_macro_entity_only_without_required_overlap"]
+    else:
+        filter_status = "retained_high_relevance" if score >= AMRG_HIGH_RELEVANCE_THRESHOLD else "retained_context"
+        filter_reasons = retained_by or ["candidate_source_retained_for_context"]
+    if score >= AMRG_HIGH_RELEVANCE_THRESHOLD:
+        tier = "high_relevance"
+    elif score >= AMRG_MODERATE_RELEVANCE_THRESHOLD:
+        tier = "moderate_relevance"
+    else:
+        tier = "weak_context_only"
+    return {
+        "relevance_score": score,
+        "relevance_tier": tier,
+        "relevance_reason_codes": sorted(set(reason_codes or ["candidate_scored_neutral"])),
+        "weak_filter_status": filter_status,
+        "weak_filter_reason_codes": sorted(set(filter_reasons)),
+        "relevance_features": {
+            "same_market_family": same_market_family,
+            "direct_complement_relation": direct_complement,
+            "same_institution": same_institution,
+            "same_decision_window": same_decision_window,
+            "explicit_resolution_anchor_overlap": explicit_anchor_overlap,
+            "broad_entity_or_macro_only": broad_context_only,
+        },
+    }
+
+
 def candidate_source_ref(source: str, ref_id: str, details: dict[str, Any] | None = None) -> dict[str, Any]:
     ref = {"source": source, "ref_id": str(ref_id)}
     if details:
@@ -2172,6 +2337,18 @@ def validate_amrg_candidate(candidate: dict[str, Any]) -> None:
     if not isinstance(timing, dict) or not timing.get("source_cutoff_timestamp"):
         raise AMRGError("candidate timing_inputs.source_cutoff_timestamp is required")
     parse_timestamp(timing["source_cutoff_timestamp"], "candidate.source_cutoff_timestamp")
+    if "relevance_score" in candidate:
+        if not isinstance(candidate["relevance_score"], (int, float)) or isinstance(candidate["relevance_score"], bool):
+            raise AMRGError("candidate relevance_score must be numeric")
+    if candidate.get("relevance_tier") is not None and candidate["relevance_tier"] not in AMRG_CANDIDATE_RELEVANCE_TIERS:
+        raise AMRGError("candidate relevance_tier is unknown")
+    if candidate.get("weak_filter_status") is not None and candidate["weak_filter_status"] not in AMRG_WEAK_FILTER_STATUSES:
+        raise AMRGError("candidate weak_filter_status is unknown")
+    for field in ("relevance_reason_codes", "weak_filter_reason_codes"):
+        if field in candidate and not isinstance(candidate[field], list):
+            raise AMRGError(f"candidate {field} must be a list")
+    if "relevance_features" in candidate and not isinstance(candidate["relevance_features"], dict):
+        raise AMRGError("candidate relevance_features must be an object")
     ensure_no_raw_amrg_fields(candidate, "candidate")
 
 
@@ -2433,7 +2610,13 @@ def merge_source_refs(refs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [keyed[key] for key in sorted(keyed)]
 
 
-def dedupe_and_cap_candidates(candidates: list[dict[str, Any]], cap: int) -> list[dict[str, Any]]:
+def dedupe_and_cap_candidates(
+    candidates: list[dict[str, Any]],
+    cap: int,
+    *,
+    evidence_packet: dict[str, Any] | None = None,
+    exclusions: Counter | None = None,
+) -> list[dict[str, Any]]:
     if cap < 0:
         raise AMRGError("candidate cap must be non-negative")
     grouped: dict[str, dict[str, Any]] = {}
@@ -2466,9 +2649,21 @@ def dedupe_and_cap_candidates(candidates: list[dict[str, Any]], cap: int) -> lis
             existing["reason_codes"],
             existing["active_safe_fields_hash"],
         )
+    ranked: list[dict[str, Any]] = []
+    for candidate in grouped.values():
+        if evidence_packet is not None:
+            candidate.update(candidate_relevance_details(evidence_packet, candidate))
+            if candidate.get("weak_filter_status") == "filtered_weak_context_only":
+                if exclusions is not None:
+                    exclusions["weak_context_candidate_filtered"] += 1
+                    for source in candidate.get("candidate_sources", []):
+                        exclusions[f"weak_context_candidate_filtered:{source}"] += 1
+                continue
+        ranked.append(candidate)
     ordered = sorted(
-        grouped.values(),
+        ranked,
         key=lambda candidate: (
+            -float(candidate.get("relevance_score", 0)),
             CANDIDATE_SOURCE_PRIORITY[candidate["candidate_source"]],
             str(candidate["market_id"]),
         ),
@@ -2490,7 +2685,7 @@ def amrg_source_policy(candidate_cap: int) -> dict[str, Any]:
         "forbidden_market_field_count": len(UNSAFE_MARKET_FIELDS),
         "post_cutoff_fields": sorted(POST_CUTOFF_FIELDS),
         "edge_default": WEAK_CONTEXT_ONLY,
-        "phase_scope": "phase_6_candidate_pool_and_weak_context_artifact",
+        "phase_scope": "phase_7_ranked_candidate_pool_and_context_artifact",
     }
 
 
@@ -2561,6 +2756,8 @@ def build_amrg_candidate_pool(
     candidates = dedupe_and_cap_candidates(
         deterministic_candidates + vector_context_candidates,
         candidate_cap,
+        evidence_packet=evidence_packet,
+        exclusions=exclusion_counts,
     )
     input_manifest_ids = [evidence_packet_ref]
     if profile_context_ref:
@@ -2591,6 +2788,7 @@ def make_weak_edge(candidate_set_id: str, candidate: dict[str, Any]) -> dict[str
         "market_id": candidate["market_id"],
         "relationship_status": WEAK_CONTEXT_ONLY,
         "relationship_label": "weak_context_untyped_phase6",
+        "relationship_types": relationship_types_for_candidate(candidate),
         "allowed_effects": AMRG_ALLOWED_EFFECTS_BY_STATUS[WEAK_CONTEXT_ONLY],
         "forbidden_effects": forbidden_effects_for_status(WEAK_CONTEXT_ONLY),
         "concept_authority": "none_candidate_input_only",
@@ -2809,6 +3007,9 @@ def _candidate_leaf_relevance(edge: dict[str, Any], candidate: dict[str, Any], c
             else ["direct_evidence", "catalyst", "other"]
         ),
         "reason_codes": sorted(set(candidate.get("reason_codes", [])))[:6],
+        "candidate_relevance_tier": candidate.get("relevance_tier", "weak_context_only"),
+        "candidate_relevance_score": candidate.get("relevance_score", 0),
+        "relevance_reason_codes": sorted(set(candidate.get("relevance_reason_codes", [])))[:6],
     }
 
 
@@ -4599,6 +4800,53 @@ def build_amrg_operator_report(
             "leaf_ids": [str(leaf_id) for leaf_id in leaf_ids],
             "branch_ids": [str(branch_id) for branch_id in branch_ids],
         }
+    hint_consumption = []
+    for hint in hints:
+        if not isinstance(hint, dict):
+            continue
+        hint_ref = str(hint.get("hint_ref"))
+        consumed = bool(
+            consumed_by_ref.get(hint_ref, {}).get("leaf_ids")
+            or consumed_by_ref.get(hint_ref, {}).get("branch_ids")
+        )
+        hint_consumption.append(
+            {
+                "hint_ref": hint.get("hint_ref"),
+                "hint_category": hint.get("hint_category"),
+                "effect_status": qdt_consumption_by_ref.get(hint_ref, {}).get(
+                    "effect_status",
+                    "consumed_context_only_no_authority"
+                    if consumed
+                    else "not_consumed_context_only_no_authority",
+                ),
+                "source_market_ref": hint.get("source_market_ref"),
+                "decomposer_consumed": consumed,
+                "consumed_by_leaf_ids": sorted(consumed_by_ref.get(hint_ref, {}).get("leaf_ids", [])),
+                "consumed_by_branch_ids": sorted(consumed_by_ref.get(hint_ref, {}).get("branch_ids", [])),
+                "ignored_reason_codes": qdt_consumption_by_ref.get(hint_ref, {}).get(
+                    "ignored_reason_codes",
+                    [] if consumed else ["not_referenced_by_qdt_branch_or_leaf"],
+                ),
+                "allowed_use": hint.get("allowed_use", []),
+                "forbidden_effects": hint.get("prohibited_use", []),
+                "consumption_authority": qdt_consumption_by_ref.get(hint_ref, {}).get(
+                    "consumption_authority",
+                    "context_ref_only_no_forecast_authority",
+                ),
+            }
+        )
+    consumed_hint_count = sum(1 for item in hint_consumption if item["decomposer_consumed"])
+    ignored_reason_counts = Counter(
+        reason
+        for item in hint_consumption
+        if not item["decomposer_consumed"]
+        for reason in item.get("ignored_reason_codes", [])
+    )
+    candidate_relevance_counts = Counter(
+        candidate.get("relevance_tier", "weak_context_only")
+        for candidate in context.get("candidates", [])
+        if isinstance(candidate, dict)
+    )
     vector_runtime = context.get("vector_runtime") if isinstance(context.get("vector_runtime"), dict) else {}
     source_policy = context.get("source_policy") if isinstance(context.get("source_policy"), dict) else {}
     vector_required = bool(source_policy.get("vector_source_required", False))
@@ -4617,6 +4865,14 @@ def build_amrg_operator_report(
             for candidate in context.get("candidates", [])
             for source in candidate.get("candidate_sources", [])
         )),
+        "candidate_relevance_counts": dict(candidate_relevance_counts),
+        "high_relevance_candidate_count": int(candidate_relevance_counts.get("high_relevance", 0)),
+        "weak_context_only_candidate_count": int(candidate_relevance_counts.get("weak_context_only", 0)),
+        "filtered_weak_context_candidate_count": int(
+            (context.get("exclusion_counts") or {}).get("weak_context_candidate_filtered", 0)
+            if isinstance(context.get("exclusion_counts"), dict)
+            else 0
+        ),
         "vector_status": vector_runtime.get("status", "not_requested"),
         "vector_readiness_status": dependency_readiness["vector_status"],
         "ollama_route": {
@@ -4663,45 +4919,10 @@ def build_amrg_operator_report(
             if isinstance(question_decomposition, dict)
             else "pending_decomposition"
         ),
-        "hint_consumption": [
-            {
-                "hint_ref": hint.get("hint_ref"),
-                "hint_category": hint.get("hint_category"),
-                "effect_status": qdt_consumption_by_ref.get(str(hint.get("hint_ref")), {}).get(
-                    "effect_status",
-                    "context_only_no_authority"
-                    if (
-                        consumed_by_ref.get(str(hint.get("hint_ref")), {}).get("leaf_ids")
-                        or consumed_by_ref.get(str(hint.get("hint_ref")), {}).get("branch_ids")
-                    )
-                    else "not_consumed_context_only_no_authority",
-                ),
-                "source_market_ref": hint.get("source_market_ref"),
-                "decomposer_consumed": bool(
-                    consumed_by_ref.get(str(hint.get("hint_ref")), {}).get("leaf_ids")
-                    or consumed_by_ref.get(str(hint.get("hint_ref")), {}).get("branch_ids")
-                ),
-                "consumed_by_leaf_ids": sorted(consumed_by_ref.get(str(hint.get("hint_ref")), {}).get("leaf_ids", [])),
-                "consumed_by_branch_ids": sorted(consumed_by_ref.get(str(hint.get("hint_ref")), {}).get("branch_ids", [])),
-                "ignored_reason_codes": qdt_consumption_by_ref.get(str(hint.get("hint_ref")), {}).get(
-                    "ignored_reason_codes",
-                    []
-                    if (
-                        consumed_by_ref.get(str(hint.get("hint_ref")), {}).get("leaf_ids")
-                        or consumed_by_ref.get(str(hint.get("hint_ref")), {}).get("branch_ids")
-                    )
-                    else ["not_referenced_by_qdt_branch_or_leaf"],
-                ),
-                "allowed_use": hint.get("allowed_use", []),
-                "forbidden_effects": hint.get("prohibited_use", []),
-                "consumption_authority": qdt_consumption_by_ref.get(str(hint.get("hint_ref")), {}).get(
-                    "consumption_authority",
-                    "context_ref_only_no_forecast_authority",
-                ),
-            }
-            for hint in hints
-            if isinstance(hint, dict)
-        ],
+        "consumed_hint_count": consumed_hint_count,
+        "ignored_hint_count": len(hint_consumption) - consumed_hint_count,
+        "ignored_hint_count_by_reason": dict(ignored_reason_counts),
+        "hint_consumption": hint_consumption,
         "authority": "operator_audit_only_no_forecast_authority",
     }
     ensure_no_raw_amrg_fields(report, "amrg_operator_report")

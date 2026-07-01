@@ -760,7 +760,7 @@ Completion note:
 
 ## Phase 7 - AMRG Ranking, Filtering, And QDT Consumption Proof
 
-Status: planned
+Status: complete
 
 Goal: make AMRG useful as context by improving candidate relevance and making QDT consumption observable, while preserving advisory boundaries.
 
@@ -846,12 +846,22 @@ Success criteria:
 
 Checklist:
 
-- [ ] Candidate scoring updated.
-- [ ] Weak-candidate filtering covered.
-- [ ] QDT AMRG consumption contract covered.
-- [ ] Operator counters added.
-- [ ] Clone proof validates relevant sibling handling.
-- [ ] Temp artifacts and one-off scripts removed.
+- [x] Candidate scoring updated.
+- [x] Weak-candidate filtering covered.
+- [x] QDT AMRG consumption contract covered.
+- [x] Operator counters added.
+- [x] Clone proof validates relevant sibling handling.
+- [x] Temp artifacts and one-off scripts removed.
+
+Completion note:
+
+- Added AMRG relevance scoring and reason codes for same market family, direct complement relation, same institution, same decision window, and explicit resolution-anchor overlap, with weak broad-context penalties.
+- Added weak candidate filtering for macro/entity-only candidates that do not share a strong anchor, and exposed retained/filtered relevance counters in AMRG exclusion summaries and operator reports.
+- Updated QDT runtime prompt contracts to consume relevant AMRG hints by `hint_ref`, leave irrelevant hints unreferenced for ignored reason codes, and preserve the advisory boundary against probability, retrieval sufficiency, QDT selection/repair, SCAE deltas, and forecast writes.
+- Added AMRG hint-consumption observability: consumed hint count, ignored hint count, ignored-by-reason counts, high-relevance candidate count, weak-context-only candidate count, and per-hint context-only effect statuses.
+- Verification passed: `orchestrator` `scripts.tests.test_amrg_context`, `scripts.tests.test_amrg_vector`, `scripts.tests.test_ads_operator_review`, `scripts.tests.test_ads_operational_canary`; `decomposer` `scripts.tests.test_qdt`, `scripts.tests.test_runtime_decomposition`; `py_compile` for changed runtime modules; and `git diff --check`.
+- Clone proof `ads-pipeline-run:0669959d1be9f7b8aef8d8491a287c9f73bd32a37363bb98658626fa8a6cb48b` used a cloned SQLite DB, fixture decomposition, direct/search/native fetches disabled, and BOI case `polymarket:1795635`. It ranked the BOI no-change sibling as the only AMRG candidate with `relevance_score=45`, `relevance_tier=high_relevance`, reason codes `same_decision_window` and `same_institution`, `weak_context_only_candidate_count=0`, and `filtered_weak_context_candidate_count=0`. QDT did not reference the hint, so the report emitted `ignored_hint_count=1` with `not_referenced_by_qdt_branch_or_leaf`, preserving context-only/no-authority semantics.
+- Direct complement ranking is covered by the AMRG unit fixture because the production BOI clone path does not currently hydrate family relation rows into the evidence packet. Temporary clone-run directories and the temporary provider module under `/tmp` were removed.
 
 ## Phase 8 - Researcher Runtime Positive Dispatch And Verification Proof
 

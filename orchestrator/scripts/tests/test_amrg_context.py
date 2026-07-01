@@ -364,7 +364,10 @@ class AMRGContextTest(unittest.TestCase):
                 for item in qdt_report["hint_consumption"]
             }
             self.assertTrue(consumed[hint_ref]["decomposer_consumed"])
+            self.assertEqual(consumed[hint_ref]["effect_status"], "consumed_context_only_no_authority")
             self.assertEqual(consumed[hint_ref]["consumed_by_leaf_ids"], ["leaf-1"])
+            self.assertEqual(qdt_report["consumed_hint_count"], 1)
+            self.assertGreaterEqual(qdt_report["high_relevance_candidate_count"], 1)
         finally:
             conn.close()
 
@@ -390,6 +393,60 @@ class AMRGContextTest(unittest.TestCase):
         self.assertEqual([candidate["candidate_id"] for candidate in first["candidates"]], [candidate["candidate_id"] for candidate in second["candidates"]])
         self.assertIn("entity_match", first["candidates"][0]["candidate_sources"])
         self.assertIn("contract_source_match", first["candidates"][0]["candidate_sources"])
+
+    def test_candidate_relevance_ranks_family_complement_and_filters_weak_macro_context(self):
+        packet = self.evidence_packet(
+            family_context={
+                "mode": "family_aware_binary_child",
+                "parent_event_id": "event:boi-july-rate-decision",
+                "selected_child_market_id": "poly-1",
+                "sibling_child_ids": ["poly-2"],
+                "family_type": "exclusive_rate_direction_group",
+                "relation_constraints": ["exactly_one_child_resolves_yes"],
+                "sibling_prices": [],
+                "family_validation_flags": [],
+            }
+        )
+        artifact = build_related_live_market_context_or_waiver(
+            evidence_packet=packet,
+            evidence_packet_ref="artifact:evidence-packet",
+            active_market_index=[
+                self.market(
+                    2,
+                    external_market_id="poly-2",
+                    title="Will Fixture Labs not win the election?",
+                    normalized_entities=["Fixture Labs"],
+                    contract_terms=["election", "no change"],
+                ),
+                self.market(
+                    3,
+                    title="Will Fixture Labs hold a press conference?",
+                    normalized_entities=["Fixture Labs"],
+                    contract_terms=["press conference"],
+                    source_of_truth_kind="different",
+                    source_url="https://example.test/press",
+                ),
+                self.market(
+                    4,
+                    title="Will an unrelated policy bill pass next year?",
+                    normalized_entities=[],
+                    contract_terms=[],
+                    source_of_truth_kind="different",
+                    source_url="https://example.test/other",
+                    closes_at="2026-08-25T00:00:00+00:00",
+                    resolves_at="2026-08-26T00:00:00+00:00",
+                ),
+            ],
+        )
+
+        self.assertEqual([candidate["market_id"] for candidate in artifact["candidates"]], [2, 3])
+        family_candidate = artifact["candidates"][0]
+        entity_candidate = artifact["candidates"][1]
+        self.assertGreater(family_candidate["relevance_score"], entity_candidate["relevance_score"])
+        self.assertEqual(family_candidate["relevance_tier"], "high_relevance")
+        self.assertIn("same_market_family", family_candidate["relevance_reason_codes"])
+        self.assertIn("direct_complement_relation", family_candidate["relevance_reason_codes"])
+        self.assertEqual(artifact["exclusion_counts"]["weak_context_candidate_filtered"], 1)
 
     def test_resolved_past_and_unsafe_sources_are_excluded(self):
         artifact = self.build_artifact(
@@ -726,7 +783,7 @@ class AMRGContextTest(unittest.TestCase):
                             "consumed_by_leaf_ids": ["leaf-amrg-context"],
                             "consumed_by_branch_ids": ["branch-amrg-context"],
                             "ignored_reason_codes": [],
-                            "effect_status": "context_only_no_authority",
+                            "effect_status": "consumed_context_only_no_authority",
                             "consumption_authority": "context_ref_only_no_forecast_authority",
                         },
                         {
@@ -747,7 +804,7 @@ class AMRGContextTest(unittest.TestCase):
         self.assertTrue(consumption[consumed_ref]["decomposer_consumed"])
         self.assertEqual(consumption[consumed_ref]["consumed_by_leaf_ids"], ["leaf-amrg-context"])
         self.assertEqual(consumption[consumed_ref]["consumed_by_branch_ids"], ["branch-amrg-context"])
-        self.assertEqual(consumption[consumed_ref]["effect_status"], "context_only_no_authority")
+        self.assertEqual(consumption[consumed_ref]["effect_status"], "consumed_context_only_no_authority")
         self.assertFalse(consumption[ignored_ref]["decomposer_consumed"])
         self.assertEqual(
             consumption[ignored_ref]["ignored_reason_codes"],
@@ -762,6 +819,10 @@ class AMRGContextTest(unittest.TestCase):
             consumption[ignored_ref]["consumption_authority"],
             "context_ref_only_no_forecast_authority",
         )
+        self.assertEqual(report["consumed_hint_count"], 1)
+        self.assertEqual(report["ignored_hint_count"], 1)
+        self.assertEqual(report["ignored_hint_count_by_reason"], {"declared_in_related_context_usage_only": 1})
+        self.assertIn("high_relevance", report["candidate_relevance_counts"])
 
     def test_relationship_typing_and_timing_alignment_can_add_safe_context_status(self):
         packet = self.evidence_packet()
