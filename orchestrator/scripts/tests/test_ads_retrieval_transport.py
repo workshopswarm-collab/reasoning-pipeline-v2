@@ -21,8 +21,10 @@ from ads_decomposer.handoff import (  # noqa: E402
 )
 from ads_decomposer.qdt import build_fixture_qdt_candidate, select_qdt_candidate  # noqa: E402
 from predquant.ads_retrieval_transport import (  # noqa: E402
+    BOI_CENTRAL_BANK_ADAPTER_ID,
     BROWSER_SEARCH_SOURCE_PROVIDER_KIND,
     DIRECT_URL_SOURCE_PROVIDER_KIND,
+    POLYMARKET_CONTRACT_ADAPTER_ID,
     RetrievalProviderPolicy,
     SOURCE_PROVIDER_RUNTIME_REF_SCHEMA_VERSION,
     collect_live_retrieval_candidates,
@@ -249,6 +251,18 @@ class AdsRetrievalTransportTest(unittest.TestCase):
         ]
         return qdt
 
+    def _direct_evidence_qdt(self) -> dict:
+        qdt = copy.deepcopy(self.qdt)
+        qdt["required_leaf_questions"] = [
+            leaf for leaf in qdt["required_leaf_questions"] if leaf["leaf_id"] == "leaf-direct-evidence"
+        ]
+        qdt["branches"] = [
+            branch
+            for branch in qdt["branches"]
+            if "leaf-direct-evidence" in branch.get("leaf_ids", [])
+        ]
+        return qdt
+
     def _boi_source_of_truth_qdt(self) -> dict:
         qdt = self._source_of_truth_qdt()
         leaf = qdt["required_leaf_questions"][0]
@@ -354,6 +368,156 @@ class AdsRetrievalTransportTest(unittest.TestCase):
         self.assertEqual(
             transport.fetched_candidates[-1]["search_candidate_url_ref"],
             search_candidate["search_candidate_url_id"],
+        )
+
+    def test_boi_source_of_truth_leaf_gets_official_adapter_before_generic_search(self) -> None:
+        provider = FakeBrowserProvider(search_results=[{"url": "https://secondary.example/boi-report"}])
+
+        transport = collect_live_retrieval_candidates(
+            qdt=self._boi_source_of_truth_qdt(),
+            evidence_packet={
+                **self.evidence_packet,
+                "market_rules": {},
+                "official_source_hints": [],
+                "market_reality_constraints": {},
+            },
+            case_contract=self.case_contract,
+            amrg_context=None,
+            source_cutoff_timestamp=CUTOFF_AT,
+            forecast_timestamp=FORECAST_AT,
+            provider_policy=RetrievalProviderPolicy(max_direct_urls=2, max_search_results_per_variant=1),
+            browser_provider=provider,
+        )
+
+        direct_urls = [item["url"] for item in transport.direct_url_candidates]
+        self.assertEqual(
+            direct_urls[:2],
+            [
+                "https://boi.org.il/en/monetary-policy/interest-rate-decisions",
+                "https://boi.org.il/en/markets/schedule",
+            ],
+        )
+        self.assertIn(
+            BOI_CENTRAL_BANK_ADAPTER_ID,
+            transport.direct_url_candidates[0]["official_direct_adapter_ids"],
+        )
+        self.assertIn(
+            "boi_context_requires_official_central_bank_source",
+            transport.direct_url_candidates[0]["official_direct_adapter_reason_codes"],
+        )
+        first_search_index = next(index for index, event in enumerate(provider.events) if event[0] == "search")
+        self.assertTrue(all(event[0] == "fetch" for event in provider.events[:first_search_index]))
+        self.assertTrue(provider.events[0][1].startswith("https://boi.org.il/"))
+        boi_candidate = next(
+            item
+            for item in transport.fetched_candidates
+            if item.get("official_direct_adapter_ids")
+            and BOI_CENTRAL_BANK_ADAPTER_ID in item["official_direct_adapter_ids"]
+        )
+        self.assertEqual(boi_candidate["source_class"], "official_or_primary")
+        self.assertEqual(boi_candidate["source_class_resolution_method"], "bank_of_israel_official_domain_path")
+        diagnostics = transport.transport_diagnostics
+        self.assertEqual(diagnostics["official_direct_adapter_candidate_count"], 2)
+        self.assertGreaterEqual(diagnostics["official_direct_adapter_fetch_attempt_count"], 2)
+        self.assertEqual(
+            diagnostics["official_direct_adapter_diagnostics"][0]["adapter_id"],
+            BOI_CENTRAL_BANK_ADAPTER_ID,
+        )
+
+    def test_resolution_mechanics_leaf_gets_polymarket_contract_adapter(self) -> None:
+        provider = FakeBrowserProvider(search_results=[{"url": "https://secondary.example/report"}])
+
+        transport = collect_live_retrieval_candidates(
+            qdt=self._resolution_mechanics_qdt(),
+            evidence_packet={
+                **self.evidence_packet,
+                "market_rules": {},
+                "official_source_hints": [],
+                "market_reality_constraints": {},
+            },
+            case_contract=self.case_contract,
+            amrg_context=None,
+            source_cutoff_timestamp=CUTOFF_AT,
+            forecast_timestamp=FORECAST_AT,
+            provider_policy=RetrievalProviderPolicy(max_direct_urls=4, max_search_results_per_variant=1),
+            browser_provider=provider,
+        )
+
+        market_hint = next(
+            item
+            for item in transport.direct_url_candidates
+            if item["url"] == "https://polymarket.com/event/example-market"
+        )
+        self.assertEqual(market_hint["source_ref"], "case_contract.market_url")
+        self.assertIn(POLYMARKET_CONTRACT_ADAPTER_ID, market_hint["official_direct_adapter_ids"])
+        self.assertIn(
+            "resolution_mechanics_leaf_requires_market_rules_source",
+            market_hint["official_direct_adapter_reason_codes"],
+        )
+        fetched_market = next(
+            item
+            for item in transport.fetched_candidates
+            if item["canonical_url"] == "https://polymarket.com/event/example-market"
+        )
+        self.assertEqual(fetched_market["source_class"], "market_rules_or_resolution_source")
+        self.assertIn(POLYMARKET_CONTRACT_ADAPTER_ID, fetched_market["official_direct_adapter_ids"])
+        first_search_index = next(index for index, event in enumerate(provider.events) if event[0] == "search")
+        self.assertTrue(all(event[0] == "fetch" for event in provider.events[:first_search_index]))
+        self.assertEqual(
+            transport.transport_diagnostics["official_direct_adapter_diagnostics"][0]["adapter_id"],
+            POLYMARKET_CONTRACT_ADAPTER_ID,
+        )
+
+    def test_non_official_leaf_can_still_use_generic_search_without_adapter(self) -> None:
+        provider = FakeBrowserProvider(search_results=[{"url": "https://secondary.example/direct-evidence"}])
+        case_contract = {**self.case_contract, "market_identity": {}}
+
+        transport = collect_live_retrieval_candidates(
+            qdt=self._direct_evidence_qdt(),
+            evidence_packet={
+                **self.evidence_packet,
+                "market_rules": {},
+                "official_source_hints": [],
+                "market_reality_constraints": {},
+            },
+            case_contract=case_contract,
+            amrg_context=None,
+            source_cutoff_timestamp=CUTOFF_AT,
+            forecast_timestamp=FORECAST_AT,
+            provider_policy=RetrievalProviderPolicy(max_direct_urls=0, max_search_results_per_variant=1),
+            browser_provider=provider,
+        )
+
+        self.assertEqual(transport.transport_diagnostics["official_direct_adapter_candidate_count"], 0)
+        self.assertEqual(transport.transport_diagnostics["official_direct_adapter_diagnostics"], [])
+        self.assertEqual(transport.transport_diagnostics["browser_search_status"], "executed")
+        self.assertEqual(transport.search_candidate_urls[0]["url"], "https://secondary.example/direct-evidence")
+
+    def test_official_adapter_direct_candidate_does_not_bypass_freshness_validator(self) -> None:
+        provider = NoTimestampBrowserProvider()
+
+        transport = collect_live_retrieval_candidates(
+            qdt=self._boi_source_of_truth_qdt(),
+            evidence_packet={
+                **self.evidence_packet,
+                "market_rules": {},
+                "official_source_hints": [],
+                "market_reality_constraints": {},
+            },
+            case_contract=self.case_contract,
+            amrg_context=None,
+            source_cutoff_timestamp=CUTOFF_AT,
+            forecast_timestamp=FORECAST_AT,
+            provider_policy=RetrievalProviderPolicy(max_direct_urls=1, broad_search_enabled=False),
+            browser_provider=provider,
+        )
+
+        candidate = transport.fetched_candidates[0]
+        self.assertIn(BOI_CENTRAL_BANK_ADAPTER_ID, candidate["official_direct_adapter_ids"])
+        self.assertEqual(candidate["admission_status"], "rejected")
+        self.assertIn(
+            "source_time_unknown_not_admitted_by_transport_adapter",
+            candidate["omission_reason_codes"],
         )
 
     def test_duplicate_canonical_direct_url_is_fetched_once_across_leaves(self) -> None:
@@ -528,7 +692,7 @@ class AdsRetrievalTransportTest(unittest.TestCase):
             qdt=self._boi_source_of_truth_qdt(),
             evidence_packet={
                 **self.evidence_packet,
-                "market_rules": {},
+                "market_rules": {"resolution_url": "https://polymarket.com/event/example-market"},
                 "official_source_hints": [],
                 "market_reality_constraints": {},
             },
@@ -540,7 +704,7 @@ class AdsRetrievalTransportTest(unittest.TestCase):
             browser_provider=provider,
         )
         candidate = transport.fetched_candidates[0]
-        self.assertEqual(candidate["direct_url_source_ref"], "case_contract.market_url")
+        self.assertEqual(candidate["direct_url_source_ref"], "evidence_packet.market_rules.resolution_url")
         self.assertEqual(candidate["source_class"], "market_rules_or_resolution_source")
 
         packet = build_live_retrieval_packet_from_candidates(

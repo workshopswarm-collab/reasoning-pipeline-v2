@@ -175,6 +175,13 @@ DIRECT_URL_SOURCE_PROVIDER_ID = "direct_official_url_candidates"
 BROWSER_SEARCH_SOURCE_PROVIDER_KIND = "browser_search_candidates"
 DIRECT_URL_SOURCE_PROVIDER_KIND = "direct_official_url_candidates"
 NATIVE_RESEARCH_SOURCE_PROVIDER_KIND = "native_gpt_research_candidates"
+POLYMARKET_CONTRACT_ADAPTER_ID = "polymarket_contract_rules_adapter"
+BOI_CENTRAL_BANK_ADAPTER_ID = "bank_of_israel_official_adapter"
+OFFICIAL_DIRECT_ADAPTER_DIAGNOSTIC_SCHEMA_VERSION = "ads-official-direct-source-adapter-diagnostic/v1"
+BOI_OFFICIAL_DIRECT_ADAPTER_URLS = (
+    "https://boi.org.il/en/monetary-policy/interest-rate-decisions",
+    "https://boi.org.il/en/markets/schedule",
+)
 
 
 class SourceDiscoveryProvider(Protocol):
@@ -490,7 +497,17 @@ def collect_live_retrieval_candidates(
         forecast_timestamp=forecast_timestamp,
         source_cutoff_timestamp=source_cutoff_timestamp,
     )
-    raw_direct_urls = _collect_direct_url_hints(case_contract, evidence_packet, amrg_context)[: policy.max_direct_urls]
+    official_direct_adapter_hints, official_direct_adapter_diagnostics = _official_direct_adapter_hints(
+        case_contract=case_contract,
+        contexts=contexts,
+        selected_at=forecast_timestamp,
+    )
+    raw_direct_urls = _collect_direct_url_hints(
+        case_contract,
+        evidence_packet,
+        amrg_context,
+        official_direct_adapter_hints=official_direct_adapter_hints,
+    )[: policy.max_direct_urls]
     direct_runtime_ref = _source_provider_runtime_ref(
         provider_id=DIRECT_URL_SOURCE_PROVIDER_ID,
         provider_kind=DIRECT_URL_SOURCE_PROVIDER_KIND,
@@ -521,6 +538,7 @@ def collect_live_retrieval_candidates(
     search_result_fetch_count = 0
     search_result_fetch_skipped_count = 0
     search_result_fetch_cache_hit_count = 0
+    direct_fetch_leaf_scope_skipped_count = 0
     native_research_call_count = 0
     native_candidate_fetch_count = 0
     native_candidate_fetch_skipped_count = 0
@@ -535,6 +553,9 @@ def collect_live_retrieval_candidates(
 
     for context in contexts:
         for rank, hint in enumerate(direct_urls, start=1):
+            if not _direct_hint_targets_context(hint, context):
+                direct_fetch_leaf_scope_skipped_count += 1
+                continue
             cache_key = _canonical_fetch_key(hint.get("url"), source_cutoff_timestamp)
             cache_hit = cache_key is not None and cache_key in fetch_cache
             if not cache_hit and direct_fetch_count >= max(0, policy.max_total_direct_fetches):
@@ -1073,6 +1094,19 @@ def collect_live_retrieval_candidates(
         "native_research_skip_diagnostics": native_research_skip_diagnostics,
         "native_research_call_diagnostics": native_research_call_diagnostics,
         "native_research_runtime_calls": native_research_runtime_calls,
+        "official_direct_adapter_diagnostics": official_direct_adapter_diagnostics,
+        "official_direct_adapter_candidate_count": sum(
+            1
+            for item in result.direct_url_candidates
+            if isinstance(item, dict) and item.get("official_direct_adapter_ids")
+        ),
+        "official_direct_adapter_fetch_attempt_count": sum(
+            1
+            for item in result.fetched_candidates
+            if isinstance(item, dict)
+            and item.get("navigation_mode") == "direct_url"
+            and item.get("official_direct_adapter_ids")
+        ),
         "source_provider_runtime_refs": source_provider_runtime_refs,
         "source_provider_runtime_ref_count": len(source_provider_runtime_refs),
         "native_research_transport_diagnostics": _native_transport_diagnostics(
@@ -1106,6 +1140,7 @@ def collect_live_retrieval_candidates(
         },
         "direct_url_fetch_attempt_count": direct_fetch_count,
         "direct_url_fetch_skipped_count": direct_fetch_skipped_count,
+        "direct_url_fetch_leaf_scope_skipped_count": direct_fetch_leaf_scope_skipped_count,
         "search_call_count": search_call_count,
         "search_primary_call_count": search_primary_call_count,
         "search_retry_attempt_count": search_retry_attempt_count,
@@ -1399,12 +1434,180 @@ def _packet_safe_provider_diagnostics(diagnostics: dict[str, Any]) -> dict[str, 
     return safe
 
 
+def _official_direct_adapter_hints(
+    *,
+    case_contract: dict[str, Any],
+    contexts: list[dict[str, Any]],
+    selected_at: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    hints: list[dict[str, Any]] = []
+    diagnostics: list[dict[str, Any]] = []
+    for context in contexts:
+        leaf_id = str(context.get("leaf_id") or "")
+        if _context_requires_boi_fact(context) and _context_requires_protected_primary(context):
+            reason_codes = [
+                "boi_context_requires_official_central_bank_source",
+                "protected_primary_leaf_direct_official_adapter_selected",
+            ]
+            leaf_hints: list[dict[str, Any]] = []
+            for index, url in enumerate(BOI_OFFICIAL_DIRECT_ADAPTER_URLS, start=1):
+                source_ref = f"official_direct_adapter.{BOI_CENTRAL_BANK_ADAPTER_ID}.{index}"
+                _add_hint(
+                    leaf_hints,
+                    url,
+                    source_ref=source_ref,
+                    source_class="official_or_primary",
+                    source_class_resolution_method="bank_of_israel_official_adapter",
+                    metadata=_official_direct_adapter_metadata(
+                        adapter_id=BOI_CENTRAL_BANK_ADAPTER_ID,
+                        source_ref=source_ref,
+                        reason_codes=reason_codes,
+                        domains=["boi.org.il"],
+                        target_leaf_ids=[leaf_id],
+                    ),
+                )
+            hints.extend(leaf_hints)
+            diagnostics.append(
+                _official_direct_adapter_diagnostic(
+                    adapter_id=BOI_CENTRAL_BANK_ADAPTER_ID,
+                    context=context,
+                    selected_at=selected_at,
+                    reason_codes=reason_codes,
+                    candidate_urls=[item["url"] for item in leaf_hints],
+                    known_source_domains=["boi.org.il"],
+                )
+            )
+
+        if _is_polymarket_case(case_contract) and _context_requires_polymarket_contract_adapter(context):
+            url = _market_url(case_contract)
+            if _valid_http_url(url):
+                reason_codes = [
+                    "polymarket_contract_rules_leaf_direct_adapter_selected",
+                    "resolution_mechanics_leaf_requires_market_rules_source",
+                ]
+                source_ref = f"official_direct_adapter.{POLYMARKET_CONTRACT_ADAPTER_ID}.market_url"
+                leaf_hints = []
+                _add_hint(
+                    leaf_hints,
+                    url,
+                    source_ref=source_ref,
+                    source_class="market_rules_or_resolution_source",
+                    source_class_resolution_method="polymarket_contract_rules_adapter",
+                    metadata=_official_direct_adapter_metadata(
+                        adapter_id=POLYMARKET_CONTRACT_ADAPTER_ID,
+                        source_ref=source_ref,
+                        reason_codes=reason_codes,
+                        domains=["polymarket.com"],
+                        target_leaf_ids=[leaf_id],
+                    ),
+                )
+                hints.extend(leaf_hints)
+                diagnostics.append(
+                    _official_direct_adapter_diagnostic(
+                        adapter_id=POLYMARKET_CONTRACT_ADAPTER_ID,
+                        context=context,
+                        selected_at=selected_at,
+                        reason_codes=reason_codes,
+                        candidate_urls=[url],
+                        known_source_domains=["polymarket.com"],
+                    )
+                )
+    return hints, diagnostics
+
+
+def _official_direct_adapter_metadata(
+    *,
+    adapter_id: str,
+    source_ref: str,
+    reason_codes: list[str],
+    domains: list[str],
+    target_leaf_ids: list[str],
+) -> dict[str, Any]:
+    return {
+        "official_direct_adapter_ids": [adapter_id],
+        "official_direct_adapter_reason_codes": list(reason_codes),
+        "official_direct_adapter_source_refs": [source_ref],
+        "official_direct_adapter_domains": list(domains),
+        "target_leaf_ids": [str(item) for item in target_leaf_ids if item],
+    }
+
+
+def _official_direct_adapter_diagnostic(
+    *,
+    adapter_id: str,
+    context: dict[str, Any],
+    selected_at: str,
+    reason_codes: list[str],
+    candidate_urls: list[str],
+    known_source_domains: list[str],
+) -> dict[str, Any]:
+    return {
+        "schema_version": OFFICIAL_DIRECT_ADAPTER_DIAGNOSTIC_SCHEMA_VERSION,
+        "adapter_id": adapter_id,
+        "status": "selected" if candidate_urls else "selected_no_candidates",
+        "leaf_id": context.get("leaf_id"),
+        "parent_branch_id": context.get("parent_branch_id"),
+        "query_context_ref": context.get("query_context_ref"),
+        "purpose": context.get("purpose"),
+        "selected_at": selected_at,
+        "reason_codes": list(reason_codes),
+        "candidate_count": len(candidate_urls),
+        "candidate_urls": list(candidate_urls),
+        "known_source_domains": list(known_source_domains),
+        "authority_boundary": _source_discovery_authority_boundary(DIRECT_URL_SOURCE_PROVIDER_KIND),
+    }
+
+
+def _context_requires_polymarket_contract_adapter(context: dict[str, Any]) -> bool:
+    purpose = str(context.get("purpose") or "")
+    role = str(context.get("leaf_temporal_role") or "")
+    fields = context.get("required_evidence_fields") if isinstance(context.get("required_evidence_fields"), list) else []
+    terms = context.get("market_component_terms") if isinstance(context.get("market_component_terms"), list) else []
+    haystack = " ".join(
+        str(value)
+        for value in [
+            purpose,
+            role,
+            context.get("leaf_question"),
+            *fields,
+            *terms,
+        ]
+        if value
+    ).lower()
+    return (
+        purpose in {"resolution_mechanics", "source_of_truth"}
+        or role == "resolution_mechanics"
+        or any(token in haystack for token in ("resolution", "resolver", "rules_text", "rules", "source hierarchy"))
+    )
+
+
+def _is_polymarket_case(case_contract: dict[str, Any]) -> bool:
+    identity = case_contract.get("market_identity") if isinstance(case_contract, dict) else {}
+    if not isinstance(identity, dict):
+        identity = {}
+    platform = str(identity.get("platform") or "").lower()
+    if platform == "polymarket":
+        return True
+    for field_name in ("market_url", "url", "external_url"):
+        value = identity.get(field_name)
+        if isinstance(value, str) and "polymarket.com" in value.lower():
+            return True
+    case_key = str(case_contract.get("case_key") or "").lower() if isinstance(case_contract, dict) else ""
+    return case_key.startswith("polymarket:")
+
+
 def _collect_direct_url_hints(
     case_contract: dict[str, Any],
     evidence_packet: dict[str, Any],
     amrg_context: dict[str, Any] | None,
+    official_direct_adapter_hints: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     hints: list[dict[str, Any]] = []
+    adapter_hints = [
+        hint
+        for hint in (official_direct_adapter_hints or [])
+        if isinstance(hint, dict) and hint.get("url")
+    ]
     for path in (
         ("official_source_hints",),
         ("protected_primary_source_hints",),
@@ -1463,6 +1666,9 @@ def _collect_direct_url_hints(
             source_class_resolution_method=None,
             deterministic_source_class_proof=False,
         )
+    for hint in adapter_hints:
+        if POLYMARKET_CONTRACT_ADAPTER_ID not in set(hint.get("official_direct_adapter_ids") or []):
+            hints.append(copy.deepcopy(hint))
     _add_hint(
         hints,
         _market_url(case_contract),
@@ -1470,6 +1676,9 @@ def _collect_direct_url_hints(
         source_class="market_rules_or_resolution_source",
         source_class_resolution_method="market_platform_resolution_url",
     )
+    for hint in adapter_hints:
+        if POLYMARKET_CONTRACT_ADAPTER_ID in set(hint.get("official_direct_adapter_ids") or []):
+            hints.append(copy.deepcopy(hint))
     return _dedupe_hints(hints)
 
 
@@ -1509,6 +1718,14 @@ def _fetch_candidate(
         "source_discovery_authority_boundary": copy.deepcopy(
             hint.get("source_discovery_authority_boundary") or {}
         ),
+        "official_direct_adapter_ids": _unique_strings(hint.get("official_direct_adapter_ids")),
+        "official_direct_adapter_reason_codes": _unique_strings(
+            hint.get("official_direct_adapter_reason_codes")
+        ),
+        "official_direct_adapter_source_refs": _unique_strings(
+            hint.get("official_direct_adapter_source_refs")
+        ),
+        "official_direct_adapter_domains": _unique_strings(hint.get("official_direct_adapter_domains")),
     }
     if not _valid_http_url(url):
         return {
@@ -2159,31 +2376,79 @@ def _add_hint(
     source_class: str | None,
     source_class_resolution_method: str | None,
     deterministic_source_class_proof: bool = True,
+    metadata: dict[str, Any] | None = None,
 ) -> None:
     if not isinstance(url, str) or not url:
         return
-    hints.append(
-        {
-            "url": url,
-            "canonical_url": _canonicalize_url(url),
-            "source_ref": source_ref,
-            "source_class": source_class,
-            "source_class_resolution_method": source_class_resolution_method,
-            "deterministic_source_class_proof": deterministic_source_class_proof,
-        }
-    )
+    hint = {
+        "url": url,
+        "canonical_url": _canonicalize_url(url),
+        "source_ref": source_ref,
+        "source_class": source_class,
+        "source_class_resolution_method": source_class_resolution_method,
+        "deterministic_source_class_proof": deterministic_source_class_proof,
+    }
+    if metadata:
+        hint.update(copy.deepcopy(metadata))
+    hints.append(hint)
 
 
 def _dedupe_hints(hints: list[dict[str, Any]]) -> list[dict[str, Any]]:
     deduped: list[dict[str, Any]] = []
-    seen: set[str] = set()
+    seen: dict[str, dict[str, Any]] = {}
     for hint in hints:
         key = hint.get("canonical_url") or hint.get("url")
-        if not key or key in seen:
+        if not key:
             continue
-        seen.add(str(key))
+        key = str(key)
+        if key in seen:
+            _merge_duplicate_hint_metadata(seen[key], hint)
+            continue
+        seen[key] = hint
         deduped.append(hint)
     return deduped
+
+
+def _merge_duplicate_hint_metadata(existing: dict[str, Any], duplicate: dict[str, Any]) -> None:
+    duplicate_ref = duplicate.get("source_ref")
+    if duplicate_ref and duplicate_ref != existing.get("source_ref"):
+        refs = _unique_strings(existing.get("duplicate_source_refs"))
+        refs.append(str(duplicate_ref))
+        existing["duplicate_source_refs"] = sorted(set(refs))
+    for key in (
+        "official_direct_adapter_ids",
+        "official_direct_adapter_reason_codes",
+        "official_direct_adapter_source_refs",
+        "official_direct_adapter_domains",
+    ):
+        values = _unique_strings(existing.get(key))
+        values.extend(_unique_strings(duplicate.get(key)))
+        if values:
+            existing[key] = sorted(set(values))
+    if existing.get("target_leaf_ids") and duplicate.get("target_leaf_ids"):
+        values = _unique_strings(existing.get("target_leaf_ids"))
+        values.extend(_unique_strings(duplicate.get("target_leaf_ids")))
+        existing["target_leaf_ids"] = sorted(set(values))
+    for key in ("source_class", "source_class_resolution_method"):
+        if not existing.get(key) and duplicate.get(key):
+            existing[key] = duplicate.get(key)
+    if existing.get("deterministic_source_class_proof") is None:
+        existing["deterministic_source_class_proof"] = duplicate.get("deterministic_source_class_proof")
+
+
+def _unique_strings(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(item) for item in value if item not in (None, "")]
+    if isinstance(value, tuple):
+        return [str(item) for item in value if item not in (None, "")]
+    if value not in (None, ""):
+        return [str(value)]
+    return []
+
+
+def _direct_hint_targets_context(hint: dict[str, Any], context: dict[str, Any]) -> bool:
+    target_leaf_ids = set(_unique_strings(hint.get("target_leaf_ids")))
+    return not target_leaf_ids or str(context.get("leaf_id") or "") in target_leaf_ids
 
 
 def _urls_at_path(root: Any, path: tuple[str, ...], prefix: str) -> list[tuple[str, str]]:

@@ -394,7 +394,7 @@ Completion note, 2026-07-01:
 
 ## Phase 3 - Official And Direct Source Priority Adapters
 
-Status: pending
+Status: completed 2026-07-01
 
 Goal: stop treating official/contract-critical source discovery as generic web search when structured
 or predictable source routes exist.
@@ -452,12 +452,21 @@ Success criteria:
 
 Checklist:
 
-- [ ] Official/direct adapters implemented.
-- [ ] Adapter routing is deterministic and tested.
-- [ ] Protected-primary leaves receive official/direct attempts.
-- [ ] Fetch/admission remains deterministic.
-- [ ] Temp artifacts and scripts are deleted.
-- [ ] `git diff --check` passes.
+- [x] Official/direct adapters implemented.
+- [x] Adapter routing is deterministic and tested.
+- [x] Protected-primary leaves receive official/direct attempts.
+- [x] Fetch/admission remains deterministic.
+- [x] Temp artifacts and scripts are deleted.
+- [x] `git diff --check` passes.
+
+Completion note, 2026-07-01:
+
+- Added deterministic official/direct adapter routing inside ADS retrieval transport for Bank of Israel protected-primary leaves and Polymarket contract/rules leaves.
+- BOI adapter candidates now target official central-bank rate-decision and schedule pages before generic browser search when a BOI protected-primary leaf has no stronger embedded source URL.
+- Polymarket resolution/source-of-truth leaves retain existing `case_contract.market_url` provenance while carrying adapter ids and reason codes for downstream diagnostics.
+- Adapter diagnostics, candidate counts, fetch attempt counts, reason codes, known domains, and authority boundaries are reported without granting source metadata, sufficiency, temporal, or forecast authority.
+- Direct adapter candidates still pass through the same fetch and deterministic admission validators; undated adapter fetches are rejected rather than admitted via direct-hint timestamp inference.
+- Verification passed: focused Orchestrator retrieval transport suite (`test_ads_retrieval_transport`, 34 tests), `py_compile` for changed transport/test files, full Orchestrator discovery, temp cleanup check, and `git diff --check`.
 
 ## Phase 4 - Bounded Parallel Search And Separate Lane Budgets
 
