@@ -1,0 +1,31 @@
+{
+  "schema_version": "ads-live-market-e2e-downstream-retrieval-hang-fixture/v1",
+  "case_key": "polymarket:1795635",
+  "pipeline_run_id": "ads-pipeline-run:b2ad82008333b61b21475e73668ecc9bebb44320283bd02b9b6fe4e9b700042f",
+  "qdt_source": "deterministic_boi_shaped_transport_response_from_actual_decomposer_handoff",
+  "elapsed_seconds_before_manual_termination": 546,
+  "events": [
+    {
+      "stage": "decomposition",
+      "event": "stage_completed"
+    },
+    {
+      "stage": "retrieval",
+      "event": "stage_started"
+    }
+  ],
+  "active_counts": {
+    "active_runs": 1,
+    "active_leases": 1
+  },
+  "child_processes": [
+    {
+      "provider": "openclaw_retrieval",
+      "status": "survived_initial_termination"
+    }
+  ],
+  "protected_write_deltas": {
+    "forecast_decision_records_delta": 0,
+    "market_predictions_delta": 0
+  }
+}

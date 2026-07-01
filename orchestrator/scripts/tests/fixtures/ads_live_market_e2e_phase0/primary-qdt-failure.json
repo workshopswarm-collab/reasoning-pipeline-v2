@@ -1,0 +1,70 @@
+{
+  "schema_version": "ads-live-market-e2e-primary-qdt-failure-fixture/v1",
+  "audit_snapshot_at": "2026-07-01T20:41:42.950241+00:00",
+  "case_key": "polymarket:1795635",
+  "market_title": "Will the Bank of Israel decrease the Bank of Israel Interest Rate after the July decision?",
+  "pipeline_run_id": "ads-pipeline-run:9be8b1342e83c013b5ad0aec3a514f0f4a8511c23e98e3b8b1ddedd1f03f5ab5",
+  "run": {
+    "pipeline_run_id": "ads-pipeline-run:9be8b1342e83c013b5ad0aec3a514f0f4a8511c23e98e3b8b1ddedd1f03f5ab5",
+    "status": "failed",
+    "failed_stage": "decomposition",
+    "completed_stage_count": 0,
+    "stage_order": [
+      "decomposition",
+      "retrieval",
+      "researcher",
+      "classification_verification",
+      "scae",
+      "decision"
+    ],
+    "metadata": {
+      "live_db_mutation": "clone_only"
+    }
+  },
+  "events": [
+    {
+      "stage": "decomposition",
+      "event": "stage_started"
+    },
+    {
+      "stage": "decomposition",
+      "event": "stage_failed"
+    }
+  ],
+  "runtime_call": {
+    "schema_version": "model-runtime-call-summary/v1",
+    "runtime_call_id": "runtime-call:qdt-boi-live",
+    "resolved_model_id": "gpt-5.5-high",
+    "mode": "live",
+    "fixture_mode": false,
+    "model_call_performed": true,
+    "model_executed": true,
+    "execution_status": "failed_schema_validation",
+    "repair_count": 1,
+    "runtime_reason_codes": [
+      "schema_repair_attempted",
+      "terminal_verification_leaf_misclassified_as_pre_resolution"
+    ],
+    "schema_repair_diagnostics": [
+      {
+        "schema_version": "model-runtime-schema-repair-diagnostic/v1",
+        "repair_attempted": true,
+        "repair_decision": "mechanical_schema_repair_available",
+        "remaining_error_counts": {
+          "terminal_temporal_role": 1
+        },
+        "remaining_leaf_ids": [
+          "leaf-boi-july-material-unknowns"
+        ]
+      }
+    ]
+  },
+  "active_counts": {
+    "active_runs": 0,
+    "active_leases": 0
+  },
+  "protected_write_deltas": {
+    "forecast_decision_records_delta": 0,
+    "market_predictions_delta": 0
+  }
+}
