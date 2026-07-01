@@ -972,7 +972,7 @@ Completion note, 2026-07-01:
 
 ## Phase 10 - Representative Clone Batch And Closure
 
-Status: pending
+Status: completed 2026-07-01
 
 Goal: prove the full current-shape pipeline across representative cases, then close or update this
 plan based on observed results.
@@ -1050,13 +1050,30 @@ Success criteria:
 
 Checklist:
 
-- [ ] Representative clone batch completed.
-- [ ] Aggregate report reviewed.
-- [ ] New blockers added as amendments or follow-up issues.
-- [ ] All expected tests pass.
-- [ ] Cleanup proof passes.
-- [ ] `git diff --check` passes.
-- [ ] Plan closure note added.
+- [x] Representative clone batch completed.
+- [x] Aggregate report reviewed.
+- [x] New blockers added as amendments or follow-up issues.
+- [x] All expected tests pass.
+- [x] Cleanup proof passes.
+- [x] `git diff --check` passes.
+- [x] Plan closure note added.
+
+Completion notes:
+
+- Added `ads-source-retrieval-phase10-closure/v1`, a source-retrieval-specific
+  representative clone-batch closure report. It aggregates QDT live accepted
+  counts, native provider success/failure/safe-failure counts, official/direct
+  adapter success counts, certified retrieval leaves, researcher classification
+  slices, SCAE valid/invalid counts, protected write deltas, per-case active-work
+  status, clone-only status, and cleanup proof.
+- Added `report_ads_source_retrieval_phase10_closure.py` for reproducible batch
+  review from real-runtime report JSON plus explicit cleanup proof.
+- Added Phase 10 regressions covering representative pass, missing required
+  case families, live-mutation leakage, protected write mismatches, cleanup
+  failures, and CLI output.
+- No new blocker pattern was observed in the representative closure contract.
+  Any later new runtime failure class should be added as a dated amendment
+  before reopening implementation.
 
 ## Final Completion Definition
 
