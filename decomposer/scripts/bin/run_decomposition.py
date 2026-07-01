@@ -392,6 +392,38 @@ def _leaf_looks_like_analyst_consensus(leaf: dict[str, Any]) -> bool:
     )
 
 
+def _leaf_looks_like_official_survey(leaf: dict[str, Any]) -> bool:
+    text = _normalized_token(
+        [
+            leaf.get("question_text"),
+            leaf.get("leaf_question"),
+            leaf.get("research_factor"),
+            leaf.get("required_evidence_fields"),
+            leaf.get("market_component_terms"),
+        ]
+    ).replace("_", " ")
+    return (
+        "official survey" in text
+        or "survey official" in text
+        or "central bank survey" in text
+    )
+
+
+def _ensure_analyst_consensus_evidence_fields(leaf: dict[str, Any]) -> None:
+    fields = leaf.get("required_evidence_fields")
+    if not isinstance(fields, list):
+        fields = []
+    fields = [str(field) for field in fields if isinstance(field, str) and field.strip()]
+    semantic = _normalized_token([fields, leaf.get("research_factor")]).replace("_", " ")
+    if not any(term in semantic for term in ("analyst", "consensus", "expectation", "survey")):
+        fields.append(
+            "official_survey_expectation"
+            if _leaf_looks_like_official_survey(leaf)
+            else "analyst_consensus_expectation"
+        )
+    leaf["required_evidence_fields"] = fields
+
+
 def _normalize_temporal_role(value: Any) -> str:
     token = _normalized_token(value)
     if token in ALLOWED_LEAF_TEMPORAL_ROLES:
@@ -486,6 +518,8 @@ def _ensure_model_candidate_contract_shape(repaired: dict[str, Any]) -> dict[str
             leaf["question_text"] = leaf["leaf_question"]
         if not leaf.get("question_text"):
             leaf["question_text"] = f"What market-specific evidence should classify {leaf_id}?"
+        if str(leaf.get("leaf_question") or "").strip() != str(leaf["question_text"]).strip():
+            leaf["leaf_question"] = leaf["question_text"]
         parent_id = str(leaf.get("parent_branch_id") or default_branch_id)
         if parent_id not in branch_by_id:
             parent_id = default_branch_id
@@ -497,6 +531,8 @@ def _ensure_model_candidate_contract_shape(repaired: dict[str, Any]) -> dict[str
             leaf["purpose"] = "direct_evidence"
             leaf["coverage_dimension"] = "source_quality"
             leaf["leaf_temporal_role"] = "pre_resolution_forecast_driver"
+            _ensure_analyst_consensus_evidence_fields(leaf)
+            leaf.pop("research_sufficiency_requirements", None)
         else:
             leaf["leaf_temporal_role"] = _normalize_temporal_role(leaf.get("leaf_temporal_role"))
         purpose = str(leaf["purpose"])

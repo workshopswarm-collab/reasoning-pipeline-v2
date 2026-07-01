@@ -223,7 +223,7 @@ python3 scripts/bin/run_ads_one_case_canary.py \
 
 ## Phase 1 - QDT Mechanical Repair And Persistence Hardening
 
-Status: pending
+Status: completed 2026-07-01
 
 Goal: land the QDT fixes found during the audit so live Decomposer output can pass when the remaining
 errors are mechanical rather than semantic.
@@ -290,12 +290,20 @@ Success criteria:
 
 Checklist:
 
-- [ ] Persistence guard remains strict.
-- [ ] Alias repair is covered.
-- [ ] Analyst-consensus canonical sufficiency is covered.
-- [ ] Focused decomposer tests pass.
-- [ ] Temp artifacts and scripts are deleted.
-- [ ] `git diff --check` passes.
+- [x] Persistence guard remains strict.
+- [x] Alias repair is covered.
+- [x] Analyst-consensus canonical sufficiency is covered.
+- [x] Focused decomposer tests pass.
+- [x] Temp artifacts and scripts are deleted.
+- [x] `git diff --check` passes.
+
+Completion note, 2026-07-01:
+
+- Preserved MIG-003 authority scanning while allowing `repair_decision` only inside `schema_repair_diagnostics`; active forecast/probability/decision authority fields remain rejected by the existing persistence guard.
+- Normalized repaired model leaves so `leaf_question` follows canonical `question_text` after repair.
+- Repaired analyst/economist consensus leaves to `direct_evidence` / `source_quality` / `pre_resolution_forecast_driver`, ensured consensus evidence fields are present, and forced canonical sufficiency rebuilding instead of preserving stale official-source classes.
+- Added a live transport-response CLI regression proving a repairable live model payload writes an accepted `decomposer_model_runtime_live` QDT artifact after one mechanical repair.
+- Verification passed: focused Decomposer Phase 1 suite (`test_runtime_decomposition`, `test_persistence`, `test_model_runtime`, 44 tests), full Decomposer discovery (116 tests), focused Orchestrator temp-DB canary QDT path test, `py_compile` for changed Decomposer files/tests, cleanup check for phase temp directories, and `git diff --check`.
 
 ## Phase 2 - Source Provider Abstraction And Runtime Artifact Persistence
 

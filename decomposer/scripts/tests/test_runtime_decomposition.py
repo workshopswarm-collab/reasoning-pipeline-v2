@@ -135,6 +135,84 @@ class RuntimeDecompositionEntrypointTest(unittest.TestCase):
         self.assertEqual(qdt["research_coverage_check"]["status"], "passed")
         self.assertIn("research_coverage_graph", qdt)
 
+    def test_cli_live_transport_repairs_alias_and_analyst_sufficiency(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            temp = Path(tempdir)
+            handoff = self._handoff()
+            handoff["case_id"] = "case-boi-rate-live-repair"
+            handoff["case_key"] = "polymarket:boi-july-live-repair"
+            handoff["macro_question"] = "Will the Bank of Israel cut interest rates at its July 2026 meeting?"
+            model_response = build_question_specific_fixture_response(handoff)
+            leaf = model_response["required_leaf_questions"][0]
+            question = (
+                "What is the analyst consensus or economist expectation for the "
+                "Bank of Israel July 2026 interest-rate decision?"
+            )
+            leaf["question_text"] = question
+            leaf["leaf_question"] = "What official BOI source resolves the market?"
+            leaf["research_factor"] = "analyst consensus for the BOI July rate decision"
+            leaf["purpose"] = "resolution_mechanics"
+            leaf["coverage_dimension"] = "resolution_mechanics"
+            leaf["leaf_temporal_role"] = "resolution_mechanics"
+            leaf["required_evidence_fields"] = ["analyst_consensus"]
+            leaf["research_sufficiency_requirements"] = {
+                "required_source_classes": ["official_or_primary", "independent_secondary"]
+            }
+            handoff_path = temp / "handoff.json"
+            transport_path = temp / "transport-response.json"
+            qdt_path = temp / "question-decomposition.json"
+            runtime_path = temp / "model-runtime-call.json"
+            handoff_path.write_text(json.dumps(handoff, sort_keys=True), encoding="utf-8")
+            transport_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": MODEL_RUNTIME_TRANSPORT_RESPONSE_SCHEMA_VERSION,
+                        "response_payload": model_response,
+                        "provider_status": {"transport": "unit-test-live-file"},
+                    },
+                    sort_keys=True,
+                ),
+                encoding="utf-8",
+            )
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "decomposer" / "scripts" / "bin" / "run_decomposition.py"),
+                    "--handoff",
+                    str(handoff_path),
+                    "--output",
+                    str(qdt_path),
+                    "--runtime-call-output",
+                    str(runtime_path),
+                    "--runtime-mode",
+                    "live",
+                    "--transport-response",
+                    str(transport_path),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+            qdt = json.loads(qdt_path.read_text(encoding="utf-8"))
+            runtime = json.loads(runtime_path.read_text(encoding="utf-8"))
+
+        repaired_leaf = next(item for item in qdt["required_leaf_questions"] if item["leaf_id"] == leaf["leaf_id"])
+        self.assertEqual(qdt["adapter_mode"], "decomposer_model_runtime_live")
+        self.assertTrue(validate_question_decomposition(qdt).valid)
+        self.assertEqual(runtime["execution_status"], "succeeded")
+        self.assertEqual(runtime["repair_count"], 1)
+        self.assertIn("live_transport_called", runtime["runtime_reason_codes"])
+        self.assertEqual(repaired_leaf["leaf_question"], repaired_leaf["question_text"])
+        self.assertEqual(repaired_leaf["coverage_dimension"], "source_quality")
+        self.assertEqual(repaired_leaf["leaf_temporal_role"], "pre_resolution_forecast_driver")
+        self.assertEqual(
+            repaired_leaf["research_sufficiency_requirements"]["required_source_classes"],
+            ["independent_secondary", "expert_or_specialist"],
+        )
+
     def test_prompt_payload_contains_phase3_temporal_contract(self) -> None:
         payload = build_decomposition_prompt_payload(self._handoff(), payloads={})
         instruction_text = json.dumps(payload["instruction_blocks"], sort_keys=True)
@@ -493,6 +571,43 @@ class RuntimeDecompositionEntrypointTest(unittest.TestCase):
         self.assertEqual(repaired_leaf["purpose"], "direct_evidence")
         self.assertEqual(repaired_leaf["coverage_dimension"], "source_quality")
         self.assertEqual(repaired_leaf["leaf_temporal_role"], "pre_resolution_forecast_driver")
+
+    def test_schema_repair_normalizes_leaf_question_alias_and_analyst_sufficiency(self) -> None:
+        handoff = self._handoff()
+        handoff["case_id"] = "case-boi-rate-runtime"
+        handoff["case_key"] = "polymarket:boi-july-rate"
+        handoff["macro_question"] = "Will the Bank of Israel cut interest rates at its July 2026 meeting?"
+        repairable = build_question_specific_fixture_response(handoff)
+        leaf = repairable["required_leaf_questions"][0]
+        question = (
+            "What is the analyst consensus or economist expectation for the "
+            "Bank of Israel July 2026 interest-rate decision?"
+        )
+        leaf["question_text"] = question
+        leaf["leaf_question"] = "What official BOI source resolves the market?"
+        leaf["research_factor"] = "analyst consensus for the BOI July rate decision"
+        leaf["purpose"] = "resolution_mechanics"
+        leaf["coverage_dimension"] = "resolution_mechanics"
+        leaf["leaf_temporal_role"] = "resolution_mechanics"
+        leaf["required_evidence_fields"] = ["analyst_consensus"]
+        leaf["research_sufficiency_requirements"] = {
+            "required_source_classes": ["official_or_primary", "independent_secondary"]
+        }
+
+        qdt, runtime = build_question_decomposition_from_handoff(
+            handoff,
+            runtime_mode="fixture",
+            fixture_response=repairable,
+        )
+
+        repaired_leaf = next(item for item in qdt["required_leaf_questions"] if item["leaf_id"] == leaf["leaf_id"])
+        self.assertTrue(validate_question_decomposition(qdt).valid)
+        self.assertEqual(runtime["repair_count"], 1)
+        self.assertEqual(repaired_leaf["leaf_question"], repaired_leaf["question_text"])
+        self.assertEqual(
+            repaired_leaf["research_sufficiency_requirements"]["required_source_classes"],
+            ["independent_secondary", "expert_or_specialist"],
+        )
 
     def test_invalid_related_context_usage_status_falls_back_to_handoff(self) -> None:
         handoff = self._handoff()

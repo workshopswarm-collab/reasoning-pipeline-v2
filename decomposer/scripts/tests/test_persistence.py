@@ -234,6 +234,55 @@ class QDTPersistenceTest(unittest.TestCase):
         with self.assertRaises(QDTPersistenceError):
             write_qdt_research_sufficiency_requirements(self.conn, unsafe_probability)
 
+    def test_accepts_schema_repair_decision_diagnostics(self) -> None:
+        qdt = self._selected_qdt()
+        diagnostic = {
+            "schema_version": "model-runtime-schema-repair-diagnostic/v1",
+            "event": "schema_repair_evaluation",
+            "repair_attempted": True,
+            "repair_decision": "mechanical_schema_repair_available",
+            "repair_skipped_reason": None,
+            "pre_repair_errors": ["required_leaf_questions[0].research_sufficiency_requirements must be an object"],
+            "pre_repair_error_groups": {
+                "forbidden_authority": [],
+                "mechanical_schema": [
+                    "required_leaf_questions[0].research_sufficiency_requirements must be an object"
+                ],
+                "semantic_quality": [],
+                "terminal_temporal_role": [],
+            },
+            "pre_repair_error_counts": {
+                "forbidden_authority": 0,
+                "mechanical_schema": 1,
+                "semantic_quality": 0,
+                "terminal_temporal_role": 0,
+            },
+            "repaired_fields": ["response.required_leaf_questions[0].research_sufficiency_requirements"],
+            "remaining_errors": [],
+            "remaining_error_groups": {
+                "forbidden_authority": [],
+                "mechanical_schema": [],
+                "semantic_quality": [],
+                "terminal_temporal_role": [],
+            },
+            "remaining_error_counts": {
+                "forbidden_authority": 0,
+                "mechanical_schema": 0,
+                "semantic_quality": 0,
+                "terminal_temporal_role": 0,
+            },
+        }
+        qdt["model_execution_context"]["schema_repair_diagnostics"] = [copy.deepcopy(diagnostic)]
+        qdt["model_execution_context"]["runtime"] = {
+            "schema_repair_diagnostics": [copy.deepcopy(diagnostic)],
+        }
+
+        with tempfile.TemporaryDirectory() as temp:
+            manifest = self._manifest(qdt, Path(temp))
+            run_id = write_decomposition_run(self.conn, qdt, manifest=manifest)
+
+        self.assertEqual(run_id, decomposition_run_id_for(qdt))
+
     def test_normalized_amrg_operator_metadata_allows_decision_leaf_ids(self) -> None:
         qdt = self._selected_qdt()
         qdt["amrg_operator_metadata"] = {

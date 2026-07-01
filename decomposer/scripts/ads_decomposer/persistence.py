@@ -115,6 +115,9 @@ ALLOWED_FALSE_AUTHORITY_FIELDS = {
     "writes_production_forecast",
     "writes_forecast_persistence",
 }
+ALLOWED_SCHEMA_REPAIR_DIAGNOSTIC_FIELDS = {
+    "repair_decision",
+}
 
 
 class QDTPersistenceError(ValueError):
@@ -276,7 +279,10 @@ def _collect_forbidden_persistence_paths(value: Any, path: str = "record") -> li
             elif "decision" in normalized and normalized not in {
                 "leaf_budget_decision",
                 "budget_decision",
-            }:
+            } and not (
+                "schema_repair_diagnostics" in path
+                and normalized in ALLOWED_SCHEMA_REPAIR_DIAGNOSTIC_FIELDS
+            ):
                 errors.append(f"{path}.{key} is forbidden in MIG-003 persistence")
             errors.extend(_collect_forbidden_persistence_paths(child, f"{path}.{key}"))
     elif isinstance(value, list):
