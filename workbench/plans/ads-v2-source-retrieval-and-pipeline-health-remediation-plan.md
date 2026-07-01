@@ -470,7 +470,7 @@ Completion note, 2026-07-01:
 
 ## Phase 4 - Bounded Parallel Search And Separate Lane Budgets
 
-Status: pending
+Status: completed 2026-07-01
 
 Goal: prevent one slow provider or one leaf from starving the rest of retrieval.
 
@@ -541,12 +541,20 @@ Success criteria:
 
 Checklist:
 
-- [ ] Bounded concurrency is implemented.
-- [ ] Separate lane budgets are implemented.
-- [ ] Critical-leaf ordering is tested.
-- [ ] Provider failure isolation is tested.
-- [ ] Temp artifacts and scripts are deleted.
-- [ ] `git diff --check` passes.
+- [x] Bounded concurrency is implemented.
+- [x] Separate lane budgets are implemented.
+- [x] Critical-leaf ordering is tested.
+- [x] Provider failure isolation is tested.
+- [x] Temp artifacts and scripts are deleted.
+- [x] `git diff --check` passes.
+
+Completion note, 2026-07-01:
+
+- Added a deterministic retrieval scheduler that orders protected-primary leaves first, then high-priority leaves, with explicit bounded leaf/provider lane concurrency policy knobs and scheduler diagnostics.
+- Split retrieval transport diagnostics into lane-budget records for official/direct discovery, direct fetch/extraction, browser search, browser search fetch/extraction, native research discovery, native candidate fetch/extraction, and downstream metadata/claim validation.
+- Changed browser search elapsed budgeting from one global search deadline to per-leaf browser-search lane windows, so one slow search provider call does not skip unrelated leaves; remaining variants for the same leaf can still be skipped when that leaf exhausts its elapsed budget.
+- Preserved retry policy and leaf-scoped provider failure isolation while exposing elapsed-budget skip counts per lane.
+- Verification passed: focused Orchestrator retrieval transport suite (`test_ads_retrieval_transport`, 36 tests), `py_compile` for changed transport/test files, full Orchestrator discovery, temp cleanup check, and `git diff --check`.
 
 ## Phase 5 - Fetch, Extraction, Claims, Freshness, And Source Families
 

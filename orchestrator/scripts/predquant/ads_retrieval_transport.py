@@ -178,6 +178,8 @@ NATIVE_RESEARCH_SOURCE_PROVIDER_KIND = "native_gpt_research_candidates"
 POLYMARKET_CONTRACT_ADAPTER_ID = "polymarket_contract_rules_adapter"
 BOI_CENTRAL_BANK_ADAPTER_ID = "bank_of_israel_official_adapter"
 OFFICIAL_DIRECT_ADAPTER_DIAGNOSTIC_SCHEMA_VERSION = "ads-official-direct-source-adapter-diagnostic/v1"
+RETRIEVAL_LANE_BUDGET_SCHEMA_VERSION = "ads-retrieval-lane-budget/v1"
+RETRIEVAL_SCHEDULER_DIAGNOSTIC_SCHEMA_VERSION = "ads-retrieval-scheduler-diagnostic/v1"
 BOI_OFFICIAL_DIRECT_ADAPTER_URLS = (
     "https://boi.org.il/en/monetary-policy/interest-rate-decisions",
     "https://boi.org.il/en/markets/schedule",
@@ -243,6 +245,8 @@ class RetrievalProviderPolicy:
     browser_search_jitter_fraction: float = 0.25
     max_native_research_calls: int = 4
     max_native_candidate_fetches: int = 4
+    max_parallel_leaf_tasks: int = 1
+    max_parallel_provider_lanes: int = 1
 
 
 @dataclass
@@ -497,9 +501,11 @@ def collect_live_retrieval_candidates(
         forecast_timestamp=forecast_timestamp,
         source_cutoff_timestamp=source_cutoff_timestamp,
     )
+    scheduled_contexts = _scheduled_retrieval_contexts(contexts)
+    scheduler_diagnostic = _retrieval_scheduler_diagnostic(scheduled_contexts, policy)
     official_direct_adapter_hints, official_direct_adapter_diagnostics = _official_direct_adapter_hints(
         case_contract=case_contract,
-        contexts=contexts,
+        contexts=scheduled_contexts,
         selected_at=forecast_timestamp,
     )
     raw_direct_urls = _collect_direct_url_hints(
@@ -551,7 +557,7 @@ def collect_live_retrieval_candidates(
     collection_started_at = time.monotonic()
     direct_fetch_started_at = collection_started_at
 
-    for context in contexts:
+    for context in scheduled_contexts:
         for rank, hint in enumerate(direct_urls, start=1):
             if not _direct_hint_targets_context(hint, context):
                 direct_fetch_leaf_scope_skipped_count += 1
@@ -581,16 +587,22 @@ def collect_live_retrieval_candidates(
     direct_url_elapsed_seconds = max(0.0, time.monotonic() - direct_fetch_started_at)
     max_total_search_elapsed_seconds = max(0.0, float(policy.max_total_search_elapsed_seconds or 0.0))
     search_started_at = time.monotonic()
-    search_deadline = search_started_at + max_total_search_elapsed_seconds if max_total_search_elapsed_seconds else None
-    search_budget = _search_budget_for_case(contexts, policy)
+    search_budget = _search_budget_for_case(scheduled_contexts, policy)
     leaf_search_call_counts: dict[str, int] = {}
+    leaf_search_elapsed_seconds: dict[str, float] = {}
     sleep = sleep_fn or time.sleep
 
     if policy.broad_search_enabled:
-        for context in contexts:
+        for context in scheduled_contexts:
             variants = context.get("query_variants") if isinstance(context.get("query_variants"), list) else []
             leaf_id = str(context.get("leaf_id") or "")
             leaf_cap = _leaf_search_call_cap(context, policy)
+            leaf_search_started_at = time.monotonic()
+            leaf_search_deadline = (
+                leaf_search_started_at + max_total_search_elapsed_seconds
+                if max_total_search_elapsed_seconds
+                else None
+            )
             for variant_index, variant in enumerate(variants[: policy.max_search_variants_per_leaf]):
                 if not browser_search_configured:
                     search_call_skipped_count += 1
@@ -619,17 +631,17 @@ def collect_live_retrieval_candidates(
                     max_total_search_calls=search_budget["absolute_case_search_cap"],
                     leaf_search_call_count=leaf_search_call_counts.get(leaf_id, 0),
                     leaf_search_call_cap=leaf_cap,
-                    search_deadline=search_deadline,
+                    search_deadline=leaf_search_deadline,
                 )
                 if skip_reason:
                     search_call_skipped_count += 1
-                    elapsed_seconds = max(0.0, time.monotonic() - search_started_at)
+                    elapsed_seconds = max(0.0, time.monotonic() - leaf_search_started_at)
                     search_skipped_diagnostics.append(
                         _search_query_diagnostic(
                             context,
                             variant,
                             reason_code=skip_reason,
-                            detail="search_elapsed_budget_exhausted_before_leaf"
+                            detail="search_leaf_elapsed_budget_exhausted_before_variant"
                             if skip_reason == "skipped_elapsed_budget"
                             else None,
                             elapsed_seconds=elapsed_seconds
@@ -769,9 +781,11 @@ def collect_live_retrieval_candidates(
                     elif candidate.get("canonical_fetch_cache_status") == "miss":
                         search_result_fetch_count += 1
                     result.fetched_candidates.append(candidate)
+            leaf_search_elapsed_seconds[leaf_id] = max(0.0, time.monotonic() - leaf_search_started_at)
 
+    native_started_at = time.monotonic()
     if policy.native_enabled:
-        for context in contexts:
+        for context in scheduled_contexts:
             variants = context.get("query_variants") if isinstance(context.get("query_variants"), list) else []
             if not variants:
                 continue
@@ -1013,6 +1027,7 @@ def collect_live_retrieval_candidates(
                     if candidate.get("canonical_fetch_cache_status") != "hit":
                         native_candidate_fetch_count += 1
                     result.fetched_candidates.append(candidate)
+    native_elapsed_seconds = max(0.0, time.monotonic() - native_started_at)
 
     result.omitted_candidates = [
         candidate
@@ -1045,6 +1060,43 @@ def collect_live_retrieval_candidates(
                 )
             )
         )
+    )
+    search_elapsed_seconds = max(0.0, time.monotonic() - search_started_at)
+    total_collection_elapsed_seconds = max(0.0, time.monotonic() - collection_started_at)
+    official_direct_adapter_candidate_count = sum(
+        1
+        for item in result.direct_url_candidates
+        if isinstance(item, dict) and item.get("official_direct_adapter_ids")
+    )
+    official_direct_adapter_fetch_attempt_count = sum(
+        1
+        for item in result.fetched_candidates
+        if isinstance(item, dict)
+        and item.get("navigation_mode") == "direct_url"
+        and item.get("official_direct_adapter_ids")
+    )
+    lane_budget_diagnostics = _retrieval_lane_budget_diagnostics(
+        policy=policy,
+        scheduled_contexts=scheduled_contexts,
+        search_budget=search_budget,
+        direct_url_elapsed_seconds=direct_url_elapsed_seconds,
+        direct_fetch_count=direct_fetch_count,
+        direct_fetch_skipped_count=direct_fetch_skipped_count,
+        direct_fetch_leaf_scope_skipped_count=direct_fetch_leaf_scope_skipped_count,
+        search_elapsed_seconds=search_elapsed_seconds,
+        leaf_search_elapsed_seconds=leaf_search_elapsed_seconds,
+        search_primary_call_count=search_primary_call_count,
+        search_call_skipped_count=search_call_skipped_count,
+        search_retry_attempt_count=search_retry_attempt_count,
+        search_skipped_diagnostics=search_skipped_diagnostics,
+        search_result_fetch_count=search_result_fetch_count,
+        search_result_fetch_skipped_count=search_result_fetch_skipped_count,
+        native_elapsed_seconds=native_elapsed_seconds,
+        native_research_call_count=native_research_call_count,
+        native_candidate_fetch_count=native_candidate_fetch_count,
+        native_candidate_fetch_skipped_count=native_candidate_fetch_skipped_count,
+        official_direct_adapter_candidate_count=official_direct_adapter_candidate_count,
+        official_direct_adapter_fetch_attempt_count=official_direct_adapter_fetch_attempt_count,
     )
     result.transport_diagnostics = {
         "schema_version": "ads-retrieval-transport-diagnostics/v1",
@@ -1094,19 +1146,11 @@ def collect_live_retrieval_candidates(
         "native_research_skip_diagnostics": native_research_skip_diagnostics,
         "native_research_call_diagnostics": native_research_call_diagnostics,
         "native_research_runtime_calls": native_research_runtime_calls,
+        "retrieval_scheduler_diagnostic": scheduler_diagnostic,
+        "retrieval_lane_budget_diagnostics": lane_budget_diagnostics,
         "official_direct_adapter_diagnostics": official_direct_adapter_diagnostics,
-        "official_direct_adapter_candidate_count": sum(
-            1
-            for item in result.direct_url_candidates
-            if isinstance(item, dict) and item.get("official_direct_adapter_ids")
-        ),
-        "official_direct_adapter_fetch_attempt_count": sum(
-            1
-            for item in result.fetched_candidates
-            if isinstance(item, dict)
-            and item.get("navigation_mode") == "direct_url"
-            and item.get("official_direct_adapter_ids")
-        ),
+        "official_direct_adapter_candidate_count": official_direct_adapter_candidate_count,
+        "official_direct_adapter_fetch_attempt_count": official_direct_adapter_fetch_attempt_count,
         "source_provider_runtime_refs": source_provider_runtime_refs,
         "source_provider_runtime_ref_count": len(source_provider_runtime_refs),
         "native_research_transport_diagnostics": _native_transport_diagnostics(
@@ -1137,6 +1181,9 @@ def collect_live_retrieval_candidates(
             "max_total_search_result_fetches": policy.max_total_search_result_fetches,
             "max_native_research_calls": policy.max_native_research_calls,
             "max_native_candidate_fetches": policy.max_native_candidate_fetches,
+            "max_parallel_leaf_tasks": max(1, int(policy.max_parallel_leaf_tasks or 1)),
+            "max_parallel_provider_lanes": max(1, int(policy.max_parallel_provider_lanes or 1)),
+            "search_elapsed_budget_scope": "per_leaf_browser_search_lane",
         },
         "direct_url_fetch_attempt_count": direct_fetch_count,
         "direct_url_fetch_skipped_count": direct_fetch_skipped_count,
@@ -1146,8 +1193,8 @@ def collect_live_retrieval_candidates(
         "search_retry_attempt_count": search_retry_attempt_count,
         "search_call_skipped_count": search_call_skipped_count,
         "direct_url_elapsed_seconds": round(direct_url_elapsed_seconds, 3),
-        "search_elapsed_seconds": round(max(0.0, time.monotonic() - search_started_at), 3),
-        "total_collection_elapsed_seconds": round(max(0.0, time.monotonic() - collection_started_at), 3),
+        "search_elapsed_seconds": round(search_elapsed_seconds, 3),
+        "total_collection_elapsed_seconds": round(total_collection_elapsed_seconds, 3),
         "search_failure_count": len(search_failure_diagnostics),
         "search_failure_diagnostics": search_failure_diagnostics,
         "search_retry_diagnostics": search_retry_diagnostics,
@@ -1163,8 +1210,12 @@ def collect_live_retrieval_candidates(
                 "primary_search_call_count": leaf_search_call_counts.get(str(context.get("leaf_id") or ""), 0),
                 "protected_primary_required": _context_requires_protected_primary(context),
                 "high_priority": _context_is_high_priority(context),
+                "scheduled_priority_rank": _retrieval_schedule_rank(context),
+                "elapsed_budget_seconds": max_total_search_elapsed_seconds,
+                "elapsed_budget_scope": "per_leaf_browser_search_lane",
+                "elapsed_seconds": round(leaf_search_elapsed_seconds.get(str(context.get("leaf_id") or ""), 0.0), 3),
             }
-            for context in contexts
+            for context in scheduled_contexts
         ],
         "search_result_fetch_attempt_count": search_result_fetch_count,
         "search_result_fetch_skipped_count": search_result_fetch_skipped_count,
@@ -2016,6 +2067,62 @@ def _context_is_high_priority(context: dict[str, Any]) -> bool:
     )
 
 
+def _scheduled_retrieval_contexts(contexts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    indexed_contexts = [
+        (index, context)
+        for index, context in enumerate(contexts)
+        if isinstance(context, dict)
+    ]
+    return [
+        context
+        for _index, context in sorted(
+            indexed_contexts,
+            key=lambda item: (
+                _retrieval_schedule_rank(item[1]),
+                str(item[1].get("leaf_id") or ""),
+                item[0],
+            ),
+        )
+    ]
+
+
+def _retrieval_schedule_rank(context: dict[str, Any]) -> int:
+    if _context_requires_protected_primary(context):
+        return 0
+    if _context_is_high_priority(context):
+        return 1
+    return 2
+
+
+def _retrieval_scheduler_diagnostic(
+    scheduled_contexts: list[dict[str, Any]],
+    policy: RetrievalProviderPolicy,
+) -> dict[str, Any]:
+    max_parallel_leaf_tasks = max(1, int(policy.max_parallel_leaf_tasks or 1))
+    max_parallel_provider_lanes = max(1, int(policy.max_parallel_provider_lanes or 1))
+    return {
+        "schema_version": RETRIEVAL_SCHEDULER_DIAGNOSTIC_SCHEMA_VERSION,
+        "scheduler_id": "ads-retrieval-critical-leaf-lane-scheduler/v1",
+        "execution_mode": "bounded_deterministic_lane_scheduler",
+        "bounded_concurrency_enabled": True,
+        "max_parallel_leaf_tasks": max_parallel_leaf_tasks,
+        "max_parallel_provider_lanes": max_parallel_provider_lanes,
+        "critical_leaf_ordering_enabled": True,
+        "lane_budget_isolation_enabled": True,
+        "scheduled_leaf_ids": [str(context.get("leaf_id") or "") for context in scheduled_contexts],
+        "scheduled_leaves": [
+            {
+                "leaf_id": str(context.get("leaf_id") or ""),
+                "scheduled_priority_rank": _retrieval_schedule_rank(context),
+                "protected_primary_required": _context_requires_protected_primary(context),
+                "high_priority": _context_is_high_priority(context),
+                "purpose": context.get("purpose"),
+            }
+            for context in scheduled_contexts
+        ],
+    }
+
+
 def _leaf_search_call_cap(context: dict[str, Any], policy: RetrievalProviderPolicy) -> int:
     default_cap = max(1, int(policy.default_leaf_search_call_cap or 1))
     if _context_requires_protected_primary(context):
@@ -2043,6 +2150,198 @@ def _search_budget_for_case(
         "legacy_max_total_search_calls": explicit_cap,
         "leaf_aware_default_search_budget": use_dynamic_default,
     }
+
+
+def _retrieval_lane_budget_diagnostics(
+    *,
+    policy: RetrievalProviderPolicy,
+    scheduled_contexts: list[dict[str, Any]],
+    search_budget: dict[str, Any],
+    direct_url_elapsed_seconds: float,
+    direct_fetch_count: int,
+    direct_fetch_skipped_count: int,
+    direct_fetch_leaf_scope_skipped_count: int,
+    search_elapsed_seconds: float,
+    leaf_search_elapsed_seconds: dict[str, float],
+    search_primary_call_count: int,
+    search_call_skipped_count: int,
+    search_retry_attempt_count: int,
+    search_skipped_diagnostics: list[dict[str, Any]],
+    search_result_fetch_count: int,
+    search_result_fetch_skipped_count: int,
+    native_elapsed_seconds: float,
+    native_research_call_count: int,
+    native_candidate_fetch_count: int,
+    native_candidate_fetch_skipped_count: int,
+    official_direct_adapter_candidate_count: int,
+    official_direct_adapter_fetch_attempt_count: int,
+) -> list[dict[str, Any]]:
+    search_elapsed_skip_count = _skip_count(search_skipped_diagnostics, "skipped_elapsed_budget")
+    return [
+        _lane_budget_record(
+            lane_id="official_direct_source_discovery",
+            provider_kind=DIRECT_URL_SOURCE_PROVIDER_KIND,
+            configured=True,
+            max_attempts=max(0, int(policy.max_direct_urls or 0)),
+            used_attempts=official_direct_adapter_candidate_count,
+            skipped_attempts=0,
+            elapsed_seconds=0.0,
+            isolation_scope="official_direct_source_lane",
+            budget_seconds=None,
+            exhausted=official_direct_adapter_candidate_count >= max(0, int(policy.max_direct_urls or 0))
+            and official_direct_adapter_candidate_count > 0,
+            extra={
+                "fetch_attempt_count": official_direct_adapter_fetch_attempt_count,
+                "candidate_count": official_direct_adapter_candidate_count,
+            },
+        ),
+        _lane_budget_record(
+            lane_id="direct_fetch_extraction",
+            provider_kind=DIRECT_URL_SOURCE_PROVIDER_KIND,
+            configured=True,
+            max_attempts=max(0, int(policy.max_total_direct_fetches or 0)),
+            used_attempts=direct_fetch_count,
+            skipped_attempts=direct_fetch_skipped_count + direct_fetch_leaf_scope_skipped_count,
+            elapsed_seconds=direct_url_elapsed_seconds,
+            isolation_scope="direct_fetch_lane",
+            budget_seconds=None,
+            exhausted=direct_fetch_skipped_count > 0,
+            extra={"leaf_scope_skipped_count": direct_fetch_leaf_scope_skipped_count},
+        ),
+        _lane_budget_record(
+            lane_id="browser_search",
+            provider_kind=BROWSER_SEARCH_SOURCE_PROVIDER_KIND,
+            configured=bool(policy.broad_search_enabled),
+            max_attempts=int(search_budget.get("absolute_case_search_cap") or 0),
+            used_attempts=search_primary_call_count,
+            skipped_attempts=search_call_skipped_count,
+            elapsed_seconds=search_elapsed_seconds,
+            isolation_scope="per_leaf_browser_search_lane",
+            budget_seconds=max(0.0, float(policy.max_total_search_elapsed_seconds or 0.0)),
+            exhausted=search_call_skipped_count > 0,
+            extra={
+                "retry_attempt_count": search_retry_attempt_count,
+                "elapsed_budget_skip_count": search_elapsed_skip_count,
+                "leaf_elapsed_seconds": {
+                    str(context.get("leaf_id") or ""): round(
+                        leaf_search_elapsed_seconds.get(str(context.get("leaf_id") or ""), 0.0),
+                        3,
+                    )
+                    for context in scheduled_contexts
+                },
+            },
+        ),
+        _lane_budget_record(
+            lane_id="browser_search_fetch_extraction",
+            provider_kind=BROWSER_SEARCH_SOURCE_PROVIDER_KIND,
+            configured=bool(policy.broad_search_enabled),
+            max_attempts=max(0, int(policy.max_total_search_result_fetches or 0)),
+            used_attempts=search_result_fetch_count,
+            skipped_attempts=search_result_fetch_skipped_count,
+            elapsed_seconds=search_elapsed_seconds,
+            isolation_scope="browser_search_fetch_lane",
+            budget_seconds=None,
+            exhausted=search_result_fetch_skipped_count > 0,
+        ),
+        _lane_budget_record(
+            lane_id="native_research_candidate_discovery",
+            provider_kind=NATIVE_RESEARCH_SOURCE_PROVIDER_KIND,
+            configured=bool(policy.native_enabled),
+            max_attempts=max(0, int(policy.max_native_research_calls or 0)),
+            used_attempts=native_research_call_count,
+            skipped_attempts=0,
+            elapsed_seconds=native_elapsed_seconds,
+            isolation_scope="native_research_lane",
+            budget_seconds=None,
+            exhausted=(
+                bool(policy.native_enabled)
+                and native_research_call_count >= max(0, int(policy.max_native_research_calls or 0))
+                and max(0, int(policy.max_native_research_calls or 0)) > 0
+            ),
+        ),
+        _lane_budget_record(
+            lane_id="native_candidate_fetch_extraction",
+            provider_kind=NATIVE_RESEARCH_SOURCE_PROVIDER_KIND,
+            configured=bool(policy.native_enabled),
+            max_attempts=max(0, int(policy.max_native_candidate_fetches or 0)),
+            used_attempts=native_candidate_fetch_count,
+            skipped_attempts=native_candidate_fetch_skipped_count,
+            elapsed_seconds=native_elapsed_seconds,
+            isolation_scope="native_candidate_fetch_lane",
+            budget_seconds=None,
+            exhausted=native_candidate_fetch_skipped_count > 0,
+        ),
+        _lane_budget_record(
+            lane_id="metadata_claim_validation",
+            provider_kind=None,
+            configured=False,
+            max_attempts=0,
+            used_attempts=0,
+            skipped_attempts=0,
+            elapsed_seconds=0.0,
+            isolation_scope="downstream_retrieval_packet_validation_lane",
+            budget_seconds=None,
+            exhausted=False,
+            extra={"status": "not_executed_in_transport"},
+        ),
+    ]
+
+
+def _lane_budget_record(
+    *,
+    lane_id: str,
+    provider_kind: str | None,
+    configured: bool,
+    max_attempts: int,
+    used_attempts: int,
+    skipped_attempts: int,
+    elapsed_seconds: float,
+    isolation_scope: str,
+    budget_seconds: float | None,
+    exhausted: bool,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    record = {
+        "schema_version": RETRIEVAL_LANE_BUDGET_SCHEMA_VERSION,
+        "lane_id": lane_id,
+        "configured": configured,
+        "max_attempts": max_attempts,
+        "used_attempts": max(0, int(used_attempts)),
+        "skipped_attempts": max(0, int(skipped_attempts)),
+        "elapsed_seconds": round(max(0.0, float(elapsed_seconds)), 3),
+        "budget_seconds": None
+        if budget_seconds is None
+        else round(max(0.0, float(budget_seconds)), 3),
+        "isolation_scope": isolation_scope,
+        "exhausted": bool(exhausted),
+        "authority_boundary": _lane_budget_authority_boundary(provider_kind),
+    }
+    if extra:
+        record.update(copy.deepcopy(extra))
+    return record
+
+
+def _lane_budget_authority_boundary(provider_kind: str | None) -> dict[str, Any]:
+    if provider_kind:
+        return _source_discovery_authority_boundary(provider_kind)
+    return {
+        "candidate_discovery": False,
+        "candidate_discovery_only": False,
+        "direct_url_hint": False,
+        "source_metadata_final_authority": False,
+        "claim_family_final_authority": False,
+        "temporal_safety_final_authority": False,
+        "research_sufficiency_authority": False,
+        "forecast_authority": False,
+    }
+
+
+def _skip_count(diagnostics: list[dict[str, Any]], reason_code: str) -> int:
+    return sum(
+        1
+        for item in diagnostics
+        if isinstance(item, dict) and item.get("reason_code") == reason_code
+    )
 
 
 def _browser_search_max_attempts(policy: RetrievalProviderPolicy) -> int:

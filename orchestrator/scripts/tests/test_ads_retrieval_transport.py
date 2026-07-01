@@ -271,6 +271,15 @@ class AdsRetrievalTransportTest(unittest.TestCase):
         leaf["required_evidence_fields"] = ["official_status", "bank_of_israel_decision"]
         return qdt
 
+    def _boi_two_leaf_qdt(self) -> dict:
+        qdt = self._two_leaf_qdt()
+        for leaf in qdt["required_leaf_questions"]:
+            if leaf["leaf_id"] == "leaf-source-of-truth":
+                leaf["question_text"] = "What did the Bank of Israel official source say about the decision?"
+                leaf["market_component_terms"] = ["Bank of Israel", "BOI"]
+                leaf["required_evidence_fields"] = ["official_status", "bank_of_israel_decision"]
+        return qdt
+
     def test_source_provider_result_normalizes_candidate_authority_metadata(self) -> None:
         runtime_ref = {
             "schema_version": SOURCE_PROVIDER_RUNTIME_REF_SCHEMA_VERSION,
@@ -814,7 +823,7 @@ class AdsRetrievalTransportTest(unittest.TestCase):
         self.assertEqual(diagnostics["search_call_skipped_count"], 0)
         self.assertEqual([event[0] for event in provider.events].count("search"), 1)
 
-    def test_elapsed_search_budget_records_leaf_skip_diagnostics(self) -> None:
+    def test_elapsed_search_budget_is_isolated_per_leaf(self) -> None:
         clock = {"now": 0.0}
 
         class SlowSearchProvider(FakeBrowserProvider):
@@ -846,11 +855,116 @@ class AdsRetrievalTransportTest(unittest.TestCase):
             for item in transport.transport_diagnostics["search_skipped_diagnostics"]
             if item["reason_code"] == "skipped_elapsed_budget"
         ]
+        scheduler = transport.transport_diagnostics["retrieval_scheduler_diagnostic"]
+        browser_lane = next(
+            item
+            for item in transport.transport_diagnostics["retrieval_lane_budget_diagnostics"]
+            if item["lane_id"] == "browser_search"
+        )
+
+        self.assertFalse(elapsed_skips)
+        self.assertEqual(provider.events[0], ("search", "leaf-source-of-truth"))
+        self.assertEqual(scheduler["scheduled_leaf_ids"][0], "leaf-source-of-truth")
+        self.assertTrue(scheduler["bounded_concurrency_enabled"])
+        self.assertTrue(scheduler["lane_budget_isolation_enabled"])
+        self.assertEqual(browser_lane["isolation_scope"], "per_leaf_browser_search_lane")
+        self.assertEqual(browser_lane["elapsed_budget_skip_count"], 0)
+        self.assertEqual(browser_lane["budget_seconds"], 1.0)
+
+    def test_elapsed_search_budget_skips_only_remaining_variants_for_same_leaf(self) -> None:
+        clock = {"now": 0.0}
+
+        class SlowSearchProvider(FakeBrowserProvider):
+            def search_candidate_urls(self, query_context: dict, query_variant: dict, *, searched_at=None) -> list[dict]:
+                clock["now"] += 2.0
+                return super().search_candidate_urls(query_context, query_variant, searched_at=searched_at)
+
+        provider = SlowSearchProvider(search_results=[{"url": "https://www.reuters.com/world/example-report"}])
+
+        with patch("predquant.ads_retrieval_transport.time.monotonic", side_effect=lambda: clock["now"]):
+            transport = collect_live_retrieval_candidates(
+                qdt=self._resolution_mechanics_qdt(),
+                evidence_packet={**self.evidence_packet, "official_source_hints": []},
+                case_contract={**self.case_contract, "market_identity": {}},
+                amrg_context=None,
+                source_cutoff_timestamp=CUTOFF_AT,
+                forecast_timestamp=FORECAST_AT,
+                provider_policy=RetrievalProviderPolicy(
+                    max_direct_urls=0,
+                    max_total_search_calls=10,
+                    max_total_search_elapsed_seconds=1,
+                    max_search_variants_per_leaf=2,
+                    max_search_results_per_variant=1,
+                ),
+                browser_provider=provider,
+            )
+
+        elapsed_skips = [
+            item
+            for item in transport.transport_diagnostics["search_skipped_diagnostics"]
+            if item["reason_code"] == "skipped_elapsed_budget"
+        ]
+        browser_lane = next(
+            item
+            for item in transport.transport_diagnostics["retrieval_lane_budget_diagnostics"]
+            if item["lane_id"] == "browser_search"
+        )
+
         self.assertTrue(elapsed_skips)
         self.assertTrue(all(item.get("leaf_id") for item in elapsed_skips))
         self.assertTrue(all(item.get("elapsed_seconds", 0) >= 1 for item in elapsed_skips))
         self.assertTrue(all(item.get("budget_seconds") == 1 for item in elapsed_skips))
+        self.assertEqual(transport.transport_diagnostics["search_call_count"], 1)
+        self.assertEqual(browser_lane["elapsed_budget_skip_count"], len(elapsed_skips))
         self.assertIn("skipped_elapsed_budget", transport.transport_diagnostics["bounded_retrieval_reason_codes"])
+
+    def test_browser_budget_exhaustion_does_not_skip_official_or_native_lanes(self) -> None:
+        def native_provider(context: dict, _variant: dict) -> list[dict]:
+            leaf_id = str(context["leaf_id"])
+            return [
+                {
+                    "url": f"https://native.example/{leaf_id}",
+                    "source_label": "Native candidate",
+                    "why_it_may_matter": "May contain source material for this leaf.",
+                    "candidate_claim_text": "Candidate claim only.",
+                }
+            ]
+
+        provider = FakeBrowserProvider()
+        transport = collect_live_retrieval_candidates(
+            qdt=self._boi_two_leaf_qdt(),
+            evidence_packet={
+                **self.evidence_packet,
+                "market_rules": {},
+                "official_source_hints": [],
+                "market_reality_constraints": {},
+            },
+            case_contract={**self.case_contract, "market_identity": {}},
+            amrg_context=None,
+            source_cutoff_timestamp=CUTOFF_AT,
+            forecast_timestamp=FORECAST_AT,
+            provider_policy=RetrievalProviderPolicy(
+                max_direct_urls=2,
+                max_total_search_calls=0,
+                max_search_results_per_variant=1,
+                native_enabled=True,
+                max_native_research_calls=4,
+            ),
+            browser_provider=provider,
+            native_candidate_provider=native_provider,
+        )
+
+        diagnostics = transport.transport_diagnostics
+        lanes = {item["lane_id"]: item for item in diagnostics["retrieval_lane_budget_diagnostics"]}
+
+        self.assertEqual(diagnostics["search_call_count"], 0)
+        self.assertGreater(diagnostics["search_call_skipped_count"], 0)
+        self.assertGreater(diagnostics["official_direct_adapter_fetch_attempt_count"], 0)
+        self.assertGreater(diagnostics["native_research_call_count"], 0)
+        self.assertEqual(lanes["browser_search"]["max_attempts"], 0)
+        self.assertTrue(lanes["browser_search"]["exhausted"])
+        self.assertGreater(lanes["official_direct_source_discovery"]["used_attempts"], 0)
+        self.assertGreater(lanes["native_research_candidate_discovery"]["used_attempts"], 0)
 
     def test_tesla_ir_resolution_url_is_deterministic_official_after_fetch(self) -> None:
         provider = FakeBrowserProvider()
