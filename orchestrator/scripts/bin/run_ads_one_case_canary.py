@@ -209,6 +209,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--metadata-json", type=parse_metadata)
     parser.add_argument("--preflight-only", action="store_true", help="Validate handler coverage and active-work state only.")
     parser.add_argument("--apply", action="store_true", help="Actually enable and run the one-case canary.")
+    parser.add_argument(
+        "--allow-live-control-state-write",
+        action="store_true",
+        help="Allow preflight/apply to write ADS pipeline control-state metadata to the known live DB.",
+    )
     parser.add_argument("--pretty", action="store_true")
     return parser.parse_args()
 
@@ -234,6 +239,7 @@ def main() -> int:
         require_qdt_model_executed=not args.skip_qdt_model_executed_check,
         require_researcher_model_executed=args.require_researcher_model_executed,
         allowed_stage_failure_classes=tuple(args.allow_stage_failure_class),
+        allow_live_control_state_write=args.allow_live_control_state_write,
     )
     if not args.handler_factory:
         print(

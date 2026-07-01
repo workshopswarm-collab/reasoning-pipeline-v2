@@ -8,8 +8,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from predquant.ads_real_runtime_canary import (
+    SOURCE_RETRIEVAL_PHASE0_AUDIT_EXPECTATIONS,
     _model_runtime_evidence,
     _retrieval_runtime_evidence,
+    build_source_retrieval_pipeline_health_taxonomy,
     build_current_audit_gap_summary,
     classify_qdt_runtime_state,
     classify_recent_run_failure,
@@ -328,6 +330,47 @@ class AdsRealRuntimeCanaryTest(unittest.TestCase):
         self.assertEqual(retrieval_evidence["source_populated_count"], 1)
         self.assertFalse(retrieval_evidence["live_acceptance_ok"])
         self.assertEqual(retrieval_evidence["meaningful_snippet_admitted_count"], 0)
+
+    def test_source_retrieval_pipeline_health_taxonomy_reports_completed_stage_readiness_block(self):
+        taxonomy = build_source_retrieval_pipeline_health_taxonomy(
+            run={
+                "completed_stage_count": SOURCE_RETRIEVAL_PHASE0_AUDIT_EXPECTATIONS[
+                    "expected_completed_stage_count"
+                ],
+                "stage_order": [f"stage-{idx}" for idx in range(13)],
+            },
+            manifests=[
+                {
+                    "stage": "classification_verification",
+                    "artifact_type": "classification_verification_readiness_block",
+                    "schema_version": "classification-verification-readiness-block/v1",
+                }
+            ],
+            runtime_criteria=[
+                {"gate": "retrieval_live_acceptance_requirements", "status": "failed"},
+                {"gate": "researcher_model_executed_if_dispatch_allowed", "status": "skipped"},
+            ],
+            prediction_deltas={
+                "market_predictions_delta": SOURCE_RETRIEVAL_PHASE0_AUDIT_EXPECTATIONS[
+                    "expected_market_predictions_delta"
+                ],
+                "non_scoreable_prediction_ids": [],
+            },
+            phase9_case={
+                "classification": "structured_non_scoreable_insufficiency",
+                "no_scoreable_write_when_blocked": True,
+            },
+        )
+
+        self.assertEqual(taxonomy["stage_outcome_state"], "stage_completed_with_readiness_block")
+        self.assertEqual(taxonomy["decision_state"], "non_scoreable_fail_closed")
+        self.assertEqual(taxonomy["readiness_block_artifact_count"], 1)
+        self.assertEqual(taxonomy["market_predictions_delta"], 0)
+        self.assertEqual(
+            taxonomy["phase0_audit_expectations"]["audit_pipeline_run_id"],
+            "ads-pipeline-run:014933b9940a5449d49b216c316ca4b0a8bddd1ed41f33dac76b5071062a0afa",
+        )
+        self.assertIn("retrieval_live_acceptance_requirements", taxonomy["failed_runtime_gates"])
 
 
 if __name__ == "__main__":

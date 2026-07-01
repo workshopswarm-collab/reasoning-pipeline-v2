@@ -11,6 +11,7 @@ from typing import Any
 from predquant.ads_case_selector import CASE_LEASE_TABLE
 from predquant.ads_handoff_report import build_handoff_report
 from predquant.ads_pipeline_runner import (
+    ADS_PIPELINE_STAGE_ORDER,
     PIPELINE_RUN_TABLE,
     ensure_pipeline_runner_schema,
     read_pipeline_control_state,
@@ -108,6 +109,28 @@ RETRIEVAL_STATE_NOT_SOURCE_POPULATED = "retrieval_not_source_populated"
 NATIVE_RESEARCH_STATE_EXECUTED_NO_CANDIDATES = "native_research_executed_no_candidates"
 NATIVE_RESEARCH_STATE_CANDIDATES_PRESENT = "native_research_candidate_urls_present"
 NATIVE_RESEARCH_STATE_NOT_EXECUTED_OR_USEFUL = "native_research_not_executed_or_useful"
+STAGE_OUTCOME_COMPLETED_WITH_READINESS_BLOCK = "stage_completed_with_readiness_block"
+STAGE_OUTCOME_COMPLETED_ACCEPTED = "stage_completed_without_readiness_block"
+STAGE_OUTCOME_PARTIAL = "stage_partially_completed"
+STAGE_OUTCOME_NOT_COMPLETED = "stage_not_completed"
+DECISION_STATE_NON_SCOREABLE_FAIL_CLOSED = "non_scoreable_fail_closed"
+DECISION_STATE_SCOREABLE_OR_UNCLASSIFIED = "scoreable_or_unclassified"
+SOURCE_RETRIEVAL_PHASE0_AUDIT_EXPECTATIONS = {
+    "schema_version": "ads-source-retrieval-phase0-audit-expectations/v1",
+    "audit_pipeline_run_id": "ads-pipeline-run:014933b9940a5449d49b216c316ca4b0a8bddd1ed41f33dac76b5071062a0afa",
+    "case_key": "polymarket:1795635",
+    "expected_completed_stage_count": 13,
+    "expected_active_work": {"active_runs": 0, "active_leases": 0},
+    "expected_market_predictions_delta": 0,
+    "expected_qdt_states": [
+        QDT_RUNTIME_STATE_LIVE_ACCEPTED,
+        QDT_RUNTIME_STATE_LIVE_REJECTED,
+    ],
+    "expected_retrieval_state": RETRIEVAL_STATE_SOURCE_POPULATED_NOT_CERTIFIED,
+    "expected_native_state": NATIVE_RESEARCH_STATE_EXECUTED_NO_CANDIDATES,
+    "expected_stage_outcome_state": STAGE_OUTCOME_COMPLETED_WITH_READINESS_BLOCK,
+    "expected_decision_state": DECISION_STATE_NON_SCOREABLE_FAIL_CLOSED,
+}
 
 
 def _decode_json(value: Any, fallback: Any) -> Any:
@@ -572,6 +595,82 @@ def build_recent_run_failure_taxonomy(
         "native_state": native_state,
         "native_research_model_executed_count": native_model_executed_count,
         "native_candidate_url_count": native_candidate_url_count,
+    }
+
+
+def _is_readiness_block_artifact(manifest: dict[str, Any]) -> bool:
+    artifact_type = str(manifest.get("artifact_type") or "")
+    schema_version = str(manifest.get("schema_version") or "")
+    normalized_type = artifact_type.replace("-", "_")
+    normalized_schema = schema_version.replace("-", "_")
+    return normalized_type.endswith("_readiness_block") or normalized_schema.endswith("_readiness_block/v1")
+
+
+def build_source_retrieval_pipeline_health_taxonomy(
+    *,
+    run: dict[str, Any] | None,
+    manifests: list[dict[str, Any]],
+    runtime_criteria: list[dict[str, Any]],
+    prediction_deltas: dict[str, Any],
+    phase9_case: dict[str, Any],
+) -> dict[str, Any]:
+    stage_order = run.get("stage_order") if isinstance(run, dict) and isinstance(run.get("stage_order"), list) else []
+    expected_stage_count = len(stage_order) if stage_order else len(ADS_PIPELINE_STAGE_ORDER)
+    completed_stage_count = _int_value(run.get("completed_stage_count")) if isinstance(run, dict) else 0
+    readiness_block_manifests = [manifest for manifest in manifests if _is_readiness_block_artifact(manifest)]
+    failed_runtime_gates = sorted(
+        str(item.get("gate"))
+        for item in runtime_criteria
+        if isinstance(item, dict) and item.get("status") == "failed" and item.get("gate")
+    )
+    skipped_runtime_gates = sorted(
+        str(item.get("gate"))
+        for item in runtime_criteria
+        if isinstance(item, dict) and item.get("status") == "skipped" and item.get("gate")
+    )
+    has_readiness_block = bool(readiness_block_manifests or failed_runtime_gates)
+    if expected_stage_count > 0 and completed_stage_count >= expected_stage_count:
+        stage_outcome_state = (
+            STAGE_OUTCOME_COMPLETED_WITH_READINESS_BLOCK
+            if has_readiness_block
+            else STAGE_OUTCOME_COMPLETED_ACCEPTED
+        )
+    elif completed_stage_count > 0:
+        stage_outcome_state = STAGE_OUTCOME_PARTIAL
+    else:
+        stage_outcome_state = STAGE_OUTCOME_NOT_COMPLETED
+
+    market_predictions_delta = _int_value(prediction_deltas.get("market_predictions_delta"))
+    fail_closed = (
+        phase9_case.get("classification")
+        in {"structured_non_scoreable_insufficiency", "structural_unanswerability"}
+        and phase9_case.get("no_scoreable_write_when_blocked") is True
+        and market_predictions_delta == 0
+        and not prediction_deltas.get("non_scoreable_prediction_ids")
+    )
+    return {
+        "schema_version": "ads-source-retrieval-pipeline-health-taxonomy/v1",
+        "stage_outcome_state": stage_outcome_state,
+        "completed_stage_count": completed_stage_count,
+        "expected_stage_count": expected_stage_count,
+        "readiness_block_artifact_count": len(readiness_block_manifests),
+        "readiness_block_artifact_types": sorted(
+            {
+                str(manifest.get("artifact_type"))
+                for manifest in readiness_block_manifests
+                if manifest.get("artifact_type")
+            }
+        ),
+        "failed_runtime_gates": failed_runtime_gates,
+        "skipped_runtime_gates": skipped_runtime_gates,
+        "decision_state": (
+            DECISION_STATE_NON_SCOREABLE_FAIL_CLOSED
+            if fail_closed
+            else DECISION_STATE_SCOREABLE_OR_UNCLASSIFIED
+        ),
+        "market_predictions_delta": market_predictions_delta,
+        "no_scoreable_write_when_blocked": bool(phase9_case.get("no_scoreable_write_when_blocked")),
+        "phase0_audit_expectations": dict(SOURCE_RETRIEVAL_PHASE0_AUDIT_EXPECTATIONS),
     }
 
 
@@ -2507,6 +2606,20 @@ def build_real_runtime_canary_report(
         retrieval_evidence=retrieval_evidence,
         errors=errors,
     )
+    taxonomy_run = dict(run or {})
+    result_record = canary_result.get("result") if isinstance(canary_result, dict) else {}
+    if isinstance(result_record, dict):
+        if _int_value(taxonomy_run.get("completed_stage_count")) == 0:
+            taxonomy_run["completed_stage_count"] = _int_value(result_record.get("completed_stage_count"))
+        if not taxonomy_run.get("stage_order") and isinstance(result_record.get("stage_order"), list):
+            taxonomy_run["stage_order"] = list(result_record["stage_order"])
+    source_retrieval_pipeline_health_taxonomy = build_source_retrieval_pipeline_health_taxonomy(
+        run=taxonomy_run,
+        manifests=manifests,
+        runtime_criteria=runtime_criteria,
+        prediction_deltas=prediction_deltas,
+        phase9_case=phase9_case,
+    )
     return {
         "schema_version": REAL_RUNTIME_CANARY_REPORT_SCHEMA_VERSION,
         "criteria_schema_version": REAL_RUNTIME_CANARY_CRITERIA_SCHEMA_VERSION,
@@ -2538,6 +2651,8 @@ def build_real_runtime_canary_report(
         "clone_only": live_db_mutation == "clone_only",
         "retry_summary": retry_summary,
         "recent_run_failure_taxonomy": current_audit_gap_summary["recent_run_failure_taxonomy"],
+        "source_retrieval_pipeline_health_taxonomy": source_retrieval_pipeline_health_taxonomy,
+        "source_retrieval_phase0_audit_expectations": dict(SOURCE_RETRIEVAL_PHASE0_AUDIT_EXPECTATIONS),
         "current_audit_gap_summary": current_audit_gap_summary,
         "phase9_representative_case": phase9_case,
         "active_work": active,
@@ -2762,9 +2877,11 @@ __all__ = [
     "REAL_RUNTIME_CANARY_CRITERIA_SCHEMA_VERSION",
     "REAL_RUNTIME_CANARY_REPORT_SCHEMA_VERSION",
     "build_recent_run_failure_taxonomy",
+    "build_source_retrieval_pipeline_health_taxonomy",
     "classify_qdt_runtime_state",
     "classify_recent_run_failure",
     "qdt_runtime_counters",
+    "SOURCE_RETRIEVAL_PHASE0_AUDIT_EXPECTATIONS",
     "build_current_audit_gap_summary",
     "build_real_runtime_canary_report",
     "phase9_leaf_retrieval_statuses",

@@ -603,6 +603,8 @@ class AdsOperationalCanaryTest(unittest.TestCase):
         require_manifest_handoffs=False,
         require_real_runtime_canary_criteria=False,
         require_researcher_model_executed=False,
+        allow_live_control_state_write=False,
+        known_live_db_paths=(),
         metadata=None,
     ):
         resolved_metadata = {"test_scope": "operational_canary"}
@@ -620,6 +622,8 @@ class AdsOperationalCanaryTest(unittest.TestCase):
             metadata=resolved_metadata,
             require_real_runtime_canary_criteria=require_real_runtime_canary_criteria,
             require_researcher_model_executed=require_researcher_model_executed,
+            allow_live_control_state_write=allow_live_control_state_write,
+            known_live_db_paths=tuple(Path(path) for path in known_live_db_paths),
         )
 
     def protected_counts_for(self, db_path: Path) -> dict[str, int]:
@@ -909,6 +913,32 @@ class AdsOperationalCanaryTest(unittest.TestCase):
         with self.assertRaisesRegex(PipelineRunnerContractError, "missing AUTO-003 stage handlers"):
             validate_preflight(self.conn, self.config(), handlers)
 
+    def test_preflight_refuses_live_control_state_write_without_explicit_allowance(self):
+        with self.assertRaisesRegex(PipelineRunnerContractError, "--allow-live-control-state-write"):
+            validate_preflight(
+                self.conn,
+                self.config(known_live_db_paths=(self.db_path,)),
+                self.stage_handlers(),
+            )
+
+        control_table_exists = self.conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'ads_pipeline_control_state'"
+        ).fetchone()
+        self.assertIsNone(control_table_exists)
+
+    def test_preflight_allows_live_control_state_write_with_explicit_allowance(self):
+        result = validate_preflight(
+            self.conn,
+            self.config(
+                allow_live_control_state_write=True,
+                known_live_db_paths=(self.db_path,),
+            ),
+            self.stage_handlers(),
+        )
+
+        self.assertTrue(result["ok"], result["errors"])
+        self.assertFalse(result["control"]["pipeline_enabled"])
+
     def test_one_case_canary_runs_once_and_disables_pipeline(self):
         self.assertTrue(validate_preflight(self.conn, self.config(), self.stage_handlers())["eligible_case_available"])
 
@@ -1085,6 +1115,11 @@ class AdsOperationalCanaryTest(unittest.TestCase):
         self.assertEqual(phase9_case["classification"], "structured_non_scoreable_insufficiency")
         self.assertTrue(phase9_case["no_scoreable_write_when_blocked"])
         self.assertIn("blocked_without_scoreable_prediction", phase9_case["reason_codes"])
+        phase0_taxonomy = criteria_report["source_retrieval_pipeline_health_taxonomy"]
+        self.assertEqual(phase0_taxonomy["stage_outcome_state"], "stage_completed_with_readiness_block")
+        self.assertEqual(phase0_taxonomy["decision_state"], "non_scoreable_fail_closed")
+        self.assertEqual(phase0_taxonomy["market_predictions_delta"], 0)
+        self.assertIn("retrieval_live_acceptance_requirements", phase0_taxonomy["failed_runtime_gates"])
         self.assertIn("retrieval_runtime_evidence", criteria_report)
         self.assertEqual(criteria_report["retrieval_runtime_evidence"]["source_populated_count"], 0)
         self.assertEqual(criteria_report["retrieval_runtime_evidence"]["admitted_evidence_ref_count"], 0)

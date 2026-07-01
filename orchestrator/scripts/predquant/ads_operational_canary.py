@@ -31,6 +31,9 @@ DEFAULT_PROTECTED_TABLES = (
     "forecast_decision_records",
     "scae_ledger_outputs",
 )
+DEFAULT_LIVE_DB_PATHS = (
+    Path(__file__).resolve().parents[1] / "data" / "predquant.sqlite3",
+)
 
 
 @dataclass(frozen=True)
@@ -53,6 +56,8 @@ class OperationalCanaryConfig:
     require_qdt_model_executed: bool = True
     require_researcher_model_executed: bool = False
     allowed_stage_failure_classes: tuple[str, ...] = ()
+    allow_live_control_state_write: bool = False
+    known_live_db_paths: tuple[Path, ...] = ()
 
 
 def table_exists(conn: sqlite3.Connection, table: str) -> bool:
@@ -102,11 +107,44 @@ def count_deltas(before: dict[str, int], after: dict[str, int]) -> dict[str, int
     return {table: after.get(table, 0) - before.get(table, 0) for table in sorted(set(before) | set(after))}
 
 
+def _resolved_db_path(path: Path | str) -> Path:
+    return Path(path).expanduser().resolve(strict=False)
+
+
+def is_known_live_db_path(
+    db_path: Path | str,
+    *,
+    known_live_db_paths: tuple[Path, ...] = (),
+) -> bool:
+    resolved = _resolved_db_path(db_path)
+    for candidate in (*DEFAULT_LIVE_DB_PATHS, *tuple(known_live_db_paths)):
+        if resolved == _resolved_db_path(candidate):
+            return True
+    return False
+
+
+def assert_live_control_state_write_allowed(
+    db_path: Path | str,
+    *,
+    allow_live_control_state_write: bool = False,
+    known_live_db_paths: tuple[Path, ...] = (),
+) -> None:
+    if is_known_live_db_path(db_path, known_live_db_paths=known_live_db_paths) and not allow_live_control_state_write:
+        raise PipelineRunnerContractError(
+            "live DB control-state write requires --allow-live-control-state-write"
+        )
+
+
 def validate_preflight(
     conn: sqlite3.Connection,
     config: OperationalCanaryConfig,
     handlers: dict[str, Callable[..., Any]],
 ) -> dict[str, Any]:
+    assert_live_control_state_write_allowed(
+        config.db_path,
+        allow_live_control_state_write=config.allow_live_control_state_write,
+        known_live_db_paths=config.known_live_db_paths,
+    )
     if config.runner_mode not in RUNNER_MODES:
         raise PipelineRunnerContractError("runner_mode is invalid")
     if not isinstance(config.max_cases, int) or config.max_cases < 1:
