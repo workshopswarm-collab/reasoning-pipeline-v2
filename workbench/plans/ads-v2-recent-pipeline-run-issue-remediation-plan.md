@@ -392,7 +392,7 @@ Completion note, 2026-07-01:
 
 ## Phase 3 - QDT Coverage Semantics And Source Quality Mapping
 
-Status: planned
+Status: completed 2026-07-01
 
 Goal: fix the mismatch where a source-quality/cutoff leaf exists but `source_quality` coverage still fails.
 
@@ -464,12 +464,21 @@ Success criteria:
 
 Checklist:
 
-- [ ] Source-quality satisfaction rule implemented.
-- [ ] Missing source-quality diagnostics implemented.
-- [ ] BOI coverage regression added.
-- [ ] Decomposer tests pass.
-- [ ] Clone proof validates intended behavior.
-- [ ] Temp artifacts and one-off scripts removed.
+- [x] Source-quality satisfaction rule implemented.
+- [x] Missing source-quality diagnostics implemented.
+- [x] BOI coverage regression added.
+- [x] Decomposer tests pass.
+- [x] Clone proof validates intended behavior.
+- [x] Temp artifacts and one-off scripts removed.
+
+Completion note, 2026-07-01:
+
+- Added deterministic source-quality satisfaction semantics for QDT coverage graphs. A leaf now contributes `source_quality` when it explicitly declares `coverage_dimension == "source_quality"` or when it is a `source_of_truth` leaf with `source_timestamp`, `publisher_authority`, `cutoff_admissibility`, and a decision-calendar evidence field.
+- Coverage graph construction now preserves the leaf's primary dimension while allowing qualifying source-of-truth calendar/cutoff leaves to add supplemental `source_quality` coverage. Unresolved pre-resolution coverage validation and candidate scoring use the same effective coverage dimensions.
+- Added `source_quality_diagnostics` and `source_quality_like_leaf_not_counted` reason codes for source-quality-like leaves that do not qualify. Diagnostics identify the exact missing field or role, including `missing_source_quality_field:cutoff_admissibility` and `missing_source_quality_decision_calendar_field`.
+- Added BOI regressions for `leaf-source-quality-calendar-cutoff`: one accepted fixture proves the source-of-truth calendar/cutoff leaf satisfies `source_quality`; one rejected fixture proves precise missing-field diagnostics when cutoff/calendar evidence is absent.
+- Clone proof: a BOI clone-only canary was run on a temporary DB copy with only external market `1795635` eligible and metadata `{"audit_id":"ads-v2-recent-run-phase3","live_db_mutation":"clone_only"}`. The broader postflight still failed on existing live-runtime/retrieval criteria, but clone-only safety held (`active_runs=0`, `active_leases=0`, protected write deltas all `0`) and the report did not list missing source-quality coverage (`qdt_missing_coverage_dimensions: []`). A transport-response variant using `leaf-source-quality-calendar-cutoff` was also attempted and stopped after exceeding the bounded proof window in later live stages; no phase temp directories or canary processes remained.
+- Verification passed: `python3 -m unittest scripts.tests.test_qdt`, `python3 -m unittest scripts.tests.test_runtime_decomposition`, full decomposer discovery, `python3 -m unittest scripts.tests.test_ads_operational_canary`, `git diff --check`, and temp-artifact/process cleanup checks.
 
 ## Phase 4 - Runtime Reporting And Operator Review Accuracy
 

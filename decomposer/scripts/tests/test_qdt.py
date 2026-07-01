@@ -84,6 +84,70 @@ class QDTContractTest(unittest.TestCase):
             research_factor=leaf.get("research_factor"),
         )
 
+    def _bank_of_israel_handoff(self) -> dict:
+        boi_handoff = copy.deepcopy(self.handoff)
+        boi_handoff["case_id"] = "case-bank-of-israel-source-quality"
+        boi_handoff["case_key"] = "polymarket:bank-of-israel-source-quality"
+        boi_handoff["dispatch_id"] = "dispatch-bank-of-israel-source-quality"
+        boi_handoff["macro_question"] = "Will the Bank of Israel cut interest rates at the next meeting?"
+        return boi_handoff
+
+    def _bank_of_israel_source_quality_calendar_cutoff_candidate(
+        self,
+        *,
+        required_evidence_fields: list[str],
+    ) -> dict:
+        handoff = self._bank_of_israel_handoff()
+        base = build_fixture_qdt_candidate(handoff, candidate_id="boi-source-quality-base")
+        leaves = copy.deepcopy(base["required_leaf_questions"])
+        leaf = next(item for item in leaves if item["leaf_id"] == "leaf-source-quality")
+        leaf.update(
+            {
+                "leaf_id": "leaf-source-quality-calendar-cutoff",
+                "question_text": (
+                    "Which Bank of Israel decision-calendar source proves the source timestamp, "
+                    "publisher authority, and cutoff admissibility for the next rate decision?"
+                ),
+                "leaf_question": (
+                    "Which Bank of Israel decision-calendar source proves the source timestamp, "
+                    "publisher authority, and cutoff admissibility for the next rate decision?"
+                ),
+                "purpose": "source_of_truth",
+                "coverage_dimension": "resolution_mechanics",
+                "research_factor": "source_quality_calendar_cutoff",
+                "research_priority": "critical",
+                "required_evidence_fields": list(required_evidence_fields),
+                "market_component_terms": [
+                    "Bank of Israel",
+                    "source quality",
+                    "decision calendar",
+                    "source cutoff",
+                ],
+            }
+        )
+        for stale_field in (
+            "research_sufficiency_requirements",
+            "evidence_requirements",
+            "classification_targets",
+            "sufficiency_criteria",
+        ):
+            leaf.pop(stale_field, None)
+        branches = copy.deepcopy(base["branches"])
+        for branch in branches:
+            leaf_ids = branch.get("leaf_ids")
+            if isinstance(leaf_ids, list):
+                branch["leaf_ids"] = [
+                    "leaf-source-quality-calendar-cutoff" if item == "leaf-source-quality" else item
+                    for item in leaf_ids
+                ]
+        return build_qdt_candidate(
+            handoff=handoff,
+            candidate_id="boi-source-quality-calendar-cutoff",
+            branches=branches,
+            required_leaf_questions=leaves,
+            leaf_budget_decision=base["leaf_budget_decision"],
+        )
+
     def _condition_scoped_qdt_with_anchor_contract(self, *, edge_id: str, edge_status: str) -> dict:
         selected = select_qdt_candidate([build_fixture_qdt_candidate(self.handoff)])
         scoped = copy.deepcopy(selected)
@@ -271,11 +335,10 @@ class QDTContractTest(unittest.TestCase):
         self.assertFalse(requirements["protected_primary_required"])
 
     def test_bank_of_israel_expectation_leaf_passes_with_corrected_role(self):
-        boi_handoff = copy.deepcopy(self.handoff)
+        boi_handoff = self._bank_of_israel_handoff()
         boi_handoff["case_id"] = "case-bank-of-israel-expectations"
         boi_handoff["case_key"] = "polymarket:bank-of-israel-expectations"
         boi_handoff["dispatch_id"] = "dispatch-bank-of-israel-expectations"
-        boi_handoff["macro_question"] = "Will the Bank of Israel cut interest rates at the next meeting?"
         qdt = select_qdt_candidate([build_fixture_qdt_candidate(boi_handoff)])
         leaf = next(item for item in qdt["required_leaf_questions"] if item["leaf_id"] == "leaf-source-quality")
         leaf.update(
@@ -296,6 +359,59 @@ class QDTContractTest(unittest.TestCase):
 
         self.assertTrue(result.valid, result.errors)
         self.assertFalse(leaf["research_sufficiency_requirements"]["protected_primary_required"])
+
+    def test_bank_of_israel_calendar_cutoff_leaf_satisfies_source_quality_coverage(self):
+        candidate = self._bank_of_israel_source_quality_calendar_cutoff_candidate(
+            required_evidence_fields=[
+                "source_timestamp",
+                "publisher_authority",
+                "cutoff_admissibility",
+                "decision_calendar",
+            ]
+        )
+
+        selected = select_qdt_candidate([candidate])
+        graph = selected["research_coverage_graph"]
+        leaf = next(
+            item
+            for item in selected["required_leaf_questions"]
+            if item["leaf_id"] == "leaf-source-quality-calendar-cutoff"
+        )
+
+        self.assertEqual(leaf["coverage_dimension"], "resolution_mechanics")
+        self.assertIn("source_quality", graph["coverage_dimensions"])
+        self.assertIn(
+            "leaf-source-quality-calendar-cutoff",
+            graph["required_leaf_ids_by_dimension"]["source_quality"],
+        )
+        self.assertEqual(graph["source_quality_diagnostics"], [])
+        self.assertTrue(validate_question_decomposition(selected).valid)
+        self.assertEqual(selected["research_coverage_check"]["status"], "passed")
+
+    def test_bank_of_israel_calendar_cutoff_leaf_reports_precise_source_quality_gap(self):
+        candidate = self._bank_of_israel_source_quality_calendar_cutoff_candidate(
+            required_evidence_fields=[
+                "source_timestamp",
+                "publisher_authority",
+            ]
+        )
+
+        result = validate_question_decomposition(candidate, require_selected=False)
+        checks = compute_qdt_quality_checks(candidate)
+        joined = "; ".join(result.errors)
+        diagnostics = candidate["research_coverage_graph"]["source_quality_diagnostics"]
+
+        self.assertFalse(result.valid)
+        self.assertIn("source_quality_like_leaf_not_counted", joined)
+        self.assertIn("missing_source_quality_field:cutoff_admissibility", joined)
+        self.assertIn("missing_source_quality_decision_calendar_field", joined)
+        self.assertEqual(diagnostics[0]["leaf_id"], "leaf-source-quality-calendar-cutoff")
+        self.assertIn("missing_source_quality_field:cutoff_admissibility", diagnostics[0]["reason_codes"])
+        self.assertEqual(checks["research_coverage_check"]["status"], "failed")
+        self.assertIn(
+            "source_quality_like_leaf_not_counted",
+            "; ".join(checks["research_coverage_check"]["reason_codes"]),
+        )
 
     def test_depth_three_tree_is_rejected_without_waiver(self):
         selected = select_qdt_candidate([build_fixture_qdt_candidate(self.handoff)])

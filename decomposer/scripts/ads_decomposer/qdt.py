@@ -166,6 +166,19 @@ UNRESOLVED_PRE_RESOLUTION_FORECAST_DIMENSIONS = {
     "source_quality",
     "material_unknowns",
 }
+SOURCE_QUALITY_REQUIRED_EVIDENCE_FIELDS = {
+    "source_timestamp",
+    "publisher_authority",
+    "cutoff_admissibility",
+}
+SOURCE_QUALITY_DECISION_CALENDAR_EVIDENCE_FIELDS = {
+    "decision_calendar",
+    "decision_calendar_context",
+    "decision_date",
+    "decision_meeting_date",
+    "meeting_calendar",
+    "policy_meeting_calendar",
+}
 TERMINAL_VERIFICATION_DOMINATION_THRESHOLD = 0.5
 TERMINAL_RESULT_VERIFICATION_PATTERNS = (
     r"\bwon\b",
@@ -493,6 +506,77 @@ def _ambiguous_terms_from_question(question: Any) -> list[dict[str, str]]:
     return terms
 
 
+def _leaf_required_evidence_field_set(leaf: dict[str, Any]) -> set[str]:
+    fields = leaf.get("required_evidence_fields")
+    if not isinstance(fields, list):
+        return set()
+    return {str(field) for field in fields if _is_non_empty_string(field)}
+
+
+def _leaf_is_source_quality_like(leaf: dict[str, Any]) -> bool:
+    if leaf.get("coverage_dimension") == "source_quality":
+        return True
+    fields = _leaf_required_evidence_field_set(leaf)
+    if fields & (SOURCE_QUALITY_REQUIRED_EVIDENCE_FIELDS | SOURCE_QUALITY_DECISION_CALENDAR_EVIDENCE_FIELDS):
+        return True
+    text = " ".join(
+        str(value or "")
+        for value in (
+            leaf.get("leaf_id"),
+            leaf.get("research_factor"),
+            " ".join(leaf.get("market_component_terms") or []),
+        )
+    ).lower()
+    return any(term in text for term in ("source_quality", "source-quality", "claim_family"))
+
+
+def _source_quality_satisfaction_for_leaf(leaf: dict[str, Any]) -> tuple[bool, list[str]]:
+    if leaf.get("coverage_dimension") == "source_quality":
+        return True, []
+    if leaf.get("purpose") != "source_of_truth":
+        if _leaf_is_source_quality_like(leaf):
+            return False, ["source_quality_requires_source_of_truth_purpose_or_explicit_dimension"]
+        return False, []
+
+    fields = _leaf_required_evidence_field_set(leaf)
+    missing_fields = sorted(SOURCE_QUALITY_REQUIRED_EVIDENCE_FIELDS - fields)
+    has_decision_calendar = bool(fields & SOURCE_QUALITY_DECISION_CALENDAR_EVIDENCE_FIELDS)
+    if not missing_fields and has_decision_calendar:
+        return True, []
+
+    if not _leaf_is_source_quality_like(leaf):
+        return False, []
+    reasons = ["missing_coverage_dimension_source_quality"]
+    reasons.extend(f"missing_source_quality_field:{field}" for field in missing_fields)
+    if not has_decision_calendar:
+        reasons.append("missing_source_quality_decision_calendar_field")
+    return False, reasons
+
+
+def _coverage_dimensions_for_leaf(leaf: dict[str, Any]) -> list[str]:
+    dimensions: list[str] = []
+    primary = _coverage_dimension_for_leaf(leaf)
+    if primary in ALLOWED_COVERAGE_DIMENSIONS:
+        dimensions.append(primary)
+    satisfies_source_quality, _reasons = _source_quality_satisfaction_for_leaf(leaf)
+    if satisfies_source_quality and "source_quality" not in dimensions:
+        dimensions.append("source_quality")
+    return dimensions
+
+
+def _source_quality_not_counted_diagnostic(leaf: dict[str, Any]) -> dict[str, Any] | None:
+    satisfies_source_quality, reasons = _source_quality_satisfaction_for_leaf(leaf)
+    if satisfies_source_quality or not reasons:
+        return None
+    return {
+        "leaf_id": str(leaf.get("leaf_id") or ""),
+        "purpose": str(leaf.get("purpose") or ""),
+        "coverage_dimension": str(leaf.get("coverage_dimension") or ""),
+        "required_evidence_fields": sorted(_leaf_required_evidence_field_set(leaf)),
+        "reason_codes": reasons,
+    }
+
+
 def _coverage_dimension_for_leaf(leaf: dict[str, Any]) -> str:
     explicit = leaf.get("coverage_dimension")
     if explicit in ALLOWED_COVERAGE_DIMENSIONS:
@@ -716,6 +800,7 @@ def _build_market_resolution_contract(handoff: dict[str, Any]) -> dict[str, Any]
 def _build_research_coverage_graph(handoff: dict[str, Any], leaves: list[dict[str, Any]]) -> dict[str, Any]:
     by_dimension: dict[str, list[str]] = {}
     research_factors: list[dict[str, str]] = []
+    source_quality_diagnostics: list[dict[str, Any]] = []
     guard_leaf_ids: list[str] = []
     material_leaf_ids: list[str] = []
     terminal_verification_leaf_ids: list[str] = []
@@ -724,8 +809,13 @@ def _build_research_coverage_graph(handoff: dict[str, Any], leaves: list[dict[st
     for leaf in leaves:
         leaf_id = str(leaf.get("leaf_id") or "")
         dimension = str(leaf.get("coverage_dimension") or _coverage_dimension_for_leaf(leaf))
+        coverage_dimensions = _coverage_dimensions_for_leaf(leaf)
         temporal_role = str(leaf.get("leaf_temporal_role") or _leaf_temporal_role(leaf))
-        by_dimension.setdefault(dimension, []).append(leaf_id)
+        for coverage_dimension in coverage_dimensions:
+            by_dimension.setdefault(coverage_dimension, []).append(leaf_id)
+        diagnostic = _source_quality_not_counted_diagnostic(leaf)
+        if diagnostic is not None:
+            source_quality_diagnostics.append(diagnostic)
         research_factors.append(
             {
                 "leaf_id": leaf_id,
@@ -768,6 +858,7 @@ def _build_research_coverage_graph(handoff: dict[str, Any], leaves: list[dict[st
         "terminal_verification_leaf_ids": terminal_verification_leaf_ids,
         "dispatchable_pre_resolution_leaf_ids": dispatchable_pre_resolution_leaf_ids,
         "required_leaf_ids_by_dimension": {key: sorted(value) for key, value in sorted(by_dimension.items())},
+        "source_quality_diagnostics": source_quality_diagnostics,
         "overlap_groups": [],
         "unanswered_material_questions": unanswered,
         "coverage_summary": {
@@ -2048,9 +2139,10 @@ def _validate_unresolved_forecast_semantics(
         )
 
     dispatchable_dimensions = {
-        str(leaf.get("coverage_dimension"))
+        dimension
         for leaf in dispatchable_leaves
-        if leaf.get("coverage_dimension") in ALLOWED_COVERAGE_DIMENSIONS
+        for dimension in _coverage_dimensions_for_leaf(leaf)
+        if dimension in ALLOWED_COVERAGE_DIMENSIONS
     }
     missing_dimensions = (
         UNRESOLVED_PRE_RESOLUTION_FORECAST_DIMENSIONS
@@ -2142,12 +2234,36 @@ def _validate_research_coverage_graph(
     missing_unanswered = missing_dimensions - _unanswered_dimensions(value)
     if missing_unanswered:
         errors.append("required_coverage_dimension_missing: " + ", ".join(sorted(missing_unanswered)))
+    source_quality_near_misses: list[str] = []
+    for leaf in leaves_by_id.values():
+        diagnostic = _source_quality_not_counted_diagnostic(leaf)
+        if diagnostic is None:
+            continue
+        source_quality_near_misses.append(
+            str(diagnostic["leaf_id"])
+            + " "
+            + ", ".join(str(reason) for reason in diagnostic["reason_codes"])
+        )
+    if "source_quality" not in by_dimension and source_quality_near_misses:
+        errors.append("source_quality_like_leaf_not_counted: " + "; ".join(sorted(source_quality_near_misses)))
+    source_quality_ids = by_dimension.get("source_quality", [])
+    if isinstance(source_quality_ids, list):
+        invalid_source_quality_ids = sorted(
+            str(leaf_id)
+            for leaf_id in source_quality_ids
+            if str(leaf_id) in leaves_by_id
+            and not _source_quality_satisfaction_for_leaf(leaves_by_id[str(leaf_id)])[0]
+        )
+        if invalid_source_quality_ids:
+            errors.append(
+                "research_coverage_graph.source_quality references non-qualifying leaves: "
+                + ", ".join(invalid_source_quality_ids)
+            )
     for leaf_id, leaf in leaves_by_id.items():
-        dimension = leaf.get("coverage_dimension")
-        if dimension in ALLOWED_COVERAGE_DIMENSIONS:
+        for dimension in _coverage_dimensions_for_leaf(leaf):
             ids = by_dimension.get(dimension, [])
             if isinstance(ids, list) and leaf_id not in ids:
-                errors.append(f"research_coverage_graph.required_leaf_ids_by_dimension omits {leaf_id}")
+                errors.append(f"research_coverage_graph.required_leaf_ids_by_dimension.{dimension} omits {leaf_id}")
         if leaf.get("leaf_temporal_role") == "terminal_verification" and leaf_id not in terminal:
             errors.append("research_coverage_graph.terminal_verification_leaf_ids omits terminal verification leaf")
     if _evidence_packet_suggests_market_family(evidence_packet):
@@ -2492,6 +2608,7 @@ def compute_qdt_quality_checks(
                 "insufficient_material_leaf_count",
                 "resolution_checklist_dominates_research_coverage",
                 "required_coverage_dimension_missing",
+                "source_quality_like_leaf_not_counted",
                 "overlapping_leaf_questions_not_deduplicated",
                 "missing_pre_resolution_dispatchable_leaves",
                 "missing_pre_resolution_forecast_dimensions",
@@ -2630,11 +2747,20 @@ def _score_qdt_candidate_details(candidate: dict[str, Any]) -> dict[str, Any]:
 
     macro_tokens = _text_tokens(candidate.get("macro_question"))
     purposes = {leaf.get("purpose") for leaf in leaves if isinstance(leaf, dict)}
+    graph_dimensions = graph.get("coverage_dimensions") if isinstance(graph.get("coverage_dimensions"), list) else []
     dimensions = {
-        leaf.get("coverage_dimension")
-        for leaf in leaves
-        if isinstance(leaf, dict) and leaf.get("coverage_dimension") in ALLOWED_COVERAGE_DIMENSIONS
+        str(dimension)
+        for dimension in graph_dimensions
+        if dimension in ALLOWED_COVERAGE_DIMENSIONS
     }
+    if not dimensions:
+        dimensions = {
+            dimension
+            for leaf in leaves
+            if isinstance(leaf, dict)
+            for dimension in _coverage_dimensions_for_leaf(leaf)
+            if dimension in ALLOWED_COVERAGE_DIMENSIONS
+        }
     by_dimension = (
         graph.get("required_leaf_ids_by_dimension")
         if isinstance(graph.get("required_leaf_ids_by_dimension"), dict)
@@ -2678,9 +2804,10 @@ def _score_qdt_candidate_details(candidate: dict[str, Any]) -> dict[str, Any]:
         if isinstance(leaf, dict)
     )
     pre_resolution_dimensions = {
-        str(leaf.get("coverage_dimension"))
+        dimension
         for leaf in dispatchable_leaves
-        if leaf.get("coverage_dimension") in UNRESOLVED_PRE_RESOLUTION_FORECAST_DIMENSIONS
+        for dimension in _coverage_dimensions_for_leaf(leaf)
+        if dimension in UNRESOLVED_PRE_RESOLUTION_FORECAST_DIMENSIONS
     }
     pre_resolution_roles = {
         str(leaf.get("leaf_temporal_role"))
