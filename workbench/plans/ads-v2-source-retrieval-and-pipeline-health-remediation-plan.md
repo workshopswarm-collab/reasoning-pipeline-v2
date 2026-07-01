@@ -558,7 +558,7 @@ Completion note, 2026-07-01:
 
 ## Phase 5 - Fetch, Extraction, Claims, Freshness, And Source Families
 
-Status: pending
+Status: completed 2026-07-01
 
 Goal: turn candidate URLs into classification-useful evidence, not just diagnostic chunks.
 
@@ -631,13 +631,22 @@ Success criteria:
 
 Checklist:
 
-- [ ] Fetch/extraction produces meaningful bounded excerpts.
-- [ ] Claim extraction is attempted and tested.
-- [ ] Source metadata/family resolution is tested.
-- [ ] Freshness gates are tested.
-- [ ] Sufficiency certification accepts only useful evidence.
-- [ ] Temp artifacts and scripts are deleted.
-- [ ] `git diff --check` passes.
+- [x] Fetch/extraction produces meaningful bounded excerpts.
+- [x] Claim extraction is attempted and tested.
+- [x] Source metadata/family resolution is tested.
+- [x] Freshness gates are tested.
+- [x] Sufficiency certification accepts only useful evidence.
+- [x] Temp artifacts and scripts are deleted.
+- [x] `git diff --check` passes.
+
+Completion note, 2026-07-01:
+
+- Tightened deterministic provenance admission so evidence counts toward breadth only after source class, source family, claim family, temporal pass, independence, and context-usefulness gates all pass.
+- Added hash-like payload detection so hash-only content stays diagnostic-only even when a fetch returns non-empty text, while short bounded excerpts remain excluded from research-useful coverage.
+- Recorded per-evidence claim extraction status/counts and source excerpt status/counts during fetch materialization.
+- Added finalized runtime summary counters for meaningful admitted snippets, diagnostic-only snippets, deterministic claim extraction attempts, and claim/source families on certified leaves.
+- Expanded focused retrieval tests for certified fetched evidence, source metadata/family/freshness certification, claim extraction, and short/hash-only diagnostic-only chunks.
+- Verification passed: focused Phase 5 retrieval tests, full Researcher discovery (`253` tests), full Orchestrator discovery (`334` tests), `py_compile` for changed Researcher files, temp cleanup check, and `git diff --check`.
 
 ## Phase 6 - Researcher Dispatch Positive Path
 

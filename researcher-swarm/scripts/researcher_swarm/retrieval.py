@@ -503,6 +503,31 @@ def _content_hash_for_duplicate_detection(candidate: dict[str, Any], content_sha
     return ""
 
 
+def _hash_like_token(value: str) -> bool:
+    token = value.strip().strip(".,;()[]{}<>")
+    lowered = token.lower()
+    if lowered.startswith(("sha1:", "sha256:", "sha512:", "md5:")):
+        _, _, lowered = lowered.partition(":")
+    if re.fullmatch(r"[a-f0-9]{32,128}", lowered):
+        return True
+    return bool(len(token) >= 40 and re.fullmatch(r"[A-Za-z0-9+/]+={0,2}", token))
+
+
+def _source_text_is_hash_only(text: str) -> bool:
+    normalized = _normalized_space(text)
+    if not normalized:
+        return False
+    tokens = [
+        token.strip().strip(".,;()[]{}<>")
+        for token in re.split(r"\s+", normalized)
+        if token.strip().strip(".,;()[]{}<>")
+    ]
+    if not tokens:
+        return False
+    allowed_labels = {"hash", "digest", "checksum", "sha1", "sha256", "sha512", "md5", "content_hash"}
+    return all(_hash_like_token(token) or token.lower().rstrip(":") in allowed_labels for token in tokens)
+
+
 def _claim_contradiction_family_id(normalized: dict[str, Any]) -> str | None:
     polarity = normalized.get("polarity")
     if polarity not in {"affirmed", "negated"}:
@@ -2823,6 +2848,7 @@ def normalize_retrieval_provenance(
     counts_toward_breadth = (
         source_class != "unknown"
         and source_family_id != "source-family-unknown"
+        and bool(claim_family_ids)
         and temporal_validation["temporal_gate_status"] == "pass"
         and independence_status in {"independent", "derived_from_primary"}
         and context_only_reason is None
@@ -3166,6 +3192,93 @@ def _research_usable_selected(
             freshness_satisfied=freshness_satisfied_by_ref.get(str(item.get("evidence_ref") or ""), True),
         )
     ]
+
+
+def _meaningful_evidence_chunk_refs(item: dict[str, Any], chunks_by_ref: dict[str, dict[str, Any]]) -> list[str]:
+    meaningful: list[str] = []
+    for ref in _evidence_chunk_refs(item):
+        chunk = chunks_by_ref.get(ref)
+        if not isinstance(chunk, dict) or chunk.get("evidence_ref") != item.get("evidence_ref"):
+            continue
+        excerpt_count = chunk.get("excerpt_char_count")
+        if (
+            _is_non_empty_string(chunk.get("content_artifact_ref"))
+            and str(chunk.get("excerpt_policy") or "") != "hash_only"
+            and isinstance(excerpt_count, int)
+            and not isinstance(excerpt_count, bool)
+            and excerpt_count >= RESEARCH_USABLE_SNIPPET_MIN_CHARS
+        ):
+            meaningful.append(ref)
+    return meaningful
+
+
+def _phase5_runtime_evidence_counts(packet: dict[str, Any]) -> dict[str, Any]:
+    chunks_by_ref = _chunks_by_ref(packet)
+    selected = [
+        item
+        for result in packet.get("leaf_retrieval_results", [])
+        if isinstance(result, dict)
+        for item in _selected_from_result(result)
+    ]
+    meaningful_refs = {
+        str(item.get("evidence_ref"))
+        for item in selected
+        if _is_non_empty_string(item.get("evidence_ref"))
+        and _meaningful_evidence_chunk_refs(item, chunks_by_ref)
+    }
+    short_or_hash_only_refs = {
+        str(item.get("evidence_ref"))
+        for item in selected
+        if _is_non_empty_string(item.get("evidence_ref"))
+        and not _meaningful_evidence_chunk_refs(item, chunks_by_ref)
+    }
+    coverages_by_leaf = _coverage_by_leaf(packet)
+    certified_leaf_ids = {
+        str(cert.get("leaf_id"))
+        for cert in packet.get("leaf_research_sufficiency_certificates", [])
+        if isinstance(cert, dict)
+        and cert.get("classification_dispatch_allowed") is True
+        and cert.get("status") == "certified_high_certainty"
+        and _is_non_empty_string(cert.get("leaf_id"))
+    }
+    certified_usable_refs = {
+        str(ref)
+        for leaf_id in certified_leaf_ids
+        for ref in coverages_by_leaf.get(leaf_id, {}).get("research_usable_evidence_refs", [])
+        if _is_non_empty_string(ref)
+    }
+    certified_meaningful_refs = meaningful_refs & certified_usable_refs
+    certified_claim_family_ids = {
+        str(claim_id)
+        for leaf_id in certified_leaf_ids
+        for claim_id in coverages_by_leaf.get(leaf_id, {}).get("independent_claim_family_ids", [])
+        if _is_known_claim_family_id(claim_id)
+    }
+    certified_source_family_ids = {
+        str(source_family_id)
+        for leaf_id in certified_leaf_ids
+        for source_family_id in coverages_by_leaf.get(leaf_id, {}).get("independent_source_family_ids", [])
+        if _is_known_source_family_id(source_family_id)
+    }
+    return {
+        "meaningful_snippet_admitted_count": len(certified_meaningful_refs),
+        "diagnostic_only_snippet_count": len(short_or_hash_only_refs),
+        "claim_family_count": len(certified_claim_family_ids),
+        "source_family_count": len(certified_source_family_ids),
+        "certified_leaf_count": len(certified_leaf_ids),
+        "certified_leaf_claim_family_count": len(certified_claim_family_ids),
+        "certified_leaf_source_family_count": len(certified_source_family_ids),
+        "certified_leaf_meaningful_snippet_count": len(certified_meaningful_refs),
+        "meaningful_snippet_min_chars": RESEARCH_USABLE_SNIPPET_MIN_CHARS,
+        "deterministic_claim_extraction_attempt_count": sum(
+            1 for item in selected if item.get("claim_extraction_attempted") is True
+        ),
+        "deterministic_claim_candidate_count": sum(
+            int(item.get("claim_candidate_count") or 0)
+            for item in selected
+            if not isinstance(item.get("claim_candidate_count"), bool)
+        ),
+    }
 
 
 def _profile_by_leaf(packet: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -5031,6 +5144,9 @@ def finalize_retrieval_packet_for_dispatch(
             replay_command=replay_command,
         )
         packet_copy.update(stage_records)
+    runtime_summary = packet_copy.get("retrieval_runtime_summary")
+    if isinstance(runtime_summary, dict):
+        runtime_summary.update(_phase5_runtime_evidence_counts(packet_copy))
     packet_copy["source_relevance_mappings"] = build_source_relevance_mappings(packet_copy)
     packet_copy["leaf_evidence_dockets"] = build_leaf_evidence_dockets(packet_copy)
 
@@ -5428,6 +5544,14 @@ def _materialize_candidate_evidence(
     evidence["source_relevance_status"] = "usable"
     if claim_family_ids and allow_candidate_claim_family_ids:
         evidence["claim_family_resolution_method"] = "explicit_candidate_claim_family_ids_allowed"
+    excerpt_policy = "hash_only" if not text or _source_text_is_hash_only(text) else "bounded_excerpt"
+    evidence["source_excerpt_status"] = (
+        "classification_useful_candidate"
+        if excerpt_policy != "hash_only" and len(text) >= RESEARCH_USABLE_SNIPPET_MIN_CHARS
+        else "diagnostic_only"
+    )
+    evidence["source_excerpt_char_count"] = len(text)
+    evidence["source_excerpt_min_chars"] = RESEARCH_USABLE_SNIPPET_MIN_CHARS
     chunk = build_evidence_chunk(
         evidence_ref=evidence["evidence_ref"],
         content_artifact_ref=str(content_artifact_ref),
@@ -5435,7 +5559,7 @@ def _materialize_candidate_evidence(
         char_start=0,
         char_end=len(text),
         text=text,
-        excerpt_policy="bounded_excerpt" if text else "hash_only",
+        excerpt_policy=excerpt_policy,
     )
     span = build_evidence_span(
         chunk_ref=chunk["chunk_ref"],
@@ -5454,6 +5578,11 @@ def _materialize_candidate_evidence(
         leaf_id=leaf_id,
         chunk_ref=chunk["chunk_ref"],
         text=text,
+    )
+    evidence["claim_extraction_attempted"] = True
+    evidence["claim_candidate_count"] = len(evidence["atomic_claim_candidates"])
+    evidence["claim_extraction_status"] = (
+        "attempted_with_claims" if evidence["atomic_claim_candidates"] else "attempted_empty"
     )
     return evidence, chunk, span
 

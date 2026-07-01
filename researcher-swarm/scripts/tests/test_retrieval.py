@@ -2401,11 +2401,19 @@ class RetrievalPacketContractTest(unittest.TestCase):
             policy_context_ref="artifact:profile-1",
         )
         coverage = packet["retrieval_breadth_coverage_slices"][0]
+        summary = packet["retrieval_runtime_summary"]
 
         self.assertTrue(coverage["breadth_certified"], coverage["unsatisfied_breadth_dimensions"])
         self.assertEqual(coverage["claim_family_count"], 2)
         self.assertEqual(coverage["source_family_count"], 2)
         self.assertEqual(coverage["fresh_source_count"], 2)
+        self.assertEqual(summary["certified_leaf_count"], 1)
+        self.assertEqual(summary["meaningful_snippet_admitted_count"], 2)
+        self.assertEqual(summary["claim_family_count"], 2)
+        self.assertEqual(summary["source_family_count"], 2)
+        self.assertEqual(summary["diagnostic_only_snippet_count"], 0)
+        self.assertEqual(summary["deterministic_claim_extraction_attempt_count"], 2)
+        self.assertGreaterEqual(summary["deterministic_claim_candidate_count"], 2)
         self.assertEqual(
             packet["research_sufficiency_summary"]["classification_dispatch_status"],
             "allowed",
@@ -2725,6 +2733,71 @@ class RetrievalPacketContractTest(unittest.TestCase):
         self.assertIn(
             "retrieved_source_text_missing",
             packet["omitted_candidates"][0]["omission_reason_codes"],
+        )
+
+    def test_phase5_short_and_hash_only_chunks_are_diagnostic_only(self) -> None:
+        qdt = copy.deepcopy(self.qdt)
+        qdt["required_leaf_questions"] = [qdt["required_leaf_questions"][0]]
+        leaf = qdt["required_leaf_questions"][0]
+        leaf["research_sufficiency_requirements"].update(
+            {
+                "required_source_classes": ["official_or_primary"],
+                "min_independent_claim_families": 1,
+                "min_independent_source_families": 1,
+                "min_temporally_fresh_sources": 1,
+                "recency_window_seconds": 3600,
+                "protected_primary_required": False,
+                "contradiction_search_required": False,
+                "required_negative_checks": [],
+            }
+        )
+        context = build_retrieval_query_contexts(qdt, evidence_packet=self.evidence_packet)[0]
+        short_candidate = self._live_candidate(context, 0, direct=True, official=True)
+        short_candidate["content"] = "Official source says decision."
+        short_candidate.pop("validated_atomic_claim_candidates", None)
+        hash_candidate = self._live_candidate(context, 1, direct=True, official=True)
+        hash_candidate.update(
+            {
+                "requested_url": "https://example.com/official/hash-only",
+                "final_url": "https://example.com/official/hash-only",
+                "canonical_url": "https://example.com/official/hash-only",
+                "content": "sha256:" + "a" * 64,
+            }
+        )
+        hash_candidate.pop("validated_atomic_claim_candidates", None)
+
+        packet = build_live_retrieval_packet_from_candidates(
+            qdt,
+            evidence_packet=self.evidence_packet,
+            fetched_candidates=[short_candidate, hash_candidate],
+            search_candidate_urls=[],
+            question_decomposition_artifact_id="artifact:qdt-1",
+            policy_context_ref="artifact:profile-1",
+        )
+        summary = packet["retrieval_runtime_summary"]
+        coverage = packet["retrieval_breadth_coverage_slices"][0]
+        reason_codes = {
+            code
+            for omission in coverage["content_usefulness_omissions"]
+            for code in omission["reason_codes"]
+        }
+
+        self.assertEqual(summary["meaningful_snippet_admitted_count"], 0)
+        self.assertEqual(summary["diagnostic_only_snippet_count"], 2)
+        self.assertEqual(summary["claim_family_count"], 0)
+        self.assertEqual(summary["source_family_count"], 0)
+        self.assertEqual(summary["deterministic_claim_extraction_attempt_count"], 2)
+        self.assertEqual(coverage["admitted_ref_count"], 0)
+        self.assertFalse(coverage["breadth_certified"])
+        self.assertIn("snippet_too_short_for_classification", reason_codes)
+        self.assertIn("hash_only_excerpt_not_research_usable", reason_codes)
+        self.assertIn(
+            "claim_extraction_not_attempted",
+            packet["leaf_research_sufficiency_certificates"][0]["unsatisfied_requirement_codes"],
+        )
+        self.assertEqual(
+            {chunk["excerpt_policy"] for chunk in packet["evidence_chunks"]},
+            {"bounded_excerpt", "hash_only"},
         )
 
     def test_post_cutoff_live_fetched_candidate_is_omitted_before_evidence_materialization(self) -> None:
