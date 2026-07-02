@@ -2,7 +2,7 @@
 
 Created: 2026-07-01
 Owner: Workbench implementation session
-Status: completed 2026-07-01
+Status: implementation phases complete; final closure blocked 2026-07-02
 
 ## Purpose
 
@@ -925,3 +925,38 @@ This plan is complete only when:
 - clone-only proof shows no live DB mutation;
 - all temporary artifacts and one-off scripts created during phase testing are deleted after tests
   pass.
+
+Final closure check - 2026-07-02:
+
+- Verdict: do not mark the full remediation finally closed yet.
+- Satisfied from pushed evidence:
+  - BOI live-market clone no longer fails at the original QDT temporal-role validation;
+  - accepted BOI QDT progresses into retrieval without hanging;
+  - retrieval emits bounded terminal timeout diagnostics;
+  - operator reports distinguish attempted runtime failures from upstream-blocked stages;
+  - SCAE/decision fail closed without scoreable market-prediction writes when evidence is invalid;
+  - clone-only proof shows no live DB mutation;
+  - Phase 8 temp clone artifacts were removed.
+- Blocking finding:
+  - a fresh BOK central-bank clone-only live-QDT probe on current `main` reached
+    `auto003_stage_failed` during `decomposition`;
+  - pipeline run:
+    `ads-pipeline-run:fdb2fefa07997b1f5c28a525b1452100cc08a392b822460cd72d049fa7835a8d`;
+  - runtime artifact status: `failed_forbidden_output`;
+  - safe failure class: `policy_violation_quarantine`;
+  - safe message: `decomposer runtime failed: ERROR model output contained forbidden authority fields`;
+  - structured forbidden-output match:
+    `response.required_leaf_questions[6].sufficiency_criteria.must_avoid_numeric_probability_or_odds`;
+  - model executed: `gpt-5.5-high`, fixture mode `false`, provider status `completed`.
+- Cleanup proof for the final check:
+  - final-check temp artifacts were deleted;
+  - live protected counts remained unchanged:
+    `ads_case_leases=9`, `ads_pipeline_runs=8`, `forecast_decision_records=8`,
+    `market_predictions=7`, `scae_ledger_outputs=0`;
+  - active work remained `active_runs=0`, `active_leases=0`.
+- Follow-up required before full closure:
+  - handle central-bank live-QDT forbidden-output/schema drift so live central-bank QDT can reach
+    accepted QDT, then retrieval, without relying on deterministic QDT substitution;
+  - likely first target: the Decomposer runtime forbidden-output scanner/prompt contract around
+    safety-style sufficiency keys such as `must_avoid_numeric_probability_or_odds`, while
+    preserving fail-closed behavior for actual probability/odds/forecast-authority outputs.
