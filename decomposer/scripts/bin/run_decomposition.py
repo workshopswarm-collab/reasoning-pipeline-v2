@@ -544,6 +544,18 @@ UNRESOLVED_TERMINAL_CONTRACT_MARKERS = (
     "primary source",
     "market rules",
 )
+UNRESOLVED_TERMINAL_FORECAST_DRIVER_MARKERS = (
+    "constraint",
+    "constraints",
+    "financial stability",
+    "foreign exchange",
+    "fx",
+    "inflation",
+    "macro",
+    "policy path",
+    "risk",
+    "stability",
+)
 
 
 def _leaf_looks_like_unresolved_terminal_contract_repair_candidate(leaf: dict[str, Any]) -> bool:
@@ -628,9 +640,98 @@ def _repair_unresolved_terminal_contract_leaf(leaf: dict[str, Any]) -> bool:
     return True
 
 
+def _leaf_looks_like_unresolved_terminal_forecast_driver_repair_candidate(
+    leaf: dict[str, Any],
+) -> bool:
+    if _leaf_looks_like_final_result_repair_blocker(leaf):
+        return False
+    role = _normalized_token(leaf.get("leaf_temporal_role"))
+    leaf_id = str(leaf.get("leaf_id") or "").lower().replace("_", "-")
+    terminal_label = (
+        role == "terminal_verification"
+        or "terminal" in role
+        or "terminal" in leaf_id
+    )
+    if not terminal_label:
+        return False
+    text = _leaf_repair_text(leaf)
+    return any(marker in text for marker in UNRESOLVED_TERMINAL_FORECAST_DRIVER_MARKERS)
+
+
+def _repair_unresolved_terminal_forecast_driver_leaf(leaf: dict[str, Any]) -> bool:
+    if not _leaf_looks_like_unresolved_terminal_forecast_driver_repair_candidate(leaf):
+        return False
+    needs_repair = (
+        leaf.get("purpose") != "catalyst"
+        or leaf.get("coverage_dimension") != "key_drivers"
+        or leaf.get("leaf_temporal_role") != "pre_resolution_forecast_driver"
+    )
+    if not needs_repair:
+        return False
+    leaf["purpose"] = "catalyst"
+    leaf["coverage_dimension"] = "key_drivers"
+    leaf["leaf_temporal_role"] = "pre_resolution_forecast_driver"
+    leaf["research_factor"] = "pre_resolution_policy_constraints_and_macro_drivers"
+    leaf["required_evidence_fields"] = [
+        "policy_constraint_status",
+        "financial_stability_context",
+        "fx_or_inflation_context",
+        "driver_timestamp",
+    ]
+    leaf["classification_targets"] = [
+        "policy_constraint_status",
+        "driver_direction",
+        "evidence_quality",
+        "missingness_status",
+    ]
+    leaf["sufficiency_criteria"] = {
+        "required_source_classes": [
+            "official_or_primary",
+            "independent_secondary",
+            "expert_or_specialist",
+        ],
+        "required_value_fields": [
+            "policy_constraint_status",
+            "financial_stability_context",
+            "driver_timestamp",
+        ],
+        "required_negative_checks": [
+            "no_post_cutoff_result_reliance",
+            "no_numeric_probability_or_odds",
+        ],
+        "classification_dispatch_requires_sufficiency_certificate": True,
+    }
+    leaf["missingness_interpretation"] = (
+        "insufficient_pre_resolution_policy_constraint_or_macro_driver_evidence"
+    )
+    raw_forbidden = leaf.get("forbidden_outputs")
+    forbidden = set()
+    if isinstance(raw_forbidden, list):
+        forbidden = {
+            str(item)
+            for item in raw_forbidden
+            if isinstance(item, str) and item.strip()
+        }
+    leaf["forbidden_outputs"] = sorted(forbidden | FORBIDDEN_LEAF_OUTPUTS)
+    structural = leaf.get("structural_validation")
+    if not isinstance(structural, dict):
+        structural = {}
+    structural["depth"] = 2
+    structural.setdefault("answerability_status", "answerable")
+    leaf["structural_validation"] = structural
+    leaf.pop("research_sufficiency_requirements", None)
+    return True
+
+
 def _leaf_looks_like_droppable_unresolved_terminal_final_result_leaf(leaf: dict[str, Any]) -> bool:
     leaf_id = str(leaf.get("leaf_id") or "").lower().replace("_", "-")
-    if "leaf-terminal-official-result" not in leaf_id:
+    if not (
+        "leaf-terminal-official-result" in leaf_id
+        or (
+            leaf_id.startswith("leaf-terminal-official")
+            and "result" in leaf_id
+        )
+    ):
         return False
     if _normalized_token(leaf.get("leaf_temporal_role")) != "terminal_verification":
         return False
@@ -730,6 +831,55 @@ def _repair_unresolved_terminal_contract_graph_refs(
             factor["coverage_dimension"] = "resolution_mechanics"
             factor["research_factor"] = "pre_resolution_resolution_mechanics_and_current_status"
             factor["leaf_temporal_role"] = "resolution_mechanics"
+
+
+def _repair_unresolved_terminal_forecast_driver_graph_refs(
+    repaired: dict[str, Any],
+    repaired_leaf_ids: set[str],
+) -> None:
+    if not repaired_leaf_ids:
+        return
+    graph = repaired.get("research_coverage_graph")
+    if not isinstance(graph, dict):
+        return
+
+    def _without_repaired_ids(value: Any) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        return [str(item) for item in value if str(item) not in repaired_leaf_ids]
+
+    def _with_repaired_ids(value: Any) -> list[str]:
+        return sorted(set(_without_repaired_ids(value)) | repaired_leaf_ids)
+
+    graph["terminal_verification_leaf_ids"] = _without_repaired_ids(
+        graph.get("terminal_verification_leaf_ids")
+    )
+    graph["contract_guard_leaf_ids"] = _without_repaired_ids(
+        graph.get("contract_guard_leaf_ids")
+    )
+    graph["material_question_leaf_ids"] = _with_repaired_ids(
+        graph.get("material_question_leaf_ids")
+    )
+    graph["dispatchable_pre_resolution_leaf_ids"] = _with_repaired_ids(
+        graph.get("dispatchable_pre_resolution_leaf_ids")
+    )
+
+    by_dimension = graph.get("required_leaf_ids_by_dimension")
+    if isinstance(by_dimension, dict):
+        for dimension, leaf_ids in list(by_dimension.items()):
+            by_dimension[dimension] = _without_repaired_ids(leaf_ids)
+        by_dimension["key_drivers"] = _with_repaired_ids(
+            by_dimension.get("key_drivers")
+        )
+
+    research_factors = graph.get("research_factors")
+    if isinstance(research_factors, list):
+        for factor in research_factors:
+            if not isinstance(factor, dict) or str(factor.get("leaf_id")) not in repaired_leaf_ids:
+                continue
+            factor["coverage_dimension"] = "key_drivers"
+            factor["research_factor"] = "pre_resolution_policy_constraints_and_macro_drivers"
+            factor["leaf_temporal_role"] = "pre_resolution_forecast_driver"
 
 
 def _drop_unresolved_terminal_final_result_graph_refs(
@@ -1005,6 +1155,7 @@ def _ensure_model_candidate_contract_shape(repaired: dict[str, Any]) -> dict[str
     leaf_purposes_by_branch: dict[str, set[str]] = {branch_id: set() for branch_id in branch_by_id}
     material_unknown_repaired_leaf_ids: set[str] = set()
     unresolved_terminal_contract_repaired_leaf_ids: set[str] = set()
+    unresolved_terminal_forecast_driver_repaired_leaf_ids: set[str] = set()
     dropped_unresolved_terminal_leaf_ids: set[str] = set()
     timing_source_quality_repaired_leaf_ids: set[str] = set()
 
@@ -1043,6 +1194,8 @@ def _ensure_model_candidate_contract_shape(repaired: dict[str, Any]) -> dict[str
             material_unknown_repaired_leaf_ids.add(leaf_id)
         elif _repair_unresolved_terminal_contract_leaf(leaf):
             unresolved_terminal_contract_repaired_leaf_ids.add(leaf_id)
+        elif _repair_unresolved_terminal_forecast_driver_leaf(leaf):
+            unresolved_terminal_forecast_driver_repaired_leaf_ids.add(leaf_id)
         elif (
             leaf.get("coverage_dimension") == "material_unknowns"
             and leaf.get("leaf_temporal_role") not in ALLOWED_LEAF_TEMPORAL_ROLES
@@ -1118,6 +1271,10 @@ def _ensure_model_candidate_contract_shape(repaired: dict[str, Any]) -> dict[str
     _repair_unresolved_terminal_contract_graph_refs(
         repaired,
         unresolved_terminal_contract_repaired_leaf_ids,
+    )
+    _repair_unresolved_terminal_forecast_driver_graph_refs(
+        repaired,
+        unresolved_terminal_forecast_driver_repaired_leaf_ids,
     )
     _repair_timing_source_quality_graph_refs(
         repaired,

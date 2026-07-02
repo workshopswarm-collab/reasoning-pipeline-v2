@@ -312,12 +312,19 @@ class ModelRuntimeContractTest(unittest.TestCase):
                 "required_leaf_questions[0].purpose is invalid",
                 "terminal_verification_leaf_misclassified_as_pre_resolution: leaf-final",
                 "material_unknown_leaf_role_drift: leaf-boi-july-material-unknowns",
+                "required_leaf_questions[3].analyst_consensus_source_classes_must_be_independent_or_expert",
                 "required_coverage_dimension_missing: source_quality",
                 "model output authority forbidden",
             ]
         )
 
-        self.assertEqual(groups["mechanical_schema"], ["required_leaf_questions[0].purpose is invalid"])
+        self.assertEqual(
+            groups["mechanical_schema"],
+            [
+                "required_leaf_questions[0].purpose is invalid",
+                "required_leaf_questions[3].analyst_consensus_source_classes_must_be_independent_or_expert",
+            ],
+        )
         self.assertEqual(
             groups["terminal_temporal_role"],
             ["terminal_verification_leaf_misclassified_as_pre_resolution: leaf-final"],

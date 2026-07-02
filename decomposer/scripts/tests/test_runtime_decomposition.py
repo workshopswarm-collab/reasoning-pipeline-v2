@@ -30,6 +30,7 @@ from ads_decomposer.qdt import (  # noqa: E402
     ALLOWED_LEAF_TEMPORAL_ROLES,
     ALLOWED_PURPOSES,
     REQUIRED_LEAF_FIELDS,
+    build_research_sufficiency_requirements,
     validate_question_decomposition,
 )
 from run_decomposition import (  # noqa: E402
@@ -302,6 +303,70 @@ class RuntimeDecompositionEntrypointTest(unittest.TestCase):
         )
         return model_response
 
+    def _bok_terminal_drift_response(self, handoff: dict) -> dict:
+        model_response = build_question_specific_fixture_response(handoff)
+        result_leaf = next(
+            item for item in model_response["required_leaf_questions"]
+            if item["coverage_dimension"] == "resolution_mechanics"
+        )
+        result_old_id = result_leaf["leaf_id"]
+        result_new_id = "leaf-terminal-official-july-base-rate-result"
+        result_question = (
+            "What did the final official result say about the Bank of Korea July "
+            "base-rate decision?"
+        )
+        result_leaf.update(
+            {
+                "leaf_id": result_new_id,
+                "question_text": result_question,
+                "leaf_question": result_question,
+                "purpose": "source_of_truth",
+                "coverage_dimension": "current_direct_evidence",
+                "research_factor": "official_final_result_status",
+                "leaf_temporal_role": "terminal_verification",
+                "required_evidence_fields": ["official_result_status"],
+                "research_sufficiency_requirements": [
+                    "model emitted a list instead of the sufficiency contract object"
+                ],
+            }
+        )
+
+        driver_leaf = next(
+            item for item in model_response["required_leaf_questions"]
+            if item["coverage_dimension"] == "key_drivers"
+        )
+        driver_old_id = driver_leaf["leaf_id"]
+        driver_new_id = "leaf-fx-financial-stability-constraints"
+        driver_question = (
+            "What current FX, inflation, and financial stability constraints could "
+            "shape the Bank of Korea July base-rate decision before cutoff?"
+        )
+        driver_leaf.update(
+            {
+                "leaf_id": driver_new_id,
+                "question_text": driver_question,
+                "leaf_question": driver_question,
+                "purpose": "direct_evidence",
+                "coverage_dimension": "current_direct_evidence",
+                "research_factor": "fx_financial_stability_constraints",
+                "leaf_temporal_role": "terminal_verification",
+                "required_evidence_fields": [
+                    "fx_pressure",
+                    "financial_stability_constraint",
+                ],
+                "research_sufficiency_requirements": [
+                    "model emitted a list instead of the sufficiency contract object"
+                ],
+            }
+        )
+
+        for branch in model_response["branches"]:
+            branch["leaf_ids"] = [
+                result_new_id if item == result_old_id else driver_new_id if item == driver_old_id else item
+                for item in branch["leaf_ids"]
+            ]
+        return model_response
+
     def test_cli_writes_question_specific_qdt_and_runtime_call(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             temp = Path(tempdir)
@@ -553,6 +618,49 @@ class RuntimeDecompositionEntrypointTest(unittest.TestCase):
         self.assertNotIn("leaf-terminal-official-result", leaf_ids)
         self.assertNotIn("leaf-terminal-official-result", graph["terminal_verification_leaf_ids"])
         self.assertNotIn("leaf-terminal-official-result", graph["dispatchable_pre_resolution_leaf_ids"])
+
+    def test_bok_terminal_official_result_variant_is_dropped_for_unresolved_market(self) -> None:
+        handoff = self._boi_rate_handoff()
+        handoff["case_id"] = "case-bok-terminal-drift"
+        handoff["case_key"] = "polymarket:bok-july-base-rate"
+        handoff["macro_question"] = "Will the Bank of Korea hold its base rate at the July 2026 meeting?"
+        repairable = self._bok_terminal_drift_response(handoff)
+
+        qdt, runtime = build_question_decomposition_from_handoff(
+            handoff,
+            runtime_mode="fixture",
+            fixture_response=repairable,
+        )
+
+        leaf_ids = {item["leaf_id"] for item in qdt["required_leaf_questions"]}
+        graph = qdt["research_coverage_graph"]
+        repaired_leaf = next(
+            item
+            for item in qdt["required_leaf_questions"]
+            if item["leaf_id"] == "leaf-fx-financial-stability-constraints"
+        )
+        self.assertTrue(validate_question_decomposition(qdt).valid)
+        self.assertEqual(runtime["execution_status"], "succeeded")
+        self.assertEqual(runtime["repair_count"], 1)
+        self.assertNotIn("leaf-terminal-official-july-base-rate-result", leaf_ids)
+        self.assertNotIn(
+            "leaf-terminal-official-july-base-rate-result",
+            graph["terminal_verification_leaf_ids"],
+        )
+        self.assertEqual(repaired_leaf["coverage_dimension"], "key_drivers")
+        self.assertEqual(repaired_leaf["leaf_temporal_role"], "pre_resolution_forecast_driver")
+        self.assertIn(
+            "leaf-fx-financial-stability-constraints",
+            graph["required_leaf_ids_by_dimension"]["key_drivers"],
+        )
+        self.assertIn(
+            "leaf-fx-financial-stability-constraints",
+            graph["dispatchable_pre_resolution_leaf_ids"],
+        )
+        self.assertNotIn(
+            "leaf-fx-financial-stability-constraints",
+            graph["terminal_verification_leaf_ids"],
+        )
 
     def test_material_unknown_repair_does_not_convert_final_result_terminal_leak(self) -> None:
         handoff = self._boi_rate_handoff()
@@ -1083,6 +1191,52 @@ class RuntimeDecompositionEntrypointTest(unittest.TestCase):
         self.assertEqual(repaired_leaf["purpose"], "direct_evidence")
         self.assertEqual(repaired_leaf["coverage_dimension"], "source_quality")
         self.assertEqual(repaired_leaf["leaf_temporal_role"], "pre_resolution_forecast_driver")
+
+    def test_rbnz_analyst_consensus_source_class_fixture_repairs_to_expert_sources(self) -> None:
+        handoff = self._handoff()
+        handoff["case_id"] = "case-rbnz-source-class-runtime"
+        handoff["case_key"] = "polymarket:rbnz-july-source-class"
+        handoff["macro_question"] = "Will the RBNZ increase the OCR at the July 2026 meeting?"
+        repairable = build_question_specific_fixture_response(handoff)
+        leaf = repairable["required_leaf_questions"][3]
+        question = (
+            "What is the analyst consensus or economist expectation for the "
+            "RBNZ July OCR decision before cutoff?"
+        )
+        leaf["question_text"] = question
+        leaf["leaf_question"] = question
+        leaf["purpose"] = "direct_evidence"
+        leaf["coverage_dimension"] = "source_quality"
+        leaf["leaf_temporal_role"] = "pre_resolution_forecast_driver"
+        leaf["research_factor"] = "analyst_consensus_expectation"
+        leaf["required_evidence_fields"] = ["analyst_consensus", "economist_expectation"]
+        leaf["research_sufficiency_requirements"] = build_research_sufficiency_requirements(
+            purpose="direct_evidence",
+            research_priority=leaf["research_priority"],
+            condition_scope=leaf["leaf_condition_scope"],
+            required_value_fields=leaf["required_evidence_fields"],
+            research_factor=leaf["research_factor"],
+        )
+        leaf["research_sufficiency_requirements"]["required_source_classes"] = [
+            "official_or_primary",
+            "independent_secondary",
+        ]
+
+        qdt, runtime = build_question_decomposition_from_handoff(
+            handoff,
+            runtime_mode="fixture",
+            fixture_response=repairable,
+        )
+
+        repaired_leaf = next(item for item in qdt["required_leaf_questions"] if item["leaf_id"] == leaf["leaf_id"])
+        diagnostic = runtime["schema_repair_diagnostics"][0]
+        self.assertTrue(validate_question_decomposition(qdt).valid)
+        self.assertEqual(runtime["repair_count"], 1)
+        self.assertEqual(diagnostic["repair_decision"], "mechanical_schema_repair_available")
+        self.assertEqual(
+            repaired_leaf["research_sufficiency_requirements"]["required_source_classes"],
+            ["independent_secondary", "expert_or_specialist"],
+        )
 
     def test_rbnz_timing_source_quality_gap_repairs_to_counted_source_quality(self) -> None:
         handoff = self._handoff()

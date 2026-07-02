@@ -142,6 +142,7 @@ SEMANTIC_QUALITY_VALIDATION_ERROR_MARKERS = tuple(
 )
 MECHANICAL_SCHEMA_VALIDATION_ERROR_MARKERS = (
     "analyst_consensus_leaf_must_be_pre_resolution_or_source_quality",
+    "analyst_consensus_source_classes_must_be_independent_or_expert",
     "analyst_consensus_leaf_wrong_temporal_role",
     " is invalid",
     " is required",
@@ -155,6 +156,14 @@ MECHANICAL_SCHEMA_VALIDATION_ERROR_MARKERS = (
     " missing ",
     " references unknown ",
     "not valid json",
+)
+REPAIRABLE_TERMINAL_TEMPORAL_ERROR_MARKERS = (
+    "leaf-terminal-",
+    "terminal_settlement",
+    "source_cutoff",
+    "decision_schedule",
+    "financial-stability-constraints",
+    "policy-constraints",
 )
 VALIDATION_ERROR_GROUPS = (
     "forbidden_authority",
@@ -452,6 +461,12 @@ def _schema_repair_decision(
         return True, "mechanical_schema_repair_available"
     if groups.get("material_unknown_role"):
         return True, "material_unknown_role_repair_available"
+    if groups.get("terminal_temporal_role") and any(
+        marker in error.lower()
+        for error in groups["terminal_temporal_role"]
+        for marker in REPAIRABLE_TERMINAL_TEMPORAL_ERROR_MARKERS
+    ):
+        return True, "terminal_temporal_role_repair_available"
     return False, "no_mechanical_schema_errors"
 
 
