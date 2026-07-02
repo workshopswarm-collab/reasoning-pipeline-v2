@@ -792,7 +792,7 @@ Checklist:
 
 ## Phase 8 - End-To-End Scoreable Or Structured Non-Scoreable Closure
 
-Status: pending
+Status: completed 2026-07-02
 
 Goal: close the remediation by proving the pipeline reaches the intended v2 terminal state on live
 market data: scoreable only with certified evidence and verified SCAE deltas, otherwise structured
@@ -814,6 +814,51 @@ Implementation:
   - protected write deltas;
   - active work cleanup.
 - Add dated amendment if any new runtime class appears.
+
+Completion note - 2026-07-02:
+
+- Added Phase 8 closure tooling:
+  - `orchestrator/scripts/predquant/ads_live_market_e2e_phase8_closure.py`;
+  - `orchestrator/scripts/bin/report_ads_live_market_e2e_phase8_closure.py`;
+  - focused closure tests in `test_ads_live_market_e2e_phase8_closure.py`.
+- Added a narrow Decomposer repair for live QDT timing/source-quality drift where a
+  timing/cutoff leaf explicitly carries source-quality constraints. The repair promotes the
+  leaf to a counted `source_quality` coverage ref, adds the source/timestamp/cutoff evidence
+  fields, and removes the invalid list-shaped sufficiency requirement.
+- Representative clone-only mini-batch completed with all required tags covered:
+  - BOI rate-decrease, live QDT:
+    `ads-pipeline-run:0fc9502e7b854e8e83611f6ee4c0ca5284c6512d099980f9706dbbee556df426`;
+  - RBNZ central-bank macro, deterministic QDT on cloned live market row:
+    `ads-pipeline-run:05e18277b973d98e7d37b7981c865ad446a4eaa708fa1c88c1f93229a80172ff`;
+  - GPT-5.6 July 13 non-central-bank, deterministic QDT on cloned live market row:
+    `ads-pipeline-run:774cb5d09bff9b14d409162cbff4a0f605577792429ca81516f1e1ae8203173e`;
+  - GPT-5.6 July 8 expected-insufficiency, deterministic QDT on cloned live market row:
+    `ads-pipeline-run:ec551bdc80f8a6560f2b6e5a71c16485bb41fb840a9500f5f835d46b05ddafa2`.
+- Aggregate closure report:
+  - `case_count=4`;
+  - classifications: `structured_non_scoreable_insufficiency=4`;
+  - QDT accepted `4/4`: live accepted `1`, deterministic accepted `3`;
+  - QDT quality OK `4/4`;
+  - retrieval terminal `4/4`, retrieval timeout `4`, browser/native timeout counts `4/4`;
+  - SCAE valid `0`, SCAE invalid `4`;
+  - protected clone deltas: `forecast_decision_records=4`, `market_predictions=0`;
+  - active work after batch: `active_runs=0`, `active_leases=0`.
+- Cleanup and live DB proof:
+  - live protected deltas stayed zero for `ads_case_leases`, `ads_pipeline_runs`,
+    `forecast_decision_records`, `market_predictions`, and `scae_ledger_outputs`;
+  - Phase 8 temp clone artifacts were deleted;
+  - cleanup proof passed.
+
+Amendment - 2026-07-02:
+
+- Additional live-QDT central-bank attempts surfaced a new runtime class after the
+  source-quality repair: `auto003_stage_failed` with `invalid_artifact_terminal` /
+  Decomposer schema-validation failure on RBNZ, BOK, and BOI-no-change probes.
+- The completed Phase 8 closure therefore separates:
+  - true live-QDT BOI proof that accepted QDT reaches bounded retrieval without hanging;
+  - deterministic-QDT category-breadth proof over cloned live market rows;
+  - the central-bank live-QDT invalid-artifact variance as a recorded follow-up blocker
+    rather than a hidden closure failure.
 
 Pseudocode:
 
@@ -857,14 +902,14 @@ Success criteria:
 
 Checklist:
 
-- [ ] Representative mini-batch completed.
-- [ ] Aggregate report reviewed.
-- [ ] Any new blocker added as amendment/subphase.
-- [ ] Expected tests pass.
-- [ ] Cleanup proof passes.
-- [ ] Live DB non-mutation proof passes.
-- [ ] `git diff --check` passes.
-- [ ] Final completion note added.
+- [x] Representative mini-batch completed.
+- [x] Aggregate report reviewed.
+- [x] Any new blocker added as amendment/subphase.
+- [x] Expected tests pass.
+- [x] Cleanup proof passes.
+- [x] Live DB non-mutation proof passes.
+- [x] `git diff --check` passes.
+- [x] Final completion note added.
 
 ## Final Completion Definition
 

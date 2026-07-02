@@ -802,6 +802,125 @@ def _ensure_analyst_consensus_evidence_fields(leaf: dict[str, Any]) -> None:
     leaf["required_evidence_fields"] = fields
 
 
+def _leaf_looks_like_timing_source_quality_gap(leaf: dict[str, Any]) -> bool:
+    if leaf.get("coverage_dimension") != "timing_deadline_constraints":
+        return False
+    text = _normalized_token(
+        [
+            leaf.get("leaf_id"),
+            leaf.get("question_text"),
+            leaf.get("leaf_question"),
+            leaf.get("research_factor"),
+            leaf.get("required_evidence_fields"),
+            leaf.get("market_component_terms"),
+        ]
+    )
+    return (
+        "source_quality" in text
+        and ("cutoff" in text or "calendar" in text or "timing" in text)
+    )
+
+
+def _repair_timing_source_quality_leaf_contract(leaf: dict[str, Any]) -> bool:
+    if not _leaf_looks_like_timing_source_quality_gap(leaf):
+        return False
+    fields = leaf.get("required_evidence_fields")
+    if not isinstance(fields, list):
+        fields = []
+    normalized_fields = [
+        str(field)
+        for field in fields
+        if isinstance(field, str) and field.strip()
+    ]
+    for field in (
+        "source_timestamp",
+        "publisher_authority",
+        "cutoff_admissibility",
+        "decision_calendar_context",
+    ):
+        if field not in normalized_fields:
+            normalized_fields.append(field)
+    leaf["required_evidence_fields"] = normalized_fields
+    leaf["purpose"] = "source_of_truth"
+    leaf["leaf_temporal_role"] = "pre_resolution_forecast_driver"
+    leaf.pop("research_sufficiency_requirements", None)
+    return True
+
+
+def _repair_timing_source_quality_graph_refs(
+    repaired: dict[str, Any],
+    repaired_leaf_ids: set[str],
+) -> None:
+    if not repaired_leaf_ids:
+        return
+    graph = repaired.get("research_coverage_graph")
+    if not isinstance(graph, dict):
+        return
+
+    coverage_dimensions = graph.get("coverage_dimensions")
+    if not isinstance(coverage_dimensions, list):
+        coverage_dimensions = []
+    graph["coverage_dimensions"] = sorted(set(str(item) for item in coverage_dimensions) | {"source_quality"})
+
+    by_dimension = graph.get("required_leaf_ids_by_dimension")
+    if not isinstance(by_dimension, dict):
+        by_dimension = {}
+        graph["required_leaf_ids_by_dimension"] = by_dimension
+    existing = [
+        str(item)
+        for item in by_dimension.get("source_quality", [])
+        if isinstance(item, str) and item.strip()
+    ] if isinstance(by_dimension.get("source_quality"), list) else []
+    by_dimension["source_quality"] = sorted(set(existing) | repaired_leaf_ids)
+
+    unanswered = graph.get("unanswered_material_questions")
+    if isinstance(unanswered, list):
+        graph["unanswered_material_questions"] = [
+            item
+            for item in unanswered
+            if not (
+                isinstance(item, dict)
+                and item.get("coverage_dimension") == "source_quality"
+            )
+        ]
+
+    diagnostics = graph.get("source_quality_diagnostics")
+    if isinstance(diagnostics, list):
+        graph["source_quality_diagnostics"] = [
+            item
+            for item in diagnostics
+            if not (
+                isinstance(item, dict)
+                and str(item.get("leaf_id")) in repaired_leaf_ids
+            )
+        ]
+
+    research_factors = graph.get("research_factors")
+    if isinstance(research_factors, list):
+        factor_keys = {
+            (str(item.get("leaf_id")), str(item.get("coverage_dimension")))
+            for item in research_factors
+            if isinstance(item, dict)
+        }
+        for leaf_id in sorted(repaired_leaf_ids):
+            if (leaf_id, "source_quality") in factor_keys:
+                continue
+            research_factors.append(
+                {
+                    "leaf_id": leaf_id,
+                    "coverage_dimension": "source_quality",
+                    "research_factor": "timing_source_quality_and_cutoff_admissibility",
+                    "leaf_temporal_role": "pre_resolution_forecast_driver",
+                }
+            )
+
+    summary = graph.get("coverage_summary")
+    if isinstance(summary, dict):
+        summary["coverage_dimension_count"] = len(graph["coverage_dimensions"])
+        if not graph.get("unanswered_material_questions"):
+            summary["status"] = "coverage_ready"
+
+
 def _normalize_temporal_role(value: Any) -> str:
     token = _normalized_token(value)
     if token in ALLOWED_LEAF_TEMPORAL_ROLES:
@@ -887,6 +1006,7 @@ def _ensure_model_candidate_contract_shape(repaired: dict[str, Any]) -> dict[str
     material_unknown_repaired_leaf_ids: set[str] = set()
     unresolved_terminal_contract_repaired_leaf_ids: set[str] = set()
     dropped_unresolved_terminal_leaf_ids: set[str] = set()
+    timing_source_quality_repaired_leaf_ids: set[str] = set()
 
     for idx, leaf in enumerate(leaves):
         if not isinstance(leaf, dict):
@@ -917,6 +1037,8 @@ def _ensure_model_candidate_contract_shape(repaired: dict[str, Any]) -> dict[str
             leaf["leaf_temporal_role"] = "pre_resolution_forecast_driver"
             _ensure_analyst_consensus_evidence_fields(leaf)
             leaf.pop("research_sufficiency_requirements", None)
+        elif _repair_timing_source_quality_leaf_contract(leaf):
+            timing_source_quality_repaired_leaf_ids.add(leaf_id)
         elif _repair_material_unknown_leaf_contract(leaf):
             material_unknown_repaired_leaf_ids.add(leaf_id)
         elif _repair_unresolved_terminal_contract_leaf(leaf):
@@ -996,6 +1118,10 @@ def _ensure_model_candidate_contract_shape(repaired: dict[str, Any]) -> dict[str
     _repair_unresolved_terminal_contract_graph_refs(
         repaired,
         unresolved_terminal_contract_repaired_leaf_ids,
+    )
+    _repair_timing_source_quality_graph_refs(
+        repaired,
+        timing_source_quality_repaired_leaf_ids,
     )
     _drop_unresolved_terminal_final_result_graph_refs(
         repaired,

@@ -1084,6 +1084,65 @@ class RuntimeDecompositionEntrypointTest(unittest.TestCase):
         self.assertEqual(repaired_leaf["coverage_dimension"], "source_quality")
         self.assertEqual(repaired_leaf["leaf_temporal_role"], "pre_resolution_forecast_driver")
 
+    def test_rbnz_timing_source_quality_gap_repairs_to_counted_source_quality(self) -> None:
+        handoff = self._handoff()
+        handoff["case_id"] = "case-rbnz-source-quality-runtime"
+        handoff["case_key"] = "polymarket:rbnz-july-source-quality"
+        handoff["macro_question"] = "Will the RBNZ increase the OCR at the July 2026 meeting?"
+        repairable = build_question_specific_fixture_response(handoff)
+        leaf = next(
+            item for item in repairable["required_leaf_questions"]
+            if item["coverage_dimension"] == "source_quality"
+        )
+        old_leaf_id = leaf["leaf_id"]
+        new_leaf_id = "leaf-july-decision-timing-release-risk"
+        leaf["leaf_id"] = new_leaf_id
+        leaf["question_text"] = (
+            "What timing and source-quality constraints exist between the source cutoff "
+            "and the RBNZ July 2026 OCR decision release?"
+        )
+        leaf["leaf_question"] = leaf["question_text"]
+        leaf["purpose"] = "structural"
+        leaf["coverage_dimension"] = "timing_deadline_constraints"
+        leaf["leaf_temporal_role"] = "pre_resolution_forecast_driver"
+        leaf["required_evidence_fields"] = [
+            "decision_release_timing",
+            "pre_decision_data_calendar",
+            "source_quality_notes",
+            "cutoff_gap",
+        ]
+        leaf["research_factor"] = "timing_and_observability_constraints"
+        leaf["market_component_terms"] = [
+            "source cutoff",
+            "RBNZ July 2026 decision",
+            "media release timing",
+            "OCR data",
+        ]
+        leaf["research_sufficiency_requirements"] = ["model emitted list drift"]
+        for branch in repairable["branches"]:
+            if old_leaf_id in branch["leaf_ids"]:
+                branch["leaf_ids"] = [
+                    new_leaf_id if item == old_leaf_id else item for item in branch["leaf_ids"]
+                ]
+        qdt, runtime = build_question_decomposition_from_handoff(
+            handoff,
+            runtime_mode="fixture",
+            fixture_response=repairable,
+        )
+
+        repaired_leaf = next(item for item in qdt["required_leaf_questions"] if item["leaf_id"] == new_leaf_id)
+        graph = qdt["research_coverage_graph"]
+        self.assertTrue(validate_question_decomposition(qdt).valid)
+        self.assertEqual(runtime["repair_count"], 1)
+        self.assertEqual(qdt["research_coverage_check"]["status"], "passed")
+        self.assertEqual(repaired_leaf["purpose"], "source_of_truth")
+        self.assertEqual(repaired_leaf["coverage_dimension"], "timing_deadline_constraints")
+        self.assertEqual(repaired_leaf["leaf_temporal_role"], "pre_resolution_forecast_driver")
+        self.assertIn("source_quality", graph["coverage_dimensions"])
+        self.assertIn(new_leaf_id, graph["required_leaf_ids_by_dimension"]["source_quality"])
+        self.assertFalse(graph["unanswered_material_questions"])
+        self.assertEqual(graph["coverage_summary"]["status"], "coverage_ready")
+
     def test_schema_repair_normalizes_leaf_question_alias_and_analyst_sufficiency(self) -> None:
         handoff = self._handoff()
         handoff["case_id"] = "case-boi-rate-runtime"
