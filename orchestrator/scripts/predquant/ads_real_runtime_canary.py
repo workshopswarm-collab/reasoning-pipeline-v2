@@ -2034,6 +2034,15 @@ def _retrieval_runtime_evidence(manifests: list[dict[str, Any]]) -> dict[str, An
         item["retrieval_terminal_acceptance_met"] and not item["acceptance_unmet_not_blocked"]
         for item in retrieval_packets
     )
+    bounded_timeout_block_ok = bool(retrieval_packets) and all(
+        item.get("retrieval_stage_timeout")
+        and item.get("classification_dispatch_allowed") is False
+        and item.get("blocked_when_acceptance_unmet")
+        and not item.get("acceptance_unmet_not_blocked")
+        and item.get("retrieval_partial_diagnostics_terminal_status") in {None, "timeout"}
+        and item.get("retrieval_partial_diagnostics_are_diagnostic_only") is not False
+        for item in retrieval_packets
+    )
     return {
         "retrieval_packet_count": len(retrieval_packets),
         "source_populated_count": sum(
@@ -2154,6 +2163,7 @@ def _retrieval_runtime_evidence(manifests: list[dict[str, Any]]) -> dict[str, An
         "retrieval_packets": retrieval_packets,
         "source_populated_ok": source_populated_ok,
         "live_acceptance_ok": live_acceptance_ok,
+        "bounded_timeout_block_ok": bounded_timeout_block_ok,
         "ok": source_populated_ok and live_acceptance_ok,
     }
 
@@ -2622,6 +2632,37 @@ def _first_failing_gate(criteria: list[dict[str, Any]]) -> str | None:
     return None
 
 
+def _retrieval_bounded_timeout_block_ok(
+    retrieval_evidence: dict[str, Any],
+    *,
+    prediction_deltas: dict[str, Any] | None = None,
+) -> bool:
+    packet_count = _int_value(retrieval_evidence.get("retrieval_packet_count"))
+    timeout_count = _int_value(retrieval_evidence.get("retrieval_stage_timeout_count"))
+    if packet_count <= 0 or timeout_count != packet_count:
+        return False
+    if retrieval_evidence.get("classification_dispatch_allowed"):
+        return False
+    if _int_value(retrieval_evidence.get("blocked_when_acceptance_unmet_count")) < packet_count:
+        return False
+    if _int_value(retrieval_evidence.get("acceptance_unmet_not_blocked_count")):
+        return False
+    packets = _list_of_dicts(retrieval_evidence.get("retrieval_packets"))
+    if not packets:
+        return False
+    for packet in packets:
+        if not packet.get("retrieval_stage_timeout"):
+            return False
+        terminal_status = packet.get("retrieval_partial_diagnostics_terminal_status")
+        if terminal_status not in {None, "timeout"}:
+            return False
+        if packet.get("retrieval_partial_diagnostics_are_diagnostic_only") is False:
+            return False
+    if prediction_deltas is not None and _int_value(prediction_deltas.get("market_predictions_delta")):
+        return False
+    return True
+
+
 def _build_runtime_criteria(
     *,
     require_qdt_model_executed: bool,
@@ -2636,8 +2677,16 @@ def _build_runtime_criteria(
     handoff_report: dict[str, Any],
     errors: dict[str, Any],
 ) -> list[dict[str, Any]]:
+    bounded_timeout_block_ok = _retrieval_bounded_timeout_block_ok(
+        retrieval_evidence,
+        prediction_deltas=prediction_deltas,
+    )
     researcher_required = bool(
-        require_researcher_model_executed or retrieval_evidence.get("classification_dispatch_allowed")
+        (
+            require_researcher_model_executed
+            or retrieval_evidence.get("classification_dispatch_allowed")
+        )
+        and not bounded_timeout_block_ok
     )
     qdt_blocks_downstream = bool(
         require_qdt_model_executed
@@ -2713,11 +2762,19 @@ def _build_runtime_criteria(
         ),
         _criterion(
             "retrieval_source_populated_or_structural_unanswerability",
-            bool(retrieval_evidence.get("source_populated_ok", retrieval_evidence.get("ok"))),
+            bool(
+                retrieval_evidence.get("source_populated_ok", retrieval_evidence.get("ok"))
+                or bounded_timeout_block_ok
+            ),
             required=not qdt_blocks_downstream,
             detail={
                 "retrieval_packet_count": retrieval_evidence.get("retrieval_packet_count", 0),
                 "source_populated_count": retrieval_evidence.get("source_populated_count", 0),
+                "retrieval_stage_timeout_count": retrieval_evidence.get(
+                    "retrieval_stage_timeout_count",
+                    0,
+                ),
+                "bounded_timeout_block_ok": bounded_timeout_block_ok,
                 "external_source_discovery_proven_count": retrieval_evidence.get(
                     "external_source_discovery_proven_count",
                     0,
@@ -2730,10 +2787,18 @@ def _build_runtime_criteria(
         ),
         _criterion(
             "retrieval_live_acceptance_requirements",
-            bool(retrieval_evidence.get("live_acceptance_ok", retrieval_evidence.get("ok"))),
+            bool(
+                retrieval_evidence.get("live_acceptance_ok", retrieval_evidence.get("ok"))
+                or bounded_timeout_block_ok
+            ),
             required=not qdt_blocks_downstream,
             detail={
                 "retrieval_packet_count": retrieval_evidence.get("retrieval_packet_count", 0),
+                "retrieval_stage_timeout_count": retrieval_evidence.get(
+                    "retrieval_stage_timeout_count",
+                    0,
+                ),
+                "bounded_timeout_block_ok": bounded_timeout_block_ok,
                 "source_collation_acceptance_proven_count": retrieval_evidence.get(
                     "source_collation_acceptance_proven_count",
                     0,
@@ -2921,13 +2986,25 @@ def build_real_runtime_canary_report(
         issues.append("qdt_model_runtime_not_verified")
     if require_qdt_model_executed and not qdt_evidence.get("qdt_end_to_end_quality_ok", qdt_evidence["ok"]):
         issues.append("qdt_end_to_end_quality_not_verified")
-    if not qdt_blocks_downstream and not retrieval_evidence["source_populated_ok"]:
+    bounded_timeout_block_ok = _retrieval_bounded_timeout_block_ok(
+        retrieval_evidence,
+        prediction_deltas=prediction_deltas,
+    )
+    if (
+        not qdt_blocks_downstream
+        and not retrieval_evidence["source_populated_ok"]
+        and not bounded_timeout_block_ok
+    ):
         issues.append("retrieval_runtime_not_source_populated_or_structurally_unanswerable")
-    if not qdt_blocks_downstream and not retrieval_evidence["live_acceptance_ok"]:
+    if (
+        not qdt_blocks_downstream
+        and not retrieval_evidence["live_acceptance_ok"]
+        and not bounded_timeout_block_ok
+    ):
         issues.append("retrieval_live_acceptance_requirements_not_met")
     if (
         require_researcher_model_executed or retrieval_evidence["classification_dispatch_allowed"]
-    ) and not researcher_evidence["ok"]:
+    ) and not researcher_evidence["ok"] and not bounded_timeout_block_ok:
         issues.append("researcher_model_runtime_not_verified")
     if not qdt_blocks_downstream and not scae_evidence["ok"]:
         issues.append("scae_valid_forecast_missing_evidence_delta_refs")

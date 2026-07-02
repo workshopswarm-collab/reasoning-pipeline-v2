@@ -688,7 +688,7 @@ Checklist:
 
 ## Phase 7 - Same-Market Clone Proof: Live QDT To Bounded Retrieval
 
-Status: pending
+Status: complete
 
 Goal: prove the same BOI live-market clone no longer fails at QDT and retrieval no longer hangs.
 
@@ -743,16 +743,52 @@ Success criteria:
   hanging state.
 - If retrieval certifies, researcher/SCAE/decision follow the existing v2 authority gates.
 
+Completion note (2026-07-01):
+
+- Implemented narrow live-QDT repair for unresolved BOI drift:
+  - terminal settlement/source/cutoff status leaves are repaired to dispatchable
+    `resolution_mechanics` leaves;
+  - redundant `leaf-terminal-official-result` leaves are dropped for unresolved markets rather
+    than converted into dispatchable evidence;
+  - final-result leak guard tests still fail closed.
+- Final clone-only proof used `polymarket:1795635` as the only eligible clone market and ran the
+  true production handler path with live Decomposer and live retrieval runtime.
+- Final canary:
+  - `pipeline_run_id`: `ads-pipeline-run:fc33c92120c7685ded8fae54f115fa7017faf9df42aaf97cfa4905587819ff93`;
+  - `terminal_status`: `stopped_after_current_case`;
+  - completed stages: `13`;
+  - QDT live model executed and accepted: `qdt_model_executed_count=1`,
+    `qdt_live_output_accepted_count=1`, `qdt_end_to_end_quality_ok=true`;
+  - Decomposer runtime status: `succeeded`, `fixture_mode=false`, `repair_count=1`,
+    remaining validation errors `0`;
+  - retrieval terminal: `timeout`, `retrieval_stage_hard_timeout`,
+    `retrieval_stage_timeout_count=1`;
+  - real-runtime criteria: `ok=true`, no issues, `first_failing_gate=null`;
+  - closure lens: `structured_non_scoreable_insufficiency`,
+    `stage_completed_with_readiness_block`, `non_scoreable_fail_closed`;
+  - protected clone write deltas: `forecast_decision_records=1`, `market_predictions=0`,
+    `scae_ledger_outputs=0`;
+  - active work after run: `active_runs=0`, `active_leases=0`.
+- Reports generated and reviewed:
+  - real-runtime canary: `ok=true`;
+  - handoff report: `ok=true`, unresolved refs `[]`, stage completions `13`;
+  - operator review: expected clone-only block, `true_runtime_cutover_status=blocked_clone_only_canary`;
+  - closure lens from `source_retrieval_pipeline_health_taxonomy` confirmed
+    non-scoreable fail-closed handling.
+- Live DB non-mutation proof: protected live counters stayed unchanged at
+  `ads_case_leases=9`, `ads_pipeline_runs=8`, `forecast_decision_records=8`,
+  `market_predictions=7`.
+
 Checklist:
 
-- [ ] Same-market clone run completed.
-- [ ] QDT accepted.
-- [ ] Retrieval terminal event emitted within deadline.
-- [ ] Active runs/leases are `0/0`.
-- [ ] Live DB mutation proof passes.
-- [ ] Reports generated and reviewed.
-- [ ] No temp artifacts remain.
-- [ ] `git diff --check` passes.
+- [x] Same-market clone run completed.
+- [x] QDT accepted.
+- [x] Retrieval terminal event emitted within deadline.
+- [x] Active runs/leases are `0/0`.
+- [x] Live DB mutation proof passes.
+- [x] Reports generated and reviewed.
+- [x] No temp artifacts remain.
+- [x] `git diff --check` passes.
 
 ## Phase 8 - End-To-End Scoreable Or Structured Non-Scoreable Closure
 

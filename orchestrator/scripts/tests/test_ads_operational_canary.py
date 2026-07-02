@@ -1133,7 +1133,12 @@ class AdsOperationalCanaryTest(unittest.TestCase):
         self.assertGreaterEqual(report["manifest_counts_by_validation_status"].get("valid", 0), len(ADS_PIPELINE_STAGE_ORDER))
 
     def test_true_production_retrieval_timeout_writes_artifact_and_drains_active_work(self):
-        config = self.config(require_scoreable_prediction=False, require_manifest_handoffs=True)
+        config = self.config(
+            require_scoreable_prediction=False,
+            require_manifest_handoffs=True,
+            require_real_runtime_canary_criteria=True,
+            require_researcher_model_executed=True,
+        )
         provider = _HangingRetrievalProvider()
         handlers = build_true_production_handlers(
             db_path=config.db_path,
@@ -1237,6 +1242,23 @@ class AdsOperationalCanaryTest(unittest.TestCase):
             expected_cases=1,
             expected_forecast_decision_records=1,
             expected_market_predictions=0,
+            require_researcher_model_executed=True,
+        )
+        self.assertTrue(runtime_report["ok"], runtime_report["issues"])
+        self.assertTrue(runtime_report["retrieval_runtime_evidence"]["bounded_timeout_block_ok"])
+        self.assertEqual(runtime_report["first_failing_gate"], None)
+        runtime_gate_statuses = {
+            item["gate"]: item["status"]
+            for item in runtime_report["criteria"]["runtime_gates"]
+        }
+        self.assertEqual(
+            runtime_gate_statuses["retrieval_source_populated_or_structural_unanswerability"],
+            "passed",
+        )
+        self.assertEqual(runtime_gate_statuses["retrieval_live_acceptance_requirements"], "passed")
+        self.assertEqual(
+            runtime_gate_statuses["researcher_model_executed_if_dispatch_allowed"],
+            "skipped",
         )
         stage_health = {item["stage"]: item for item in runtime_report["stage_health"]}
         self.assertEqual(stage_health["decomposition"]["health"], ATTEMPTED_AND_ACCEPTED)
@@ -1989,6 +2011,45 @@ class AdsOperationalCanaryTest(unittest.TestCase):
         self.assertEqual(
             _first_failing_gate(retrieval_failed),
             "retrieval_source_populated_or_structural_unanswerability",
+        )
+
+        bounded_timeout = _build_runtime_criteria(
+            **{
+                **base,
+                "require_researcher_model_executed": True,
+                "retrieval_evidence": {
+                    "ok": False,
+                    "source_populated_ok": False,
+                    "live_acceptance_ok": False,
+                    "retrieval_packet_count": 1,
+                    "source_populated_count": 0,
+                    "retrieval_stage_timeout_count": 1,
+                    "blocked_when_acceptance_unmet_count": 1,
+                    "acceptance_unmet_not_blocked_count": 0,
+                    "classification_dispatch_allowed": False,
+                    "retrieval_packets": [
+                        {
+                            "retrieval_stage_timeout": True,
+                            "retrieval_partial_diagnostics_terminal_status": "timeout",
+                            "retrieval_partial_diagnostics_are_diagnostic_only": True,
+                            "classification_dispatch_allowed": False,
+                            "blocked_when_acceptance_unmet": True,
+                            "acceptance_unmet_not_blocked": False,
+                        }
+                    ],
+                },
+            }
+        )
+        bounded_timeout_statuses = {item["gate"]: item["status"] for item in bounded_timeout}
+        self.assertIsNone(_first_failing_gate(bounded_timeout))
+        self.assertEqual(
+            bounded_timeout_statuses["retrieval_source_populated_or_structural_unanswerability"],
+            "passed",
+        )
+        self.assertEqual(bounded_timeout_statuses["retrieval_live_acceptance_requirements"], "passed")
+        self.assertEqual(
+            bounded_timeout_statuses["researcher_model_executed_if_dispatch_allowed"],
+            "skipped",
         )
 
         qdt_failed = _build_runtime_criteria(

@@ -526,6 +526,117 @@ def _repair_material_unknown_leaf_contract(leaf: dict[str, Any]) -> bool:
     return True
 
 
+UNRESOLVED_TERMINAL_CONTRACT_MARKERS = (
+    "settlement",
+    "resolution mechanics",
+    "resolution rule",
+    "resolution criteria",
+    "resolution source",
+    "resolution timing",
+    "source cutoff",
+    "decision schedule",
+    "decision calendar",
+    "meeting schedule",
+    "announcement status",
+    "current status",
+    "pre resolution status",
+    "official source",
+    "primary source",
+    "market rules",
+)
+
+
+def _leaf_looks_like_unresolved_terminal_contract_repair_candidate(leaf: dict[str, Any]) -> bool:
+    if _leaf_looks_like_final_result_repair_blocker(leaf):
+        return False
+    role = _normalized_token(leaf.get("leaf_temporal_role"))
+    leaf_id = str(leaf.get("leaf_id") or "").lower().replace("_", "-")
+    terminal_label = (
+        role == "terminal_verification"
+        or "terminal" in role
+        or "settlement" in role
+        or "terminal" in leaf_id
+        or "settlement" in leaf_id
+    )
+    if not terminal_label:
+        return False
+    text = _leaf_repair_text(leaf)
+    return any(marker in text for marker in UNRESOLVED_TERMINAL_CONTRACT_MARKERS)
+
+
+def _repair_unresolved_terminal_contract_leaf(leaf: dict[str, Any]) -> bool:
+    if not _leaf_looks_like_unresolved_terminal_contract_repair_candidate(leaf):
+        return False
+    needs_repair = (
+        leaf.get("purpose") != "resolution_mechanics"
+        or leaf.get("coverage_dimension") != "resolution_mechanics"
+        or leaf.get("leaf_temporal_role") != "resolution_mechanics"
+    )
+    if not needs_repair:
+        return False
+    leaf["purpose"] = "resolution_mechanics"
+    leaf["coverage_dimension"] = "resolution_mechanics"
+    leaf["leaf_temporal_role"] = "resolution_mechanics"
+    leaf["research_factor"] = "pre_resolution_resolution_mechanics_and_current_status"
+    leaf["required_evidence_fields"] = [
+        "resolution_source",
+        "resolution_criteria",
+        "settlement_timing",
+        "source_cutoff_admissibility",
+        "current_official_status",
+    ]
+    leaf["classification_targets"] = [
+        "resolution_source",
+        "resolution_criteria",
+        "settlement_timing",
+        "source_cutoff_admissibility",
+        "current_official_status",
+        "evidence_quality",
+        "missingness_status",
+    ]
+    leaf["sufficiency_criteria"] = {
+        "required_source_classes": ["official_or_primary", "market_or_exchange"],
+        "required_value_fields": [
+            "resolution_source",
+            "resolution_criteria",
+            "settlement_timing",
+            "current_official_status",
+        ],
+        "required_negative_checks": ["no_post_cutoff_result_reliance"],
+        "unanswerability_allowed": True,
+        "classification_dispatch_requires_sufficiency_certificate": True,
+    }
+    leaf["missingness_interpretation"] = (
+        "insufficient_pre_resolution_resolution_mechanics_or_current_status_evidence"
+    )
+    raw_forbidden = leaf.get("forbidden_outputs")
+    forbidden = set()
+    if isinstance(raw_forbidden, list):
+        forbidden = {
+            str(item)
+            for item in raw_forbidden
+            if isinstance(item, str) and item.strip()
+        }
+    leaf["forbidden_outputs"] = sorted(forbidden | FORBIDDEN_LEAF_OUTPUTS)
+    structural = leaf.get("structural_validation")
+    if not isinstance(structural, dict):
+        structural = {}
+    structural["depth"] = 2
+    structural.setdefault("answerability_status", "answerable")
+    leaf["structural_validation"] = structural
+    leaf.pop("research_sufficiency_requirements", None)
+    return True
+
+
+def _leaf_looks_like_droppable_unresolved_terminal_final_result_leaf(leaf: dict[str, Any]) -> bool:
+    leaf_id = str(leaf.get("leaf_id") or "").lower().replace("_", "-")
+    if "leaf-terminal-official-result" not in leaf_id:
+        return False
+    if _normalized_token(leaf.get("leaf_temporal_role")) != "terminal_verification":
+        return False
+    return _leaf_looks_like_final_result_repair_blocker(leaf)
+
+
 def _repair_material_unknown_graph_refs(repaired: dict[str, Any], repaired_leaf_ids: set[str]) -> None:
     if not repaired_leaf_ids:
         return
@@ -570,6 +681,110 @@ def _repair_material_unknown_graph_refs(repaired: dict[str, Any], repaired_leaf_
             factor["coverage_dimension"] = "material_unknowns"
             factor["research_factor"] = "unanswered_material_questions"
             factor["leaf_temporal_role"] = "material_unknown"
+
+
+def _repair_unresolved_terminal_contract_graph_refs(
+    repaired: dict[str, Any],
+    repaired_leaf_ids: set[str],
+) -> None:
+    if not repaired_leaf_ids:
+        return
+    graph = repaired.get("research_coverage_graph")
+    if not isinstance(graph, dict):
+        return
+
+    def _without_repaired_ids(value: Any) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        return [str(item) for item in value if str(item) not in repaired_leaf_ids]
+
+    def _with_repaired_ids(value: Any) -> list[str]:
+        return sorted(set(_without_repaired_ids(value)) | repaired_leaf_ids)
+
+    graph["terminal_verification_leaf_ids"] = _without_repaired_ids(
+        graph.get("terminal_verification_leaf_ids")
+    )
+    graph["contract_guard_leaf_ids"] = _with_repaired_ids(
+        graph.get("contract_guard_leaf_ids")
+    )
+    graph["material_question_leaf_ids"] = _without_repaired_ids(
+        graph.get("material_question_leaf_ids")
+    )
+    graph["dispatchable_pre_resolution_leaf_ids"] = _with_repaired_ids(
+        graph.get("dispatchable_pre_resolution_leaf_ids")
+    )
+
+    by_dimension = graph.get("required_leaf_ids_by_dimension")
+    if isinstance(by_dimension, dict):
+        for dimension, leaf_ids in list(by_dimension.items()):
+            by_dimension[dimension] = _without_repaired_ids(leaf_ids)
+        by_dimension["resolution_mechanics"] = _with_repaired_ids(
+            by_dimension.get("resolution_mechanics")
+        )
+
+    research_factors = graph.get("research_factors")
+    if isinstance(research_factors, list):
+        for factor in research_factors:
+            if not isinstance(factor, dict) or str(factor.get("leaf_id")) not in repaired_leaf_ids:
+                continue
+            factor["coverage_dimension"] = "resolution_mechanics"
+            factor["research_factor"] = "pre_resolution_resolution_mechanics_and_current_status"
+            factor["leaf_temporal_role"] = "resolution_mechanics"
+
+
+def _drop_unresolved_terminal_final_result_graph_refs(
+    repaired: dict[str, Any],
+    dropped_leaf_ids: set[str],
+) -> None:
+    if not dropped_leaf_ids:
+        return
+    graph = repaired.get("research_coverage_graph")
+    if not isinstance(graph, dict):
+        return
+
+    def _without_dropped_ids(value: Any) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        return [str(item) for item in value if str(item) not in dropped_leaf_ids]
+
+    for key in (
+        "terminal_verification_leaf_ids",
+        "contract_guard_leaf_ids",
+        "material_question_leaf_ids",
+        "dispatchable_pre_resolution_leaf_ids",
+    ):
+        graph[key] = _without_dropped_ids(graph.get(key))
+
+    by_dimension = graph.get("required_leaf_ids_by_dimension")
+    if isinstance(by_dimension, dict):
+        for dimension, leaf_ids in list(by_dimension.items()):
+            retained = _without_dropped_ids(leaf_ids)
+            if retained:
+                by_dimension[dimension] = retained
+            else:
+                by_dimension.pop(dimension, None)
+
+    research_factors = graph.get("research_factors")
+    if isinstance(research_factors, list):
+        graph["research_factors"] = [
+            factor
+            for factor in research_factors
+            if not isinstance(factor, dict) or str(factor.get("leaf_id")) not in dropped_leaf_ids
+        ]
+
+    overlap_groups = graph.get("overlap_groups")
+    if isinstance(overlap_groups, list):
+        retained_groups = []
+        for group in overlap_groups:
+            if not isinstance(group, dict):
+                retained_groups.append(group)
+                continue
+            leaf_ids = _without_dropped_ids(group.get("leaf_ids"))
+            if len(leaf_ids) >= 2:
+                repaired_group = dict(group)
+                repaired_group["leaf_ids"] = leaf_ids
+                retained_groups.append(repaired_group)
+        graph["overlap_groups"] = retained_groups
 
 
 def _ensure_analyst_consensus_evidence_fields(leaf: dict[str, Any]) -> None:
@@ -670,6 +885,8 @@ def _ensure_model_candidate_contract_shape(repaired: dict[str, Any]) -> dict[str
     membership: dict[str, list[str]] = {branch_id: [] for branch_id in branch_by_id}
     leaf_purposes_by_branch: dict[str, set[str]] = {branch_id: set() for branch_id in branch_by_id}
     material_unknown_repaired_leaf_ids: set[str] = set()
+    unresolved_terminal_contract_repaired_leaf_ids: set[str] = set()
+    dropped_unresolved_terminal_leaf_ids: set[str] = set()
 
     for idx, leaf in enumerate(leaves):
         if not isinstance(leaf, dict):
@@ -688,6 +905,9 @@ def _ensure_model_candidate_contract_shape(repaired: dict[str, Any]) -> dict[str
         if parent_id not in branch_by_id:
             parent_id = default_branch_id
         leaf["parent_branch_id"] = parent_id
+        if _leaf_looks_like_droppable_unresolved_terminal_final_result_leaf(leaf):
+            dropped_unresolved_terminal_leaf_ids.add(leaf_id)
+            continue
         membership.setdefault(parent_id, []).append(leaf_id)
         purpose = _normalize_purpose(leaf.get("purpose"))
         leaf["purpose"] = purpose
@@ -699,6 +919,8 @@ def _ensure_model_candidate_contract_shape(repaired: dict[str, Any]) -> dict[str
             leaf.pop("research_sufficiency_requirements", None)
         elif _repair_material_unknown_leaf_contract(leaf):
             material_unknown_repaired_leaf_ids.add(leaf_id)
+        elif _repair_unresolved_terminal_contract_leaf(leaf):
+            unresolved_terminal_contract_repaired_leaf_ids.add(leaf_id)
         elif (
             leaf.get("coverage_dimension") == "material_unknowns"
             and leaf.get("leaf_temporal_role") not in ALLOWED_LEAF_TEMPORAL_ROLES
@@ -737,7 +959,48 @@ def _ensure_model_candidate_contract_shape(repaired: dict[str, Any]) -> dict[str
         structural.setdefault("answerability_status", "answerable")
         leaf["structural_validation"] = structural
 
+    if dropped_unresolved_terminal_leaf_ids:
+        leaves[:] = [
+            leaf
+            for leaf in leaves
+            if not (
+                isinstance(leaf, dict)
+                and str(leaf.get("leaf_id")) in dropped_unresolved_terminal_leaf_ids
+            )
+        ]
+        for branch_id in list(membership):
+            membership[branch_id] = [
+                leaf_id
+                for leaf_id in membership.get(branch_id, [])
+                if leaf_id not in dropped_unresolved_terminal_leaf_ids
+            ]
+        leaf_purposes_by_branch = {branch_id: set() for branch_id in branch_by_id}
+        for leaf in leaves:
+            if not isinstance(leaf, dict):
+                continue
+            parent_id = str(leaf.get("parent_branch_id") or default_branch_id)
+            leaf_purposes_by_branch.setdefault(parent_id, set()).add(str(leaf.get("purpose") or "other"))
+        branches[:] = [
+            branch
+            for branch in branches
+            if isinstance(branch, dict)
+            and membership.get(str(branch.get("branch_id") or default_branch_id))
+        ]
+        branch_by_id = {
+            str(branch.get("branch_id")): branch
+            for branch in branches
+            if isinstance(branch, dict) and isinstance(branch.get("branch_id"), str)
+        }
+
     _repair_material_unknown_graph_refs(repaired, material_unknown_repaired_leaf_ids)
+    _repair_unresolved_terminal_contract_graph_refs(
+        repaired,
+        unresolved_terminal_contract_repaired_leaf_ids,
+    )
+    _drop_unresolved_terminal_final_result_graph_refs(
+        repaired,
+        dropped_unresolved_terminal_leaf_ids,
+    )
 
     has_anchor_contracts = bool(repaired.get("amrg_anchor_dependency_contracts"))
     if not has_anchor_contracts:

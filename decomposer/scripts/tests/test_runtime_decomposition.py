@@ -166,6 +166,142 @@ class RuntimeDecompositionEntrypointTest(unittest.TestCase):
         }
         return model_response
 
+    def _boi_terminal_settlement_role_drift_response(
+        self,
+        handoff: dict,
+        *,
+        final_result_question: bool = False,
+    ) -> dict:
+        model_response = build_question_specific_fixture_response(handoff)
+        leaf = next(
+            item for item in model_response["required_leaf_questions"]
+            if item["coverage_dimension"] == "resolution_mechanics"
+        )
+        old_leaf_id = leaf["leaf_id"]
+        new_leaf_id = "leaf-terminal-settlement-check"
+        if final_result_question:
+            question = (
+                "What did the final official result say about whether the Bank of Israel "
+                "decreased the Bank of Israel Interest Rate after the July decision?"
+            )
+        else:
+            question = (
+                "What does the Bank of Israel July 2026 rate decision schedule and "
+                "resolution source require checking at settlement, and what current "
+                "pre-resolution status is observable before the source cutoff?"
+            )
+        leaf.update(
+            {
+                "leaf_id": new_leaf_id,
+                "question_text": question,
+                "leaf_question": question,
+                "purpose": "direct_evidence",
+                "coverage_dimension": "current_direct_evidence",
+                "research_factor": (
+                    "final_result_status"
+                    if final_result_question
+                    else "terminal_settlement_check"
+                ),
+                "leaf_temporal_role": "terminal_verification",
+                "required_evidence_fields": (
+                    ["official_result_status"]
+                    if final_result_question
+                    else [
+                        "official_resolution_source",
+                        "settlement_timing",
+                        "current_announcement_status",
+                    ]
+                ),
+                "research_sufficiency_requirements": [
+                    "model emitted a list instead of the sufficiency contract object"
+                ],
+            }
+        )
+        for branch in model_response["branches"]:
+            branch["leaf_ids"] = [
+                new_leaf_id if item == old_leaf_id else item for item in branch["leaf_ids"]
+            ]
+        model_response["research_coverage_graph"] = {
+            "terminal_verification_leaf_ids": [new_leaf_id],
+            "contract_guard_leaf_ids": [],
+            "material_question_leaf_ids": [new_leaf_id],
+            "dispatchable_pre_resolution_leaf_ids": [new_leaf_id],
+            "required_leaf_ids_by_dimension": {
+                "current_direct_evidence": [new_leaf_id],
+            },
+            "research_factors": [
+                {
+                    "leaf_id": new_leaf_id,
+                    "coverage_dimension": "current_direct_evidence",
+                    "research_factor": (
+                        "final_result_status"
+                        if final_result_question
+                        else "terminal_settlement_check"
+                    ),
+                    "leaf_temporal_role": "terminal_verification",
+                }
+            ],
+        }
+        return model_response
+
+    def _boi_extra_terminal_official_result_response(self, handoff: dict) -> dict:
+        model_response = build_question_specific_fixture_response(handoff)
+        base_leaf = next(
+            item for item in model_response["required_leaf_questions"]
+            if item["coverage_dimension"] == "resolution_mechanics"
+        )
+        branch = model_response["branches"][0]
+        terminal_leaf = dict(base_leaf)
+        question = (
+            "What did the final official result say about whether the Bank of Israel "
+            "decreased the Bank of Israel Interest Rate after the July decision?"
+        )
+        terminal_leaf.update(
+            {
+                "leaf_id": "leaf-terminal-official-result",
+                "parent_branch_id": branch["branch_id"],
+                "question_text": question,
+                "leaf_question": question,
+                "purpose": "source_of_truth",
+                "coverage_dimension": "current_direct_evidence",
+                "research_factor": "official_final_result_status",
+                "leaf_temporal_role": "terminal_verification",
+                "required_evidence_fields": ["official_result_status"],
+                "research_sufficiency_requirements": [
+                    "model emitted a list instead of the sufficiency contract object"
+                ],
+            }
+        )
+        model_response["required_leaf_questions"].append(terminal_leaf)
+        branch["leaf_ids"].append("leaf-terminal-official-result")
+        model_response["research_coverage_graph"] = {
+            "terminal_verification_leaf_ids": [],
+            "contract_guard_leaf_ids": [],
+            "material_question_leaf_ids": [],
+            "dispatchable_pre_resolution_leaf_ids": [],
+            "required_leaf_ids_by_dimension": {},
+            "research_factors": [],
+        }
+        model_response["research_coverage_graph"]["terminal_verification_leaf_ids"] = [
+            "leaf-terminal-official-result"
+        ]
+        model_response["research_coverage_graph"]["dispatchable_pre_resolution_leaf_ids"].append(
+            "leaf-terminal-official-result"
+        )
+        model_response["research_coverage_graph"]["required_leaf_ids_by_dimension"].setdefault(
+            "current_direct_evidence",
+            [],
+        ).append("leaf-terminal-official-result")
+        model_response["research_coverage_graph"]["research_factors"].append(
+            {
+                "leaf_id": "leaf-terminal-official-result",
+                "coverage_dimension": "current_direct_evidence",
+                "research_factor": "official_final_result_status",
+                "leaf_temporal_role": "terminal_verification",
+            }
+        )
+        return model_response
+
     def test_cli_writes_question_specific_qdt_and_runtime_call(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             temp = Path(tempdir)
@@ -332,6 +468,91 @@ class RuntimeDecompositionEntrypointTest(unittest.TestCase):
             any(path.endswith(".leaf_temporal_role") for path in diagnostic["repaired_fields"]),
             diagnostic["repaired_fields"],
         )
+
+    def test_boi_terminal_settlement_check_repairs_to_resolution_mechanics_contract(self) -> None:
+        handoff = self._boi_rate_handoff()
+        repairable = self._boi_terminal_settlement_role_drift_response(handoff)
+
+        qdt, runtime = build_question_decomposition_from_handoff(
+            handoff,
+            runtime_mode="fixture",
+            fixture_response=repairable,
+        )
+
+        repaired_leaf = next(
+            item for item in qdt["required_leaf_questions"]
+            if item["leaf_id"] == "leaf-terminal-settlement-check"
+        )
+        graph = qdt["research_coverage_graph"]
+        diagnostic = runtime["schema_repair_diagnostics"][0]
+        self.assertTrue(validate_question_decomposition(qdt).valid)
+        self.assertEqual(runtime["execution_status"], "succeeded")
+        self.assertEqual(runtime["repair_count"], 1)
+        self.assertEqual(diagnostic["repair_decision"], "mechanical_schema_repair_available")
+        self.assertGreater(diagnostic["pre_repair_error_counts"]["mechanical_schema"], 0)
+        self.assertGreater(diagnostic["pre_repair_error_counts"]["terminal_temporal_role"], 0)
+        self.assertEqual(diagnostic["remaining_error_counts"]["terminal_temporal_role"], 0)
+        self.assertEqual(repaired_leaf["purpose"], "resolution_mechanics")
+        self.assertEqual(repaired_leaf["coverage_dimension"], "resolution_mechanics")
+        self.assertEqual(repaired_leaf["leaf_temporal_role"], "resolution_mechanics")
+        self.assertEqual(
+            repaired_leaf["research_factor"],
+            "pre_resolution_resolution_mechanics_and_current_status",
+        )
+        self.assertIn("probability", repaired_leaf["forbidden_outputs"])
+        self.assertIn("final_forecast", repaired_leaf["forbidden_outputs"])
+        self.assertIn(repaired_leaf["leaf_id"], graph["dispatchable_pre_resolution_leaf_ids"])
+        self.assertIn(repaired_leaf["leaf_id"], graph["contract_guard_leaf_ids"])
+        self.assertIn(
+            repaired_leaf["leaf_id"],
+            graph["required_leaf_ids_by_dimension"]["resolution_mechanics"],
+        )
+        self.assertNotIn(repaired_leaf["leaf_id"], graph["terminal_verification_leaf_ids"])
+
+    def test_terminal_settlement_repair_does_not_convert_final_result_terminal_leak(self) -> None:
+        handoff = self._boi_rate_handoff()
+        bad_response = self._boi_terminal_settlement_role_drift_response(
+            handoff,
+            final_result_question=True,
+        )
+
+        with self.assertRaises(ModelRuntimeError) as raised:
+            build_question_decomposition_from_handoff(
+                handoff,
+                runtime_mode="fixture",
+                fixture_response=bad_response,
+            )
+
+        runtime = raised.exception.runtime_call
+        diagnostic = runtime["schema_repair_diagnostics"][0]
+        self.assertEqual(runtime["execution_status"], "failed_schema_validation")
+        self.assertEqual(runtime["repair_count"], 1)
+        self.assertEqual(diagnostic["repair_decision"], "mechanical_schema_repair_available")
+        self.assertGreater(diagnostic["remaining_error_counts"]["terminal_temporal_role"], 0)
+        self.assertIn("leaf-terminal-settlement-check", "; ".join(diagnostic["remaining_errors"]))
+
+    def test_extra_terminal_official_result_leaf_is_dropped_for_unresolved_market(self) -> None:
+        handoff = self._boi_rate_handoff()
+        repairable = self._boi_extra_terminal_official_result_response(handoff)
+
+        qdt, runtime = build_question_decomposition_from_handoff(
+            handoff,
+            runtime_mode="fixture",
+            fixture_response=repairable,
+        )
+
+        leaf_ids = {item["leaf_id"] for item in qdt["required_leaf_questions"]}
+        graph = qdt["research_coverage_graph"]
+        diagnostic = runtime["schema_repair_diagnostics"][0]
+        self.assertTrue(validate_question_decomposition(qdt).valid)
+        self.assertEqual(runtime["execution_status"], "succeeded")
+        self.assertEqual(runtime["repair_count"], 1)
+        self.assertEqual(diagnostic["repair_decision"], "mechanical_schema_repair_available")
+        self.assertGreater(diagnostic["pre_repair_error_counts"]["terminal_temporal_role"], 0)
+        self.assertEqual(diagnostic["remaining_error_counts"]["terminal_temporal_role"], 0)
+        self.assertNotIn("leaf-terminal-official-result", leaf_ids)
+        self.assertNotIn("leaf-terminal-official-result", graph["terminal_verification_leaf_ids"])
+        self.assertNotIn("leaf-terminal-official-result", graph["dispatchable_pre_resolution_leaf_ids"])
 
     def test_material_unknown_repair_does_not_convert_final_result_terminal_leak(self) -> None:
         handoff = self._boi_rate_handoff()
