@@ -89,6 +89,14 @@ FORBIDDEN_OUTPUT_VALUES = {
 DECLARATIVE_FORBIDDEN_OUTPUT_LIST_KEYS = {
     "forbidden_outputs",
 }
+DECLARATIVE_SAFETY_KEY_CONTEXTS = {
+    "sufficiency_criteria",
+}
+DECLARATIVE_SAFETY_KEY_PREFIXES = (
+    "must_avoid_",
+    "must_not_",
+    "do_not_",
+)
 NON_REPAIRABLE_VALIDATION_ERROR_MARKERS = (
     "ambiguous_terms_not_decomposed",
     "insufficient_material_leaf_count",
@@ -293,6 +301,13 @@ def _normalized_field_name(value: Any) -> str:
     return normalized.strip("_")
 
 
+def _is_declarative_safety_key(normalized: str, path: str) -> bool:
+    parent = path.rsplit(".", 1)[-1]
+    if parent not in DECLARATIVE_SAFETY_KEY_CONTEXTS:
+        return False
+    return normalized.startswith(DECLARATIVE_SAFETY_KEY_PREFIXES)
+
+
 def _collect_forbidden_outputs(
     value: Any,
     matches: list[dict[str, str]],
@@ -303,7 +318,10 @@ def _collect_forbidden_outputs(
     if isinstance(value, dict):
         for key, child in value.items():
             normalized = _normalized_field_name(key)
-            if any(fragment in normalized for fragment in FORBIDDEN_OUTPUT_KEY_FRAGMENTS):
+            if (
+                not _is_declarative_safety_key(normalized, path)
+                and any(fragment in normalized for fragment in FORBIDDEN_OUTPUT_KEY_FRAGMENTS)
+            ):
                 matches.append({"path": f"{path}.{key}", "match_type": "key", "matched": normalized})
             _collect_forbidden_outputs(
                 child,

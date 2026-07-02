@@ -925,6 +925,28 @@ class QDTContractTest(unittest.TestCase):
         self.assertFalse(result.valid)
         self.assertIn("leaf_temporal_role", "; ".join(result.errors))
 
+    def test_declarative_sufficiency_safety_key_is_allowed(self):
+        selected = select_qdt_candidate([build_fixture_qdt_candidate(self.handoff)])
+        selected["required_leaf_questions"][0]["sufficiency_criteria"][
+            "must_avoid_numeric_probability_or_odds"
+        ] = True
+
+        result = validate_question_decomposition(selected)
+
+        self.assertTrue(result.valid, result.errors)
+
+    def test_active_probability_key_in_sufficiency_is_rejected(self):
+        selected = select_qdt_candidate([build_fixture_qdt_candidate(self.handoff)])
+        selected["required_leaf_questions"][0]["sufficiency_criteria"]["probability"] = 0.7
+
+        result = validate_question_decomposition(selected)
+
+        self.assertFalse(result.valid)
+        self.assertIn(
+            "sufficiency_criteria.probability is forbidden",
+            "; ".join(result.errors),
+        )
+
     def test_terminal_verification_graph_refs_must_match_leaf_role(self):
         selected = select_qdt_candidate([build_fixture_qdt_candidate(self.handoff)])
         broken = copy.deepcopy(selected)

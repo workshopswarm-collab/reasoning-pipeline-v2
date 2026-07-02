@@ -214,6 +214,14 @@ FORBIDDEN_LEAF_OUTPUTS = {
     "scae_delta",
     "final_forecast",
 }
+DECLARATIVE_SAFETY_KEY_CONTEXTS = {
+    "sufficiency_criteria",
+}
+DECLARATIVE_SAFETY_KEY_PREFIXES = (
+    "must_avoid_",
+    "must_not_",
+    "do_not_",
+)
 GENERIC_QDT_SKELETONS = (
     "What official or primary-source information can resolve the market question?",
     "What fresh direct evidence bears on the target event before the cutoff?",
@@ -430,6 +438,13 @@ def _token_slug(value: Any, *, fallback: str = "market") -> str:
             tokens.append(token)
     slug = "-".join(tokens[:4])
     return slug or fallback
+
+
+def _normalized_field_name(value: Any) -> str:
+    normalized = "".join(ch.lower() if ch.isalnum() else "_" for ch in str(value))
+    while "__" in normalized:
+        normalized = normalized.replace("__", "_")
+    return normalized.strip("_")
 
 
 def _template_similarity(left: str, right: str) -> float:
@@ -1133,8 +1148,16 @@ def _market_reality_constraints_digest_from_evidence_packet(evidence_packet: dic
 def _reject_forbidden_qdt_keys(value: Any, errors: list[str], path: str = "qdt") -> None:
     if isinstance(value, dict):
         for key, child in value.items():
-            normalized = str(key).lower()
-            if any(fragment in normalized for fragment in FORBIDDEN_QDT_KEY_FRAGMENTS):
+            normalized = _normalized_field_name(key)
+            parent = path.rsplit(".", 1)[-1]
+            declarative_safety_key = (
+                parent in DECLARATIVE_SAFETY_KEY_CONTEXTS
+                and normalized.startswith(DECLARATIVE_SAFETY_KEY_PREFIXES)
+            )
+            if (
+                not declarative_safety_key
+                and any(fragment in normalized for fragment in FORBIDDEN_QDT_KEY_FRAGMENTS)
+            ):
                 errors.append(f"{path}.{key} is forbidden in question-decomposition/v1")
             _reject_forbidden_qdt_keys(child, errors, f"{path}.{key}")
     elif isinstance(value, list):

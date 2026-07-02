@@ -960,3 +960,27 @@ Final closure check - 2026-07-02:
   - likely first target: the Decomposer runtime forbidden-output scanner/prompt contract around
     safety-style sufficiency keys such as `must_avoid_numeric_probability_or_odds`, while
     preserving fail-closed behavior for actual probability/odds/forecast-authority outputs.
+
+Central-bank live-QDT blocker repair attempt - 2026-07-02:
+
+- Implemented the first-target fix:
+  - Decomposer model-runtime forbidden-output scan now allows declarative safety keys under
+    `sufficiency_criteria` when they start with `must_avoid_`, `must_not_`, or `do_not_`;
+  - QDT forbidden-key validation uses the same narrow allowance;
+  - active keys such as `sufficiency_criteria.probability` and active values such as
+    `classification_target="probability"` still fail closed.
+- Verification:
+  - `python3 -m unittest scripts.tests.test_model_runtime` passed `21` tests;
+  - `python3 -m unittest scripts.tests.test_qdt` passed `67` tests;
+  - `python3 -m unittest scripts.tests.test_runtime_decomposition` passed `28` tests;
+  - changed Decomposer files passed `py_compile`.
+- Fresh BOK central-bank clone-only live-QDT probes no longer reproduced the
+  `failed_forbidden_output` / `must_avoid_numeric_probability_or_odds` blocker, but both stopped
+  before QDT output on retryable model transport exhaustion:
+  - `ads-pipeline-run:742de89e445097cb2ff1230f394d9c9902771c6d6623510bdf037087f234f816`;
+  - `ads-pipeline-run:c50f65994518f6ce168d3863662487bc1ef2c6386dcbade25c3911814c0212dc`.
+- Current final-closure status:
+  - forbidden-output/schema drift is repaired at the scanner/validator boundary;
+  - full central-bank live-QDT closure proof remains blocked until live transport returns a QDT
+    response that can be checked for accepted QDT and retrieval progression;
+  - failed-probe temp artifacts were deleted and live protected counts remained unchanged.

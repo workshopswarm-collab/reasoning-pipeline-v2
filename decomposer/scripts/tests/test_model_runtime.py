@@ -233,6 +233,44 @@ class ModelRuntimeContractTest(unittest.TestCase):
 
         self.assertEqual(scan["status"], "passed")
 
+    def test_declarative_sufficiency_safety_key_does_not_fail_scan(self) -> None:
+        scan = scan_forbidden_model_outputs(
+            {
+                "ok": True,
+                "required_leaf_questions": [
+                    {
+                        "leaf_id": "leaf-a",
+                        "sufficiency_criteria": {
+                            "must_avoid_numeric_probability_or_odds": True,
+                        },
+                    }
+                ],
+            }
+        )
+
+        self.assertEqual(scan["status"], "passed")
+
+    def test_active_probability_key_under_sufficiency_still_fails_scan(self) -> None:
+        scan = scan_forbidden_model_outputs(
+            {
+                "ok": True,
+                "required_leaf_questions": [
+                    {
+                        "leaf_id": "leaf-a",
+                        "sufficiency_criteria": {
+                            "probability": 0.7,
+                        },
+                    }
+                ],
+            }
+        )
+
+        self.assertEqual(scan["status"], "failed")
+        self.assertEqual(
+            scan["matches"][0]["path"],
+            "response.required_leaf_questions[0].sufficiency_criteria.probability",
+        )
+
     def test_active_forbidden_values_still_fail_scan(self) -> None:
         scan = scan_forbidden_model_outputs(
             {
